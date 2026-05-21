@@ -1,0 +1,11 @@
+f : Int -> Int;
+f x = x;
+g, h : Int;
+g = 1;
+h = 2;
+data Bool = True | False;
+data Maybe a = Nothing | Just a;
+data Either a b = Left a | Right b;
+fixity + left;
+fixity * left tighter than +;
+fixity == left looser than +

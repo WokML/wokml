@@ -1,0 +1,20 @@
+f x = let
+{
+  y = x + 1;
+  z = y * 2
+}
+in z + y;
+g x = case x of
+{
+  0 -> "zero";
+  _ -> "other"
+};
+multi x = h x where
+{
+  h n = let
+  {
+    k = n + 1
+  }
+  in k
+}
+

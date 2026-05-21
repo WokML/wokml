@@ -1,0 +1,8 @@
+a = 1 - 2;
+foo-5 = 0;
+result c = if c then 1 else 2 + 10;
+(<>) x y = x;
+x </> y = y;
+x ` combine ` y = x;
+opVal = (+);
+negLit = -5

@@ -1,0 +1,68 @@
+cabal-version:      3.0
+name:               wok
+version:            0.1.0.0
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             zypeh
+maintainer:         zhengyan@posteo.net
+category:           Language
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:           warnings
+    exposed-modules:
+        GeneratedParser.Wok.Abs
+        GeneratedParser.Wok.Lex
+        GeneratedParser.Wok.Par
+        GeneratedParser.Wok.Print
+        GeneratedParser.Wok.Layout
+        GeneratedParser.Wok.ErrM
+        Wok.Parsing
+        Wok.Reordering
+    build-depends:
+        base ^>=4.20,
+        array ^>=0.5,
+        containers,
+        text
+    hs-source-dirs:   src
+    default-language: GHC2024
+    -- NOTE: cabal auto-invokes alex (.x) and happy (.y) but NOT bnfc (.cf).
+    -- BNFC is listed so `cabal install --only-dependencies` pulls it in; the
+    -- grammar must still be regenerated manually after editing grammar/Wok.cf:
+    --   bnfc --haskell -d --text-token -o src grammar/Wok.cf
+    build-tool-depends:
+        BNFC:bnfc,
+        alex:alex,
+        happy:happy
+
+executable wok
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:
+        base ^>=4.20,
+        wok,
+        text
+    hs-source-dirs:   app
+    default-language: GHC2024
+
+test-suite wok-tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    build-depends:
+        base ^>=4.20,
+        wok,
+        tasty,
+        tasty-golden,
+        tasty-hunit,
+        bytestring,
+        containers,
+        filepath,
+        directory,
+        text
+    hs-source-dirs:   test
+    default-language: GHC2024

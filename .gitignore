@@ -1,0 +1,19 @@
+dist-newstyle/
+dist/
+.ghc.environment.*
+*.hi
+*.o
+.DS_Store
+.stack-work/
+cabal.project.local
+
+# BNFC generates these but we don't use them
+src/GeneratedParser/Wok/Test.hs
+src/GeneratedParser/Wok/Skel.hs
+src/GeneratedParser/Wok/Doc.txt
+
+# BNFC's .bak files (backups of overwritten generated files)
+*.bak
+
+# Happy's .hs output for Par.y (cabal compiles Par.y in dist-newstyle; no need to commit)
+src/GeneratedParser/Wok/Par.hs

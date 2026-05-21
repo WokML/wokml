@@ -1,0 +1,14 @@
+fixity + left;
+fixity * left tighter than +;
+inLet x = let
+{
+  y = x + (1 * 2)
+}
+in y;
+inCase n = case n of
+{
+  0 -> 1 + (2 * 3);
+  _ -> 0
+};
+inLambda = \ x -> x + (1 * 2);
+inIf c x = if c then 1 + (2 * x) else x

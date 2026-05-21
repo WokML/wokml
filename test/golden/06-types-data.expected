@@ -1,0 +1,15 @@
+data List a = Nil | Cons a (List a);
+data Tree a = Leaf | Node (Tree a) a (Tree a);
+data Pair a b = MkPair a b;
+mkInt : Int -> Int;
+mkInt x = x;
+curried : Int -> Int -> Int -> Int;
+curried x y z = x;
+maybeInt : Maybe Int;
+maybeInt = Just 1;
+listInt : [Int];
+listInt = [1, 2, 3];
+pair : (Int, String);
+pair = (1, "x");
+complex : Maybe (Either Int String) -> [Int];
+complex m = []

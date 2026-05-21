@@ -1,0 +1,5 @@
+-- Backtick-applied alphabetic infix operator participates in precedence.
+fixity + left
+fixity mod left tighter than +
+
+remPlus n = n + 7 `mod` 3

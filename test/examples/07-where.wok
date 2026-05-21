@@ -1,0 +1,16 @@
+f x = y + z
+  where
+    y = x + 1
+    z = y * 2
+
+g x = case x of
+  0 -> result
+    where
+      result = "zero"
+  _ -> "other"
+
+h x =
+  let
+    sq = mul x x
+      where mul a b = a + b
+  in sq

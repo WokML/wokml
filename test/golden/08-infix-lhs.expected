@@ -1,0 +1,6 @@
+(+) x y = x;
+(*) x y = y;
+x ` add ` y = x;
+x ## y = x;
+apply f x = f x;
+add x y = x

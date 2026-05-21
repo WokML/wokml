@@ -1,0 +1,13 @@
+-- Mixed arithmetic precedence with relational fixity decls.
+fixity + left
+fixity - left
+fixity * left tighter than +
+fixity / left tighter than +
+fixity ^ right tighter than *
+fixity == left looser than +
+
+mulAdd a b c = a + b * c
+addMul a b c = a * b + c
+powRight x  = x ^ x ^ x
+equality a b = a == b + 1
+chainAdd a b c = a + b + c

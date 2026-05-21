@@ -1,0 +1,205 @@
+-- wok grammar v1 (current high-water: Task 12 — negative literal lexer)
+
+entrypoints Module ;
+
+-- Layout pragma: indentation-based blocks for let/where/case-of and top-level decls.
+-- BNFC's layout filter inserts virtual {, ;, } tokens based on indentation, so the
+-- grammar can be written with explicit braces while source code uses indentation.
+--
+--   layout toplevel ;          the file itself is a layout block of decls
+--   layout "let", "where", "of"  after each of these, open an indented block
+--   layout stop "in"           "in" closes the matching "let" block early
+layout toplevel ;
+layout "let", "where", "of" ;
+layout stop "in" ;
+
+Module.   Module ::= [Decl] ;
+
+DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
+DSig.     Decl ::= VarId [VarIdComma] ":" Type ;       -- multi-name sig
+DData.    Decl ::= "data" VarId [VarId] "=" [ConDef] ;
+DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
+
+separator Decl ";" ;
+
+-- Helper: comma-separated additional VarIds for multi-name sigs (`f, g, h : T`)
+-- BNFC allows only ONE `separator <Cat> <sep>` declaration per category.
+-- `separator VarId ""` is already used below for DData's type params (whitespace-separated).
+-- So multi-name signatures use this VarIdComma indirection instead of `separator VarId ","`.
+-- Task 9's LDSig should use [VarIdComma] for consistency with DSig here.
+VICons.   VarIdComma ::= "," VarId ;
+separator VarIdComma "" ;
+
+-- For `data T a b c = ...`, type params are bare VarIds (whitespace-separated list)
+separator VarId "" ;
+
+-- Function LHS — four equivalent forms for defining operators:
+--   add x y    = ...   (LHSPre, FNBare VarId)
+--   (+) x y    = ...   (LHSPre, FNParen)
+--   x + y      = ...   (LHSInfSym — symbolic infix)
+--   x `add` y  = ...   (LHSInfBT — backtick-wrapped alphabetic infix)
+--
+-- LALR(1) disambiguation:
+--   second token after the first FunName/AtomPat decides:
+--     - VarId, AtomPat-starter (paren, bracket, literal, _) -> LHSPre (more args)
+--     - VarSym -> LHSInfSym (commit to infix)
+--     - backtick -> LHSInfBT
+LHSPre.    FunLHS ::= FunName [AtomPat] ;
+LHSInfSym. FunLHS ::= AtomPat VarSym AtomPat ;
+LHSInfBT.  FunLHS ::= AtomPat "`" VarId "`" AtomPat ;
+
+FNBare.    FunName ::= VarId ;
+FNBareSym. FunName ::= VarSym ;
+FNParen.   FunName ::= "(" VarSym ")" ;
+
+-- Patterns (full version: variable, wildcard, literals, constructor app, cons, tuple, list)
+--
+-- Pat is the top-level pattern with constructor application and right-assoc cons.
+-- AtomPat is the non-applied atom shape used as constructor args, ELam binders,
+-- LHSPre args, and inside parens.
+--
+-- Design note: PApp requires at least one AtomPat argument (VarId AtomPat [AtomPat]).
+-- Bare name patterns (variables and nullary constructors) parse as PAtom (APVar x).
+-- The semantic pass distinguishes variables (lowercase first char) from nullary
+-- constructors (uppercase first char). This avoids a reduce/reduce conflict that
+-- arises if PCon. Pat ::= VarId [AtomPat] is used (zero-arg empty list case clashes
+-- with APVar. AtomPat ::= VarId when both are reachable from Pat).
+PApp.     Pat ::= VarId AtomPat [AtomPat] ; -- constructor applied to 1+ args
+PCons.    Pat ::= AtomPat "::" Pat ;        -- right-associative cons
+-- PAtom is an explicit wrapper (NOT a transparent `_.` coercion). BNFC's `_.` only
+-- works between same-base-category precedence levels (e.g., Exp/Exp1/Exp2), not
+-- between distinct categories like Pat and AtomPat. Downstream semantic / resolver
+-- code must `case` on PAtom to unwrap to AtomPat.
+PAtom.    Pat ::= AtomPat ;                -- atom (var, wildcard, lit, paren, list, tuple) as Pat
+
+APVar.    AtomPat ::= VarId ;
+APWild.   AtomPat ::= "_" ;
+APLitI.   AtomPat ::= WokInt ;
+APLitS.   AtomPat ::= String ;
+APLitC.   AtomPat ::= Char ;
+APTuple.  AtomPat ::= "(" Pat "," [Pat] ")" ;   -- 2-or-more; single-element is APParen
+APList.   AtomPat ::= "[" [Pat] "]" ;
+APParen.  AtomPat ::= "(" Pat ")" ;
+
+separator AtomPat "" ;   -- covers both LHSPre args and ELam binders
+separator Pat "," ;
+
+-- Types (Task 8: full type expressions)
+--
+-- Precedence levels:
+--   Type  = TFun: right-assoc function arrow `A -> B -> C` = `A -> (B -> C)`
+--   Type1 = AppType: left-assoc juxtaposition application `Maybe a b` = `(Maybe a) b`
+--   Type2 = AtomType: type var/ctor, list type, tuple type, paren
+--
+-- Mapping to spec's pseudo-grammar:
+--   spec's `Type`    = our `Type`
+--   spec's `AppType` = our `Type1`
+--   spec's `AtomType`= our `Type2`
+
+TFun.     Type  ::= Type1 "->" Type ;      -- right-assoc function arrow
+_.        Type  ::= Type1 ;
+
+TApp.     Type1 ::= Type1 Type2 ;          -- left-assoc type application
+_.        Type1 ::= Type2 ;
+
+TVar.     Type2 ::= VarId ;                -- type variable or type constructor
+TList.    Type2 ::= "[" Type "]" ;
+TTuple.   Type2 ::= "(" Type "," [Type] ")" ;
+TParen.   Type2 ::= "(" Type ")" ;
+
+separator Type "," ;
+
+-- Constructor definition body for `data` (typed args)
+-- ConDef takes 0+ Type2 (atomic) args. Multi-word types like `List a` need parens
+-- because constructor args are juxtaposed: `Cons a (List a)` not `Cons a List a`.
+ConDef.   ConDef ::= VarId [Type2] ;
+separator ConDef "|" ;
+separator Type2 "" ;
+
+-- Fixity decls
+FNSym.    FixName ::= VarSym ;
+FNAlpha.  FixName ::= VarId ;
+
+FALeft.   FixAssoc ::= "left" ;
+FARight.  FixAssoc ::= "right" ;
+
+FRTight.  FixRel ::= "tighter" "than" FixName ;
+FRLoose.  FixRel ::= "looser" "than" FixName ;
+
+separator FixRel "" ;
+
+-- Expressions (Task 6: atoms + juxtaposition application + infix operator chains
+--              + lambda, let, case, if-then-else)
+--
+-- Precedence levels:
+--   Exp   = EExpr: head Exp1 + flat list of InfixTail entries (deferred precedence)
+--   Exp1  = AppExp (left-assoc juxtaposition)
+--   Exp2  = AtomExp (parenthesised, list, tuple, literals, var, lambda, let, case, if)
+
+EExpr.    Exp  ::= Exp1 [InfixTail] ;
+
+ITail.    InfixTail ::= InfixOp Exp1 ;
+separator InfixTail "" ;
+
+IOSym.    InfixOp ::= VarSym ;
+IOBT.     InfixOp ::= "`" VarId "`" ;
+
+EApp.     Exp1 ::= Exp1 Exp2 ;    -- left-assoc juxtaposition application
+_.        Exp1 ::= Exp2 ;
+
+EVar.     Exp2 ::= VarId ;
+ELitI.    Exp2 ::= WokInt ;
+ELitS.    Exp2 ::= String ;
+ELitC.    Exp2 ::= Char ;
+EParen.   Exp2 ::= "(" Exp ")" ;
+EParenOp. Exp2 ::= "(" VarSym ")" ;    -- (+), (>>=), etc.
+EList.    Exp2 ::= "[" [Exp] "]" ;
+ETuple.   Exp2 ::= "(" Exp "," [Exp] ")" ;
+-- Lambda binders are AtomPat (not full Pat) per Haskell convention: a binder
+-- like `\Just x -> ...` would be ambiguous (one constructor pattern vs two
+-- variable binders), so constructor / cons patterns must be paren-wrapped:
+-- `\(Just x) -> ...`. NOTE: the spec text says `[Pat]` here; the grammar
+-- intentionally uses `[AtomPat]` for the disambiguation reason above.
+ELam.     Exp2 ::= "\\" [AtomPat] "->" Exp ;
+ELet.     Exp2 ::= "let" "{" [LocalDecl] "}" "in" Exp ;
+-- Empty `case x of { }` is syntactically allowed (BNFC list is 0-or-more);
+-- semantic pass should reject non-exhaustive empty alternatives.
+ECase.    Exp2 ::= "case" Exp "of" "{" [Alt] "}" ;
+EIf.      Exp2 ::= "if" Exp "then" Exp "else" Exp ;
+
+separator Exp "," ;   -- shared by EList and ETuple bodies
+
+-- Local decls (for `let` blocks; same shape allowed in `where` blocks in Task 9)
+LDEqn.    LocalDecl ::= FunLHS "=" Exp MaybeWhere ;
+LDSig.    LocalDecl ::= VarId [VarIdComma] ":" Type ;
+separator LocalDecl ";" ;
+
+-- Optional where-block attached to DEqn / LDEqn / AltC
+-- LocalDecl in where is the restricted subset (LDEqn + LDSig only; no nested data/fixity).
+NoWhere.  MaybeWhere ::= ;
+WithWh.   MaybeWhere ::= "where" "{" [LocalDecl] "}" ;
+
+-- Case alternatives
+AltC.     Alt ::= Pat "->" Exp MaybeWhere ;
+separator Alt ";" ;
+
+-- Token definitions (carried forward from Task 2)
+
+-- Negative integer literal: `-` immediately followed by digits lexes as one WokInt token.
+-- The lexer's longest-match rule ensures `-5` wins over splitting into VarSym "-" + WokInt 5.
+-- Trade-off (documented wart): `1-2` lexes as [1, -2] not [1, -, 2]; subtraction needs spaces.
+-- NOTE: We use `WokInt` (not `Integer`) because BNFC does not allow overriding its built-in
+-- `Integer` token; attempting to redefine `Integer` results in a duplicate token in Par.y.
+position token WokInt ('-')? digit+ ;
+
+position token VarId
+  (letter | '_') (letter | digit | '_' | '\'' | '-')*
+  ;
+
+position token VarSym
+  ('!' | '#' | '$' | '%' | '&' | '*' | '+' | '.' | '/' |
+   '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '|' | '-' | '~')+
+  ;
+
+comment "--" ;
+comment "{-" "-}" ;

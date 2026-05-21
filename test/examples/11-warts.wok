@@ -1,0 +1,21 @@
+-- "1-2" lexes as [1, -2] -- needs spaces for subtraction
+a = 1 - 2 ;
+
+-- "foo-5" is one VarId
+foo-5 = 0 ;
+
+-- if/then/else as AtomExp: (if c then a else b) + 1
+result c = if c then 1 else 2 + 10 ;
+
+-- operator def, three forms
+(<>) x y = x ;
+
+x </> y = y ;
+
+x `combine` y = x ;
+
+-- operator as value
+opVal = (+) ;
+
+-- negative literal wart: -5 lexes as one token, not minus + 5
+negLit = -5

@@ -1,0 +1,12 @@
+fixity + left;
+fixity - left;
+fixity * left tighter than +;
+fixity / left tighter than +;
+fixity ^ right tighter than *;
+fixity == left looser than +;
+fixity && left looser than ==;
+fixity || left looser than &&;
+fixity ++ right;
+fixity $ right looser than ||;
+fixity div left tighter than +;
+fixity mod left tighter than +

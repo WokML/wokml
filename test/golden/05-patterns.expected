@@ -1,0 +1,33 @@
+unwrap m = case m of
+{
+  Nothing -> 0;
+  Just x -> x
+};
+head xs = case xs of
+{
+  h :: _ -> h
+};
+tuple p = case p of
+{
+  (a, b) -> a
+};
+threeTuple p = case p of
+{
+  (a, b, c) -> a
+};
+listLit xs = case xs of
+{
+  [] -> 0;
+  [x] -> x;
+  [x, y] -> x
+};
+nested xs = case xs of
+{
+  (Just x) :: _ -> x;
+  _ -> 0
+};
+wildcard = case 0 of
+{
+  _ -> 1
+}
+
