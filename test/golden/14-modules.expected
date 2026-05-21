@@ -1,0 +1,6 @@
+module Geometry . Shapes;
+import Data . List;
+use Math . Trig;
+area : Int;
+area = 1;
+local scratch n = n

@@ -1,4 +1,4 @@
--- wok grammar v1 (current high-water: Task 12 — negative literal lexer)
+-- wok grammar v2
 
 entrypoints Module ;
 
@@ -17,10 +17,30 @@ Module.   Module ::= [Decl] ;
 
 DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
 DSig.     Decl ::= VarId [VarIdComma] ":" Type ;       -- multi-name sig
-DData.    Decl ::= "data" VarId [VarId] "=" [ConDef] ;
+DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 
 separator Decl ";" ;
+
+-- Hierarchical dotted module paths (e.g. Data.List)
+MPName.   ModPath ::= ConId ;
+MPDot.    ModPath ::= ModPath "." ConId ;
+
+-- Module-level declarations.
+-- DModule is conventionally the first decl; a later semantic pass enforces
+-- "present, first, unique". DLocal recursively wraps any Decl; the semantic
+-- pass restricts it to value/type/data/fixity decls.
+DModule.  Decl ::= "module" ModPath ;
+DImport.  Decl ::= "import" ModPath ;
+DUse.     Decl ::= "use" ModPath ;
+DLocal.   Decl ::= "local" Decl ;
+
+-- Reserved for future language features. ReservedKw exists only so BNFC adds
+-- these words to the lexer's reserved set, keeping them out of VarId. When a
+-- feature ships, move its word out of here into that feature's real production.
+rules     ReservedKw ::= "contract" | "type" | "class" | "instance"
+                       | "deriving" | "forall" | "do" | "record" ;
+DReserved. Decl ::= ReservedKw ;
 
 -- Helper: comma-separated additional VarIds for multi-name sigs (`f, g, h : T`)
 -- BNFC allows only ONE `separator <Cat> <sep>` declaration per category.
@@ -58,13 +78,13 @@ FNParen.   FunName ::= "(" VarSym ")" ;
 -- AtomPat is the non-applied atom shape used as constructor args, ELam binders,
 -- LHSPre args, and inside parens.
 --
--- Design note: PApp requires at least one AtomPat argument (VarId AtomPat [AtomPat]).
--- Bare name patterns (variables and nullary constructors) parse as PAtom (APVar x).
--- The semantic pass distinguishes variables (lowercase first char) from nullary
--- constructors (uppercase first char). This avoids a reduce/reduce conflict that
--- arises if PCon. Pat ::= VarId [AtomPat] is used (zero-arg empty list case clashes
--- with APVar. AtomPat ::= VarId when both are reachable from Pat).
-PApp.     Pat ::= VarId AtomPat [AtomPat] ; -- constructor applied to 1+ args
+-- Design note: PApp requires at least one AtomPat argument (ConId AtomPat [AtomPat]).
+-- Nullary constructors and bare variables both arrive as PAtom; APCon covers nullary
+-- constructors, APVar covers variables. The ConId/VarId lexical split means the
+-- semantic pass no longer needs first-character inspection. The pre-split grammar
+-- used `VarId [AtomPat]` for PApp; that caused a reduce/reduce conflict (zero-arg
+-- list clashed with APVar. AtomPat ::= VarId). The lexer-level split eliminates it.
+PApp.     Pat ::= ModPath AtomPat [AtomPat] ; -- constructor applied to 1+ args
 PCons.    Pat ::= AtomPat "::" Pat ;        -- right-associative cons
 -- PAtom is an explicit wrapper (NOT a transparent `_.` coercion). BNFC's `_.` only
 -- works between same-base-category precedence levels (e.g., Exp/Exp1/Exp2), not
@@ -73,6 +93,7 @@ PCons.    Pat ::= AtomPat "::" Pat ;        -- right-associative cons
 PAtom.    Pat ::= AtomPat ;                -- atom (var, wildcard, lit, paren, list, tuple) as Pat
 
 APVar.    AtomPat ::= VarId ;
+APCon.    AtomPat ::= ModPath ;
 APWild.   AtomPat ::= "_" ;
 APLitI.   AtomPat ::= WokInt ;
 APLitS.   AtomPat ::= String ;
@@ -102,7 +123,8 @@ _.        Type  ::= Type1 ;
 TApp.     Type1 ::= Type1 Type2 ;          -- left-assoc type application
 _.        Type1 ::= Type2 ;
 
-TVar.     Type2 ::= VarId ;                -- type variable or type constructor
+TVar.     Type2 ::= VarId ;                -- type variable
+TCon.     Type2 ::= ModPath ;              -- type constructor (qualified or bare)
 TList.    Type2 ::= "[" Type "]" ;
 TTuple.   Type2 ::= "(" Type "," [Type] ")" ;
 TParen.   Type2 ::= "(" Type ")" ;
@@ -112,7 +134,7 @@ separator Type "," ;
 -- Constructor definition body for `data` (typed args)
 -- ConDef takes 0+ Type2 (atomic) args. Multi-word types like `List a` need parens
 -- because constructor args are juxtaposed: `Cons a (List a)` not `Cons a List a`.
-ConDef.   ConDef ::= VarId [Type2] ;
+ConDef.   ConDef ::= ConId [Type2] ;
 separator ConDef "|" ;
 separator Type2 "" ;
 
@@ -148,6 +170,9 @@ EApp.     Exp1 ::= Exp1 Exp2 ;    -- left-assoc juxtaposition application
 _.        Exp1 ::= Exp2 ;
 
 EVar.     Exp2 ::= VarId ;
+ECon.     Exp2 ::= ConId ;
+EProj.    Exp2 ::= Exp2 "." VarId ;
+EProjC.   Exp2 ::= Exp2 "." ConId ;
 ELitI.    Exp2 ::= WokInt ;
 ELitS.    Exp2 ::= String ;
 ELitC.    Exp2 ::= Char ;
@@ -192,12 +217,16 @@ separator Alt ";" ;
 -- `Integer` token; attempting to redefine `Integer` results in a duplicate token in Par.y.
 position token WokInt ('-')? digit+ ;
 
+position token ConId
+  upper (letter | digit | '_' | '\'' | '-')*
+  ;
+
 position token VarId
-  (letter | '_') (letter | digit | '_' | '\'' | '-')*
+  (lower | '_') (letter | digit | '_' | '\'' | '-')*
   ;
 
 position token VarSym
-  ('!' | '#' | '$' | '%' | '&' | '*' | '+' | '.' | '/' |
+  ('!' | '#' | '$' | '%' | '&' | '*' | '+' | '/' |
    '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '|' | '-' | '~')+
   ;
 

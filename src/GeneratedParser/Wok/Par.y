@@ -24,42 +24,56 @@ import qualified Data.Text
 %monad { Err } { (>>=) } { return }
 %tokentype {Token}
 %token
-  '('       { PT _ (TS _ 1)     }
-  ')'       { PT _ (TS _ 2)     }
-  ','       { PT _ (TS _ 3)     }
-  '->'      { PT _ (TS _ 4)     }
-  ':'       { PT _ (TS _ 5)     }
-  '::'      { PT _ (TS _ 6)     }
-  ';'       { PT _ (TS _ 7)     }
-  '='       { PT _ (TS _ 8)     }
-  '['       { PT _ (TS _ 9)     }
-  '\\'      { PT _ (TS _ 10)    }
-  ']'       { PT _ (TS _ 11)    }
-  '_'       { PT _ (TS _ 12)    }
-  '`'       { PT _ (TS _ 13)    }
-  'case'    { PT _ (TS _ 14)    }
-  'data'    { PT _ (TS _ 15)    }
-  'else'    { PT _ (TS _ 16)    }
-  'fixity'  { PT _ (TS _ 17)    }
-  'if'      { PT _ (TS _ 18)    }
-  'in'      { PT _ (TS _ 19)    }
-  'left'    { PT _ (TS _ 20)    }
-  'let'     { PT _ (TS _ 21)    }
-  'looser'  { PT _ (TS _ 22)    }
-  'of'      { PT _ (TS _ 23)    }
-  'right'   { PT _ (TS _ 24)    }
-  'than'    { PT _ (TS _ 25)    }
-  'then'    { PT _ (TS _ 26)    }
-  'tighter' { PT _ (TS _ 27)    }
-  'where'   { PT _ (TS _ 28)    }
-  '{'       { PT _ (TS _ 29)    }
-  '|'       { PT _ (TS _ 30)    }
-  '}'       { PT _ (TS _ 31)    }
-  L_charac  { PT _ (TC $$)      }
-  L_quoted  { PT _ (TL $$)      }
-  L_WokInt  { PT _ (T_WokInt _) }
-  L_VarId   { PT _ (T_VarId _)  }
-  L_VarSym  { PT _ (T_VarSym _) }
+  '('        { PT _ (TS _ 1)     }
+  ')'        { PT _ (TS _ 2)     }
+  ','        { PT _ (TS _ 3)     }
+  '->'       { PT _ (TS _ 4)     }
+  '.'        { PT _ (TS _ 5)     }
+  ':'        { PT _ (TS _ 6)     }
+  '::'       { PT _ (TS _ 7)     }
+  ';'        { PT _ (TS _ 8)     }
+  '='        { PT _ (TS _ 9)     }
+  '['        { PT _ (TS _ 10)    }
+  '\\'       { PT _ (TS _ 11)    }
+  ']'        { PT _ (TS _ 12)    }
+  '_'        { PT _ (TS _ 13)    }
+  '`'        { PT _ (TS _ 14)    }
+  'case'     { PT _ (TS _ 15)    }
+  'class'    { PT _ (TS _ 16)    }
+  'contract' { PT _ (TS _ 17)    }
+  'data'     { PT _ (TS _ 18)    }
+  'deriving' { PT _ (TS _ 19)    }
+  'do'       { PT _ (TS _ 20)    }
+  'else'     { PT _ (TS _ 21)    }
+  'fixity'   { PT _ (TS _ 22)    }
+  'forall'   { PT _ (TS _ 23)    }
+  'if'       { PT _ (TS _ 24)    }
+  'import'   { PT _ (TS _ 25)    }
+  'in'       { PT _ (TS _ 26)    }
+  'instance' { PT _ (TS _ 27)    }
+  'left'     { PT _ (TS _ 28)    }
+  'let'      { PT _ (TS _ 29)    }
+  'local'    { PT _ (TS _ 30)    }
+  'looser'   { PT _ (TS _ 31)    }
+  'module'   { PT _ (TS _ 32)    }
+  'of'       { PT _ (TS _ 33)    }
+  'record'   { PT _ (TS _ 34)    }
+  'right'    { PT _ (TS _ 35)    }
+  'than'     { PT _ (TS _ 36)    }
+  'then'     { PT _ (TS _ 37)    }
+  'tighter'  { PT _ (TS _ 38)    }
+  'type'     { PT _ (TS _ 39)    }
+  'use'      { PT _ (TS _ 40)    }
+  'where'    { PT _ (TS _ 41)    }
+  '{'        { PT _ (TS _ 42)    }
+  '|'        { PT _ (TS _ 43)    }
+  '}'        { PT _ (TS _ 44)    }
+  L_charac   { PT _ (TC $$)      }
+  L_quoted   { PT _ (TL $$)      }
+  L_WokInt   { PT _ (T_WokInt _) }
+  L_ConId    { PT _ (T_ConId _)  }
+  L_VarId    { PT _ (T_VarId _)  }
+  L_VarSym   { PT _ (T_VarSym _) }
 
 %%
 
@@ -71,6 +85,9 @@ String   : L_quoted { (Data.Text.unpack $1) }
 
 WokInt :: { GeneratedParser.Wok.Abs.WokInt }
 WokInt  : L_WokInt { GeneratedParser.Wok.Abs.WokInt (mkPosToken $1) }
+
+ConId :: { GeneratedParser.Wok.Abs.ConId }
+ConId  : L_ConId { GeneratedParser.Wok.Abs.ConId (mkPosToken $1) }
 
 VarId :: { GeneratedParser.Wok.Abs.VarId }
 VarId  : L_VarId { GeneratedParser.Wok.Abs.VarId (mkPosToken $1) }
@@ -85,14 +102,35 @@ Decl :: { GeneratedParser.Wok.Abs.Decl }
 Decl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.DEqn $1 $3 $4 }
   | VarId ListVarIdComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
-  | 'data' VarId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
+  | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
+  | 'module' ModPath { GeneratedParser.Wok.Abs.DModule $2 }
+  | 'import' ModPath { GeneratedParser.Wok.Abs.DImport $2 }
+  | 'use' ModPath { GeneratedParser.Wok.Abs.DUse $2 }
+  | 'local' Decl { GeneratedParser.Wok.Abs.DLocal $2 }
+  | ReservedKw { GeneratedParser.Wok.Abs.DReserved $1 }
 
 ListDecl :: { [GeneratedParser.Wok.Abs.Decl] }
 ListDecl
   : {- empty -} { [] }
   | Decl { (:[]) $1 }
   | Decl ';' ListDecl { (:) $1 $3 }
+
+ModPath :: { GeneratedParser.Wok.Abs.ModPath }
+ModPath
+  : ConId { GeneratedParser.Wok.Abs.MPName $1 }
+  | ModPath '.' ConId { GeneratedParser.Wok.Abs.MPDot $1 $3 }
+
+ReservedKw :: { GeneratedParser.Wok.Abs.ReservedKw }
+ReservedKw
+  : 'contract' { GeneratedParser.Wok.Abs.ReservedKw_contract }
+  | 'type' { GeneratedParser.Wok.Abs.ReservedKw_type }
+  | 'class' { GeneratedParser.Wok.Abs.ReservedKw_class }
+  | 'instance' { GeneratedParser.Wok.Abs.ReservedKw_instance }
+  | 'deriving' { GeneratedParser.Wok.Abs.ReservedKw_deriving }
+  | 'forall' { GeneratedParser.Wok.Abs.ReservedKw_forall }
+  | 'do' { GeneratedParser.Wok.Abs.ReservedKw_do }
+  | 'record' { GeneratedParser.Wok.Abs.ReservedKw_record }
 
 VarIdComma :: { GeneratedParser.Wok.Abs.VarIdComma }
 VarIdComma : ',' VarId { GeneratedParser.Wok.Abs.VICons $2 }
@@ -118,13 +156,14 @@ FunName
 
 Pat :: { GeneratedParser.Wok.Abs.Pat }
 Pat
-  : VarId AtomPat ListAtomPat { GeneratedParser.Wok.Abs.PApp $1 $2 $3 }
+  : ModPath AtomPat ListAtomPat { GeneratedParser.Wok.Abs.PApp $1 $2 $3 }
   | AtomPat '::' Pat { GeneratedParser.Wok.Abs.PCons $1 $3 }
   | AtomPat { GeneratedParser.Wok.Abs.PAtom $1 }
 
 AtomPat :: { GeneratedParser.Wok.Abs.AtomPat }
 AtomPat
   : VarId { GeneratedParser.Wok.Abs.APVar $1 }
+  | ModPath { GeneratedParser.Wok.Abs.APCon $1 }
   | '_' { GeneratedParser.Wok.Abs.APWild }
   | WokInt { GeneratedParser.Wok.Abs.APLitI $1 }
   | String { GeneratedParser.Wok.Abs.APLitS $1 }
@@ -155,6 +194,7 @@ Type1
 Type2 :: { GeneratedParser.Wok.Abs.Type }
 Type2
   : VarId { GeneratedParser.Wok.Abs.TVar $1 }
+  | ModPath { GeneratedParser.Wok.Abs.TCon $1 }
   | '[' Type ']' { GeneratedParser.Wok.Abs.TList $2 }
   | '(' Type ',' ListType ')' { GeneratedParser.Wok.Abs.TTuple $2 $4 }
   | '(' Type ')' { GeneratedParser.Wok.Abs.TParen $2 }
@@ -166,7 +206,7 @@ ListType
   | Type ',' ListType { (:) $1 $3 }
 
 ConDef :: { GeneratedParser.Wok.Abs.ConDef }
-ConDef : VarId ListType2 { GeneratedParser.Wok.Abs.ConDef $1 $2 }
+ConDef : ConId ListType2 { GeneratedParser.Wok.Abs.ConDef $1 $2 }
 
 ListConDef :: { [GeneratedParser.Wok.Abs.ConDef] }
 ListConDef
@@ -217,6 +257,9 @@ Exp1
 Exp2 :: { GeneratedParser.Wok.Abs.Exp }
 Exp2
   : VarId { GeneratedParser.Wok.Abs.EVar $1 }
+  | ConId { GeneratedParser.Wok.Abs.ECon $1 }
+  | Exp2 '.' VarId { GeneratedParser.Wok.Abs.EProj $1 $3 }
+  | Exp2 '.' ConId { GeneratedParser.Wok.Abs.EProjC $1 $3 }
   | WokInt { GeneratedParser.Wok.Abs.ELitI $1 }
   | String { GeneratedParser.Wok.Abs.ELitS $1 }
   | Char { GeneratedParser.Wok.Abs.ELitC $1 }

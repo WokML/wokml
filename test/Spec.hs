@@ -81,7 +81,7 @@ parseSrc src =
     Left err  -> error $ "parse failed in test fixture: " ++ err
 
 fixityTests :: TestTree
-fixityTests = testGroup "Wok.Fixity"
+fixityTests = testGroup "Wok.Reordering (fixity table)"
   [ testGroup "construction"
       [ testCase "empty module: assocOf returns Nothing" $
           tableOf "" $ \t -> assocOf t "+" @?= Nothing
@@ -187,14 +187,14 @@ hasErr label p errs =
   assertBool ("expected " ++ label ++ " error in: " ++ show errs) (any p errs)
 
 -- ---------------------------------------------------------------------
--- Wok.Resolve tests
+-- Wok.Reordering tests
 --
 -- Compare resolved/printed source. Each test feeds the whole module through
--- parseSrc -> resolveModule -> printTree and asserts the resulting string.
+-- parseSrc -> reorderModule -> printTree and asserts the resulting string.
 -- ---------------------------------------------------------------------
 
 resolveTests :: TestTree
-resolveTests = testGroup "Wok.Resolve"
+resolveTests = testGroup "Wok.Reordering (chains)"
   [ testGroup "passthrough"
       [ testCase "atomic decl unchanged" $
           resolvedShouldBe "id x = x\n" "id x = x"
@@ -233,6 +233,36 @@ resolveTests = testGroup "Wok.Resolve"
           resolvedShouldBe
             "fixity + left\nfixity * left tighter than +\nfixity ^ right tighter than *\nx = a + b * c ^ d\n"
             "fixity + left;\nfixity * left tighter than +;\nfixity ^ right tighter than *;\nx = a + (b * (c ^ d))"
+
+      , testCase "four-op left-assoc chain nests fully left" $
+          resolvedShouldBe
+            "fixity + left\nx = a + b + c + d\n"
+            "fixity + left;\nx = ((a + b) + c) + d"
+
+      , testCase "four-op right-assoc chain nests fully right" $
+          resolvedShouldBe
+            "fixity $ right\nx = a $ b $ c $ d\n"
+            "fixity $ right;\nx = a $ (b $ (c $ d))"
+
+      , testCase "loosest operator in the middle splits there" $
+          resolvedShouldBe
+            "fixity + left\nfixity * left tighter than +\nx = a * b + c * d\n"
+            "fixity + left;\nfixity * left tighter than +;\nx = (a * b) + (c * d)"
+
+      , testCase "tighter op embedded mid left-assoc chain" $
+          resolvedShouldBe
+            "fixity + left\nfixity * left tighter than +\nx = a + b * c + d\n"
+            "fixity + left;\nfixity * left tighter than +;\nx = (a + (b * c)) + d"
+
+      , testCase "tighter ops on both sides of the loosest" $
+          resolvedShouldBe
+            "fixity + left\nfixity * left tighter than +\nx = a + b * c + d * e\n"
+            "fixity + left;\nfixity * left tighter than +;\nx = (a + (b * c)) + (d * e)"
+
+      , testCase "three precedence levels across a longer chain" $
+          resolvedShouldBe
+            "fixity + left\nfixity * left tighter than +\nfixity ^ right tighter than *\nx = a + b * c ^ d + e\n"
+            "fixity + left;\nfixity * left tighter than +;\nfixity ^ right tighter than *;\nx = (a + (b * (c ^ d))) + e"
       ]
 
   , testGroup "errors"

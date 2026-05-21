@@ -29,7 +29,7 @@ $u = [. \n]          -- universal: any character
 
 -- Symbols and non-identifier-like reserved words
 
-@rsyms = \= | \: | \; | \, | \` | \( | \) | \: \: | \_ | \[ | \] | \- \> | \| | \\ | \{ | \}
+@rsyms = \= | \: | \; | \. | \, | \` | \( | \) | \: \: | \_ | \[ | \] | \- \> | \| | \\ | \{ | \}
 
 :-
 
@@ -50,12 +50,16 @@ $white+ ;
 \- ? $d +
     { tok (eitherResIdent T_WokInt) }
 
+-- token ConId
+$c ([\' \- \_]| ($d | $l)) *
+    { tok (eitherResIdent T_ConId) }
+
 -- token VarId
-(\_ | $l)([\' \- \_]| ($d | $l)) *
+(\_ | $s)([\' \- \_]| ($d | $l)) *
     { tok (eitherResIdent T_VarId) }
 
 -- token VarSym
-[\! \# \$ \% \& \* \+ \- \. \/ \< \= \> \? \@ \\ \^ \| \~]+
+[\! \# \$ \% \& \* \+ \- \/ \< \= \> \? \@ \\ \^ \| \~]+
     { tok (eitherResIdent T_VarSym) }
 
 -- Keywords and Ident
@@ -84,6 +88,7 @@ data Tok
   | TD !Data.Text.Text            -- ^ Float literal.
   | TC !Data.Text.Text            -- ^ Character literal.
   | T_WokInt !Data.Text.Text
+  | T_ConId !Data.Text.Text
   | T_VarId !Data.Text.Text
   | T_VarSym !Data.Text.Text
   deriving (Eq, Show, Ord)
@@ -149,6 +154,7 @@ tokenText t = case t of
   PT _ (TC s)   -> s
   Err _         -> Data.Text.pack "#error"
   PT _ (T_WokInt s) -> s
+  PT _ (T_ConId s) -> s
   PT _ (T_VarId s) -> s
   PT _ (T_VarSym s) -> s
 
@@ -177,21 +183,28 @@ eitherResIdent tv s = treeFind resWords
 -- | The keywords and symbols of the language organized as binary search tree.
 resWords :: BTree
 resWords =
-  b "else" 16
-    (b "=" 8
-       (b "->" 4
-          (b ")" 2 (b "(" 1 N N) (b "," 3 N N))
-          (b "::" 6 (b ":" 5 N N) (b ";" 7 N N)))
-       (b "_" 12
-          (b "\\" 10 (b "[" 9 N N) (b "]" 11 N N))
-          (b "case" 14 (b "`" 13 N N) (b "data" 15 N N))))
-    (b "right" 24
-       (b "left" 20
-          (b "if" 18 (b "fixity" 17 N N) (b "in" 19 N N))
-          (b "looser" 22 (b "let" 21 N N) (b "of" 23 N N)))
-       (b "where" 28
-          (b "then" 26 (b "than" 25 N N) (b "tighter" 27 N N))
-          (b "|" 30 (b "{" 29 N N) (b "}" 31 N N))))
+  b "forall" 23
+    (b "]" 12
+       (b ":" 6
+          (b "," 3 (b ")" 2 (b "(" 1 N N) N) (b "." 5 (b "->" 4 N N) N))
+          (b "=" 9 (b ";" 8 (b "::" 7 N N) N) (b "\\" 11 (b "[" 10 N N) N)))
+       (b "data" 18
+          (b "case" 15
+             (b "`" 14 (b "_" 13 N N) N) (b "contract" 17 (b "class" 16 N N) N))
+          (b "else" 21
+             (b "do" 20 (b "deriving" 19 N N) N) (b "fixity" 22 N N))))
+    (b "record" 34
+       (b "let" 29
+          (b "in" 26
+             (b "import" 25 (b "if" 24 N N) N)
+             (b "left" 28 (b "instance" 27 N N) N))
+          (b "module" 32
+             (b "looser" 31 (b "local" 30 N N) N) (b "of" 33 N N)))
+       (b "use" 40
+          (b "then" 37
+             (b "than" 36 (b "right" 35 N N) N)
+             (b "type" 39 (b "tighter" 38 N N) N))
+          (b "|" 43 (b "{" 42 (b "where" 41 N N) N) (b "}" 44 N N))))
   where
   b s n = B bs (TS bs n)
     where

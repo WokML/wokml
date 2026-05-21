@@ -20,8 +20,27 @@ data Module = Module [Decl]
 data Decl
     = DEqn FunLHS Exp MaybeWhere
     | DSig VarId [VarIdComma] Type
-    | DData VarId [VarId] [ConDef]
+    | DData ConId [VarId] [ConDef]
     | DFixity FixName FixAssoc [FixRel]
+    | DModule ModPath
+    | DImport ModPath
+    | DUse ModPath
+    | DLocal Decl
+    | DReserved ReservedKw
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ModPath = MPName ConId | MPDot ModPath ConId
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ReservedKw
+    = ReservedKw_contract
+    | ReservedKw_type
+    | ReservedKw_class
+    | ReservedKw_instance
+    | ReservedKw_deriving
+    | ReservedKw_forall
+    | ReservedKw_do
+    | ReservedKw_record
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data VarIdComma = VICons VarId
@@ -37,11 +56,14 @@ data FunName = FNBare VarId | FNBareSym VarSym | FNParen VarSym
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data Pat
-    = PApp VarId AtomPat [AtomPat] | PCons AtomPat Pat | PAtom AtomPat
+    = PApp ModPath AtomPat [AtomPat]
+    | PCons AtomPat Pat
+    | PAtom AtomPat
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data AtomPat
     = APVar VarId
+    | APCon ModPath
     | APWild
     | APLitI WokInt
     | APLitS String
@@ -55,12 +77,13 @@ data Type
     = TFun Type Type
     | TApp Type Type
     | TVar VarId
+    | TCon ModPath
     | TList Type
     | TTuple Type [Type]
     | TParen Type
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
-data ConDef = ConDef VarId [Type]
+data ConDef = ConDef ConId [Type]
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data FixName = FNSym VarSym | FNAlpha VarId
@@ -76,6 +99,9 @@ data Exp
     = EExpr Exp [InfixTail]
     | EApp Exp Exp
     | EVar VarId
+    | ECon ConId
+    | EProj Exp VarId
+    | EProjC Exp ConId
     | ELitI WokInt
     | ELitS String
     | ELitC Char
@@ -108,6 +134,9 @@ data Alt = AltC Pat Exp MaybeWhere
 newtype WokInt = WokInt ((C.Int, C.Int), Data.Text.Text)
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
+newtype ConId = ConId ((C.Int, C.Int), Data.Text.Text)
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
 newtype VarId = VarId ((C.Int, C.Int), Data.Text.Text)
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
@@ -131,6 +160,9 @@ class HasPosition a where
 
 instance HasPosition WokInt where
   hasPosition (WokInt (p, _)) = C.Just p
+
+instance HasPosition ConId where
+  hasPosition (ConId (p, _)) = C.Just p
 
 instance HasPosition VarId where
   hasPosition (VarId (p, _)) = C.Just p

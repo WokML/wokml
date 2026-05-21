@@ -1,5 +1,22 @@
 # Revision history for wok
 
+## 0.2.0.0
+
+### Added
+
+- ConId/VarId lexical split — constructors and type constructors are now
+  lexically distinct from variables.
+- Module syntax: `module` header, `import`, `use`, and the `local` private
+  marker, with hierarchical dotted module paths.
+- The `x.y` projection expression (module access or record field).
+- A reserved-word bucket for future-feature keywords.
+
+### Changed
+
+- `.` is no longer a `VarSym` operator character; it is the projection /
+  module-path separator.
+- Token payloads in the AST are now `Text` (generated with BNFC `--text-token`).
+
 ## 0.1.0.0 -- Unreleased
 
 v1 grammar frontend. Lex + parse + pretty-print round-trip. No typechecker, no runtime.

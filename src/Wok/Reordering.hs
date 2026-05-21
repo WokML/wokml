@@ -179,6 +179,11 @@ reorderDecl t (DEqn lhs e mw) = DEqn lhs <$> reorderExp t e <*> reorderMW t mw
 reorderDecl _ d@(DSig{})      = Right d
 reorderDecl _ d@(DData{})     = Right d
 reorderDecl _ d@(DFixity{})   = Right d
+reorderDecl _ d@(DModule{})   = Right d
+reorderDecl _ d@(DImport{})   = Right d
+reorderDecl _ d@(DUse{})      = Right d
+reorderDecl t (DLocal d)      = DLocal <$> reorderDecl t d
+reorderDecl _ d@(DReserved{}) = Right d
 
 reorderLocalDecl :: FixityTable -> LocalDecl -> Either [ReorderError] LocalDecl
 reorderLocalDecl t (LDEqn lhs e mw) = LDEqn lhs <$> reorderExp t e <*> reorderMW t mw
@@ -206,6 +211,8 @@ reorderExp t (ELam ps body)  = ELam ps <$> reorderExp t body
 reorderExp t (ELet lds body) = ELet <$> traverse (reorderLocalDecl t) lds <*> reorderExp t body
 reorderExp t (ECase s alts)  = ECase <$> reorderExp t s <*> traverse (reorderAlt t) alts
 reorderExp t (EIf a b c)     = EIf <$> reorderExp t a <*> reorderExp t b <*> reorderExp t c
+reorderExp t (EProj e s)     = (\e' -> EProj e' s)  <$> reorderExp t e
+reorderExp t (EProjC e s)    = (\e' -> EProjC e' s) <$> reorderExp t e
 reorderExp _ e               = Right e
 
 reorderTail :: FixityTable -> InfixTail -> Either [ReorderError] InfixTail

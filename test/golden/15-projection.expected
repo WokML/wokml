@@ -1,0 +1,11 @@
+module Demo;
+qcall = Data . List . foldr f z;
+field r = r . name;
+qctor = List . Cons 1 List . Nil;
+qsig : Data . Maybe . Maybe Int;
+qsig = Data . Maybe . Nothing;
+qmatch x = case x of
+{
+  List . Cons h t -> h
+}
+

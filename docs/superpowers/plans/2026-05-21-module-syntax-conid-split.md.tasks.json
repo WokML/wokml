@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-21-module-syntax-conid-split.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 1: ConId/VarId lexer split",
+      "status": "pending",
+      "description": "**Goal:** Split the single VarId token into ConId (uppercase-initial) and VarId (lowercase/_-initial), reclassifying every grammar position.\n\n**Files:** grammar/Wok.cf; regenerate src/GeneratedParser/Wok/{Abs.hs,Lex.x,Par.y,Print.hs,Layout.hs,ErrM.hs}; create test/examples/12-conid-split.wok + golden and test/examples/13-data-lowercase-error.wok + golden.\n\n**Regen:** bnfc --haskell -d -p GeneratedParser --text-token -o src grammar/Wok.cf\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src/GeneratedParser/Wok/Abs.hs\", \"src/GeneratedParser/Wok/Lex.x\", \"src/GeneratedParser/Wok/Par.y\", \"src/GeneratedParser/Wok/Print.hs\", \"src/GeneratedParser/Wok/Layout.hs\", \"src/GeneratedParser/Wok/ErrM.hs\", \"test/examples/12-conid-split.wok\", \"test/golden/12-conid-split.expected\", \"test/examples/13-data-lowercase-error.wok\", \"test/golden/13-data-lowercase-error.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"ConId and VarId tokens defined with disjoint first chars\", \"DData/ConDef/PApp use ConId; APCon/TCon/ECon added\", \"bnfc and cabal build succeed\", \"pre-existing tests pass unchanged\", \"data foo = Bar is a parse error\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 2: Module declarations",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Add the module header, import, use, local, and the hierarchical ModPath nonterminal; remove . from the operator alphabet.\n\n**Files:** grammar/Wok.cf; regenerate src/GeneratedParser/Wok/{Abs.hs,Lex.x,Par.y,Print.hs,Layout.hs,ErrM.hs}; create test/examples/14-modules.wok + golden.\n\n**Regen:** bnfc --haskell -d -p GeneratedParser --text-token -o src grammar/Wok.cf\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src/GeneratedParser/Wok/Abs.hs\", \"src/GeneratedParser/Wok/Lex.x\", \"src/GeneratedParser/Wok/Par.y\", \"src/GeneratedParser/Wok/Print.hs\", \"src/GeneratedParser/Wok/Layout.hs\", \"src/GeneratedParser/Wok/ErrM.hs\", \"test/examples/14-modules.wok\", \"test/golden/14-modules.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"ModPath/DModule/DImport/DUse/DLocal defined\", \"dot removed from VarSym\", \"module/import/use/local reserved\", \"module example parses and round-trips\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 3: Dotted names - projection and qualified constructors",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Add the x.y projection (EProj/EProjC), upgrade TCon/PApp/APCon to qualified ModPath names, and make Wok.Reordering recurse into projection heads.\n\n**Files:** grammar/Wok.cf, src/Wok/Reordering.hs; regenerate src/GeneratedParser/Wok/{Abs.hs,Lex.x,Par.y,Print.hs,Layout.hs,ErrM.hs}; create test/examples/15-projection.wok + golden and test/resolve-examples/04-projection-chain.wok + golden.\n\n**Regen:** bnfc --haskell -d -p GeneratedParser --text-token -o src grammar/Wok.cf\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src/Wok/Reordering.hs\", \"src/GeneratedParser/Wok/Abs.hs\", \"src/GeneratedParser/Wok/Lex.x\", \"src/GeneratedParser/Wok/Par.y\", \"src/GeneratedParser/Wok/Print.hs\", \"src/GeneratedParser/Wok/Layout.hs\", \"src/GeneratedParser/Wok/ErrM.hs\", \"test/examples/15-projection.wok\", \"test/golden/15-projection.expected\", \"test/resolve-examples/04-projection-chain.wok\", \"test/resolve-golden/04-projection-chain.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"EProj and EProjC defined\", \"TCon/PApp/APCon use ModPath\", \"reorderExp recurses into projection heads\", \"projection example round-trips and chain inside head resolves\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 4: Reserved-word bucket",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Reserve the eight Tier-C future-feature keywords via a ReservedKw bucket reachable through DReserved.\n\n**Files:** grammar/Wok.cf; regenerate src/GeneratedParser/Wok/{Abs.hs,Lex.x,Par.y,Print.hs,Layout.hs,ErrM.hs}; create test/examples/16-reserved.wok + golden and test/examples/17-reserved-error.wok + golden.\n\n**Regen:** bnfc --haskell -d -p GeneratedParser --text-token -o src grammar/Wok.cf\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src/GeneratedParser/Wok/Abs.hs\", \"src/GeneratedParser/Wok/Lex.x\", \"src/GeneratedParser/Wok/Par.y\", \"src/GeneratedParser/Wok/Print.hs\", \"src/GeneratedParser/Wok/Layout.hs\", \"src/GeneratedParser/Wok/ErrM.hs\", \"test/examples/16-reserved.wok\", \"test/golden/16-reserved.expected\", \"test/examples/17-reserved-error.wok\", \"test/golden/17-reserved-error.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"ReservedKw bucket and DReserved defined\", \"all 8 words in Lex.x resWords\", \"bare reserved word parses as DReserved\", \"reserved word as VarId is a parse error\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 5: Documentation update",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Update README.md and CHANGELOG.md for the v2 surface syntax.\n\n**Files:** README.md, CHANGELOG.md.\n\n**Verify:** cabal test still passes; README/CHANGELOG read correctly\n\n```json:metadata\n{\"files\": [\"README.md\", \"CHANGELOG.md\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"README documents split, modules, projection, reserved words\", \"README warts section updated\", \"CHANGELOG has 0.2.0.0 entry\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-05-21"
+}

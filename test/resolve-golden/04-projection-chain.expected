@@ -1,0 +1,3 @@
+fixity + left;
+fixity * left tighter than +;
+proj = (a + (b * c)) . field
