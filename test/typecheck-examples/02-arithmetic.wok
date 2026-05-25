@@ -1,0 +1,11 @@
+fixity + left
+fixity * left tighter than +
+
+add : Int -> Int -> Int
+add x y = x + y
+
+double : Int -> Int
+double n = n * 2
+
+quad : Int -> Int
+quad n = double (double n)

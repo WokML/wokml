@@ -1,0 +1,2 @@
+length : forall a. List a -> Int
+map : forall a b. (a -> b) -> List a -> List b

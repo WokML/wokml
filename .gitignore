@@ -6,14 +6,15 @@ dist/
 .DS_Store
 .stack-work/
 cabal.project.local
+.worktrees/
 
 # BNFC generates these but we don't use them
-src/GeneratedParser/Wok/Test.hs
-src/GeneratedParser/Wok/Skel.hs
-src/GeneratedParser/Wok/Doc.txt
+src-generated/GeneratedParser/Wok/Test.hs
+src-generated/GeneratedParser/Wok/Skel.hs
+src-generated/GeneratedParser/Wok/Doc.txt
 
 # BNFC's .bak files (backups of overwritten generated files)
 *.bak
 
 # Happy's .hs output for Par.y (cabal compiles Par.y in dist-newstyle; no need to commit)
-src/GeneratedParser/Wok/Par.hs
+src-generated/GeneratedParser/Wok/Par.hs

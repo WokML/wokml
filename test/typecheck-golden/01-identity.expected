@@ -1,0 +1,3 @@
+const : forall a b. a -> b -> a
+flip : forall a b c. (a -> b -> c) -> b -> a -> c
+id : forall a. a -> a

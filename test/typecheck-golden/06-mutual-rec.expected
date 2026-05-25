@@ -1,0 +1,2 @@
+even : Int -> Bool
+odd : Int -> Bool

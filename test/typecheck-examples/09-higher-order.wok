@@ -1,0 +1,8 @@
+twice : (a -> a) -> a -> a
+twice f x = f (f x)
+
+compose : (b -> c) -> (a -> b) -> a -> c
+compose f g x = f (g x)
+
+apply : (a -> b) -> a -> b
+apply f x = f x

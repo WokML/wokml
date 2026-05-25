@@ -1,0 +1,4 @@
+fixity + left
+
+bad : a -> a
+bad x = x + 1

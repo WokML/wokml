@@ -12,8 +12,12 @@ extra-doc-files:    CHANGELOG.md
 common warnings
     ghc-options: -Wall
 
-library
+-- Generated BNFC + alex + happy parser modules. Kept in a separate
+-- internal sublibrary because alex's lexer relies on laziness in its
+-- state machine; library-wide Strict/StrictData would break it.
+library wok-generated
     import:           warnings
+    visibility:       public
     exposed-modules:
         GeneratedParser.Wok.Abs
         GeneratedParser.Wok.Lex
@@ -21,23 +25,54 @@ library
         GeneratedParser.Wok.Print
         GeneratedParser.Wok.Layout
         GeneratedParser.Wok.ErrM
-        Wok.Parsing
-        Wok.Reordering
     build-depends:
-        base ^>=4.20,
-        array ^>=0.5,
-        containers,
+        base         ^>=4.20,
+        array        ^>=0.5,
         text
-    hs-source-dirs:   src
+    hs-source-dirs:   src-generated
     default-language: GHC2024
     -- NOTE: cabal auto-invokes alex (.x) and happy (.y) but NOT bnfc (.cf).
     -- BNFC is listed so `cabal install --only-dependencies` pulls it in; the
     -- grammar must still be regenerated manually after editing grammar/Wok.cf:
-    --   bnfc --haskell -d --text-token -o src grammar/Wok.cf
+    --   bnfc --haskell -d --text-token -o src-generated grammar/Wok.cf
     build-tool-depends:
         BNFC:bnfc,
         alex:alex,
         happy:happy
+
+-- Hand-written wok modules: strict by default. The TypeChecking
+-- inferrer is fundamentally strict (in-place unification via ST,
+-- monotonic counters, complete tree walks), so Strict/StrictData
+-- is a uniform improvement.
+library
+    import:           warnings
+    exposed-modules:
+        Wok.Parsing
+        Wok.Reordering
+        Wok.TypeChecking
+        Wok.TypeChecking.Types
+        Wok.TypeChecking.Env
+        Wok.TypeChecking.Error
+        Wok.TypeChecking.Monad
+        Wok.TypeChecking.Unify
+        Wok.TypeChecking.Infer
+        Wok.TypeChecking.Builtins
+    build-depends:
+        base         ^>=4.20,
+        array        ^>=0.5,
+        containers,
+        mtl,
+        text,
+        transformers,
+        wok:wok-generated
+    hs-source-dirs:   src
+    default-language: GHC2024
+    default-extensions:
+        Strict
+        StrictData
+        LambdaCase
+    ghc-options:
+        -funbox-strict-fields
 
 executable wok
     import:           warnings
@@ -56,6 +91,7 @@ test-suite wok-tests
     build-depends:
         base ^>=4.20,
         wok,
+        wok:wok-generated,
         tasty,
         tasty-golden,
         tasty-hunit,
@@ -63,6 +99,7 @@ test-suite wok-tests
         containers,
         filepath,
         directory,
+        mtl,
         text
     hs-source-dirs:   test
     default-language: GHC2024

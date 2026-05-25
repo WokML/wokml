@@ -1,0 +1,2 @@
+fromMaybe : forall a. a -> Maybe a -> a
+mapMaybe : forall a b. (a -> b) -> Maybe a -> Maybe b

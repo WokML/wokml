@@ -1,0 +1,2 @@
+bad : Int
+bad = "not an int"

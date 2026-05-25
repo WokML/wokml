@@ -1,0 +1,15 @@
+data Maybe a = Nothing | Just a
+
+first : (a, b) -> a
+first p = case p of
+  (x, _) -> x
+
+isNothing : Maybe a -> Bool
+isNothing m = case m of
+  Nothing -> True
+  Just _  -> False
+
+headOr : a -> [a] -> a
+headOr d xs = case xs of
+  []     -> d
+  x :: _ -> x

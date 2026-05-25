@@ -1,0 +1,8 @@
+fixity + left
+fixity * left tighter than +
+
+hyp : Int -> Int -> Int
+hyp x y = root (sq x + sq y)
+  where
+    sq n = n * n
+    root n = n

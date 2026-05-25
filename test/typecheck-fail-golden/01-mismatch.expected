@@ -1,0 +1,1 @@
+typecheck: Mismatch Nothing (CTCon TcInt []) (CTCon TcString [])

@@ -1,0 +1,9 @@
+zero, one, two : Int
+zero = 0
+one = 1
+two = 2
+
+allZeros : Bool
+allZeros = case zero of
+  0 -> True
+  _ -> False

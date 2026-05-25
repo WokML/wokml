@@ -1,0 +1,1 @@
+mapEither : forall a b c. (a -> b) -> (c -> b) -> Either a c -> b

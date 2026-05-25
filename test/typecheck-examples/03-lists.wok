@@ -1,0 +1,13 @@
+fixity + left
+
+data List a = Nil | Cons a (List a)
+
+length : List a -> Int
+length xs = case xs of
+  Nil       -> 0
+  Cons _ ys -> 1 + length ys
+
+map : (a -> b) -> List a -> List b
+map f xs = case xs of
+  Nil       -> Nil
+  Cons y ys -> Cons (f y) (map f ys)

@@ -1,0 +1,4 @@
+allZeros : Bool
+one : Int
+two : Int
+zero : Int

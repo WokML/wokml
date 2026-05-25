@@ -30,7 +30,7 @@ cabal run wok -- test/examples/01-literals.wok
 ## Regenerate after editing `grammar/Wok.cf`
 
 ```bash
-bnfc --haskell -d -p GeneratedParser --text-token -o src grammar/Wok.cf
+bnfc --haskell -d -p GeneratedParser --text-token -o src-generated grammar/Wok.cf
 cabal build
 ```
 

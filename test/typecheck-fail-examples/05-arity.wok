@@ -1,0 +1,5 @@
+data Maybe a = Nothing | Just a
+
+bad m = case m of
+  Just      -> 0
+  Nothing   -> 1

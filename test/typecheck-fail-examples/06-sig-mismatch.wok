@@ -1,0 +1,2 @@
+liesAboutType : Int -> Int
+liesAboutType x = "definitely not Int"

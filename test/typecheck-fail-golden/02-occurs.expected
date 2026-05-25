@@ -1,0 +1,1 @@
+typecheck: OccursCheck Nothing 1 (CTGen 1)
