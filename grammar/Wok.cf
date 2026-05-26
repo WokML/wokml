@@ -9,6 +9,23 @@ entrypoints Module ;
 --   layout toplevel ;          the file itself is a layout block of decls
 --   layout "let", "where", "of"  after each of these, open an indented block
 --   layout stop "in"           "in" closes the matching "let" block early
+--
+-- POST-REGEN NOTE: src-generated/GeneratedParser/Wok/Layout.hs needs a manual
+-- patch after every `bnfc` regeneration. The auto-generated layout filter
+-- skips `maybeInsertSeparator` on the combined `isLayoutOpen || isParenOpen`
+-- branch, which breaks top-level decls starting with `(` (e.g.
+-- `(+) : U64 -> U64 -> U64` as the second decl of a file). Split that one
+-- branch into two and add the separator call only on the paren branch:
+--   res pt st (t0 : ts)
+--     | isLayoutOpen t0
+--       = t0 : res (Just t0) (Explicit : st) ts
+--     | isParenOpen t0
+--       = maybeInsertSeparator pt t0 st $
+--         t0 : res (Just t0) (Explicit : st) ts
+-- (Note: the lambda binder must be `pt`, not `_`. Adding the separator on
+-- the layout-open branch too would over-insert `;` before printed `let { ... }`
+-- forms during round-trip parsing.) See git log for
+-- `fix(parser): insert decl separator before paren-opening top-level decls`.
 layout toplevel ;
 layout "let", "where", "of" ;
 layout stop "in" ;
@@ -16,7 +33,7 @@ layout stop "in" ;
 Module.   Module ::= [Decl] ;
 
 DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
-DSig.     Decl ::= VarId [VarIdComma] ":" Type ;       -- multi-name sig
+DSig.     Decl ::= SigName [SigNameComma] ":" Type ;   -- multi-name sig; name may be VarId or (VarSym)
 DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 
@@ -42,13 +59,16 @@ rules     ReservedKw ::= "contract" | "type" | "class" | "instance"
                        | "deriving" | "forall" | "do" | "record" ;
 DReserved. Decl ::= ReservedKw ;
 
--- Helper: comma-separated additional VarIds for multi-name sigs (`f, g, h : T`)
--- BNFC allows only ONE `separator <Cat> <sep>` declaration per category.
--- `separator VarId ""` is already used below for DData's type params (whitespace-separated).
--- So multi-name signatures use this VarIdComma indirection instead of `separator VarId ","`.
--- Task 9's LDSig should use [VarIdComma] for consistency with DSig here.
-VICons.   VarIdComma ::= "," VarId ;
-separator VarIdComma "" ;
+-- Helper: comma-separated additional names for multi-name sigs (`f, (+), h : T`).
+-- A SigName is either a bare VarId or a parenthesised VarSym, mirroring the
+-- FunName design on the LHS-of-equation side (FNBare / FNParen). BNFC allows
+-- only ONE `separator <Cat> <sep>` declaration per category, and the comma
+-- separator is dedicated to this multi-name sig list.
+SNBare.   SigName ::= VarId ;
+SNParen.  SigName ::= "(" VarSym ")" ;
+
+SNCons.   SigNameComma ::= "," SigName ;
+separator SigNameComma "" ;
 
 -- For `data T a b c = ...`, type params are bare VarIds (whitespace-separated list)
 separator VarId "" ;
@@ -101,6 +121,7 @@ APLitC.   AtomPat ::= Char ;
 APTuple.  AtomPat ::= "(" Pat "," [Pat] ")" ;   -- 2-or-more; single-element is APParen
 APList.   AtomPat ::= "[" [Pat] "]" ;
 APParen.  AtomPat ::= "(" Pat ")" ;
+PUnit.    AtomPat ::= "(" ")" ;          -- unit pattern; whitespace permitted: ( ), (   )
 
 separator AtomPat "" ;   -- covers both LHSPre args and ELam binders
 separator Pat "," ;
@@ -128,6 +149,7 @@ TCon.     Type2 ::= ModPath ;              -- type constructor (qualified or bar
 TList.    Type2 ::= "[" Type "]" ;
 TTuple.   Type2 ::= "(" Type "," [Type] ")" ;
 TParen.   Type2 ::= "(" Type ")" ;
+TUnit.    Type2 ::= "(" ")" ;            -- unit type; whitespace permitted
 
 separator Type "," ;
 
@@ -178,6 +200,7 @@ ELitS.    Exp2 ::= String ;
 ELitC.    Exp2 ::= Char ;
 EParen.   Exp2 ::= "(" Exp ")" ;
 EParenOp. Exp2 ::= "(" VarSym ")" ;    -- (+), (>>=), etc.
+EUnit.    Exp2 ::= "(" ")" ;           -- unit value; whitespace permitted
 EList.    Exp2 ::= "[" [Exp] "]" ;
 ETuple.   Exp2 ::= "(" Exp "," [Exp] ")" ;
 -- Lambda binders are AtomPat (not full Pat) per Haskell convention: a binder
@@ -196,7 +219,7 @@ separator Exp "," ;   -- shared by EList and ETuple bodies
 
 -- Local decls (for `let` blocks; same shape allowed in `where` blocks in Task 9)
 LDEqn.    LocalDecl ::= FunLHS "=" Exp MaybeWhere ;
-LDSig.    LocalDecl ::= VarId [VarIdComma] ":" Type ;
+LDSig.    LocalDecl ::= SigName [SigNameComma] ":" Type ;
 separator LocalDecl ";" ;
 
 -- Optional where-block attached to DEqn / LDEqn / AltC

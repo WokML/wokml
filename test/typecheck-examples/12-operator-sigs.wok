@@ -1,0 +1,12 @@
+module Main
+
+-- Bodyless operator sig: registers (+) in scope with the declared scheme.
+-- This fixture deliberately does NOT import Std.Base, so the operator
+-- comes only from the user-declared bodyless sig + fixity below.
+(+) : U64 -> U64 -> U64
+
+fixity + left
+
+-- A user binding that uses it:
+add : U64 -> U64 -> U64
+add x y = x + y

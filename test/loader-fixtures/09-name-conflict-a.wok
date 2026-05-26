@@ -1,0 +1,4 @@
+module A
+
+foo : U64
+foo = 1

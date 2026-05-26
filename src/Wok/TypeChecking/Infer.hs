@@ -9,7 +9,11 @@ module Wok.TypeChecking.Infer
   , inferPat
   , inferExpr
   , inferProgram
+  , inferProgramWith
+  , modPathText
+  , modPathPos
   , TypedDecl (..)
+  , Warning (..)
   , prettyScheme
   , prettyCType
   ) where
@@ -19,10 +23,13 @@ import Control.Monad (foldM, forM, when)
 import Control.Monad.Except (throwError)
 import qualified Data.List
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef)
 import qualified Data.Text as Tx
 import Data.Text (Text)
 import qualified GeneratedParser.Wok.Abs as Abs
+import GeneratedParser.Wok.Abs (BNFC'Position)
+import Wok.SourceOrigin (Origin (..))
 import qualified Wok.TypeChecking.Builtins as Builtins
 import Wok.TypeChecking.Env
   ( ConInfo (..), Env, TyConInfo (..)
@@ -142,13 +149,21 @@ instantiate (Scheme vars body) = do
         goR (CRExtend l ty rest) = RowExtend l (goT ty) (goR rest)
         goR (CRGen _) = error "instantiate: CRGen in scheme not supported in v1"
 
--- | Like 'instantiate', but each quantifier becomes a rigid skolem instead
--- of a fresh inference variable. Used to check user-supplied type signatures
--- against inferred bodies: skolems cannot be linked to anything except
--- themselves (or an Unbound inference variable), so a body that is more
--- specific than the sig will fail to unify and raise 'RigidEscape'.
-skolemize :: Scheme -> TC s (Type s)
-skolemize (Scheme vars body) = do
+-- | Replace each forall-bound type variable in a user's signature with
+-- a fresh Rigid type — one the unifier treats as an opaque constant.
+-- Catches signatures that over-promise: in
+--
+--     double : a -> a
+--     double n = n + n
+--
+-- the body forces a = u64 (because (+) is u64 -> u64 -> u64), so the
+-- body's inferred type is u64 -> u64. Without freezing, unifying
+-- (a -> a) with (u64 -> u64) silently weakens the sig to (u64 -> u64).
+-- With freezing, the sig becomes (rigid_1 -> rigid_1); unification
+-- with (u64 -> u64) fails, and the over-promise surfaces as a type
+-- error rather than disappearing.
+freezeSig :: Scheme -> TC s (Type s)
+freezeSig (Scheme vars body) = do
   skolems <- mapM (\(i, k) -> do
                      u <- freshUniq
                      ref <- liftST $ newSTRef (Rigid u k)
@@ -164,14 +179,14 @@ skolemize (Scheme vars body) = do
         goT (CTArr a r b) = TArr (goT a) (goR r) (goT b)
         goT (CTGen i) = case Map.lookup i m of
           Just t -> t
-          Nothing -> error ("skolemize: dangling CTGen " ++ show i)
+          Nothing -> error ("freezeSig: dangling CTGen " ++ show i)
         goR CREmpty = RowEmpty
         goR (CRExtend l ty rest) = RowExtend l (goT ty) (goR rest)
         goR (CRGen _) = RowEmpty  -- v1: no row vars in schemes
 
 -- | Translate a parsed Abs.Type into a Scheme. Free VarIds in the
 -- type become universally quantified CTGen slots (in first-occurrence
--- order). Validates tycon arity. Built-in tycon names (Int, Char,
+-- order). Validates tycon arity. Built-in tycon names (U64, Char,
 -- String, Bool, Unit, list) map to specialised TyCon tags; user
 -- names become TcUser.
 translateSig :: Env -> Abs.Type -> TC s Scheme
@@ -204,7 +219,8 @@ translateSig env ty = do
                 pure n
               pure (CTGen i)
         goT (Abs.TCon modPath) = do
-          let (name, pos) = modPathHead modPath
+          let name = modPathText modPath
+              pos  = modPathPos modPath
           case lookupTyCon name env' of
             Just info
               | tcArity info == 0 -> pure (CTCon (resolveTyCon name) [])
@@ -215,7 +231,8 @@ translateSig env ty = do
           let (h, args) = collectApp f x
           case h of
             Abs.TCon modPath -> do
-              let (name, pos) = modPathHead modPath
+              let name = modPathText modPath
+                  pos  = modPathPos modPath
               case lookupTyCon name env' of
                 Just info
                   | tcArity info == length args ->
@@ -233,6 +250,7 @@ translateSig env ty = do
           ts <- mapM goT (a : others)
           pure (CTCon (TcTuple (1 + length others)) ts)
         goT (Abs.TParen t') = goT t'
+        goT Abs.TUnit = pure (CTCon TcUnit [])
 
 -- ---------------------------------------------------------------------------
 -- Module-level helpers shared by translateSig and processDataDecls
@@ -242,14 +260,34 @@ collectApp :: Abs.Type -> Abs.Type -> (Abs.Type, [Abs.Type])
 collectApp (Abs.TApp f x) y = let (h, xs) = collectApp f x in (h, xs ++ [y])
 collectApp other y = (other, [y])
 
-modPathHead :: Abs.ModPath -> (Text, (Int, Int))
-modPathHead (Abs.MPName (Abs.ConId (pos, name))) = (name, pos)
-modPathHead (Abs.MPDot _ _) =
-  error "modPathHead: qualified names (Data.X.Y form) not supported in v1"
+-- | Flatten a dotted ModPath into its text key, e.g. Std.Base -> "Std.Base".
+-- Used by the module loader for module-name keys and by the typechecker
+-- for tycon/constructor lookup against env keys.
+modPathText :: Abs.ModPath -> Text
+modPathText (Abs.MPName (Abs.ConId (_, n))) = n
+modPathText (Abs.MPDot p (Abs.ConId (_, n))) =
+  modPathText p <> Tx.pack "." <> n
+
+-- | Position of the leftmost (first) ConId in a ModPath, used for
+-- error reporting.
+modPathPos :: Abs.ModPath -> (Int, Int)
+modPathPos (Abs.MPName (Abs.ConId (pos, _))) = pos
+modPathPos (Abs.MPDot p _)                   = modPathPos p
+
+-- | Extract the text name of a SigName (LHS of a DSig/LDSig).
+-- A SigName is either a bare VarId (`foo`) or a parenthesised VarSym (`(+)`).
+sigNameText :: Abs.SigName -> Text
+sigNameText (Abs.SNBare  (Abs.VarId  (_, n))) = n
+sigNameText (Abs.SNParen (Abs.VarSym (_, n))) = n
+
+-- | Position of a SigName for error reporting.
+sigNamePos :: Abs.SigName -> (Int, Int)
+sigNamePos (Abs.SNBare  (Abs.VarId  (p, _))) = p
+sigNamePos (Abs.SNParen (Abs.VarSym (p, _))) = p
 
 resolveTyCon :: Text -> TyCon
 resolveTyCon name
-  | name == Tx.pack "Int"    = TcInt
+  | name == Tx.pack "U64"    = TcU64
   | name == Tx.pack "Char"   = TcChar
   | name == Tx.pack "String" = TcString
   | name == Tx.pack "Bool"   = TcBool
@@ -325,7 +363,8 @@ processDataDecls env0 decls = do
         walkArg (Abs.TFun a b) =
           CTArr <$> walkArg a <*> pure CREmpty <*> walkArg b
         walkArg (Abs.TCon mp) = do
-          let (n, p) = modPathHead mp
+          let n = modPathText mp
+              p = modPathPos mp
           case lookupTyCon n env of
             Just info
               | tcArity info == 0 -> pure (CTCon (resolveTyCon n) [])
@@ -335,7 +374,8 @@ processDataDecls env0 decls = do
           let (h, args) = collectApp f x
           case h of
             Abs.TCon mp -> do
-              let (n, p) = modPathHead mp
+              let n = modPathText mp
+                  p = modPathPos mp
               case lookupTyCon n env of
                 Just info
                   | tcArity info == length args ->
@@ -352,6 +392,7 @@ processDataDecls env0 decls = do
           ts <- mapM walkArg (a : others)
           pure (CTCon (TcTuple (1 + length others)) ts)
         walkArg (Abs.TParen t') = walkArg t'
+        walkArg Abs.TUnit = pure (CTCon TcUnit [])
 
 -- ---------------------------------------------------------------------------
 -- Pattern inference
@@ -362,7 +403,8 @@ processDataDecls env0 decls = do
 inferPat :: Abs.Pat -> TC s (Type s, [(Text, Type s)])
 inferPat (Abs.PAtom ap) = inferAtomPat ap
 inferPat (Abs.PApp modPath ap aps) = do
-  let (name, pos) = modPathHead modPath
+  let name  = modPathText modPath
+      pos   = modPathPos modPath
       atoms = ap : aps
   env <- currentEnv
   case lookupCon name env of
@@ -390,11 +432,13 @@ inferAtomPat (Abs.APVar (Abs.VarId (_, name))) = do
 inferAtomPat Abs.APWild = do
   t <- freshTVar KStar
   pure (t, [])
-inferAtomPat (Abs.APLitI _) = pure (TCon TcInt [], [])
+inferAtomPat Abs.PUnit = pure (TCon TcUnit [], [])
+inferAtomPat (Abs.APLitI _) = pure (TCon TcU64 [], [])
 inferAtomPat (Abs.APLitS _) = pure (TCon TcString [], [])
 inferAtomPat (Abs.APLitC _) = pure (TCon TcChar [], [])
 inferAtomPat (Abs.APCon modPath) = do
-  let (name, pos) = modPathHead modPath
+  let name = modPathText modPath
+      pos  = modPathPos modPath
   env <- currentEnv
   case lookupCon name env of
     Nothing -> throwError (UnknownCon (Just pos) name)
@@ -445,9 +489,10 @@ inferExpr e = inferExprW Map.empty e
 -- These are looked up directly without instantiation, preserving the
 -- identity of the mutable TVar across all uses in the expression.
 inferExprW :: Map.Map Text (Type s) -> Abs.Exp -> TC s (Type s)
-inferExprW _ (Abs.ELitI _) = pure (TCon TcInt [])
+inferExprW _ (Abs.ELitI _) = pure (TCon TcU64 [])
 inferExprW _ (Abs.ELitS _) = pure (TCon TcString [])
 inferExprW _ (Abs.ELitC _) = pure (TCon TcChar [])
+inferExprW _ Abs.EUnit = pure (TCon TcUnit [])
 inferExprW mono (Abs.EVar (Abs.VarId (pos, name))) =
   case Map.lookup name mono of
     Just t -> pure t
@@ -580,10 +625,20 @@ inferLetGroup mono decls k = do
     mapM (unifyGroupWith monoRec) placeholders
   -- Phase 2: back at outer level, generalize or check sig.
   results <- mapM (finalizeGroup sigMap) unified
+  -- Bodyless sigs in this let block become visible bindings with the
+  -- declared scheme verbatim (NO freezeSig). Warnings are NOT emitted
+  -- here in v1 -- let-block bodyless diagnostics are deferred to a
+  -- future warning-pass task.
   let monoBindings = [ (n, tv) | Left  (n, tv) <- results ]
       polyBindings = [ (n, s)  | Right (n, s)  <- results ]
+      coveredEqn   = Set.fromList (map fst groups)
+      sigOnlyBindings = [ (n, sigMap Map.! n)
+                        | n <- sigNamesInOrder sigs
+                        , Map.member n sigMap
+                        , not (Set.member n coveredEqn) ]
       mono'   = foldr (\(n, tv) m -> Map.insert n tv m) mono monoBindings
-      extend2 = foldr (.) id [ extendVarTC n s | (n, s) <- polyBindings ]
+      extend2 = foldr (.) id [ extendVarTC n s
+                             | (n, s) <- polyBindings ++ sigOnlyBindings ]
   extend2 (k mono')
 
 partitionLocalDecls :: [Abs.LocalDecl] -> ([Abs.LocalDecl], [Abs.LocalDecl])
@@ -594,10 +649,10 @@ partitionLocalDecls = foldr step ([], [])
 
 buildSigMap :: [Abs.LocalDecl] -> TC s (Map.Map Text Scheme)
 buildSigMap [] = pure Map.empty
-buildSigMap (Abs.LDSig (Abs.VarId (_, n)) extras ty : rest) = do
+buildSigMap (Abs.LDSig sn extras ty : rest) = do
   env <- currentEnv
   s <- translateSig env ty
-  let names = n : [ x | Abs.VICons (Abs.VarId (_, x)) <- extras ]
+  let names = sigNameText sn : [ sigNameText x | Abs.SNCons x <- extras ]
   m <- buildSigMap rest
   pure (foldr (\nm acc -> Map.insert nm s acc) m names)
 buildSigMap (_ : rest) = buildSigMap rest
@@ -616,7 +671,7 @@ groupEquations = Data.List.foldl' step []
 
 eqName :: Abs.LocalDecl -> Text
 eqName (Abs.LDEqn lhs _ _) = funLHSName lhs
-eqName (Abs.LDSig (Abs.VarId (_, n)) _ _) = n
+eqName (Abs.LDSig sn _ _) = sigNameText sn
 
 funLHSName :: Abs.FunLHS -> Text
 funLHSName (Abs.LHSPre fn _) = funNameText fn
@@ -701,7 +756,7 @@ finalizeGroup
 finalizeGroup sigMap (name, tv) =
   case Map.lookup name sigMap of
     Just declared -> do
-      declT <- skolemize declared
+      declT <- freezeSig declared
       unify Nothing declT tv
       pure (Right (name, declared))
     Nothing -> do
@@ -748,56 +803,126 @@ data TypedDecl = TypedDecl
   }
   deriving (Eq, Show)
 
--- | The pipeline entry point. Three passes:
--- 1) processDataDecls (tycons + constructors).
--- 2) Collect standalone signatures into the env.
--- 3) Type the top-level function-equation group as one mutually-recursive let.
-inferProgram :: Abs.Module -> Either TypeError (Env, [TypedDecl])
-inferProgram (Abs.Module decls) =
-  runTC Builtins.initialEnv (inferProgramTC decls)
+-- | Non-fatal diagnostics surfaced by the typechecker.
+data Warning
+  = BodylessBinding Text BNFC'Position
+    -- ^ A signature (LDSig/DSig) had no matching equation. The binding
+    -- still enters the env (with its declared scheme verbatim); this
+    -- warning fires only for UserFile-origin modules. Std.Base
+    -- (Embedded) is silent because primitive operator schemes live there.
+  deriving (Eq, Show)
 
-inferProgramTC :: [Abs.Decl] -> TC s (Env, [TypedDecl])
-inferProgramTC decls = do
-  -- Pass 1: register data declarations
-  env1 <- processDataDecls Builtins.initialEnv decls
+-- | Pipeline entry parameterised by the seed env and module origin.
+-- The seed env is the irreducible pre-env (from Builtins) overlaid with
+-- every imported module's exported env, as composed by the module loader.
+-- Origin gates bodyless-sig warnings: silent for Embedded (Std.Base),
+-- emitted for UserFile.
+inferProgramWith
+  :: Env -> Origin -> Abs.Module
+  -> Either TypeError (Env, [TypedDecl], [Warning])
+inferProgramWith seedEnv origin (Abs.Module decls) =
+  runTC seedEnv (inferProgramTC seedEnv origin decls)
+
+-- | Back-compat: keep the v1 signature so existing direct callers
+-- (test harness, smoke tests) continue to work. Uses the hand-coded
+-- initialEnv as the seed; discards warnings; tags the file as UserFile.
+inferProgram :: Abs.Module -> Either TypeError (Env, [TypedDecl])
+inferProgram m =
+  case inferProgramWith Builtins.initialEnv (UserFile "<unknown>") m of
+    Left err -> Left err
+    Right (env, decls, _warnings) -> Right (env, decls)
+
+inferProgramTC
+  :: Env -> Origin -> [Abs.Decl] -> TC s (Env, [TypedDecl], [Warning])
+inferProgramTC seedEnv origin decls = do
+  -- Pass 1: register data declarations against the seed env (which is
+  -- the irreducible pre-env overlaid with imports for the loader path,
+  -- or just Builtins.initialEnv for the back-compat path).
+  env1 <- processDataDecls seedEnv decls
   -- Convert top-level decls to LocalDecl form for reuse of inferLetGroup
   let localDecls = concatMap toLocalDecl decls
-  -- Pass 2 + 3: collect sigs and infer equations via inferLetGroup
+  -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup
   withEnv (const env1) $ do
-    schemes <- inferTopLetGroup localDecls
+    (schemes, warnings) <- inferTopLetGroup origin localDecls
     env2 <- currentEnv
     let finalEnv = foldr (\(n, s) e -> extendVar n s e) env2 schemes
-    pure (finalEnv, [ TypedDecl n s | (n, s) <- schemes ])
+    pure (finalEnv, [ TypedDecl n s | (n, s) <- schemes ], warnings)
 
 -- | Convert a top-level Decl to zero or more LocalDecls so we can reuse
 -- the existing inferLetGroup machinery.
 toLocalDecl :: Abs.Decl -> [Abs.LocalDecl]
 toLocalDecl (Abs.DEqn lhs body mw) = [Abs.LDEqn lhs body mw]
-toLocalDecl (Abs.DSig vid extras ty) = [Abs.LDSig vid extras ty]
+toLocalDecl (Abs.DSig sn extras ty) = [Abs.LDSig sn extras ty]
 toLocalDecl _ = []
 
 -- | Type the top-level declarations as one big mutually-recursive let,
--- returning the list of (name, scheme) pairs in binding order.
-inferTopLetGroup :: [Abs.LocalDecl] -> TC s [(Text, Scheme)]
-inferTopLetGroup localDecls = do
+-- returning the list of (name, scheme) pairs in binding order plus any
+-- non-fatal warnings (e.g. bodyless top-level sigs in UserFile origin).
+inferTopLetGroup
+  :: Origin -> [Abs.LocalDecl] -> TC s ([(Text, Scheme)], [Warning])
+inferTopLetGroup origin localDecls = do
   let (sigs, eqns) = partitionLocalDecls localDecls
   sigMap <- buildSigMap sigs
-  let groups = groupEquations eqns
-  unified <- enterLevel $ do
+  let groups        = groupEquations eqns
+      coveredEqn    = Set.fromList (map fst groups)
+      -- Walk `sigs` in source order so warnings + bindings appear in the
+      -- order names were declared, not Map order (alphabetical).
+      sigOnlyNames    = [ n | n <- sigNamesInOrder sigs
+                            , Map.member n sigMap
+                            , not (Set.member n coveredEqn) ]
+      sigOnlyBindings = [ (n, sigMap Map.! n) | n <- sigOnlyNames ]
+  -- Top-level bodyless sigs are in scope when peer equations are typechecked
+  -- (mirrors the let-block path in inferLetGroup, which extends the env with
+  -- sigOnlyBindings via `extend2` before recursing). Without this, an equation
+  -- like `add x y = x + y` next to a bodyless `(+) : U64 -> U64 -> U64`
+  -- would fail UnknownVar at the `+` reference.
+  let extendSigOnly env = foldr (\(n, s) e -> extendVar n s e) env sigOnlyBindings
+  unified <- withEnv extendSigOnly $ enterLevel $ do
     placeholders <- mapM (allocatePlaceholderTVar sigMap) groups
     let monoRec = foldr (\(n, tv, _) m -> Map.insert n tv m) Map.empty placeholders
     mapM (unifyGroupWith monoRec) placeholders
-  results <- mapM (finalizeGroup sigMap) unified
+  results <- withEnv extendSigOnly $ mapM (finalizeGroup sigMap) unified
   -- Top level has no outer scope, so finalizeGroup should never report
   -- escape for a top-level binding. If it does, the inferrer's invariants
   -- are violated -- fail loudly rather than silently emitting a Scheme []
   -- whose body references unquantified CTGen slots (the exact dangling
   -- pattern the escape fix was meant to eliminate).
-  forM results $ \case
+  topResults <- forM results $ \case
     Right (n, s) -> pure (n, s)
     Left (n, _) -> error
       ("inferTopLetGroup: unexpected escape for top-level binding "
       ++ Tx.unpack n)
+  -- Emit a warning only for UserFile origin so Std.Base (Embedded) primitive
+  -- schemes stay silent.
+  let warnings = case origin of
+        Embedded   -> []
+        UserFile _ -> [ BodylessBinding n (sigPos sigs n)
+                      | n <- sigOnlyNames ]
+  pure (topResults ++ sigOnlyBindings, warnings)
+
+-- | Find the BNFC'Position of the LDSig that declared @name@. Multi-name
+-- sigs share the head LDSig's position.
+sigPos :: [Abs.LocalDecl] -> Text -> BNFC'Position
+sigPos sigs name = go sigs
+  where
+    go [] = error
+      ("sigPos: name " ++ Tx.unpack name
+        ++ " absent from sigs (broken invariant: callers must filter to known sig names)")
+    go (Abs.LDSig sn extras _ : rest)
+      | sigNameText sn == name = Just (sigNamePos sn)
+      | any (\(Abs.SNCons x) -> sigNameText x == name) extras
+          = Just (sigNamePos sn)
+      | otherwise = go rest
+    go (_ : rest) = go rest
+
+-- | Flatten LDSig decls into the source-order sequence of names they declare,
+-- preserving multi-name fan-out (`a, b, c : T` -> ["a", "b", "c"]).
+sigNamesInOrder :: [Abs.LocalDecl] -> [Text]
+sigNamesInOrder = concatMap one
+  where
+    one (Abs.LDSig sn extras _) =
+      sigNameText sn : [ sigNameText x | Abs.SNCons x <- extras ]
+    one _ = []
 
 -- ---------------------------------------------------------------------------
 -- Pretty-printing closed types and schemes
@@ -821,7 +946,7 @@ varName i
 
 prettyCType :: CType -> Text
 prettyCType (CTGen i) = varName i
-prettyCType (CTCon TcInt    []) = Tx.pack "Int"
+prettyCType (CTCon TcU64    []) = Tx.pack "U64"
 prettyCType (CTCon TcChar   []) = Tx.pack "Char"
 prettyCType (CTCon TcString []) = Tx.pack "String"
 prettyCType (CTCon TcBool   []) = Tx.pack "Bool"

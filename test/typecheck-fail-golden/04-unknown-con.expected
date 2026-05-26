@@ -1,1 +1,1 @@
-typecheck: UnknownCon (Just (1,10)) "Frobnicate"
+typecheck: typecheck in Main: UnknownCon (Just (4,10)) "Frobnicate"

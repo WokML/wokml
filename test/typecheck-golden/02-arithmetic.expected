@@ -1,3 +1,3 @@
-add : Int -> Int -> Int
-double : Int -> Int
-quad : Int -> Int
+add : U64 -> U64 -> U64
+double : U64 -> U64
+quad : U64 -> U64

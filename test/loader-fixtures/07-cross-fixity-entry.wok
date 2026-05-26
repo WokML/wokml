@@ -1,0 +1,10 @@
+module Main
+import Extra
+
+a, b, c : U64
+a = 1
+b = 2
+c = 3
+
+result : U64
+result = a @@ b %% c

@@ -1,3 +1,6 @@
+module Main
+import Std.Base
+
 twice : (a -> a) -> a -> a
 twice f x = f (f x)
 

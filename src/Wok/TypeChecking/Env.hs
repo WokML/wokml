@@ -3,7 +3,9 @@ module Wok.TypeChecking.Env
   ( Env (..)
   , ConInfo (..)
   , TyConInfo (..)
+  , EnvNs (..)
   , emptyEnv
+  , overlayEnvs
   , lookupVar
   , lookupCon
   , lookupTyCon
@@ -40,6 +42,32 @@ data Env = Env
 
 emptyEnv :: Env
 emptyEnv = Env Map.empty Map.empty Map.empty
+
+-- | Tag for which of the three Env namespaces a name lives in.
+-- Used by 'overlayEnvs' to attribute collisions.
+data EnvNs = NsVar | NsCon | NsTyCon
+  deriving (Eq, Ord, Show)
+
+-- | Left-biased union of two 'Env's. On any name collision in any of
+-- the three namespaces, returns 'Left' with one (namespace, name) pair
+-- per offending name. The order of pairs in the result is: envVars
+-- collisions first (in Map order), then envCons, then envTyCons.
+--
+-- "Left-biased" means that on disjoint inputs the result is the
+-- straightforward union; the bias only matters at the API contract
+-- level since we reject any actual overlap rather than silently picking
+-- a side.
+overlayEnvs :: Env -> Env -> Either [(EnvNs, Text)] Env
+overlayEnvs (Env v1 c1 tc1) (Env v2 c2 tc2) =
+  let varClash = Map.keys (Map.intersection v1 v2)
+      conClash = Map.keys (Map.intersection c1 c2)
+      tcClash  = Map.keys (Map.intersection tc1 tc2)
+      clashes  =  [ (NsVar,   k) | k <- varClash ]
+               ++ [ (NsCon,   k) | k <- conClash ]
+               ++ [ (NsTyCon, k) | k <- tcClash  ]
+  in case clashes of
+       [] -> Right (Env (Map.union v1 v2) (Map.union c1 c2) (Map.union tc1 tc2))
+       _  -> Left clashes
 
 lookupVar :: Text -> Env -> Maybe Scheme
 lookupVar k = Map.lookup k . envVars

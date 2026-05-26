@@ -1,1 +1,1 @@
-hyp : Int -> Int -> Int
+hyp : U64 -> U64 -> U64

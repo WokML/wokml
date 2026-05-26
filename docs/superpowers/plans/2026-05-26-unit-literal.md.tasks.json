@@ -1,0 +1,19 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-26-unit-literal.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 1: Grammar productions + BNFC regen + parse golden tests",
+      "status": "pending",
+      "description": "**Goal:** Three new BNFC productions (`EUnit`, `TUnit`, `PUnit`), regenerated parser, parse-golden coverage proving `()`, `( )`, and `(   )` parse identically.\n\n**Files:**\n- Modify: `grammar/Wok.cf`\n- Regenerated: `src-generated/GeneratedParser/Wok/*`\n- Create: `test/examples/11-unit.wok`, `test/golden/11-unit.expected`\n\n**Acceptance Criteria:**\n- [ ] Grammar contains `EUnit`/`TUnit`/`PUnit` (`\"(\" \")\"` form).\n- [ ] BNFC regen runs without conflicts.\n- [ ] cabal build succeeds.\n- [ ] Three whitespace variants parse identically.\n- [ ] No parse-golden regressions.\n\n**Verify:** `cabal test --test-options=\"-p parse\"`\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok/Abs.hs\", \"test/examples/11-unit.wok\", \"test/golden/11-unit.expected\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p parse\\\"\", \"acceptanceCriteria\": [\"grammar contains EUnit/TUnit/PUnit\", \"BNFC regen produces no conflicts\", \"cabal build succeeds\", \"constructors present in Abs\", \"three whitespace variants parse identically\", \"no parse-golden regressions\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 2: Typechecker case branches + typecheck golden tests",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Hook EUnit/TUnit/PUnit into the typechecker so `()` typechecks as `()`, with golden coverage for value/type/pattern positions and a failure case.\n\n**Files:**\n- Modify: `src/Wok/TypeChecking/Infer.hs` (3 case branches)\n- Modify: `src/Wok/Reordering.hs` (if needed for exhaustiveness)\n- Create: `test/typecheck-examples/11-unit.wok`, `test/typecheck-golden/11-unit.expected`\n- Create: `test/typecheck-fail-examples/09-unit-mismatch.wok`, `test/typecheck-fail-golden/09-unit-mismatch.expected`\n\n**Acceptance Criteria:**\n- [ ] `inferAtomPat Abs.PUnit` returns `(TCon TcUnit [], [])`.\n- [ ] `inferExprW _ Abs.EUnit` returns `TCon TcUnit []`.\n- [ ] `translateType _ Abs.TUnit` returns `CTCon TcUnit []`.\n- [ ] Success golden passes; fail golden produces Mismatch ... TcInt ... TcUnit.\n- [ ] No non-exhaustive-pattern warnings introduced.\n- [ ] Entire test suite passes.\n\n**Verify:** `cabal test 2>&1 | tail -20`\n\n**Depends on:** Task 1.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/Reordering.hs\", \"test/typecheck-examples/11-unit.wok\", \"test/typecheck-golden/11-unit.expected\", \"test/typecheck-fail-examples/09-unit-mismatch.wok\", \"test/typecheck-fail-golden/09-unit-mismatch.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"inferAtomPat PUnit returns TcUnit\", \"inferExprW EUnit returns TcUnit\", \"translateType TUnit returns TcUnit\", \"success golden passes\", \"fail golden produces Mismatch\", \"no non-exhaustive warnings\", \"all tests pass\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-05-26T03:14:27Z"
+}

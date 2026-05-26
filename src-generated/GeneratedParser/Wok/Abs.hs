@@ -19,7 +19,7 @@ data Module = Module [Decl]
 
 data Decl
     = DEqn FunLHS Exp MaybeWhere
-    | DSig VarId [VarIdComma] Type
+    | DSig SigName [SigNameComma] Type
     | DData ConId [VarId] [ConDef]
     | DFixity FixName FixAssoc [FixRel]
     | DModule ModPath
@@ -43,7 +43,10 @@ data ReservedKw
     | ReservedKw_record
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
-data VarIdComma = VICons VarId
+data SigName = SNBare VarId | SNParen VarSym
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data SigNameComma = SNCons SigName
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data FunLHS
@@ -71,6 +74,7 @@ data AtomPat
     | APTuple Pat [Pat]
     | APList [Pat]
     | APParen Pat
+    | PUnit
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data Type
@@ -81,6 +85,7 @@ data Type
     | TList Type
     | TTuple Type [Type]
     | TParen Type
+    | TUnit
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data ConDef = ConDef ConId [Type]
@@ -107,6 +112,7 @@ data Exp
     | ELitC Char
     | EParen Exp
     | EParenOp VarSym
+    | EUnit
     | EList [Exp]
     | ETuple Exp [Exp]
     | ELam [AtomPat] Exp
@@ -122,7 +128,7 @@ data InfixOp = IOSym VarSym | IOBT VarId
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl
-    = LDEqn FunLHS Exp MaybeWhere | LDSig VarId [VarIdComma] Type
+    = LDEqn FunLHS Exp MaybeWhere | LDSig SigName [SigNameComma] Type
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data MaybeWhere = NoWhere | WithWh [LocalDecl]

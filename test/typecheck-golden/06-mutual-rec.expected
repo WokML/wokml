@@ -1,2 +1,2 @@
-even : Int -> Bool
-odd : Int -> Bool
+even : U64 -> Bool
+odd : U64 -> Bool

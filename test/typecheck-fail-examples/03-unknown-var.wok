@@ -1,2 +1,4 @@
-fixity + left
+module Main
+import Std.Base
+
 useGhost = ghost + 1

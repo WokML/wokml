@@ -1,1 +1,1 @@
-typecheck: UnknownVar (Just (2,12)) "ghost"
+typecheck: typecheck in Main: UnknownVar (Just (4,12)) "ghost"

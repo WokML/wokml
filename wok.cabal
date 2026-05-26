@@ -8,6 +8,7 @@ maintainer:         zhengyan@posteo.net
 category:           Language
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
+data-files:         prelude/Std/Base.wok
 
 common warnings
     ghc-options: -Wall
@@ -47,8 +48,12 @@ library wok-generated
 library
     import:           warnings
     exposed-modules:
+        Wok.Loader
         Wok.Parsing
+        Wok.Pipeline
+        Wok.Prelude
         Wok.Reordering
+        Wok.SourceOrigin
         Wok.TypeChecking
         Wok.TypeChecking.Types
         Wok.TypeChecking.Env
@@ -57,6 +62,10 @@ library
         Wok.TypeChecking.Unify
         Wok.TypeChecking.Infer
         Wok.TypeChecking.Builtins
+    autogen-modules:
+        Paths_wok
+    other-modules:
+        Paths_wok
     build-depends:
         base         ^>=4.20,
         array        ^>=0.5,
@@ -80,6 +89,7 @@ executable wok
     build-depends:
         base ^>=4.20,
         wok,
+        containers,
         text
     hs-source-dirs:   app
     default-language: GHC2024

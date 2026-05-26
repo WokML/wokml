@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+unit : ()
+unit = ()
+
+unitWs : ()
+unitWs = ( )
+
+discard : () -> U64
+discard () = 0
+
+pairUU : ((), ())
+pairUU = ((), ())

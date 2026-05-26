@@ -1,0 +1,12 @@
+u : ();
+u = ();
+u2 : ();
+u2 = ();
+u3 : ();
+u3 = ();
+pairUU : ((), ());
+pairUU = ((), ());
+discard : () -> Int;
+discard () = 0;
+returnsZero : () -> Int;
+returnsZero u = 0

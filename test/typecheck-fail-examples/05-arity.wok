@@ -1,5 +1,6 @@
-data Maybe a = Nothing | Just a
+module Main
+import Std.Base
 
 bad m = case m of
-  Just      -> 0
-  Nothing   -> 1
+  Some    -> 0
+  None    -> 1

@@ -1,0 +1,35 @@
+module Std.Base
+
+fixity + left
+fixity - left
+fixity * left tighter than +
+fixity / left tighter than +
+fixity == left looser than +
+fixity /= left looser than +
+fixity && left looser than ==
+fixity || left looser than &&
+fixity ++ right
+fixity $  right looser than ||
+
+data Bool = True | False
+data Option a = Some a | None
+data Result t e = Ok t | Err e
+
+(+)  : U64 -> U64 -> U64
+(-)  : U64 -> U64 -> U64
+(*)  : U64 -> U64 -> U64
+(/)  : U64 -> U64 -> U64
+div  : U64 -> U64 -> U64
+mod  : U64 -> U64 -> U64
+(==) : U64 -> U64 -> Bool
+(/=) : U64 -> U64 -> Bool
+(&&) : Bool -> Bool -> Bool
+(||) : Bool -> Bool -> Bool
+(++) : [a] -> [a] -> [a]
+($)  : (a -> b) -> a -> b
+
+id : a -> a
+id x = x
+
+const : a -> b -> a
+const x y = x

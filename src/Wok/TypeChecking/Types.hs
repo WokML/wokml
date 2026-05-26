@@ -37,7 +37,7 @@ newtype Level = Level Int
   deriving (Eq, Ord, Show)
 
 data TyCon
-  = TcInt
+  = TcU64
   | TcChar
   | TcString
   | TcBool
@@ -55,9 +55,10 @@ data Type s
 data TVar s
   = Unbound { uniq :: Int, level :: Level, kind :: Kind }
   | Rigid   { uniq :: Int, kind :: Kind }
-    -- ^ Skolem constant introduced by skolemize. Represents a rigid type
-    -- variable from a user-supplied signature. Cannot be linked to anything
-    -- except itself; a mismatch raises RigidEscape.
+    -- ^ Rigid (frozen) type introduced by freezeSig. Represents a rigid
+    -- type — an opaque constant the unifier can only equate with itself.
+    -- See freezeSig in Wok.TypeChecking.Infer for the over-promising
+    -- motivation.
   | Link (Type s)
 
 data Row s

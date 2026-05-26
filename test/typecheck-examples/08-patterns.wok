@@ -1,13 +1,14 @@
-data Maybe a = Nothing | Just a
+module Main
+import Std.Base
 
 first : (a, b) -> a
 first p = case p of
   (x, _) -> x
 
-isNothing : Maybe a -> Bool
-isNothing m = case m of
-  Nothing -> True
-  Just _  -> False
+isNone : Option a -> Bool
+isNone m = case m of
+  None   -> True
+  Some _ -> False
 
 headOr : a -> [a] -> a
 headOr d xs = case xs of

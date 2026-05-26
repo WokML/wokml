@@ -1,0 +1,83 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-26-include-path-and-stdbase.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 1: Create Wok.SourceOrigin leaf module",
+      "status": "completed",
+      "description": "**Goal:** Leaf module hosting `Origin` so `Wok.Loader` and `Wok.TypeChecking.Infer` can both depend on it without a cyclic import.\n\n**Files:** Create `src/Wok/SourceOrigin.hs`; Modify `wok.cabal`, `test/Spec.hs` (smoke test).\n\n**Verify:** `cabal test --test-options=\"-p sourceOrigin\"`\n\n```json:metadata\n{\"files\": [\"src/Wok/SourceOrigin.hs\", \"wok.cabal\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p sourceOrigin\\\"\", \"acceptanceCriteria\": [\"Origin ADT exported\", \"originPath round-trips\", \"no transitive deps\", \"smoke test passes\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 2: Add overlayEnvs + EnvNs to Wok.TypeChecking.Env",
+      "status": "completed",
+      "description": "**Goal:** Left-biased Env merge combinator surfacing per-namespace collisions; used by the loader to compose imports.\n\n**Files:** Modify `src/Wok/TypeChecking/Env.hs`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p envOverlay\"`\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Env.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p envOverlay\\\"\", \"acceptanceCriteria\": [\"EnvNs exported\", \"overlayEnvs disjoint union works\", \"all three namespace collisions detected\", \"multi-namespace collisions all reported\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 3: Add overlayFixities + reorderModuleWith to Wok.Reordering",
+      "status": "completed",
+      "description": "**Goal:** Split fixity-table construction from expression reordering so the loader can seed reordering with an external (merged-from-imports) fixity table.\n\n**Files:** Modify `src/Wok/Reordering.hs`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p Wok.Reordering\"`\n\n```json:metadata\n{\"files\": [\"src/Wok/Reordering.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p Wok.Reordering\\\"\", \"acceptanceCriteria\": [\"overlayFixities + emptyFixityTable + reorderModuleWith exported\", \"RedeclaredOp on conflict\", \"reorderModule unchanged externally\", \"three new tests pass\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 4: Rename skolemize -> freezeSig",
+      "status": "completed",
+      "description": "**Goal:** Replace skolem jargon. Function rename + Types.hs comment + syntax.md reword. Rigid constructor stays.\n\n**Files:** Modify `src/Wok/TypeChecking/Infer.hs`, `Types.hs`, `syntax.md`.\n\n**Verify:** `cabal test 2>&1 | tail -5` + `grep -RIn \"skolem\\|Skolem\" src app syntax.md` empty.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Types.hs\", \"syntax.md\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"no skolem references remain\", \"freezeSig docstring uses double example\", \"all tests pass\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 5: Add modPathText + modPathPos; remove modPathHead",
+      "status": "completed",
+      "description": "**Goal:** Replace `modPathHead` (errors on MPDot) with `modPathText` (flattens MPDot to dotted Text) + `modPathPos` (first ConId position for error reporting).\n\n**Files:** Modify `src/Wok/TypeChecking/Infer.hs`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p modPath\"`\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p modPath\\\"\", \"acceptanceCriteria\": [\"modPathText flattens any depth\", \"modPathPos returns leftmost pos\", \"modPathHead removed\", \"callers updated\", \"tests pass\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 6: Warning channel + bodyless sig support + inferProgramWith",
+      "status": "completed",
+      "blockedBy": [0, 3],
+      "description": "**Goal:** Add Warning ADT, fix bodyless sig silent-drop bug, add `inferProgramWith :: Env -> Origin -> Module -> Either TypeError (Env, [TypedDecl], [Warning])`. Existing `inferProgram` retained as wrapper.\n\n**Files:** Modify `src/Wok/TypeChecking/Infer.hs`, `Wok.TypeChecking.hs`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p bodyless\"`\n\n**Depends on:** Task 1 (Origin), Task 4 (freezeSig name).\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p bodyless\\\"\", \"acceptanceCriteria\": [\"Warning ADT exported\", \"inferProgramWith threading Env+Origin+warnings\", \"back-compat inferProgram works\", \"bodyless sigs reach env verbatim\", \"UserFile emits warnings; Embedded silent\", \"multi-name handles per-name\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 7: Create Wok.Prelude with placeholder embedded source",
+      "status": "completed",
+      "description": "**Goal:** Embedding plumbing. `Wok.Prelude` exposes `preludeName` + `preludeSource` via file-embed. Real content lands at cutover.\n\n**Files:** Create `prelude/Std/Base.wok`, `src/Wok/Prelude.hs`; Modify `wok.cabal`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p prelude\"`\n\n```json:metadata\n{\"files\": [\"prelude/Std/Base.wok\", \"src/Wok/Prelude.hs\", \"wok.cabal\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p prelude\\\"\", \"acceptanceCriteria\": [\"preludeName is Std.Base\", \"preludeSource embedded via file-embed\", \"cabal exposes Wok.Prelude with file-embed dep\", \"smoke tests pass\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 8: Create Wok.Loader (module map, dep graph, topo sort)",
+      "status": "completed",
+      "blockedBy": [0, 2, 4, 6],
+      "description": "**Goal:** `loadProgram :: FilePath -> [FilePath] -> IO (Either LoaderError [LoadedModule])`. Embeds Std.Base; parses + collects fixities; validates headers; builds dep graph; topo-sorts.\n\n**Files:** Create `src/Wok/Loader.hs`, `test/loader-fixtures/`; Modify `wok.cabal`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p loader\"`\n\n**Depends on:** Task 1 (Origin), Task 3 (FixityTable ops), Task 5 (modPathText), Task 7 (preludeSource).\n\n```json:metadata\n{\"files\": [\"src/Wok/Loader.hs\", \"wok.cabal\", \"test/loader-fixtures/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p loader\\\"\", \"acceptanceCriteria\": [\"loadProgram signature exact\", \"Std.Base first in topo order\", \"10 LoaderError variants\", \"7 fixture tests pass\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 9: Rename TcInt -> TcU64 across code and test fixtures",
+      "status": "pending",
+      "description": "**Goal:** Mechanical rename. Constructor + Builtins env key + every test fixture/golden. No behaviour change.\n\n**Files:** Modify `src/Wok/TypeChecking/Types.hs`, `Builtins.hs`, `Infer.hs`; every `test/typecheck-*`; `test/Spec.hs`.\n\n**Verify:** `cabal test 2>&1 | tail -10` + greps empty.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Types.hs\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/typecheck-examples/\", \"test/typecheck-golden/\", \"test/typecheck-fail-examples/\", \"test/typecheck-fail-golden/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"no TcInt references\", \"no surface Int in fixtures\", \"all tests pass\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 10: Cutover — populate Std.Base, shrink Builtins, rewrite Main, migrate fixtures",
+      "status": "pending",
+      "blockedBy": [0, 1, 2, 3, 4, 5, 6, 7, 8],
+      "description": "**Goal:** The atomic switch. Populate Std.Base; shrink Builtins to irreducible pre-env; rewrite Main with CLI + Loader pipeline; switch test harness to Loader; migrate every typecheck fixture to `module Main; import Std.Base` + Option/Result/[]/u64.\n\n**Files:** Modify `prelude/Std/Base.wok`, `Builtins.hs`, `Infer.hs`, `app/Main.hs`, `test/Spec.hs`, all `test/typecheck-*`.\n\n**Verify:** `cabal test 2>&1 | tail -20`\n\n**Depends on:** Tasks 1-9 (all foundations + TcInt rename).\n\n```json:metadata\n{\"files\": [\"prelude/Std/Base.wok\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"app/Main.hs\", \"test/Spec.hs\", \"test/typecheck-examples/\", \"test/typecheck-fail-examples/\", \"test/typecheck-golden/\", \"test/typecheck-fail-golden/\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"Std.Base populated\", \"Builtins shrunk to irreducible\", \"Main CLI + Loader pipeline working\", \"harness routes through Loader\", \"all 18 fixture goldens pass migration\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 11: Add Loader-tier integration tests",
+      "status": "pending",
+      "blockedBy": [9],
+      "description": "**Goal:** Cross-module fixity, fixity redecl, name conflict, bodyless-user-warning, silent-bodyless-in-prelude tests.\n\n**Files:** Create `test/loader-fixtures/07-*.wok` etc.; Modify `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p crossModule OR bodyless\"`\n\n**Depends on:** Task 10.\n\n```json:metadata\n{\"files\": [\"test/loader-fixtures/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p crossModule OR bodyless\\\"\", \"acceptanceCriteria\": [\"cross-module fixity threading verified\", \"cross-module fixity redecl detected\", \"cross-module name conflict detected\", \"user-file bodyless warning emitted\", \"Std.Base bodyless silent\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 12: Migrate examples/hehe.wok and examples/types-tour.wok",
+      "status": "pending",
+      "blockedBy": [9],
+      "description": "**Goal:** Add `module Main; import Std.Base`; drop redundant fixity/data Bool/Maybe/List; rewrite to Option/[].\n\n**Files:** Modify `examples/hehe.wok`, `examples/types-tour.wok`.\n\n**Verify:** `cabal run wok -- examples/hehe.wok && cabal run wok -- examples/types-tour.wok`\n\n**Depends on:** Task 10.\n\n```json:metadata\n{\"files\": [\"examples/hehe.wok\", \"examples/types-tour.wok\"], \"verifyCommand\": \"cabal run wok -- examples/hehe.wok && cabal run wok -- examples/types-tour.wok\", \"acceptanceCriteria\": [\"both files have new header\", \"data Maybe/List removed\", \"wok command runs to completion on both\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-05-26T03:14:27Z"
+}

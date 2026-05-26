@@ -101,7 +101,7 @@ Module : ListDecl { GeneratedParser.Wok.Abs.Module $1 }
 Decl :: { GeneratedParser.Wok.Abs.Decl }
 Decl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.DEqn $1 $3 $4 }
-  | VarId ListVarIdComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
+  | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
   | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
   | 'module' ModPath { GeneratedParser.Wok.Abs.DModule $2 }
@@ -132,12 +132,17 @@ ReservedKw
   | 'do' { GeneratedParser.Wok.Abs.ReservedKw_do }
   | 'record' { GeneratedParser.Wok.Abs.ReservedKw_record }
 
-VarIdComma :: { GeneratedParser.Wok.Abs.VarIdComma }
-VarIdComma : ',' VarId { GeneratedParser.Wok.Abs.VICons $2 }
+SigName :: { GeneratedParser.Wok.Abs.SigName }
+SigName
+  : VarId { GeneratedParser.Wok.Abs.SNBare $1 }
+  | '(' VarSym ')' { GeneratedParser.Wok.Abs.SNParen $2 }
 
-ListVarIdComma :: { [GeneratedParser.Wok.Abs.VarIdComma] }
-ListVarIdComma
-  : {- empty -} { [] } | VarIdComma ListVarIdComma { (:) $1 $2 }
+SigNameComma :: { GeneratedParser.Wok.Abs.SigNameComma }
+SigNameComma : ',' SigName { GeneratedParser.Wok.Abs.SNCons $2 }
+
+ListSigNameComma :: { [GeneratedParser.Wok.Abs.SigNameComma] }
+ListSigNameComma
+  : {- empty -} { [] } | SigNameComma ListSigNameComma { (:) $1 $2 }
 
 ListVarId :: { [GeneratedParser.Wok.Abs.VarId] }
 ListVarId : {- empty -} { [] } | VarId ListVarId { (:) $1 $2 }
@@ -171,6 +176,7 @@ AtomPat
   | '(' Pat ',' ListPat ')' { GeneratedParser.Wok.Abs.APTuple $2 $4 }
   | '[' ListPat ']' { GeneratedParser.Wok.Abs.APList $2 }
   | '(' Pat ')' { GeneratedParser.Wok.Abs.APParen $2 }
+  | '(' ')' { GeneratedParser.Wok.Abs.PUnit }
 
 ListAtomPat :: { [GeneratedParser.Wok.Abs.AtomPat] }
 ListAtomPat
@@ -198,6 +204,7 @@ Type2
   | '[' Type ']' { GeneratedParser.Wok.Abs.TList $2 }
   | '(' Type ',' ListType ')' { GeneratedParser.Wok.Abs.TTuple $2 $4 }
   | '(' Type ')' { GeneratedParser.Wok.Abs.TParen $2 }
+  | '(' ')' { GeneratedParser.Wok.Abs.TUnit }
 
 ListType :: { [GeneratedParser.Wok.Abs.Type] }
 ListType
@@ -265,6 +272,7 @@ Exp2
   | Char { GeneratedParser.Wok.Abs.ELitC $1 }
   | '(' Exp ')' { GeneratedParser.Wok.Abs.EParen $2 }
   | '(' VarSym ')' { GeneratedParser.Wok.Abs.EParenOp $2 }
+  | '(' ')' { GeneratedParser.Wok.Abs.EUnit }
   | '[' ListExp ']' { GeneratedParser.Wok.Abs.EList $2 }
   | '(' Exp ',' ListExp ')' { GeneratedParser.Wok.Abs.ETuple $2 $4 }
   | '\\' ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.ELam $2 $4 }
@@ -281,7 +289,7 @@ ListExp
 LocalDecl :: { GeneratedParser.Wok.Abs.LocalDecl }
 LocalDecl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.LDEqn $1 $3 $4 }
-  | VarId ListVarIdComma ':' Type { GeneratedParser.Wok.Abs.LDSig $1 $2 $4 }
+  | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.LDSig $1 $2 $4 }
 
 ListLocalDecl :: { [GeneratedParser.Wok.Abs.LocalDecl] }
 ListLocalDecl

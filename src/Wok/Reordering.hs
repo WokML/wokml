@@ -5,10 +5,12 @@ module Wok.Reordering
     OpKind(..)
   , OpInfo(..)
   , FixityTable
+  , emptyFixityTable
   , entriesOf
   , lookupOp
   , FixityError(..)
   , buildFixityTable
+  , overlayFixities
   , assocOf
   , kindOf
   , Order(..)
@@ -17,6 +19,7 @@ module Wok.Reordering
   , ReorderError(..)
   , ReorderedModule(..)
   , reorderModule
+  , reorderModuleWith
   ) where
 
 import qualified Data.Map.Strict as Map
@@ -43,6 +46,11 @@ data OpInfo = OpInfo
 
 newtype FixityTable = FixityTable { entriesOf :: Map.Map Text OpInfo }
   deriving (Show)
+
+-- | An empty fixity table. Identity for 'overlayFixities' and the
+-- starting accumulator used by the module loader.
+emptyFixityTable :: FixityTable
+emptyFixityTable = FixityTable Map.empty
 
 lookupOp :: FixityTable -> Text -> Maybe OpInfo
 lookupOp (FixityTable m) k = Map.lookup k m
@@ -86,6 +94,21 @@ buildFixityTable (Module decls) =
       in (m', errs ++ selfErrs ++ redeclErrs)
     collect acc _ = acc
 
+-- | Left-biased union of two fixity tables. On any operator name that
+-- appears in BOTH, returns 'RedeclaredOp name posA posB' (one entry per
+-- offending operator), with @posA@ taken from the first table and
+-- @posB@ from the second. Used by the module loader to detect cross-
+-- module fixity conflicts when merging imports' tables.
+overlayFixities
+  :: FixityTable -> FixityTable -> Either [FixityError] FixityTable
+overlayFixities (FixityTable a) (FixityTable b) =
+  let clashes = Map.intersectionWithKey
+                  (\k ai bi -> RedeclaredOp k (opPos ai) (opPos bi))
+                  a b
+  in case Map.elems clashes of
+       [] -> Right (FixityTable (Map.union a b))
+       es -> Left es
+
 checkNeighbors :: Map.Map Text OpInfo -> [FixityError]
 checkNeighbors m =
   [ UnresolvedNeighbor name n (opPos info)
@@ -94,6 +117,7 @@ checkNeighbors m =
   , not (Map.member n m)
   ]
 
+-- SCC here because we can do detect all cycles in one pass.
 checkCycles :: Map.Map Text OpInfo -> [FixityError]
 checkCycles m =
   let nodes = [ (k, k, filter (/= k) (outEdgesIn m k)) | k <- Map.keys m ]
@@ -160,11 +184,26 @@ data ReorderedModule = ReorderedModule
   , reorderedFixities :: FixityTable
   }
 
+-- | Reorder a module's expressions against an *externally supplied*
+-- fixity table. The external table is overlaid (left-biased; conflicts
+-- reported as 'RedeclaredOp' lifted via 'FixityErr') with the module's
+-- own DFixity decls. Used by the module loader to thread imported
+-- modules' fixities into the importer's reordering pass.
+--
+-- The single-module 'reorderModule' is now a thin wrapper that passes
+-- 'emptyFixityTable' as the external table.
+reorderModuleWith
+  :: FixityTable -> Module -> Either [ReorderError] Module
+reorderModuleWith externalTable m = do
+  ownTable <- mapLeft (map FixityErr) (buildFixityTable m)
+  merged   <- mapLeft (map FixityErr) (overlayFixities externalTable ownTable)
+  reorderAst merged m
+
 reorderModule :: Module -> Either [ReorderError] ReorderedModule
 reorderModule m = do
   table <- mapLeft (map FixityErr) (buildFixityTable m)
-  ast'  <- reorderAst table m
-  Right (ReorderedModule ast' table)
+  ast   <- reorderModuleWith emptyFixityTable m
+  Right (ReorderedModule ast table)
 
 mapLeft :: (e -> e') -> Either e a -> Either e' a
 mapLeft f = either (Left . f) Right

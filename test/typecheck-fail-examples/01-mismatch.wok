@@ -1,2 +1,5 @@
-bad : Int
+module Main
+import Std.Base
+
+bad : U64
 bad = "not an int"

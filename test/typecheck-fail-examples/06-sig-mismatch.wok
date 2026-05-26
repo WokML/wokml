@@ -1,2 +1,5 @@
-liesAboutType : Int -> Int
-liesAboutType x = "definitely not Int"
+module Main
+import Std.Base
+
+liesAboutType : U64 -> U64
+liesAboutType x = "definitely not U64"

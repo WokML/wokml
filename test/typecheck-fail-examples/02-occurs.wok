@@ -1,1 +1,4 @@
+module Main
+import Std.Base
+
 omega = \x -> x x

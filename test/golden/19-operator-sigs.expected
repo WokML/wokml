@@ -1,0 +1,8 @@
+(+) : Int -> Int -> Int;
+foo, (==) : Int;
+bar : Int;
+useLocalOp = let
+{
+  (##) : Int -> Int -> Int
+}
+in 0

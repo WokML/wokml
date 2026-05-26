@@ -1,11 +1,12 @@
-fixity - left
+module Main
+import Std.Base
 
-even : Int -> Bool
+even : U64 -> Bool
 even n = case n of
   0 -> True
   _ -> odd (n - 1)
 
-odd : Int -> Bool
+odd : U64 -> Bool
 odd n = case n of
   0 -> False
   _ -> even (n - 1)

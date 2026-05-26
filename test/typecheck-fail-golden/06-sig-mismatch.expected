@@ -1,1 +1,1 @@
-typecheck: Mismatch Nothing (CTCon TcInt []) (CTCon TcString [])
+typecheck: typecheck in Main: Mismatch Nothing (CTCon TcU64 []) (CTCon TcString [])

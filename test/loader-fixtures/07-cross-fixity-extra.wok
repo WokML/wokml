@@ -1,0 +1,13 @@
+module Extra
+
+-- Two fresh operators with a precedence relation defined here in Extra.
+-- The entry uses BOTH of them but redeclares NEITHER fixity nor signature;
+-- the only way reordering can succeed in the entry is if Extra's fixity
+-- table is overlaid into the entry's reorder pass (cross-module fixity
+-- threading). Without that, the entry's own buildFixityTable is empty, and
+-- the chain `a @@ b %% c` is rejected as UndeclaredOperator.
+fixity @@ left
+fixity %% left tighter than @@
+
+(@@) : U64 -> U64 -> U64
+(%%) : U64 -> U64 -> U64

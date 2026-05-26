@@ -94,13 +94,21 @@ resolveLayout topLayout =
   res _ [] ts = layoutError ts "layout stack empty"
 
   -- Handling explicit blocks:
-  res _ st (t0 : ts)
-    -- We found an open brace in the input,
-    -- put an explicit layout block on the stack.
-    -- This is done even if there was no layout word,
-    -- to keep opening and closing braces.
-    | isLayoutOpen t0 || isParenOpen t0
+  res pt st (t0 : ts)
+    -- Layout open brace: belongs to the just-seen layout word (`let {`,
+    -- `where {`, `of {`). Do NOT insert a separator -- the open brace
+    -- is the body of the preceding layout-word's block, not a new decl.
+    | isLayoutOpen t0
       = t0 : res (Just t0) (Explicit : st) ts
+    -- Paren open: in surface Wok this can start a top-level decl (e.g.
+    -- a bodyless operator sig like `(+) : U64 -> U64 -> U64`). Insert
+    -- a separator if the previous token sits on a different layout-
+    -- column line, mirroring how plain identifiers get separated. The
+    -- auto-generated BNFC filter omitted this call, so paren-leading
+    -- decls following any other decl failed to parse.
+    | isParenOpen t0
+      = maybeInsertSeparator pt t0 st $
+        t0 : res (Just t0) (Explicit : st) ts
 
     -- If we encounter a closing brace, exit the first explicit layout block.
     | isLayoutClose t0 || isParenClose t0

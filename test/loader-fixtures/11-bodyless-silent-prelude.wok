@@ -1,0 +1,5 @@
+module Main
+import Std.Base
+
+g : U64 -> U64
+g x = x + 1

@@ -1,7 +1,7 @@
-fixity + left
-fixity * left tighter than +
+module Main
+import Std.Base
 
-hyp : Int -> Int -> Int
+hyp : U64 -> U64 -> U64
 hyp x y = root (sq x + sq y)
   where
     sq n = n * n

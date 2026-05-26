@@ -1,11 +1,12 @@
-data Maybe a = Nothing | Just a
+module Main
+import Std.Base
 
-fromMaybe : a -> Maybe a -> a
-fromMaybe d m = case m of
-  Nothing -> d
-  Just x  -> x
+fromOption : a -> Option a -> a
+fromOption d m = case m of
+  None   -> d
+  Some x -> x
 
-mapMaybe : (a -> b) -> Maybe a -> Maybe b
-mapMaybe f m = case m of
-  Nothing -> Nothing
-  Just x  -> Just (f x)
+mapOption : (a -> b) -> Option a -> Option b
+mapOption f m = case m of
+  None   -> None
+  Some x -> Some (f x)

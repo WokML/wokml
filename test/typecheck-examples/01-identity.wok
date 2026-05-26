@@ -1,8 +1,11 @@
-id : a -> a
-id x = x
+module Main
+import Std.Base
 
-const : a -> b -> a
-const x y = x
+myId : a -> a
+myId x = x
 
-flip : (a -> b -> c) -> b -> a -> c
-flip f x y = f y x
+myConst : a -> b -> a
+myConst x y = x
+
+myFlip : (a -> b -> c) -> b -> a -> c
+myFlip f x y = f y x

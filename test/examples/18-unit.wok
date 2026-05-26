@@ -1,0 +1,25 @@
+-- Unit literal coverage: value, type, pattern, and whitespace variants.
+
+-- Bare unit value
+u : ()
+u = ()
+
+-- Unit value with whitespace inside the parens
+u2 : ()
+u2 = ( )
+
+-- Unit value with extra whitespace
+u3 : ()
+u3 = (   )
+
+-- Unit in a tuple position (sanity: doesn't collide with ETuple)
+pairUU : ((), ())
+pairUU = ((), ())
+
+-- Unit as a pattern
+discard : () -> Int
+discard () = 0
+
+-- Unit as a function argument type only
+returnsZero : () -> Int
+returnsZero u = 0

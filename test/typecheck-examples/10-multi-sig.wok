@@ -1,4 +1,7 @@
-zero, one, two : Int
+module Main
+import Std.Base
+
+zero, one, two : U64
 zero = 0
 one = 1
 two = 2

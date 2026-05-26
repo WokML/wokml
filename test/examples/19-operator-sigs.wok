@@ -1,0 +1,15 @@
+-- Operator-name bodyless sigs (no equation body).
+-- Standalone signature with an operator name in parens:
+(+) : Int -> Int -> Int
+
+-- Mixed multi-name signature:
+foo, (==) : Int
+
+-- Plain VarId signature still works (back-compat):
+bar : Int
+
+-- Local operator sig inside a let:
+useLocalOp =
+  let
+    (##) : Int -> Int -> Int
+  in 0
