@@ -52,6 +52,7 @@ library
         Wok.Parsing
         Wok.Pipeline
         Wok.Prelude
+        Wok.RecordLayout
         Wok.Reordering
         Wok.SourceOrigin
         Wok.TypeChecking

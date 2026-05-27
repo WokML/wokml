@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+
+data Point = Point { x : U64, y : U64 }
+
+getX : Point -> U64
+getX p = p.x
+
+getXOpen : Point + row r -> U64
+getXOpen p = p.x
+
+preserveExtras : Point + row r -> Point + row r
+preserveExtras p = Point { ..p }
+
+flipXY : Point + row r -> Point + row r
+flipXY p = Point { ..p, x = p.y, y = p.x }

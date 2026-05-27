@@ -99,6 +99,18 @@ prettyWarning :: TC.Warning -> String
 prettyWarning (TC.BodylessBinding name pos) =
   "warning: bodyless binding `" <> Tx.unpack name <> "`" <> showPos pos
     <> "\n  add an equation, or move the declaration into Std.Base if intentional."
-  where
-    showPos (Just (l, c)) = " at line " <> show l <> ", col " <> show c
-    showPos Nothing       = ""
+prettyWarning (TC.RowShadow pos label outerTy innerTy) =
+  "warning: row-shadow" <> showPos pos
+    <> ": label `" <> Tx.unpack label <> "` already exists in the row."
+    <> "\n  outer type: " <> show outerTy
+    <> "\n  inner type (shadowed): " <> show innerTy
+    <> "\n  the outer label takes precedence (Leijen scoped-label semantics)."
+prettyWarning (TC.NonExhaustiveRecordPattern pos tag) =
+  "warning: non-exhaustive patterns" <> showPos pos
+    <> "\n  scrutinee of type `" <> Tx.unpack tag <> " + row _` is open (has extensions),"
+    <> " but all arms are strict."
+    <> "\n  add a `, ..` to one arm to cover the extension case, or use a wildcard arm."
+
+showPos :: TC.BNFC'Position -> String
+showPos (Just (l, c)) = " at line " <> show l <> ", col " <> show c
+showPos Nothing       = ""

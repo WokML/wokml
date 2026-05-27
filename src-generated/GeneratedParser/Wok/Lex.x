@@ -29,7 +29,7 @@ $u = [. \n]          -- universal: any character
 
 -- Symbols and non-identifier-like reserved words
 
-@rsyms = \= | \: | \; | \. | \( | \) | \, | \` | \: \: | \_ | \[ | \] | \- \> | \| | \\ | \{ | \}
+@rsyms = \= | \: | \; | \. | \( | \) | \, | \` | \: \: | \_ | \[ | \] | \{ | \} | \. \. | \- \> | \| | \\
 
 :-
 
@@ -183,28 +183,30 @@ eitherResIdent tv s = treeFind resWords
 -- | The keywords and symbols of the language organized as binary search tree.
 resWords :: BTree
 resWords =
-  b "forall" 23
-    (b "]" 12
-       (b ":" 6
+  b "forall" 24
+    (b "\\" 12
+       (b ".." 6
           (b "," 3 (b ")" 2 (b "(" 1 N N) N) (b "." 5 (b "->" 4 N N) N))
-          (b "=" 9 (b ";" 8 (b "::" 7 N N) N) (b "\\" 11 (b "[" 10 N N) N)))
-       (b "data" 18
-          (b "case" 15
-             (b "`" 14 (b "_" 13 N N) N) (b "contract" 17 (b "class" 16 N N) N))
-          (b "else" 21
-             (b "do" 20 (b "deriving" 19 N N) N) (b "fixity" 22 N N))))
-    (b "record" 34
-       (b "let" 29
-          (b "in" 26
-             (b "import" 25 (b "if" 24 N N) N)
-             (b "left" 28 (b "instance" 27 N N) N))
-          (b "module" 32
-             (b "looser" 31 (b "local" 30 N N) N) (b "of" 33 N N)))
-       (b "use" 40
-          (b "then" 37
-             (b "than" 36 (b "right" 35 N N) N)
-             (b "type" 39 (b "tighter" 38 N N) N))
-          (b "|" 43 (b "{" 42 (b "where" 41 N N) N) (b "}" 44 N N))))
+          (b ";" 9 (b "::" 8 (b ":" 7 N N) N) (b "[" 11 (b "=" 10 N N) N)))
+       (b "contract" 18
+          (b "`" 15
+             (b "_" 14 (b "]" 13 N N) N) (b "class" 17 (b "case" 16 N N) N))
+          (b "do" 21
+             (b "deriving" 20 (b "data" 19 N N) N)
+             (b "fixity" 23 (b "else" 22 N N) N))))
+    (b "right" 36
+       (b "let" 30
+          (b "in" 27
+             (b "import" 26 (b "if" 25 N N) N)
+             (b "left" 29 (b "instance" 28 N N) N))
+          (b "module" 33
+             (b "looser" 32 (b "local" 31 N N) N)
+             (b "record" 35 (b "of" 34 N N) N)))
+       (b "use" 42
+          (b "then" 39
+             (b "than" 38 (b "row" 37 N N) N)
+             (b "type" 41 (b "tighter" 40 N N) N))
+          (b "|" 45 (b "{" 44 (b "where" 43 N N) N) (b "}" 46 N N))))
   where
   b s n = B bs (TS bs n)
     where

@@ -1,0 +1,23 @@
+-- Parameterized record types: v1 limitation
+--
+-- `data Container a = Container { value : a }` declares fine, but construction
+-- and field access don't work because the `TApp -> TCon` path produces a
+-- `TcUser "Container"` carrier instead of a `TRecord`. The two carriers
+-- never unify.
+--
+-- Deferred to v2 (per spec §"Type-system additions"). This fixture documents
+-- the current failure mode so a future v2 implementation can use it as a
+-- regression test once parameterized record support lands.
+
+module Records.Polymorphic
+import Std.Base
+
+data Container a = Container { value : a }
+
+-- Construction with monomorphic type.
+intBox : Container U64
+intBox = Container { value = 42 }
+
+-- Polymorphic identity over Container.
+idContainer : Container a -> Container a
+idContainer c = c

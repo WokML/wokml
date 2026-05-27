@@ -29,10 +29,9 @@ module Wok.TypeChecking
 import GeneratedParser.Wok.Abs (BNFC'Position)
 import Wok.SourceOrigin (Origin (..), originPath)
 import Wok.TypeChecking.Env (Env (..), ConInfo (..), TyConInfo (..))
-import Wok.TypeChecking.Error (TypeError (..))
+import Wok.TypeChecking.Error (TypeError (..), Warning (..))
 import Wok.TypeChecking.Infer
   ( TypedDecl (..)
-  , Warning (..)
   , inferProgram
   , inferProgramWith
   , prettyScheme

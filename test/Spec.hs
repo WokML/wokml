@@ -71,6 +71,15 @@ main = do
     , crossModuleFixityTests
     , crossModuleNameConflictTests
     , bodylessUserWarningTests
+    , rowUnifyTests
+    , recordDeclTests
+    , typeLevelExtTests
+    , recordConstructionTests
+    , fieldAccessTests
+    , recordPatternTests
+    , rowShadowTests
+    , patternCoverageTests
+    , blockLayoutTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -592,7 +601,7 @@ modPathTests = testGroup "modPath"
 monadSmokeTests :: TestTree
 monadSmokeTests = testGroup "Wok.TypeChecking.Monad"
   [ testCase "freshUniq returns increasing values" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.freshUniq
             b <- TM.freshUniq
             c <- TM.freshUniq
@@ -601,7 +610,7 @@ monadSmokeTests = testGroup "Wok.TypeChecking.Monad"
            Right t -> t @?= (0, 1, 2)
            Left e  -> assertFailure (show e)
   , testCase "enterLevel bumps then restores" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             l0 <- TM.currentLevel
             l1 <- TM.enterLevel TM.currentLevel
             l2 <- TM.currentLevel
@@ -610,7 +619,7 @@ monadSmokeTests = testGroup "Wok.TypeChecking.Monad"
            Right t -> t @?= (Ty.Level 0, Ty.Level 1, Ty.Level 0)
            Left e  -> assertFailure (show e)
   , testCase "freshTVar runs without error" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             _ <- TM.enterLevel (TM.freshTVar Ty.KStar)
             pure ()
       in case result of
@@ -618,7 +627,7 @@ monadSmokeTests = testGroup "Wok.TypeChecking.Monad"
            Left e -> assertFailure (show e)
   , testCase "throwError caught as Left" $
       let result :: Either TErr.TypeError ()
-          result = TM.runTC TE.emptyEnv $
+          result = TM.runTC_ TE.emptyEnv $
             throwError (TErr.UnknownVar Nothing (T.pack "x"))
       in case result of
            Left (TErr.UnknownVar _ _) -> pure ()
@@ -628,20 +637,20 @@ monadSmokeTests = testGroup "Wok.TypeChecking.Monad"
 unifyWalksTests :: TestTree
 unifyWalksTests = testGroup "Wok.TypeChecking.Unify (walks)"
   [ testCase "freeze TCon Int" $
-      let result = TM.runTC TE.emptyEnv $
+      let result = TM.runTC_ TE.emptyEnv $
             U.freeze (Ty.TCon Ty.TcU64 [])
       in case result of
            Right ct -> ct @?= Ty.CTCon Ty.TcU64 []
            Left e   -> assertFailure ("expected Right, got: " ++ show e)
   , testCase "freeze fresh TVar produces CTGen" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             t <- TM.freshTVar Ty.KStar
             U.freeze t
       in case result of
            Right (Ty.CTGen _) -> pure ()
            _ -> assertFailure ("expected CTGen, got " ++ show result)
   , testCase "occursAdjust fires when target appears" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.freshTVar Ty.KStar
             case a of
               Ty.TVar ref -> U.occursAdjust Nothing ref (Ty.Level 0)
@@ -656,13 +665,13 @@ unifyWalksTests = testGroup "Wok.TypeChecking.Unify (walks)"
 unifyTests :: TestTree
 unifyTests = testGroup "Wok.TypeChecking.Unify (unify)"
   [ testCase "identical TCon unifies" $
-      let result = TM.runTC TE.emptyEnv $
+      let result = TM.runTC_ TE.emptyEnv $
             U.unify Nothing (Ty.TCon Ty.TcU64 []) (Ty.TCon Ty.TcU64 [])
       in case result of
            Right () -> pure ()
            Left e -> assertFailure (show e)
   , testCase "mismatched TCons fail" $
-      let result = TM.runTC TE.emptyEnv $
+      let result = TM.runTC_ TE.emptyEnv $
             U.unify Nothing (Ty.TCon Ty.TcU64 []) (Ty.TCon Ty.TcBool [])
       in case result of
            Left (TErr.Mismatch _ _ _) -> pure ()
@@ -670,7 +679,7 @@ unifyTests = testGroup "Wok.TypeChecking.Unify (unify)"
                   ("expected Mismatch, got "
                   ++ either show (const "Right ()") result)
   , testCase "fresh TVar unifies with concrete type" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.freshTVar Ty.KStar
             U.unify Nothing a (Ty.TCon Ty.TcU64 [])
             U.freeze a
@@ -678,7 +687,7 @@ unifyTests = testGroup "Wok.TypeChecking.Unify (unify)"
            Right ct -> ct @?= Ty.CTCon Ty.TcU64 []
            Left e -> assertFailure (show e)
   , testCase "TArr unifies (with empty effect row)" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.freshTVar Ty.KStar
             U.unify Nothing
               (Ty.TArr a Ty.RowEmpty (Ty.TCon Ty.TcBool []))
@@ -688,7 +697,7 @@ unifyTests = testGroup "Wok.TypeChecking.Unify (unify)"
            Right ct -> ct @?= Ty.CTCon Ty.TcU64 []
            Left e -> assertFailure (show e)
   , testCase "occurs check fires (a ~ List a)" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.freshTVar Ty.KStar
             U.unify Nothing a (Ty.TCon Ty.TcList [a])
       in case result of
@@ -765,7 +774,7 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
   [ testCase "U64 -> U64 translates to monotype" $
       let int = Abs.TCon (Abs.MPName (Abs.ConId ((0,0), T.pack "U64")))
           ty  = Abs.TFun int int
-          result = TM.runTC B.initialEnv (I.translateSig B.initialEnv ty)
+          result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv ty)
       in case result of
            Right s -> s @?= Ty.Scheme []
                             (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty
@@ -774,7 +783,7 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
   , testCase "a -> a translates to forall a. a -> a" $
       let var = Abs.TVar (Abs.VarId ((0,0), T.pack "a"))
           ty  = Abs.TFun var var
-          result = TM.runTC B.initialEnv (I.translateSig B.initialEnv ty)
+          result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv ty)
       in case result of
            Right (Ty.Scheme [(0, Ty.KStar)]
                     (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0))) ->
@@ -782,14 +791,14 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
            other -> assertFailure ("unexpected: " ++ show other)
   , testCase "[a] translates to forall a. [a]" $
       let var = Abs.TVar (Abs.VarId ((0,0), T.pack "a"))
-          result = TM.runTC B.initialEnv (I.translateSig B.initialEnv (Abs.TList var))
+          result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv (Abs.TList var))
       in case result of
            Right (Ty.Scheme [(0, Ty.KStar)] (Ty.CTCon Ty.TcList [Ty.CTGen 0])) ->
              pure ()
            other -> assertFailure ("unexpected: " ++ show other)
   , testCase "unknown tycon errors" $
       let unk = Abs.TCon (Abs.MPName (Abs.ConId ((0,0), T.pack "Frob")))
-          result = TM.runTC B.initialEnv (I.translateSig B.initialEnv unk)
+          result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv unk)
       in case result of
            Left (TErr.UnknownTyCon _ _) -> pure ()
            _ -> assertFailure ("expected UnknownTyCon, got "
@@ -799,13 +808,13 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
 generalizeTests :: TestTree
 generalizeTests = testGroup "Wok.TypeChecking.Infer (generalize/instantiate)"
   [ testCase "generalize Int yields no quantifiers" $
-      let result = TM.runTC TE.emptyEnv $
+      let result = TM.runTC_ TE.emptyEnv $
             I.generalize (Ty.TCon Ty.TcU64 [])
       in case result of
            Right s -> s @?= Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])
            Left e -> assertFailure (show e)
   , testCase "generalize fresh a -> a yields forall a. a -> a" $
-      let result = TM.runTC TE.emptyEnv $ do
+      let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.enterLevel (TM.freshTVar Ty.KStar)
             I.generalize (Ty.TArr a Ty.RowEmpty a)
       in case result of
@@ -816,7 +825,7 @@ generalizeTests = testGroup "Wok.TypeChecking.Infer (generalize/instantiate)"
   , testCase "instantiate forall a. a -> a yields shared TVar" $
       let s = Ty.Scheme [(0, Ty.KStar)]
                 (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0))
-          result = TM.runTC TE.emptyEnv $ do
+          result = TM.runTC_ TE.emptyEnv $ do
             t <- I.instantiate s
             case t of
               Ty.TArr (Ty.TVar r1) Ty.RowEmpty (Ty.TVar r2) ->
@@ -838,7 +847,7 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
                    [ Abs.ConDef (vc "Nothing") []
                    , Abs.ConDef (vc "Just") [Abs.TVar (vv "a")]
                    ]
-          result = TM.runTC B.initialEnv $
+          result = TM.runTC_ B.initialEnv $
                      I.processDataDecls B.initialEnv [decl]
       in case result of
            Right env -> do
@@ -866,7 +875,7 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
       let pos = (0,0)
           vc s = Abs.ConId (pos, T.pack s)
           decl = Abs.DData (vc "Bool") [] []
-          result = TM.runTC env $ I.processDataDecls env [decl]
+          result = TM.runTC_ env $ I.processDataDecls env [decl]
       case result of
         Left (TErr.DuplicateTyCon _ _) -> pure ()
         _ -> assertFailure
@@ -877,7 +886,7 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
 patternTests :: TestTree
 patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
   [ testCase "var pattern returns fresh type and one binding" $
-      let result = TM.runTC B.initialEnv $ do
+      let result = TM.runTC_ B.initialEnv $ do
             (t, bs) <- I.inferPat
               (Abs.PAtom (Abs.APVar (Abs.VarId ((0,0), T.pack "x"))))
             pure (length bs, case t of Ty.TVar _ -> True; _ -> False)
@@ -885,7 +894,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
            Right (1, True) -> pure ()
            other -> assertFailure ("unexpected: " ++ show other)
   , testCase "literal Int pattern" $
-      let result = TM.runTC B.initialEnv $ do
+      let result = TM.runTC_ B.initialEnv $ do
             (t, _) <- I.inferPat
               (Abs.PAtom (Abs.APLitI
                 (Abs.WokInt ((0,0), T.pack "5"))))
@@ -894,7 +903,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
            Right ct -> ct @?= Ty.CTCon Ty.TcU64 []
            Left e -> assertFailure (show e)
   , testCase "wildcard pattern returns fresh type, no bindings" $
-      let result = TM.runTC B.initialEnv $ do
+      let result = TM.runTC_ B.initialEnv $ do
             (_, bs) <- I.inferPat (Abs.PAtom Abs.APWild)
             pure (length bs)
       in case result of
@@ -902,7 +911,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
            other -> assertFailure ("unexpected: " ++ show other)
   , testCase "True nullary constructor pattern" $ do
       env <- stdBaseExtendedEnv
-      let result = TM.runTC env $ do
+      let result = TM.runTC_ env $ do
             (t, _) <- I.inferPat (Abs.PAtom
               (Abs.APCon (Abs.MPName (Abs.ConId ((0,0), T.pack "True")))))
             U.freeze t
@@ -912,7 +921,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
   , testCase "tuple pattern (x, y) gives 2-tuple type and 2 bindings" $
       let pos = (0,0)
           vp s = Abs.PAtom (Abs.APVar (Abs.VarId (pos, T.pack s)))
-          result = TM.runTC B.initialEnv $ do
+          result = TM.runTC_ B.initialEnv $ do
             (t, bs) <- I.inferPat
               (Abs.PAtom (Abs.APTuple (vp "x") [vp "y"]))
             ct <- U.freeze t
@@ -925,7 +934,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
 exprBasicTests :: TestTree
 exprBasicTests = testGroup "ExprBasic"
   [ testCase "literal Int" $
-      let result = TM.runTC B.initialEnv $ do
+      let result = TM.runTC_ B.initialEnv $ do
             t <- I.inferExpr (Abs.ELitI (Abs.WokInt ((0,0), T.pack "42")))
             U.freeze t
       in case result of
@@ -935,7 +944,7 @@ exprBasicTests = testGroup "ExprBasic"
       env <- stdBaseExtendedEnv
       let true = Abs.ECon (Abs.ConId ((0,0), T.pack "True"))
           mkI s = Abs.ELitI (Abs.WokInt ((0,0), T.pack s))
-          result = TM.runTC env $ do
+          result = TM.runTC_ env $ do
             t <- I.inferExpr (Abs.EIf true (mkI "1") (mkI "2"))
             U.freeze t
       case result of
@@ -945,7 +954,7 @@ exprBasicTests = testGroup "ExprBasic"
       env <- stdBaseExtendedEnv
       let plus = Abs.EParenOp (Abs.VarSym ((0,0), T.pack "+"))
           mkI s = Abs.ELitI (Abs.WokInt ((0,0), T.pack s))
-          result = TM.runTC env $ do
+          result = TM.runTC_ env $ do
             t <- I.inferExpr (Abs.EApp (Abs.EApp plus (mkI "1")) (mkI "2"))
             U.freeze t
       case result of
@@ -954,21 +963,21 @@ exprBasicTests = testGroup "ExprBasic"
   , testCase "\\x -> x : a -> a" $
       let lam = Abs.ELam [Abs.APVar (Abs.VarId ((0,0), T.pack "x"))]
                   (Abs.EVar (Abs.VarId ((0,0), T.pack "x")))
-          result = TM.runTC B.initialEnv $ do
+          result = TM.runTC_ B.initialEnv $ do
             t <- I.inferExpr lam
             U.freeze t
       in case result of
            Right (Ty.CTArr (Ty.CTGen i) Ty.CREmpty (Ty.CTGen j)) | i == j -> pure ()
            other -> assertFailure ("unexpected: " ++ show other)
-  , testCase "EProj fails as unsupported" $
+  , testCase "EProj on unknown var fails with UnknownVar" $
       let proj = Abs.EProj (Abs.EVar (Abs.VarId ((0,0), T.pack "x")))
                    (Abs.VarId ((0,0), T.pack "y"))
-          result = TM.runTC B.initialEnv
+          result = TM.runTC_ B.initialEnv
                      (I.inferExpr proj >>= \t -> U.freeze t)
       in case result of
-           Left (TErr.UnsupportedFeature _ _) -> pure ()
+           Left (TErr.UnknownVar _ _) -> pure ()
            _ -> assertFailure
-                  ("expected UnsupportedFeature, got "
+                  ("expected UnknownVar, got "
                   ++ either show (const "Right") result)
   ]
 
@@ -987,7 +996,7 @@ exprLetTests = testGroup "ExprLet"
           body = Abs.ETuple
                    (Abs.EApp (Abs.EVar (v "id")) one)
                    [Abs.EApp (Abs.EVar (v "id")) true]
-          result = TM.runTC env $ do
+          result = TM.runTC_ env $ do
             t <- I.inferExpr (Abs.ELet [ldId] body)
             U.freeze t
       case result of
@@ -1004,7 +1013,7 @@ exprLetTests = testGroup "ExprLet"
                           (mkI "1") Abs.NoWhere
           altF = Abs.AltC (Abs.PAtom (Abs.APCon (Abs.MPName (c "False"))))
                           (mkI "0") Abs.NoWhere
-          result = TM.runTC env $ do
+          result = TM.runTC_ env $ do
             t <- I.inferExpr (Abs.ECase true [altT, altF])
             U.freeze t
       case result of
@@ -1312,4 +1321,917 @@ bodylessUserWarningTests = testGroup "bodylessUser"
             Right (_, ws) -> assertFailure ("expected no warnings, got: " ++ show ws)
             Left s -> assertFailure ("pipeline unexpectedly failed: " ++ s)
         Left lerr -> assertFailure ("loader unexpectedly failed: " ++ show lerr)
+  ]
+
+-- ---------------------------------------------------------------------
+-- Row unification tests (Leijen 2005 scoped-label algorithm)
+-- ---------------------------------------------------------------------
+
+-- | Run a TC action in a fresh ST context, returning Either TypeError a.
+runUnify :: (forall s. TM.TC s a) -> Either TErr.TypeError a
+runUnify action = TM.runTC_ TE.emptyEnv action
+
+-- | Build a row from a list of (label, type) pairs.
+mkRow :: [(T.Text, Ty.Type s)] -> Ty.Row s
+mkRow = foldr (\(l, t) acc -> Ty.RowExtend l t acc) Ty.RowEmpty
+
+rowUnifyTests :: TestTree
+rowUnifyTests = testGroup "RowUnify"
+  [ testCase "RowEmpty ~ RowEmpty unifies" $
+      let result = runUnify $
+            U.unifyRow Nothing Ty.RowEmpty Ty.RowEmpty
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "{x:U64} ~ {x:U64} unifies" $
+      let result = runUnify $ do
+            let r1 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty
+                r2 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty
+            U.unifyRow Nothing r1 r2
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "{x:U64} ~ {x:Bool} fails with RowMismatch or Mismatch" $
+      let result = runUnify $ do
+            let r1 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty
+                r2 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcBool []) Ty.RowEmpty
+            U.unifyRow Nothing r1 r2
+      in case result of
+           Left (TErr.Mismatch _ _ _) -> pure ()
+           Left (TErr.RowMismatch _ _ _) -> pure ()
+           _ -> assertFailure ("expected Mismatch or RowMismatch, got: " ++ show result)
+
+  , testCase "{x:U64, y:Bool} ~ {y:Bool, x:U64} unifies (permutation)" $
+      -- Leijen permits reordering: same labels, different extension order.
+      let result = runUnify $ do
+            let r1 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 [])
+                       (Ty.RowExtend (T.pack "y") (Ty.TCon Ty.TcBool []) Ty.RowEmpty)
+                r2 = Ty.RowExtend (T.pack "y") (Ty.TCon Ty.TcBool [])
+                       (Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty)
+            U.unifyRow Nothing r1 r2
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "row variable extends to add label" $
+      -- Given fresh RowVar r, unify (RowVar r) with {x : U64}. After: r is bound.
+      let result = runUnify $ do
+            rVar <- TM.freshRVar
+            let row = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty
+            U.unifyRow Nothing rVar row
+            -- Force rVar to check it was bound
+            forced <- U.forceRow rVar
+            U.freezeRow forced
+      in case result of
+           Right cr -> assertBool "expected CRExtend x ..." $
+             case cr of
+               Ty.CRExtend lbl (Ty.CTCon Ty.TcU64 []) _ -> lbl == T.pack "x"
+               _ -> False
+           Left e -> assertFailure ("expected Right, got: " ++ show e)
+
+  , testCase "row variable unifies with RowEmpty" $
+      let result = runUnify $ do
+            rVar <- TM.freshRVar
+            U.unifyRow Nothing rVar Ty.RowEmpty
+            forced <- U.forceRow rVar
+            U.freezeRow forced
+      in case result of
+           Right Ty.CREmpty -> pure ()
+           Right cr -> assertFailure ("expected CREmpty, got: " ++ show cr)
+           Left e -> assertFailure ("expected Right, got: " ++ show e)
+
+  , testCase "rewriteRowStrict refuses RowVar" $
+      -- rewriteRowStrict should throw UnknownField when given a RowVar.
+      let result :: Either TErr.TypeError (Ty.CType, Ty.CRow)
+          result = runUnify $ do
+            rVar <- TM.freshRVar
+            (ty, rest) <- U.rewriteRowStrict Nothing (T.pack "x") rVar
+            ct <- U.freeze ty
+            cr <- U.freezeRow rest
+            pure (ct, cr)
+      in case result of
+           Left (TErr.UnknownField _ _ lbl) -> lbl @?= T.pack "x"
+           _ -> assertFailure ("expected UnknownField, got: " ++ show result)
+
+  , testCase "rewriteRow on RowVar allocates fresh field and tail" $
+      -- rewriteRow should succeed on RowVar by allocating fresh vars.
+      let result = runUnify $ do
+            rVar <- TM.freshRVar
+            (ty, _tail) <- U.rewriteRow Nothing (T.pack "x") rVar
+            U.freeze ty
+      in case result of
+           Right (Ty.CTGen _) -> pure ()
+           Right ct -> assertFailure ("expected CTGen (fresh), got: " ++ show ct)
+           Left e -> assertFailure ("expected Right, got: " ++ show e)
+
+  , testCase "scoped labels: {x:U64, x:Bool} stays distinct" $
+      -- Two same-name labels coexist. Unifying a row with itself should succeed.
+      let result = runUnify $ do
+            let row = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 [])
+                        (Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcBool []) Ty.RowEmpty)
+            U.unifyRow Nothing row row
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "scoped labels: rewriteRow returns outermost, inner survives in tail" $
+      -- rewriteRow on {x:U64, x:Bool} for label "x" must return the OUTERMOST
+      -- field (U64) and leave the inner {x:Bool} intact in the tail.
+      let result = runUnify $ do
+            let row = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 [])
+                        (Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcBool []) Ty.RowEmpty)
+            (ty, rest) <- U.rewriteRow Nothing (T.pack "x") row
+            ct  <- U.freeze ty
+            cr  <- U.freezeRow rest
+            pure (ct, cr)
+      in case result of
+           Right (Ty.CTCon Ty.TcU64 [], Ty.CRExtend lbl (Ty.CTCon Ty.TcBool []) Ty.CREmpty)
+             | lbl == T.pack "x" -> pure ()
+           Right other ->
+             assertFailure ("expected (CTCon TcU64 [], CRExtend x (CTCon TcBool []) CREmpty), got: " ++ show other)
+           Left e -> assertFailure ("expected Right, got: " ++ show e)
+
+  , testCase "occurs check: r := {x : r} is rejected" $
+      -- Setup: fresh RowVar r. Attempt to bind r to RowExtend "x" someType (RowVar r).
+      -- Expected: throws RowOccursCheck (dedicated cycle error).
+      let result = runUnify $ do
+            rVar <- TM.freshRVar
+            case rVar of
+              Ty.RowVar ref -> do
+                let cyclicRow = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) rVar
+                U.bindRowVar Nothing ref cyclicRow
+              _ -> error "expected RowVar from freshRVar"
+      in case result of
+           Left (TErr.RowOccursCheck _ _ _) -> pure ()
+           _ -> assertFailure ("expected RowOccursCheck (cycle), got: " ++ show result)
+
+  , testCase "TRecord tag mismatch fails with NominalMismatch" $
+      let result = runUnify $ do
+            let r1 = Ty.TRecord (T.pack "Point") Ty.RowEmpty
+                r2 = Ty.TRecord (T.pack "Line") Ty.RowEmpty
+            U.unify Nothing r1 r2
+      in case result of
+           Left (TErr.NominalMismatch _ t1 t2) -> do
+             t1 @?= T.pack "Point"
+             t2 @?= T.pack "Line"
+           _ -> assertFailure ("expected NominalMismatch, got: " ++ show result)
+
+  , testCase "TRecord same tag with matching rows unifies" $
+      let result = runUnify $ do
+            let row = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty
+                r1 = Ty.TRecord (T.pack "Point") row
+                r2 = Ty.TRecord (T.pack "Point") row
+            U.unify Nothing r1 r2
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "RowVar ~ RowVar (same ref) unifies trivially" $
+      let result = runUnify $ do
+            rVar <- TM.freshRVar
+            U.unifyRow Nothing rVar rVar
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "two distinct RowVars are unified by binding one to the other" $
+      let result = runUnify $ do
+            r1 <- TM.freshRVar
+            r2 <- TM.freshRVar
+            U.unifyRow Nothing r1 r2
+            -- Both should now freeze to the same CRow (CRGen)
+            cr1 <- U.freezeRow r1
+            cr2 <- U.freezeRow r2
+            pure (cr1, cr2)
+      in case result of
+           Right (cr1, cr2) -> cr1 @?= cr2
+           Left e -> assertFailure ("expected Right, got: " ++ show e)
+  ]
+
+-- ---------------------------------------------------------------------
+-- Record data-decl processing tests (Task 4)
+-- ---------------------------------------------------------------------
+
+-- | Parse a source fragment containing only data decls (no module header)
+-- and run processDataDecls against the given environment.
+runDataDeclsIn :: TE.Env -> Text -> Either TErr.TypeError TE.Env
+runDataDeclsIn env src =
+  case parse (T.pack "module Main\n" `T.append` src) of
+    Left e -> Left (TErr.UnsupportedFeature Nothing (T.pack ("parse: " ++ e)))
+    Right ast ->
+      let decls = case ast of Abs.Module ds -> ds
+      in TM.runTC_ env (I.processDataDecls env decls)
+
+-- | Convenience wrapper using the minimal builtins env (no Std.Base).
+runDataDecls :: Text -> Either TErr.TypeError TE.Env
+runDataDecls = runDataDeclsIn B.initialEnv
+
+recordDeclTests :: TestTree
+recordDeclTests = testGroup "RecordDecl"
+  [ testCase "register named-form Point in envRecordCons and envTyCons" $ do
+      case runDataDecls (T.pack "data Point = Point { x : U64, y : U64 }") of
+        Left e  -> assertFailure ("unexpected error: " ++ show e)
+        Right env -> do
+          case TE.lookupRecordCon (T.pack "Point") env of
+            Nothing   -> assertFailure "Point not in envRecordCons"
+            Just info -> do
+              TE.rcTag info @?= T.pack "Point"
+              length (TE.rcFields info) @?= 2
+          case TE.lookupTyCon (T.pack "Point") env of
+            Nothing -> assertFailure "Point not in envTyCons"
+            Just _  -> pure ()
+          -- Must NOT be in the positional (curried) constructor namespace.
+          TE.lookupCon (T.pack "Point") env @?= Nothing
+
+  , testCase "elided form is equivalent to named form" $ do
+      case runDataDecls (T.pack "data Point = { x : U64, y : U64 }") of
+        Left e  -> assertFailure ("unexpected error: " ++ show e)
+        Right env ->
+          case TE.lookupRecordCon (T.pack "Point") env of
+            Nothing   -> assertFailure "Point not in envRecordCons"
+            Just info -> do
+              -- Tag must be filled in from the data-type name.
+              TE.rcTag info @?= T.pack "Point"
+              length (TE.rcFields info) @?= 2
+
+  , testCase "elision in multi-constructor decl is rejected" $ do
+      case runDataDecls (T.pack "data Shape = { x : U64 } | Square { side : U64 }") of
+        Left _  -> pure ()   -- any error is acceptable
+        Right _ -> assertFailure "expected an error for elision in multi-con decl"
+
+  , testCase "same field name across two constructors is rejected" $ do
+      case runDataDecls (T.pack "data X = A { x : U64 } | B { x : U64 }") of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected an error for duplicate field name"
+
+  , testCase "mixed positional and record constructors in one decl" $ do
+      baseEnv <- stdBaseExtendedEnv
+      -- Use a distinct name to avoid clashing with Std.Base's Result/Ok/Err.
+      let src = T.pack "data Outcome a e = Good a | Bad { code : U64, flag : Bool }"
+      case runDataDeclsIn baseEnv src of
+        Left e  -> assertFailure ("unexpected error: " ++ show e)
+        Right env -> do
+          -- Good is positional (curried scheme) only.
+          case TE.lookupCon (T.pack "Good") env of
+            Nothing -> assertFailure "Good not in envCons"
+            Just _  -> pure ()
+          TE.lookupRecordCon (T.pack "Good") env @?= Nothing
+          -- Bad is record-only.
+          case TE.lookupRecordCon (T.pack "Bad") env of
+            Nothing -> assertFailure "Bad not in envRecordCons"
+            Just _  -> pure ()
+          TE.lookupCon (T.pack "Bad") env @?= Nothing
+
+  , testCase "polymorphic record constructor carries type params" $ do
+      case runDataDecls (T.pack "data Container a = Container { value : a }") of
+        Left e  -> assertFailure ("unexpected error: " ++ show e)
+        Right env ->
+          case TE.lookupRecordCon (T.pack "Container") env of
+            Nothing   -> assertFailure "Container not in envRecordCons"
+            Just info -> do
+              length (TE.rcFields info) @?= 1
+              length (TE.rcParams info) @?= 1
+  ]
+
+-- ---------------------------------------------------------------------
+-- Type-level + elaboration tests (Task 8)
+-- ---------------------------------------------------------------------
+
+-- | Build an env with Point defined and run translateSig on the given type.
+-- Returns the Scheme or the TypeError.
+translateSigInPointEnv :: Abs.Type -> Either TErr.TypeError Ty.Scheme
+translateSigInPointEnv ty =
+  case runDataDecls (T.pack "data Point = Point { x : U64, y : U64 }") of
+    Left e -> Left e
+    Right env ->
+      TM.runTC_ env (I.translateSig env ty)
+
+-- | Helper: build an Abs.Type for `Point` (a TCon).
+mkPointTy :: Abs.Type
+mkPointTy = Abs.TCon (Abs.MPName (Abs.ConId ((0,0), T.pack "Point")))
+
+-- | Helper: build a VarSym.
+mkVarSym :: String -> Abs.VarSym
+mkVarSym s = Abs.VarSym ((0,0), T.pack s)
+
+-- | Helper: build a RCAnon from a list of (name, type) pairs.
+mkRCAnon :: [(String, Abs.Type)] -> Abs.RowContrib
+mkRCAnon fields =
+  Abs.RCAnon [ Abs.RFType (Abs.VarId ((0,0), T.pack n)) ty | (n, ty) <- fields ]
+
+-- | Helper: U64 type.
+mkU64 :: Abs.Type
+mkU64 = Abs.TCon (Abs.MPName (Abs.ConId ((0,0), T.pack "U64")))
+
+-- | Helper: build RCVar for a named row variable.
+mkRCVar :: String -> Abs.RowContrib
+mkRCVar s = Abs.RCVar (Abs.VarId ((0,0), T.pack s))
+
+-- | Extract the fields from a CTRecord's CRow into a list of label names.
+cRowLabels :: Ty.CRow -> [T.Text]
+cRowLabels Ty.CREmpty = []
+cRowLabels (Ty.CRExtend l _ rest) = l : cRowLabels rest
+cRowLabels (Ty.CRGen _) = []
+
+typeLevelExtTests :: TestTree
+typeLevelExtTests = testGroup "TypeLevelExtension"
+  [ testCase "concrete extension translates to TRecord with merged fields" $ do
+      -- Point + { score : U64 } should yield CTRecord "Point" with x, y, score
+      let ty = Abs.TExtend mkPointTy (mkVarSym "+")
+                 (mkRCAnon [("score", mkU64)])
+      case translateSigInPointEnv ty of
+        Left e -> assertFailure ("unexpected error: " ++ show e)
+        Right (Ty.Scheme _ (Ty.CTRecord tag row)) -> do
+          tag @?= T.pack "Point"
+          let labels = cRowLabels row
+          -- score is prepended (outermost), x and y come from Point's fields
+          length labels @?= 3
+          head labels @?= T.pack "score"
+          T.pack "x" `elem` labels @? "expected x in row"
+          T.pack "y" `elem` labels @? "expected y in row"
+        Right other -> assertFailure ("expected CTRecord scheme, got: " ++ show other)
+
+  , testCase "row variable extension translates to CTRecord with CRGen tail" $ do
+      -- Point + row r should yield CTRecord "Point" (x, y, r)
+      let ty = Abs.TExtend mkPointTy (mkVarSym "+") (mkRCVar "r")
+      case translateSigInPointEnv ty of
+        Left e -> assertFailure ("unexpected error: " ++ show e)
+        Right (Ty.Scheme qs (Ty.CTRecord tag row)) -> do
+          tag @?= T.pack "Point"
+          -- The row should end with a CRGen for the row variable
+          let hasRowVar (Ty.CRGen _) = True
+              hasRowVar Ty.CREmpty   = False
+              hasRowVar (Ty.CRExtend _ _ rest) = hasRowVar rest
+          hasRowVar row @? "expected row variable (CRGen) in row"
+          -- There should be exactly one KEffect quantifier for the row var
+          let rowQs = [ i | (i, Ty.KEffect) <- qs ]
+          length rowQs @?= 1
+        Right other -> assertFailure ("expected CTRecord scheme, got: " ++ show other)
+
+  , testCase "two uses of same row var share one CRGen slot" $ do
+      -- (Point + row r) -> (Point + row r): both `r` should map to same index
+      let extTy = Abs.TExtend mkPointTy (mkVarSym "+") (mkRCVar "r")
+          ty    = Abs.TFun extTy extTy
+      case translateSigInPointEnv ty of
+        Left e -> assertFailure ("unexpected error: " ++ show e)
+        Right (Ty.Scheme qs _) -> do
+          -- Exactly one KEffect slot (one row var `r`)
+          let rowQs = [ i | (i, Ty.KEffect) <- qs ]
+          length rowQs @?= 1
+        Right other -> assertFailure ("unexpected: " ++ show other)
+
+  , testCase "non-plus operator rejected with NonPlusTypeOp" $ do
+      -- Point - { score : U64 } should fail with NonPlusTypeOp
+      let ty = Abs.TExtend mkPointTy (mkVarSym "-")
+                 (mkRCAnon [("score", mkU64)])
+      case translateSigInPointEnv ty of
+        Left (TErr.NonPlusTypeOp _ sym) -> sym @?= T.pack "-"
+        Left other -> assertFailure ("expected NonPlusTypeOp, got: " ++ show other)
+        Right _ -> assertFailure "expected error, got Right"
+
+  , testCase "plain TCon for record type produces CTRecord" $ do
+      -- Just referencing `Point` in a sig should produce CTRecord "Point" {...}
+      case translateSigInPointEnv mkPointTy of
+        Left e -> assertFailure ("unexpected error: " ++ show e)
+        Right (Ty.Scheme _ (Ty.CTRecord tag row)) -> do
+          tag @?= T.pack "Point"
+          let labels = cRowLabels row
+          length labels @?= 2
+          T.pack "x" `elem` labels @? "expected x"
+          T.pack "y" `elem` labels @? "expected y"
+        Right other -> assertFailure ("expected CTRecord, got: " ++ show other)
+
+  , testCase "chained extension Point + { score } + { color } works" $ do
+      -- (Point + { score : U64 }) + { color : U64 }
+      let step1 = Abs.TExtend mkPointTy (mkVarSym "+")
+                    (mkRCAnon [("score", mkU64)])
+          ty    = Abs.TExtend step1 (mkVarSym "+")
+                    (mkRCAnon [("color", mkU64)])
+      case translateSigInPointEnv ty of
+        Left e -> assertFailure ("unexpected error: " ++ show e)
+        Right (Ty.Scheme _ (Ty.CTRecord tag row)) -> do
+          tag @?= T.pack "Point"
+          let labels = cRowLabels row
+          length labels @?= 4
+          T.pack "x"     `elem` labels @? "expected x"
+          T.pack "y"     `elem` labels @? "expected y"
+          T.pack "score" `elem` labels @? "expected score"
+          T.pack "color" `elem` labels @? "expected color"
+        Right other -> assertFailure ("expected CTRecord, got: " ++ show other)
+
+  , testCase "anonymous record { x : U64 } outside + is a parse error" $ do
+      -- The grammar's RowContrib is only reachable from TExtend.
+      -- A standalone `{ x : U64 }` in a type position does NOT parse as a type.
+      -- Verify by checking that the source doesn't produce a valid parse
+      -- when { ... } appears as a top-level type.
+      -- (This is a grammar-level guarantee, not an elaborator one.)
+      -- We use parseSrc via parse on a sig that would need that form.
+      -- `f : { x : U64 } -> U64` should fail to parse.
+      let src = T.pack "module Main\nf : { x : U64 } -> U64\nf r = 0\n"
+      case parse src of
+        Left _  -> pure ()  -- expected: parse fails
+        Right _ -> assertFailure "expected parse failure for standalone { } in type position"
+
+  , testCase "bare row var without row keyword is a parse error" $ do
+      -- `f : Point + r -> U64` where r has no `row` prefix should fail to parse.
+      -- The grammar requires `row VarId` for RCVar.
+      let src = T.pack "module Main\ndata Point = Point { x : U64, y : U64 }\nf : Point + r -> U64\nf p = 0\n"
+      case parse src of
+        Left _  -> pure ()  -- expected: parse fails
+        Right _ -> assertFailure "expected parse failure for bare row var without `row` keyword"
+  ]
+
+-- ---------------------------------------------------------------------
+-- Record construction inference tests (Task 5)
+-- ---------------------------------------------------------------------
+
+-- | Preamble that defines Point for record construction tests.
+pointDecl :: T.Text
+pointDecl = T.pack "data Point = Point { x : U64, y : U64 }\n"
+
+-- | Run the full typecheck pipeline on the given source (no module header
+-- needed; inferProgram accepts raw decl lists). Returns Right scheme list
+-- or Left error.
+runTypecheckSrc :: T.Text -> Either String [(T.Text, Ty.Scheme)]
+runTypecheckSrc src =
+  case parse src of
+    Left e -> Left ("parse: " ++ e)
+    Right ast ->
+      case reorderModule ast of
+        Left es -> Left ("reorder: " ++ show es)
+        Right rm ->
+          case TC.inferProgram (reorderedAst rm) of
+            Left e -> Left ("typecheck: " ++ show e)
+            Right (_, decls) -> Right [ (TC.tdName d, TC.tdScheme d) | d <- decls ]
+
+-- | Expect a source to typecheck without error.
+expectOK :: T.Text -> Assertion
+expectOK src =
+  case runTypecheckSrc src of
+    Right _ -> pure ()
+    Left e  -> assertFailure ("expected success but got: " ++ e)
+
+-- | Expect a source to fail typechecking (any error).
+expectError :: T.Text -> Assertion
+expectError src =
+  case runTypecheckSrc src of
+    Left _  -> pure ()
+    Right _ -> assertFailure "expected typecheck error but got success"
+
+-- | Expect a source to fail typechecking with an error message containing
+-- the given substring.
+expectErrorContaining :: T.Text -> String -> Assertion
+expectErrorContaining src substr =
+  case runTypecheckSrc src of
+    Left e  -> assertBool
+                 ("expected error containing " ++ show substr ++ " but got: " ++ e)
+                 (substr `Data.List.isInfixOf` e)
+    Right _ -> assertFailure ("expected error containing " ++ show substr ++ " but got success")
+
+recordConstructionTests :: TestTree
+recordConstructionTests = testGroup "RecordConstruction"
+  [ testCase "closed Point infers as TRecord Point" $ do
+      let src = pointDecl <> T.pack "p = Point { x = 1, y = 2 }\n"
+      case runTypecheckSrc src of
+        Left e -> assertFailure ("unexpected error: " ++ e)
+        Right decls ->
+          case lookup (T.pack "p") decls of
+            Nothing -> assertFailure "p not in decls"
+            Just (Ty.Scheme [] (Ty.CTRecord tag row)) -> do
+              tag @?= T.pack "Point"
+              let labels = cRowLabels row
+              Data.List.sort labels @?= Data.List.sort [T.pack "x", T.pack "y"]
+            Just other -> assertFailure ("unexpected scheme: " ++ show other)
+
+  , testCase "extras without sig produce UnknownField error" $ do
+      let src = pointDecl <> T.pack "p = Point { x = 1, y = 2, z = 3 }\n"
+      expectError src
+
+  , testCase "spread-only copies Point" $ do
+      let src = pointDecl
+             <> T.pack "origin = Point { x = 0, y = 0 }\n"
+             <> T.pack "copy = Point { ..origin }\n"
+      expectOK src
+
+  , testCase "spread with same-type override typechecks" $ do
+      let src = pointDecl
+             <> T.pack "origin = Point { x = 0, y = 0 }\n"
+             <> T.pack "moved = Point { ..origin, x = 99 }\n"
+      expectOK src
+
+  , testCase "spread with type-mismatch override errors" $ do
+      let src = pointDecl
+             <> T.pack "origin = Point { x = 0, y = 0 }\n"
+             <> T.pack "broken = Point { ..origin, x = \"hi\" }\n"
+      expectError src
+
+  , testCase "record constructor not a value" $
+      expectErrorContaining
+        (pointDecl <> T.pack "f = Point\n")
+        "RecordConstructorNotAValue"
+
+  , testCase "record constructor positional application errors" $
+      expectErrorContaining
+        (pointDecl <> T.pack "z = Point 1\n")
+        "RecordConstructorNeedsBraces"
+
+  , testCase "positional constructor stays first-class" $ do
+      -- Define a positional constructor in the same source and verify it
+      -- can be used as a first-class value (no RecordConstructorNotAValue).
+      let src = T.pack "data Wrap = Wrap U64\nf = Wrap\n"
+      case runTypecheckSrc src of
+        Left e  -> assertFailure ("expected success, got: " ++ e)
+        Right _ -> pure ()
+
+  , testCase "missing field errors" $ do
+      let src = pointDecl <> T.pack "p = Point { x = 1 }\n"
+      expectError src
+
+  , testCase "nominal tag mismatch in spread errors" $ do
+      -- Line must define two different record types and try to spread wrong one.
+      -- Since we only have Point in this test, verify that spreading a
+      -- non-record-type expression produces NotARecord.
+      let src = pointDecl
+             <> T.pack "bad = Point { ..1 }\n"
+      expectError src
+
+  , testCase "sig with extension allows extras" $ do
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "named : Point + { score : U64 }"
+            , "named = Point { x = 0, y = 0, score = 99 }"
+            ]
+      expectOK src
+
+  , testCase "sig with extension rejects unrelated extras" $ do
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "named : Point + { score : U64 }"
+            , "named = Point { x = 0, y = 0, score = 99, color = 1 }"
+            ]
+      expectError src
+
+  , testCase "sig with extension spread plus addition" $ do
+      -- withScore p s = Point { ..p, score = s }
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "withScore : Point -> U64 -> Point + { score : U64 }"
+            , "withScore p s = Point { ..p, score = s }"
+            ]
+      expectOK src
+
+  , testCase "sig with extension spread addition rejects unrelated field" $ do
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "withScore : Point -> U64 -> Point + { score : U64 }"
+            , "withScore p s = Point { ..p, score = s, color = 1 }"
+            ]
+      expectError src
+  ]
+
+fieldAccessTests :: TestTree
+fieldAccessTests = testGroup "FieldAccess"
+  [ testCase "p.x on Point returns U64" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "getX : Point -> U64"
+        , "getX p = p.x"
+        ]
+
+  , testCase "p.score on Point + concrete extension" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "getScore : Point + { score : U64 } -> U64"
+        , "getScore p = p.score"
+        ]
+
+  , testCase "p.x on Point + row r (declared field accessible)" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "getX : Point + row r -> U64"
+        , "getX p = p.x"
+        ]
+
+  , testCase "p.score on Point + row r errors with UnknownField" $
+      expectErrorContaining
+        ( T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "getScore : Point + row r -> U64"
+            , "getScore p = p.score"
+            ]
+        )
+        "UnknownField"
+
+  , testCase "p.x on non-record errors with NotARecord" $
+      expectErrorContaining
+        ( T.unlines
+            [ "f : U64 -> U64"
+            , "f p = p.x"
+            ]
+        )
+        "NotARecord"
+  ]
+
+recordPatternTests :: TestTree
+recordPatternTests = testGroup "RecordPattern"
+  [ testCase "strict pattern matches Point" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "describe : Point -> U64"
+        , "describe p = case p of"
+        , "  Point { x = a, y = b } -> a"
+        ]
+
+  , testCase "strict pattern bindings have correct types" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "getX : Point -> U64"
+        , "getX p = case p of"
+        , "  Point { x = a, y = _ } -> a"
+        , "getY : Point -> U64"
+        , "getY p = case p of"
+        , "  Point { x = _, y = b } -> b"
+        ]
+
+  , testCase "strict pattern rejects extended scrutinee" $
+      expectError $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "f : Point + { z : U64 } -> U64"
+        , "f p = case p of"
+        , "  Point { x = a, y = b } -> a"
+        ]
+
+  , testCase "open pattern matches Point + extension" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "g : Point + row r -> U64"
+        , "g p = case p of"
+        , "  Point { x = a, y = b, .. } -> a"
+        ]
+
+  , testCase "open pattern with subset of declared fields" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "getX : Point + row r -> U64"
+        , "getX p = case p of"
+        , "  Point { x = a, .. } -> a"
+        ]
+
+  , testCase "pure wild pattern matches any Point-tagged record" $
+      expectOK $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "h : Point + row r -> U64"
+        , "h p = case p of"
+        , "  Point { .. } -> 0"
+        ]
+
+  , testCase "named row-tail capture is deferred to v2" $
+      expectErrorContaining
+        ( T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "k p = case p of"
+            , "  Point { x = a, ..rest } -> a"
+            ]
+        )
+        "NamedRowTailCaptureDeferred"
+
+  , testCase "strict pattern with unknown field errors" $
+      expectError $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "f p = case p of"
+        , "  Point { x = a, y = b, z = c } -> a"
+        ]
+
+  , testCase "strict pattern with missing field errors" $
+      expectError $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "f p = case p of"
+        , "  Point { x = a } -> a"
+        ]
+  ]
+
+-- | Run typechecking and return (decls, warnings) or fail with a message.
+-- Used by RowShadow tests.
+expectOKWithWarnings :: T.Text -> IO ([(T.Text, Ty.Scheme)], [TC.Warning])
+expectOKWithWarnings src =
+  case parse src of
+    Left e -> assertFailure ("parse error: " ++ e) >> undefined
+    Right ast ->
+      case reorderModule ast of
+        Left es -> assertFailure ("reorder error: " ++ show es) >> undefined
+        Right rm ->
+          case TC.inferProgramWith B.initialEnv (SO.UserFile "<test>") (reorderedAst rm) of
+            Left e -> assertFailure ("typecheck error: " ++ show e) >> undefined
+            Right (_, decls, ws) ->
+              pure ([ (TC.tdName d, TC.tdScheme d) | d <- decls ], ws)
+
+-- ---------------------------------------------------------------------------
+-- Row-shadow warning tests
+-- ---------------------------------------------------------------------------
+
+rowShadowTests :: TestTree
+rowShadowTests = testGroup "RowShadow"
+  [ testCase "no warning when no label collision" $ do
+      -- g1 called on Point + { color : U64 }: no 'tag' in caller's row
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "g1 : Point + row r -> Point + row r + { tag : U64 }"
+            , "g1 p = Point { ..p, tag = 0 }"
+            , "clean : Point + { color : U64 }"
+            , "clean = Point { x = 0, y = 0, color = 1 }"
+            , "result = g1 clean"
+            ]
+      (_, warnings) <- expectOKWithWarnings src
+      let shadows = [ w | w@(TC.RowShadow _ lbl _ _) <- warnings, lbl == T.pack "tag" ]
+      length shadows @?= 0
+
+  , testCase "warning emitted when caller's row has same label as function's addition" $ do
+      -- g1 called on Point + { tag : U64 }: 'tag' collides with the added 'tag : U64'
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "g1 : Point + row r -> Point + row r + { tag : U64 }"
+            , "g1 p = Point { ..p, tag = 0 }"
+            , "weird : Point + { tag : U64 }"
+            , "weird = Point { x = 0, y = 0, tag = 42 }"
+            , "result = g1 weird"
+            ]
+      (_, warnings) <- expectOKWithWarnings src
+      let shadows = [ w | w@(TC.RowShadow _ lbl _ _) <- warnings, lbl == T.pack "tag" ]
+      assertBool ("expected at least one RowShadow on 'tag', got warnings: " ++ show warnings)
+                 (length shadows >= 1)
+
+  , testCase "collision program still typechecks (warning is informational)" $ do
+      -- Same as above: must not fail with a TypeError
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "g1 : Point + row r -> Point + row r + { tag : U64 }"
+            , "g1 p = Point { ..p, tag = 0 }"
+            , "weird : Point + { tag : U64 }"
+            , "weird = Point { x = 0, y = 0, tag = 42 }"
+            , "result = g1 weird"
+            ]
+      expectOK src
+
+  , testCase "warning identifies the colliding label" $ do
+      let src = T.unlines
+            [ "data Box = Box { val : U64 }"
+            , "addScore : Box + row r -> Box + row r + { score : U64 }"
+            , "addScore b = Box { ..b, score = 0 }"
+            , "already : Box + { score : U64 }"
+            , "already = Box { val = 1, score = 99 }"
+            , "result = addScore already"
+            ]
+      (_, warnings) <- expectOKWithWarnings src
+      let shadows = [ lbl | TC.RowShadow _ lbl _ _ <- warnings ]
+      assertBool ("expected 'score' in shadow labels, got: " ++ show shadows)
+                 (T.pack "score" `elem` shadows)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Pattern coverage tests
+-- ---------------------------------------------------------------------------
+
+patternCoverageTests :: TestTree
+patternCoverageTests = testGroup "PatternCoverage"
+  [ testCase "strict-only arms over open scrutinee warns" $ do
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "f : Point + row r -> U64"
+            , "f p = case p of"
+            , "  Point { x = a, y = b } -> a"
+            ]
+      (_, warnings) <- expectOKWithWarnings src
+      let nonExh = [ w | w@(TC.NonExhaustiveRecordPattern _ tag) <- warnings
+                       , tag == T.pack "Point" ]
+      length nonExh @?= 1
+
+  , testCase "open arm satisfies coverage" $ do
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "g : Point + row r -> U64"
+            , "g p = case p of"
+            , "  Point { x = a, y = b, .. } -> a"
+            ]
+      (_, warnings) <- expectOKWithWarnings src
+      let nonExh = [ w | w@(TC.NonExhaustiveRecordPattern _ _) <- warnings ]
+      length nonExh @?= 0
+
+  , testCase "strict arm on closed scrutinee — no warning" $ do
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "h : Point -> U64"
+            , "h p = case p of"
+            , "  Point { x = a, y = b } -> a"
+            ]
+      (_, warnings) <- expectOKWithWarnings src
+      let nonExh = [ w | w@(TC.NonExhaustiveRecordPattern _ _) <- warnings ]
+      length nonExh @?= 0
+
+  , testCase "strict arm stays reachable (no unreachable warning)" $
+      -- Verify that strict arms over an open scrutinee do NOT cause an
+      -- unreachable-arm warning; they remain reachable when r := RowEmpty.
+      -- The only warning emitted is NonExhaustiveRecordPattern (tested above).
+      let src = T.unlines
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "f : Point + row r -> U64"
+            , "f p = case p of"
+            , "  Point { x = a, y = b } -> a"
+            ]
+          -- The codebase has no UnreachableArm variant; this predicate is
+          -- intentionally False for all current Warning constructors,
+          -- locking in the design decision that strict arms stay reachable.
+          isUnreachable :: TC.Warning -> Bool
+          isUnreachable _ = False
+      in do
+        (_, warnings) <- expectOKWithWarnings src
+        let unreachable = filter isUnreachable warnings
+        length unreachable @?= 0
+  ]
+
+-- ---------------------------------------------------------------------------
+-- BlockLayout tests
+-- ---------------------------------------------------------------------------
+
+-- | Assert that the given source parses without errors.
+shouldParse :: Text -> Assertion
+shouldParse src =
+  case parse src of
+    Right _   -> pure ()
+    Left  err -> assertFailure ("expected successful parse, got: " ++ err)
+
+blockLayoutTests :: TestTree
+blockLayoutTests = testGroup "BlockLayout"
+  [ testCase "inline decl unchanged" $
+      shouldParse "data Point = Point { x : U64, y : U64 }\n"
+
+  , testCase "block decl (named)" $
+      shouldParse $ T.unlines
+        [ "data Point = Point {"
+        , "  x : U64"
+        , "  y : U64"
+        , "}"
+        ]
+
+  , testCase "block decl (elided)" $
+      shouldParse $ T.unlines
+        [ "data Point = {"
+        , "  x : U64"
+        , "  y : U64"
+        , "}"
+        ]
+
+  , testCase "mixed comma + newline in decl" $
+      shouldParse $ T.unlines
+        [ "data Big = Big {"
+        , "  name : String, age : U64"
+        , "  score : U64"
+        , "}"
+        ]
+
+  , testCase "inline value construction unchanged" $
+      shouldParse "data Point = Point { x : U64, y : U64 }\np = Point { x = 1, y = 2 }\n"
+
+  , testCase "block value construction" $
+      shouldParse $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "p = Point {"
+        , "  x = 1"
+        , "  y = 2"
+        , "}"
+        ]
+
+  , testCase "block pattern" $
+      shouldParse $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "f p = case p of"
+        , "  Point {"
+        , "    x = a"
+        , "    y = b"
+        , "  } -> a"
+        ]
+
+  , testCase "nested record literals" $
+      shouldParse $ T.unlines
+        [ "data Inner = Inner { a : U64, b : U64 }"
+        , "data Outer = Outer { inner : Inner, tag : U64 }"
+        , "o = Outer {"
+        , "  inner = Inner {"
+        , "    a = 1"
+        , "    b = 2"
+        , "  }"
+        , "  tag = 99"
+        , "}"
+        ]
+
+  , testCase "block open-row pattern" $
+      shouldParse $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "f p = case p of"
+        , "  Point {"
+        , "    x = a"
+        , "    .."
+        , "  } -> a"
+        ]
   ]

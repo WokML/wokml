@@ -28,35 +28,35 @@ data LayoutDelimiters
 
 layoutWords :: [(TokSymbol, LayoutDelimiters)]
 layoutWords =
-  [ ( TokSymbol "let" 29
-    , LayoutDelimiters (TokSymbol ";" 8) (Just (TokSymbol "{" 42)) (Just (TokSymbol "}" 44))
+  [ ( TokSymbol "let" 30
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 44)) (Just (TokSymbol "}" 46))
     )
-  , ( TokSymbol "where" 41
-    , LayoutDelimiters (TokSymbol ";" 8) (Just (TokSymbol "{" 42)) (Just (TokSymbol "}" 44))
+  , ( TokSymbol "where" 43
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 44)) (Just (TokSymbol "}" 46))
     )
-  , ( TokSymbol "of" 33
-    , LayoutDelimiters (TokSymbol ";" 8) (Just (TokSymbol "{" 42)) (Just (TokSymbol "}" 44))
+  , ( TokSymbol "of" 34
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 44)) (Just (TokSymbol "}" 46))
     )
   ]
 
 layoutStopWords :: [TokSymbol]
-layoutStopWords = [TokSymbol "in" 26]
+layoutStopWords = [TokSymbol "in" 27]
 
 -- layout separators
 
 layoutOpen, layoutClose, layoutSep :: [TokSymbol]
 layoutOpen  = List.nub $ mapMaybe (delimOpen  . snd) layoutWords
 layoutClose = List.nub $ mapMaybe (delimClose . snd) layoutWords
-layoutSep   = List.nub $ TokSymbol ";" 8 : map (delimSep . snd) layoutWords
+layoutSep   = List.nub $ TokSymbol ";" 9 : map (delimSep . snd) layoutWords
 
 parenOpen, parenClose :: [TokSymbol]
 parenOpen  =
   [ TokSymbol "(" 1
-  , TokSymbol "[" 10
+  , TokSymbol "[" 11
   ]
 parenClose =
   [ TokSymbol ")" 2
-  , TokSymbol "]" 12
+  , TokSymbol "]" 13
   ]
 
 -- | Report an error during layout resolution.
@@ -84,7 +84,7 @@ resolveLayout topLayout =
   res Nothing [if topLayout then Implicit topDelim Definitive 1 else Explicit]
   where
   topDelim :: LayoutDelimiters
-  topDelim = LayoutDelimiters (TokSymbol ";" 8) Nothing Nothing
+  topDelim = LayoutDelimiters (TokSymbol ";" 9) Nothing Nothing
 
   res :: Maybe Token -- ^ The previous token, if any.
       -> [Block]     -- ^ A stack of layout blocks.

@@ -41,6 +41,7 @@ data ReservedKw
     | ReservedKw_forall
     | ReservedKw_do
     | ReservedKw_record
+    | ReservedKw_row
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data SigName = SNBare VarId | SNParen VarSym
@@ -75,6 +76,15 @@ data AtomPat
     | APList [Pat]
     | APParen Pat
     | PUnit
+    | PRecord ConId [RecordFieldPat]
+    | PRecordOpen ConId [RecordFieldPat] PatRowTail
+    | PRecordWild ConId PatRowTail
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data RecordFieldPat = RFPat VarId Pat
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data PatRowTail = PRTNamed VarId | PRTAnon
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data Type
@@ -86,9 +96,19 @@ data Type
     | TTuple Type [Type]
     | TParen Type
     | TUnit
+    | TExtend Type VarSym RowContrib
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
-data ConDef = ConDef ConId [Type]
+data RowContrib = RCAnon [RecordFieldType] | RCVar VarId
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ConDef
+    = ConDef ConId [Type]
+    | ConDefRec ConId [RecordFieldType]
+    | ConDefRecElide [RecordFieldType]
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data RecordFieldType = RFType VarId Type
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data FixName = FNSym VarSym | FNAlpha VarId
@@ -107,6 +127,8 @@ data Exp
     | ECon ConId
     | EProj Exp VarId
     | EProjC Exp ConId
+    | ERecord ConId [RecordFieldExpr]
+    | ERecordExt ConId Exp MaybeTrailing
     | ELitI WokInt
     | ELitS String
     | ELitC Char
@@ -125,6 +147,12 @@ data InfixTail = ITail InfixOp Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixOp = IOSym VarSym | IOBT VarId
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data MaybeTrailing = TFNone | TFSome [RecordFieldExpr]
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data RecordFieldExpr = RFExpr VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl

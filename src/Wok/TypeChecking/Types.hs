@@ -50,6 +50,11 @@ data TyCon
 data Type s
   = TCon TyCon [Type s]
   | TArr (Type s) (Row s) (Type s)
+  -- | Nominal-tagged record type. The 'Text' is the constructor tag
+  -- (e.g., \"Point\") and is load-bearing for nominal identity.
+  -- Unification of two 'TRecord's requires tag equality; see
+  -- 'Wok.TypeChecking.Unify'.
+  | TRecord Text (Row s)
   | TVar (STRef s (TVar s))
 
 data TVar s
@@ -73,6 +78,7 @@ data RVar s
 data CType
   = CTCon TyCon [CType]
   | CTArr CType CRow CType
+  | CTRecord Text CRow          -- ^ Nominal-tagged record type, closed form.
   | CTGen Int
   deriving (Eq, Show)
 

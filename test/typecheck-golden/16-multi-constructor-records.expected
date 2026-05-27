@@ -1,0 +1,6 @@
+aRect : Rect { width,height, }
+getRadius : U64
+getSide : U64
+getWidth : U64
+unitCircle : Circle { radius, }
+unitSquare : Square { side, }

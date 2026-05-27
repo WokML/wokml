@@ -1,0 +1,4 @@
+flipXY : forall a. Point { x,y,r0 } -> Point { x,y,r0 }
+getX : Point { x,y, } -> U64
+getXOpen : forall a. Point { x,y,r0 } -> U64
+preserveExtras : forall a. Point { x,y,r0 } -> Point { x,y,r0 }

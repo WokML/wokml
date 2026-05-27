@@ -1,7 +1,8 @@
--- | Type errors emitted by the HM core checker.
+-- | Type errors and warnings emitted by the HM core checker.
 module Wok.TypeChecking.Error
   ( SourceSpan
   , TypeError (..)
+  , Warning (..)
   ) where
 
 import Data.Text (Text)
@@ -21,6 +22,9 @@ data TypeError
   | ArityMismatch SourceSpan Text Int Int
     -- ^ name, expected, got
   | RowMismatch SourceSpan CRow CRow
+  | RowOccursCheck SourceSpan Int CRow
+    -- ^ A row variable occurs inside the row being assigned to it.
+    -- Args: pos, the row var's uniq, the cyclic row (for diagnostics).
   | SigMismatch SourceSpan Text CType CType
     -- ^ binding name, declared, inferred
   | EscapedTyVar SourceSpan Int
@@ -34,4 +38,50 @@ data TypeError
   | DuplicateBinding SourceSpan Text
   | UnsupportedFeature SourceSpan Text
     -- ^ for module access (EProj/EProjC) in v1
+  | RecordConstructorNotAValue SourceSpan Text
+    -- ^ A record constructor was used in a value position.
+    -- E.g. "Point is a record constructor; use Point { ... } syntax."
+  | RecordConstructorNeedsBraces SourceSpan Text
+    -- ^ A record constructor was applied positionally rather than with braces.
+    -- E.g. "Point requires { ... } syntax; positional application not supported."
+  | UnknownField SourceSpan Text Text
+    -- ^ A field name is not present in the record's row.
+    -- Args: position, record tag, field name.
+  | NominalMismatch SourceSpan Text Text
+    -- ^ Two record types with identical rows but different nominal tags were unified.
+    -- E.g. "expected UserId but found OrderId".
+  | NamedRowTailCaptureDeferred SourceSpan Text
+    -- ^ Named row-tail capture is deferred to v2.
+    -- E.g. "named row-tail capture deferred to v2; use .. to discard".
+  | BareRowVar SourceSpan Text
+    -- ^ A bare row variable was used where a row contribution was expected.
+    -- E.g. "did you mean + row r instead of + r?".
+  | NonPlusTypeOp SourceSpan Text
+    -- ^ An operator other than + was used at the type level.
+    -- E.g. "only + is valid as a type-level operator; found -".
+  | AnonRecordNotInRowContrib SourceSpan
+    -- ^ An anonymous record literal was used outside of a row contribution context.
+    -- E.g. "anonymous record { ... } only allowed as the RHS of +".
+  | NotARecord SourceSpan CType
+    -- ^ Field access was attempted on a value whose type is not a record.
   deriving (Show)
+
+-- | Non-fatal diagnostics emitted by the typechecker.
+data Warning
+  = BodylessBinding Text SourceSpan
+    -- ^ A signature had no matching equation. Still enters the env verbatim;
+    -- only emitted for UserFile-origin modules (not Embedded / Std.Base).
+  | RowShadow SourceSpan Text CType CType
+    -- ^ A row-variable instantiation introduced a label collision: the concrete
+    -- part of the row already had the given label, and the substituted-in row
+    -- also carries it. Args: call-site position, the colliding label, the outer
+    -- (existing) type, the inner (newly introduced) type.
+    -- The program still typechecks; this is informational only (v1 has no
+    -- escape hatch; v2 will add Lacks-style constraints).
+  | NonExhaustiveRecordPattern SourceSpan Text
+    -- ^ A case expression scrutinises a record type whose row is open (has a
+    -- row-variable tail), but ALL arms are strict (no open '..' arm and no
+    -- wildcard). The strict arms are still reachable (they match when the row
+    -- variable is instantiated to RowEmpty), but the open-extension case is
+    -- not covered. Args: position, the record constructor tag.
+  deriving (Eq, Show)

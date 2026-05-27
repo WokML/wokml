@@ -1,0 +1,2 @@
+orderValue : OrderId { value, } -> U64
+userValue : UserId { value, } -> U64

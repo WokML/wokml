@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+data Point = Point { x : U64, y : U64 }
+
+sumCoords : Point -> U64
+sumCoords p = case p of
+  Point { x = 0, y = 0 } -> 0
+  Point { x = a, y = b } -> a + b
+
+sumCoordsOpen : Point + row r -> U64
+sumCoordsOpen p = case p of
+  Point { x = a, y = b, .. } -> a + b

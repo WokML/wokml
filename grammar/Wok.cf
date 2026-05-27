@@ -26,6 +26,34 @@ entrypoints Module ;
 -- the layout-open branch too would over-insert `;` before printed `let { ... }`
 -- forms during round-trip parsing.) See git log for
 -- `fix(parser): insert decl separator before paren-opening top-level decls`.
+--
+-- POST-REGEN NOTE: src-generated/GeneratedParser/Wok/Par.y needs a manual
+-- patch after every `bnfc` regeneration. The auto-generated grammar emits a
+-- right-recursive `ListRecordFieldPat` rule, which causes an LALR(1)
+-- shift/reduce conflict: the parser absorbs the trailing comma before `..` in
+-- the `PRecordOpen` production, making the open-record-pattern syntax
+-- `Point { x = a, .. }` unparseable.
+--
+-- Fix: replace the auto-generated `ListRecordFieldPat` with a left-recursive
+-- `NEListRecordFieldPat`. Build the list in reversed order inside the Happy
+-- semantic actions and call `reverse` at the production root. The affected
+-- Happy production is `PRecordOpen`:
+--
+--   -- PATCH: left-recursive NEListRecordFieldPat to avoid shift/reduce conflict
+--   --        with the trailing comma before `..` in PRecordOpen.
+--   NEListRecordFieldPat
+--     : RecordFieldPat
+--         { [$1] }
+--     | NEListRecordFieldPat ',' RecordFieldPat
+--         { $3 : $1 }
+--
+--   -- Updated PRecordOpen to use reverse(NEListRecordFieldPat)
+--   -- (PRecord keeps [RecordFieldPat] via the standard BNFC separator rule)
+--   AtomPat
+--     : ConId '{' reverse_NEListRecordFieldPat ',' PatRowTail '}'
+--         { PRecordOpen $1 (reverse $3) $5 }
+--
+-- See commit e06ba60 `feat(tc): record patterns (Task 7)` for the applied patch.
 layout toplevel ;
 layout "let", "where", "of" ;
 layout stop "in" ;
@@ -56,7 +84,7 @@ DLocal.   Decl ::= "local" Decl ;
 -- these words to the lexer's reserved set, keeping them out of VarId. When a
 -- feature ships, move its word out of here into that feature's real production.
 rules     ReservedKw ::= "contract" | "type" | "class" | "instance"
-                       | "deriving" | "forall" | "do" | "record" ;
+                       | "deriving" | "forall" | "do" | "record" | "row" ;
 DReserved. Decl ::= ReservedKw ;
 
 -- Helper: comma-separated additional names for multi-name sigs (`f, (+), h : T`).
@@ -123,6 +151,20 @@ APList.   AtomPat ::= "[" [Pat] "]" ;
 APParen.  AtomPat ::= "(" Pat ")" ;
 PUnit.    AtomPat ::= "(" ")" ;          -- unit pattern; whitespace permitted: ( ), (   )
 
+-- Record patterns.
+-- PRecord     : Point { x = a, y = b }       (strict, matches only exact Point)
+-- PRecordOpen : Point { x = a, .. }          (open, matches Point + any extension)
+-- PRecordWild : Point { .. } or Point { ..rest }  (PRTNamed parses; elaborator rejects)
+PRecord.       AtomPat ::= ConId "{" [RecordFieldPat] "}" ;
+PRecordOpen.   AtomPat ::= ConId "{" [RecordFieldPat] "," PatRowTail "}" ;
+PRecordWild.   AtomPat ::= ConId "{" PatRowTail "}" ;
+
+RFPat.         RecordFieldPat ::= VarId "=" Pat ;
+separator      RecordFieldPat "," ;
+
+PRTNamed.      PatRowTail ::= ".." VarId ;
+PRTAnon.       PatRowTail ::= ".." ;
+
 separator AtomPat "" ;   -- covers both LHSPre args and ELam binders
 separator Pat "," ;
 
@@ -151,12 +193,34 @@ TTuple.   Type2 ::= "(" Type "," [Type] ")" ;
 TParen.   Type2 ::= "(" Type ")" ;
 TUnit.    Type2 ::= "(" ")" ;            -- unit type; whitespace permitted
 
+-- Type-level extension `Point + ext` (left-assoc; tighter than `->`).
+-- The `+` token is captured via `VarSym`; the elaborator restricts to literal "+"
+-- so we don't have to promote `+` out of `VarSym` globally and break expression
+-- syntax.
+TExtend.       Type1 ::= Type1 VarSym RowContrib ;
+
+-- RowContrib is the right operand of type-level `+`.
+-- RCAnon is a concrete record literal (anonymous row contribution).
+-- RCVar is a row variable, marked by the `row` keyword (distinguishes row
+-- vars from ordinary type vars at the surface level).
+-- Anonymous record types CANNOT appear elsewhere in Type expressions -- they
+-- live only here.
+RCAnon.        RowContrib ::= "{" [RecordFieldType] "}" ;
+RCVar.         RowContrib ::= "row" VarId ;
+
 separator Type "," ;
 
--- Constructor definition body for `data` (typed args)
--- ConDef takes 0+ Type2 (atomic) args. Multi-word types like `List a` need parens
--- because constructor args are juxtaposed: `Cons a (List a)` not `Cons a List a`.
-ConDef.   ConDef ::= ConId [Type2] ;
+-- Constructor definition body for `data`. Three forms:
+--   ConDef         positional:        Cons a (List a)
+--   ConDefRec      record, named:     Point { x : U64, y : U64 }
+--   ConDefRecElide record, name elided (single-con record decls only; elaborator-enforced)
+ConDef.         ConDef ::= ConId [Type2] ;
+ConDefRec.      ConDef ::= ConId "{" [RecordFieldType] "}" ;
+ConDefRecElide. ConDef ::= "{" [RecordFieldType] "}" ;
+
+RFType.        RecordFieldType ::= VarId ":" Type ;
+separator      RecordFieldType "," ;
+
 separator ConDef "|" ;
 separator Type2 "" ;
 
@@ -195,6 +259,20 @@ EVar.     Exp2 ::= VarId ;
 ECon.     Exp2 ::= ConId ;
 EProj.    Exp2 ::= Exp2 "." VarId ;
 EProjC.   Exp2 ::= Exp2 "." ConId ;
+-- Value-level record construction.
+-- ERecord    : Point { x = 1, y = 2 }
+-- ERecordExt : Point { ..p } or Point { ..p, x = 99 } (trailing fields optional, G3 fix)
+ERecord.       Exp2 ::= ConId "{" [RecordFieldExpr] "}" ;
+ERecordExt.    Exp2 ::= ConId "{" ".." Exp MaybeTrailing "}" ;
+
+-- Optional trailing field list after the spread in ERecordExt.
+-- MaybeTrailing allows `Point { ..p }` or `Point { ..p, x = 99 }`.
+TFNone.        MaybeTrailing ::= ;
+TFSome.        MaybeTrailing ::= "," [RecordFieldExpr] ;
+
+RFExpr.        RecordFieldExpr ::= VarId "=" Exp ;
+separator      RecordFieldExpr "," ;
+
 ELitI.    Exp2 ::= WokInt ;
 ELitS.    Exp2 ::= String ;
 ELitC.    Exp2 ::= Char ;

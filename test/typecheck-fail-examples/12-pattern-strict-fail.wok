@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+
+data Point = Point { x : U64, y : U64 }
+
+f : Point + { z : U64 } -> U64
+f p = case p of
+  Point { x = a, y = b } -> a

@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+
+data Point = Point { x : U64, y : U64 }
+
+bad : Point
+bad = Point { x = 1, y = 2, z = 3 }

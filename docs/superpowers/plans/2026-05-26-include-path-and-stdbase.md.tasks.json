@@ -48,33 +48,33 @@
       "id": 7,
       "subject": "Task 8: Create Wok.Loader (module map, dep graph, topo sort)",
       "status": "completed",
-      "blockedBy": [0, 2, 4, 6],
+      "blockedBy": [0, 2, 4, 6, 6],
       "description": "**Goal:** `loadProgram :: FilePath -> [FilePath] -> IO (Either LoaderError [LoadedModule])`. Embeds Std.Base; parses + collects fixities; validates headers; builds dep graph; topo-sorts.\n\n**Files:** Create `src/Wok/Loader.hs`, `test/loader-fixtures/`; Modify `wok.cabal`, `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p loader\"`\n\n**Depends on:** Task 1 (Origin), Task 3 (FixityTable ops), Task 5 (modPathText), Task 7 (preludeSource).\n\n```json:metadata\n{\"files\": [\"src/Wok/Loader.hs\", \"wok.cabal\", \"test/loader-fixtures/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p loader\\\"\", \"acceptanceCriteria\": [\"loadProgram signature exact\", \"Std.Base first in topo order\", \"10 LoaderError variants\", \"7 fixture tests pass\"]}\n```"
     },
     {
       "id": 8,
       "subject": "Task 9: Rename TcInt -> TcU64 across code and test fixtures",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Mechanical rename. Constructor + Builtins env key + every test fixture/golden. No behaviour change.\n\n**Files:** Modify `src/Wok/TypeChecking/Types.hs`, `Builtins.hs`, `Infer.hs`; every `test/typecheck-*`; `test/Spec.hs`.\n\n**Verify:** `cabal test 2>&1 | tail -10` + greps empty.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Types.hs\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/typecheck-examples/\", \"test/typecheck-golden/\", \"test/typecheck-fail-examples/\", \"test/typecheck-fail-golden/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"no TcInt references\", \"no surface Int in fixtures\", \"all tests pass\"]}\n```"
     },
     {
       "id": 9,
       "subject": "Task 10: Cutover — populate Std.Base, shrink Builtins, rewrite Main, migrate fixtures",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [0, 1, 2, 3, 4, 5, 6, 7, 8],
       "description": "**Goal:** The atomic switch. Populate Std.Base; shrink Builtins to irreducible pre-env; rewrite Main with CLI + Loader pipeline; switch test harness to Loader; migrate every typecheck fixture to `module Main; import Std.Base` + Option/Result/[]/u64.\n\n**Files:** Modify `prelude/Std/Base.wok`, `Builtins.hs`, `Infer.hs`, `app/Main.hs`, `test/Spec.hs`, all `test/typecheck-*`.\n\n**Verify:** `cabal test 2>&1 | tail -20`\n\n**Depends on:** Tasks 1-9 (all foundations + TcInt rename).\n\n```json:metadata\n{\"files\": [\"prelude/Std/Base.wok\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"app/Main.hs\", \"test/Spec.hs\", \"test/typecheck-examples/\", \"test/typecheck-fail-examples/\", \"test/typecheck-golden/\", \"test/typecheck-fail-golden/\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"Std.Base populated\", \"Builtins shrunk to irreducible\", \"Main CLI + Loader pipeline working\", \"harness routes through Loader\", \"all 18 fixture goldens pass migration\"]}\n```"
     },
     {
       "id": 10,
       "subject": "Task 11: Add Loader-tier integration tests",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [9],
       "description": "**Goal:** Cross-module fixity, fixity redecl, name conflict, bodyless-user-warning, silent-bodyless-in-prelude tests.\n\n**Files:** Create `test/loader-fixtures/07-*.wok` etc.; Modify `test/Spec.hs`.\n\n**Verify:** `cabal test --test-options=\"-p crossModule OR bodyless\"`\n\n**Depends on:** Task 10.\n\n```json:metadata\n{\"files\": [\"test/loader-fixtures/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options=\\\"-p crossModule OR bodyless\\\"\", \"acceptanceCriteria\": [\"cross-module fixity threading verified\", \"cross-module fixity redecl detected\", \"cross-module name conflict detected\", \"user-file bodyless warning emitted\", \"Std.Base bodyless silent\"]}\n```"
     },
     {
       "id": 11,
       "subject": "Task 12: Migrate examples/hehe.wok and examples/types-tour.wok",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [9],
       "description": "**Goal:** Add `module Main; import Std.Base`; drop redundant fixity/data Bool/Maybe/List; rewrite to Option/[].\n\n**Files:** Modify `examples/hehe.wok`, `examples/types-tour.wok`.\n\n**Verify:** `cabal run wok -- examples/hehe.wok && cabal run wok -- examples/types-tour.wok`\n\n**Depends on:** Task 10.\n\n```json:metadata\n{\"files\": [\"examples/hehe.wok\", \"examples/types-tour.wok\"], \"verifyCommand\": \"cabal run wok -- examples/hehe.wok && cabal run wok -- examples/types-tour.wok\", \"acceptanceCriteria\": [\"both files have new header\", \"data Maybe/List removed\", \"wok command runs to completion on both\"]}\n```"
     }

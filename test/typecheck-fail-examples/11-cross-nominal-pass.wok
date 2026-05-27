@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+data UserId = UserId { value : U64 }
+data OrderId = OrderId { value : U64 }
+
+takesOrder : OrderId -> U64
+takesOrder o = o.value
+
+asUser : UserId -> U64
+asUser u = takesOrder u

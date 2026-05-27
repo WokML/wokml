@@ -30,9 +30,11 @@ initialEnv = emptyEnv
 
     tyConEntries :: [(Text, TyConInfo)]
     tyConEntries =
-      [ ("U64", TyConInfo KStar 0 [])
-      , ("()",  TyConInfo KStar 0 [])
-      , ("[]",  TyConInfo listKind 1 [])
+      [ ("U64",    TyConInfo KStar 0 [])
+      , ("String", TyConInfo KStar 0 [])
+      , ("Char",   TyConInfo KStar 0 [])
+      , ("()",     TyConInfo KStar 0 [])
+      , ("[]",     TyConInfo listKind 1 [])
       ] ++ [ (tupleName n, TyConInfo (tupleKind n) n []) | n <- [2 .. 16] ]
 
     tupleName :: Int -> Text

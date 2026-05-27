@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+-- Multi-constructor data decl: each constructor has its own record fields.
+-- Field names must be unique across constructors within the same decl.
+data Shape
+  = Circle { radius : U64 }
+  | Square { side : U64 }
+  | Rect { width : U64, height : U64 }
+
+-- Construction: each constructor produces a record typed by its own tag.
+unitCircle = Circle { radius = 1 }
+unitSquare = Square { side = 1 }
+aRect = Rect { width = 4, height = 3 }
+
+-- Field access works on the constructor-typed record.
+getRadius = unitCircle.radius
+getSide = unitSquare.side
+getWidth = aRect.width

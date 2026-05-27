@@ -13,18 +13,19 @@ module Wok.TypeChecking.Infer
   , modPathText
   , modPathPos
   , TypedDecl (..)
-  , Warning (..)
   , prettyScheme
   , prettyCType
   ) where
 
 import qualified Control.Monad.ST
-import Control.Monad (foldM, forM, when)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Except (throwError)
+import Data.Maybe (fromMaybe)
+import Data.List (foldl')
 import qualified Data.List
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef)
+import Data.STRef (STRef, modifySTRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
 import qualified Data.Text as Tx
 import Data.Text (Text)
 import qualified GeneratedParser.Wok.Abs as Abs
@@ -32,11 +33,12 @@ import GeneratedParser.Wok.Abs (BNFC'Position)
 import Wok.SourceOrigin (Origin (..))
 import qualified Wok.TypeChecking.Builtins as Builtins
 import Wok.TypeChecking.Env
-  ( ConInfo (..), Env, TyConInfo (..)
-  , extendCon, extendTyCon, extendVar, lookupCon, lookupTyCon, lookupVar )
-import Wok.TypeChecking.Error (TypeError (..))
-import Wok.TypeChecking.Monad (TC, currentEnv, currentLevel, enterLevel, extendVarTC, freshTVar, freshUniq, liftST, runTC, withEnv)
-import Wok.TypeChecking.Unify (force, forceRow, unify)
+  ( ConInfo (..), Env, RecordConInfo (..), TyConInfo (..)
+  , extendCon, extendRecordCon, extendTyCon, extendVar
+  , lookupCon, lookupRecordCon, lookupTyCon, lookupVar )
+import Wok.TypeChecking.Error (TypeError (..), Warning (..))
+import Wok.TypeChecking.Monad (TC, addWarning, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, withEnv)
+import Wok.TypeChecking.Unify (force, forceRow, freeze, unify, rewriteRowStrict)
 import Wok.TypeChecking.Types
   ( CRow (..), CType (..), Kind (..), Level (..), RVar (..), Row (..)
   , Scheme (..), TyCon (..), TVar (..), Type (..) )
@@ -72,6 +74,7 @@ freezeQuantify outer nextRef seenRef kindsRef = goT
       case ty' of
         TCon c ts -> CTCon c <$> mapM goT ts
         TArr a r b -> CTArr <$> goT a <*> goR r <*> goT b
+        TRecord tag row -> CTRecord tag <$> goR row
         TVar ref -> do
           tv <- readSTRef ref
           case tv of
@@ -129,25 +132,59 @@ freezeQuantify outer nextRef seenRef kindsRef = goT
           _ -> pure rr
       _ -> pure rr
 
--- | Instantiate a scheme: each quantifier becomes a fresh TVar at the
--- current level; the body is rebuilt with those fresh refs substituted.
+-- | Instantiate a scheme: each quantifier becomes a fresh TVar (KStar) or
+-- fresh RowVar (KEffect) at the current level; the body is rebuilt with
+-- those fresh refs substituted.
 instantiate :: Scheme -> TC s (Type s)
 instantiate (Scheme vars body) = do
-  freshes <- mapM (\(i, k) -> do { t <- freshTVar k; pure (i, t) }) vars
-  let subst = Map.fromList freshes
-  pure (substInCType subst body)
+  tySubst  <- Map.fromList <$>
+    mapM (\(i, k) -> do { t <- freshTVar k; pure (i, t) })
+         [ (i, k) | (i, k) <- vars, k /= KEffect ]
+  rowSubst <- Map.fromList <$>
+    mapM (\(i, _) -> do { r <- freshRVar; pure (i, r) })
+         [ (i, k) | (i, k) <- vars, k == KEffect ]
+  pure (substInCType tySubst rowSubst body)
   where
-    substInCType :: Map.Map Int (Type s) -> CType -> Type s
-    substInCType m = goT
+    substInCType :: Map.Map Int (Type s) -> Map.Map Int (Row s) -> CType -> Type s
+    substInCType m rm = goT
       where
         goT (CTCon c ts) = TCon c (map goT ts)
         goT (CTArr a r b) = TArr (goT a) (goR r) (goT b)
+        goT (CTRecord tag row) = TRecord tag (goR row)
         goT (CTGen i) = case Map.lookup i m of
           Just t -> t
           Nothing -> error ("instantiate: dangling CTGen " ++ show i)
         goR CREmpty = RowEmpty
         goR (CRExtend l ty rest) = RowExtend l (goT ty) (goR rest)
-        goR (CRGen _) = error "instantiate: CRGen in scheme not supported in v1"
+        goR (CRGen i) = case Map.lookup i rm of
+          Just r -> r
+          Nothing -> error ("instantiate: dangling CRGen " ++ show i)
+
+-- | Allocate a fresh TVar (or RowVar for KEffect) for each param slot in
+-- @rcParams@. Returns a map from CTGen index to fresh Type.
+instantiateParamSubst :: [(Int, Kind)] -> TC s (Map.Map Int (Type s))
+instantiateParamSubst params = do
+  pairs <- forM params $ \(i, k) -> do
+    t <- freshTVar k
+    pure (i, t)
+  pure (Map.fromList pairs)
+
+-- | Substitute CTGen slots in a CType using the given index->Type map.
+-- Used when instantiating field types of a record constructor whose
+-- declaration carries type parameters.
+substCTypeWith :: Map.Map Int (Type s) -> CType -> Type s
+substCTypeWith m = goT
+  where
+    goT (CTCon c ts)       = TCon c (map goT ts)
+    goT (CTArr a r b)      = TArr (goT a) (goR r) (goT b)
+    goT (CTRecord tag row) = TRecord tag (goR row)
+    goT (CTGen i)          = case Map.lookup i m of
+      Just t  -> t
+      Nothing -> error ("substCTypeWith: dangling CTGen " ++ show i)
+
+    goR CREmpty            = RowEmpty
+    goR (CRExtend l t rst) = RowExtend l (goT t) (goR rst)
+    goR (CRGen _)          = RowEmpty  -- row params not supported in v1
 
 -- | Replace each forall-bound type variable in a user's signature with
 -- a fresh Rigid type — one the unifier treats as an opaque constant.
@@ -162,71 +199,112 @@ instantiate (Scheme vars body) = do
 -- With freezing, the sig becomes (rigid_1 -> rigid_1); unification
 -- with (u64 -> u64) fails, and the over-promise surfaces as a type
 -- error rather than disappearing.
+--
+-- Row variables (KEffect slots, CRGen) become fresh RowVars rather than
+-- being dropped as RowEmpty. This ensures two uses of the same row variable
+-- in a sig (e.g. `Point + row r -> Point + row r`) share the same RowVar.
 freezeSig :: Scheme -> TC s (Type s)
 freezeSig (Scheme vars body) = do
   skolems <- mapM (\(i, k) -> do
                      u <- freshUniq
                      ref <- liftST $ newSTRef (Rigid u k)
                      pure (i, TVar ref)
-                  ) vars
-  let subst = Map.fromList skolems
-  pure (substInCType subst body)
+                  ) [ (i, k) | (i, k) <- vars, k /= KEffect ]
+  rowVars <- mapM (\(i, _) -> do
+                     r <- freshRVar
+                     pure (i, r)
+                  ) [ (i, k) | (i, k) <- vars, k == KEffect ]
+  let tySubst  = Map.fromList skolems
+      rowSubst = Map.fromList rowVars
+  pure (substInCType tySubst rowSubst body)
   where
-    substInCType :: Map.Map Int (Type s) -> CType -> Type s
-    substInCType m = goT
+    substInCType :: Map.Map Int (Type s) -> Map.Map Int (Row s) -> CType -> Type s
+    substInCType m rm = goT
       where
         goT (CTCon c ts) = TCon c (map goT ts)
         goT (CTArr a r b) = TArr (goT a) (goR r) (goT b)
+        goT (CTRecord tag row) = TRecord tag (goR row)
         goT (CTGen i) = case Map.lookup i m of
           Just t -> t
           Nothing -> error ("freezeSig: dangling CTGen " ++ show i)
         goR CREmpty = RowEmpty
         goR (CRExtend l ty rest) = RowExtend l (goT ty) (goR rest)
-        goR (CRGen _) = RowEmpty  -- v1: no row vars in schemes
+        goR (CRGen i) = case Map.lookup i rm of
+          Just r -> r
+          Nothing -> RowEmpty  -- row var not in subst: treat as empty (shouldn't happen)
 
 -- | Translate a parsed Abs.Type into a Scheme. Free VarIds in the
 -- type become universally quantified CTGen slots (in first-occurrence
--- order). Validates tycon arity. Built-in tycon names (U64, Char,
--- String, Bool, Unit, list) map to specialised TyCon tags; user
--- names become TcUser.
+-- order). Row variables (introduced via @row r@ in RowContrib) become
+-- universally quantified CRGen slots with KEffect kind. Validates tycon
+-- arity. Built-in tycon names (U64, Char, String, Bool, Unit, list) map
+-- to specialised TyCon tags; user names become TcUser.
+-- Record-form TyCons (registered in envRecordCons with matching name)
+-- produce CTRecord with the closed row of declared fields.
 translateSig :: Env -> Abs.Type -> TC s Scheme
 translateSig env ty = do
-  seenRef <- liftST $ newSTRef (Map.empty :: Map.Map Text Int)
-  nextRef <- liftST $ newSTRef (0 :: Int)
-  body <- walk env seenRef nextRef ty
-  slots <- liftST $ readSTRef seenRef
-  let pairs = Data.List.sortBy (\a b -> compare (snd a) (snd b)) (Map.toList slots)
-      qs = map (\(_, i) -> (i, KStar)) pairs
+  seenRef    <- liftST $ newSTRef (Map.empty :: Map.Map Text Int)
+  nextRef    <- liftST $ newSTRef (0 :: Int)
+  rowSeenRef <- liftST $ newSTRef (Map.empty :: Map.Map Text Int)
+  body <- walk env seenRef nextRef rowSeenRef ty
+  slots    <- liftST $ readSTRef seenRef
+  rowSlots <- liftST $ readSTRef rowSeenRef
+  -- Type vars use KStar, row vars use KEffect.
+  let tyPairs  = Data.List.sortBy (\a b -> compare (snd a) (snd b)) (Map.toList slots)
+      rowPairs = Data.List.sortBy (\a b -> compare (snd a) (snd b)) (Map.toList rowSlots)
+      qs = map (\(_, i) -> (i, KStar)) tyPairs
+        ++ map (\(_, i) -> (i, KEffect)) rowPairs
   pure (Scheme qs body)
   where
     walk :: Env
          -> STRef s (Map.Map Text Int)
          -> STRef s Int
+         -> STRef s (Map.Map Text Int)
          -> Abs.Type
          -> TC s CType
-    walk env' seenRef nextRef = goT
+    walk env' seenRef nextRef rowSeenRef = goT
       where
+        -- Allocate a fresh slot index in the shared nextRef counter,
+        -- inserting the name into the given seen map.
+        allocSlot ref name = liftST $ do
+          n <- readSTRef nextRef
+          writeSTRef nextRef (n + 1)
+          modifySTRef' ref (Map.insert name n)
+          pure n
+
         goT (Abs.TFun a b) = CTArr <$> goT a <*> pure CREmpty <*> goT b
         goT (Abs.TVar (Abs.VarId (_, name))) = do
           seen <- liftST (readSTRef seenRef)
           case Map.lookup name seen of
-            Just i -> pure (CTGen i)
-            Nothing -> do
-              i <- liftST $ do
-                n <- readSTRef nextRef
-                writeSTRef nextRef (n + 1)
-                writeSTRef seenRef (Map.insert name n seen)
-                pure n
-              pure (CTGen i)
+            Just i  -> pure (CTGen i)
+            Nothing -> CTGen <$> allocSlot seenRef name
         goT (Abs.TCon modPath) = do
           let name = modPathText modPath
               pos  = modPathPos modPath
-          case lookupTyCon name env' of
-            Just info
-              | tcArity info == 0 -> pure (CTCon (resolveTyCon name) [])
-              | otherwise -> throwError
-                  (ArityMismatch (Just pos) name (tcArity info) 0)
-            Nothing -> throwError (UnknownTyCon (Just pos) name)
+          -- Check record-form first: if this TyCon name is also registered
+          -- as a record constructor (data Foo = Foo { ... }), produce
+          -- CTRecord with the closed row of declared fields.
+          case lookupRecordCon name env' of
+            Just rcInfo
+              | rcTag rcInfo == name -> do
+                  -- Zero-arity record type: no CTGen substitution needed.
+                  -- (Parameterised record types are a v2 concern.)
+                  let fields = rcFields rcInfo
+                  case lookupTyCon name env' of
+                    Just info | tcArity info /= 0 ->
+                      throwError (UnsupportedFeature (Just pos)
+                        (Tx.pack ("parameterised record type in sig not yet supported: " <> Tx.unpack name)))
+                    _ -> pure ()
+                  cRow <- buildCRowFromFields fields
+                  pure (CTRecord name cRow)
+            _ ->
+              -- Regular TyCon path.
+              case lookupTyCon name env' of
+                Just info
+                  | tcArity info == 0 -> pure (CTCon (resolveTyCon name) [])
+                  | otherwise -> throwError
+                      (ArityMismatch (Just pos) name (tcArity info) 0)
+                Nothing -> throwError (UnknownTyCon (Just pos) name)
         goT (Abs.TApp f x) = do
           let (h, args) = collectApp f x
           case h of
@@ -251,6 +329,76 @@ translateSig env ty = do
           pure (CTCon (TcTuple (1 + length others)) ts)
         goT (Abs.TParen t') = goT t'
         goT Abs.TUnit = pure (CTCon TcUnit [])
+        -- Type-level extension: `T + { fields }` or `T + row r`.
+        -- Only `+` is accepted as the type-level operator; anything else
+        -- is rejected with NonPlusTypeOp.
+        goT (Abs.TExtend lhs (Abs.VarSym (pos, sym)) rc) = do
+          unless (sym == Tx.pack "+") $
+            throwError (NonPlusTypeOp (Just pos) sym)
+          lhsCT <- goT lhs
+          case lhsCT of
+            CTRecord tag lhsRow -> do
+              extRow <- goRC rc
+              let merged = appendCRow extRow lhsRow
+              pure (CTRecord tag merged)
+            _ -> throwError (UnsupportedFeature Nothing
+                  (Tx.pack "left of `+` in a type sig must be a nominal record type"))
+
+        -- Translate a RowContrib to a CRow.
+        goRC (Abs.RCAnon fieldDefs) = do
+          cts <- forM fieldDefs $ \(Abs.RFType (Abs.VarId (_, fname)) fty) -> do
+            ct <- goT fty
+            pure (fname, ct)
+          pure (foldr (\(l, t) acc -> CRExtend l t acc) CREmpty cts)
+        goRC (Abs.RCVar (Abs.VarId (_, rname))) = do
+          rowSeen <- liftST (readSTRef rowSeenRef)
+          case Map.lookup rname rowSeen of
+            Just i  -> pure (CRGen i)
+            Nothing -> CRGen <$> allocSlot rowSeenRef rname
+
+        -- Build a CRow from a list of (field name, CType) pairs
+        -- (in declaration order, outermost label first).
+        buildCRowFromFields fields =
+          pure (foldr (\(l, t) acc -> CRExtend l t acc) CREmpty fields)
+
+        -- Merge two CRows for type-level extension.
+        -- Labels from `ext` are prepended before `base`'s labels.
+        -- The terminal element of `ext` (CREmpty or CRGen) replaces the
+        -- terminal CREmpty of `base`, making row variables in `ext` the
+        -- open tail of the merged row.
+        --
+        -- `Point + { score }`:  ext = CRExtend "score" t CREmpty
+        --                       base = CRExtend "x" t (CRExtend "y" t CREmpty)
+        --                       result = CRExtend "score" t (CRExtend "x" t (CRExtend "y" t CREmpty))
+        --
+        -- `Point + row r`:     ext = CRGen i
+        --                      base = CRExtend "x" t (CRExtend "y" t CREmpty)
+        --                      result = CRExtend "x" t (CRExtend "y" t (CRGen i))
+        appendCRow :: CRow -> CRow -> CRow
+        appendCRow ext base =
+          let newTail = cRowTail ext
+              base'   = replaceCREmpty newTail base
+          in  prependLabels ext base'
+
+        -- Extract the terminal (CREmpty or CRGen) of a CRow.
+        cRowTail :: CRow -> CRow
+        cRowTail CREmpty = CREmpty
+        cRowTail (CRGen i) = CRGen i
+        cRowTail (CRExtend _ _ rest) = cRowTail rest
+
+        -- Replace the terminal CREmpty of a CRow with a new tail.
+        replaceCREmpty :: CRow -> CRow -> CRow
+        replaceCREmpty newTail CREmpty = newTail
+        replaceCREmpty _ (CRGen i) = CRGen i  -- already open; preserve it
+        replaceCREmpty newTail (CRExtend l t rest) =
+          CRExtend l t (replaceCREmpty newTail rest)
+
+        -- Prepend the labels from `ext` before `base`, stopping at ext's terminal.
+        prependLabels :: CRow -> CRow -> CRow
+        prependLabels CREmpty base = base
+        prependLabels (CRGen _) base = base  -- terminal: labels exhausted
+        prependLabels (CRExtend l t rest) base =
+          CRExtend l t (prependLabels rest base)
 
 -- ---------------------------------------------------------------------------
 -- Module-level helpers shared by translateSig and processDataDecls
@@ -299,6 +447,48 @@ resolveTyCon name
 -- Data declaration processing
 -- ---------------------------------------------------------------------------
 
+-- | Normalize @ConDefRecElide@ into @ConDefRec@ by filling in the data-type
+-- name as the constructor tag. Rejects the elided form when the decl has
+-- more than one constructor (the tag would be ambiguous or misleading).
+normalizeElision
+  :: BNFC'Position
+  -> Text
+  -> [Abs.ConDef]
+  -> TC s [Abs.ConDef]
+normalizeElision pos typeName cons = case cons of
+  [Abs.ConDefRecElide fields] ->
+    let rawPos = fromMaybe (1, 1) pos
+    in  pure [Abs.ConDefRec (Abs.ConId (rawPos, typeName)) fields]
+  _ | any isElided cons ->
+        throwError (UnsupportedFeature pos
+          (Tx.pack "name-elided constructor `{ ... }` is only valid in single-constructor record decls"))
+  _ -> pure cons
+  where
+    isElided (Abs.ConDefRecElide _) = True
+    isElided _                      = False
+
+-- | Verify that no two constructors of the same data decl declare a field
+-- with the same name. Positional constructors (ConDef) carry no field names
+-- and therefore do not participate in the check.
+checkFieldNameUniqueness :: BNFC'Position -> [Abs.ConDef] -> TC s ()
+checkFieldNameUniqueness pos cons = do
+  let allNames = concatMap fieldNamesOf cons
+      dups     = findDups allNames
+  case dups of
+    []        -> pure ()
+    (name : _) -> throwError (UnsupportedFeature pos
+      (Tx.pack ("field `" <> Tx.unpack name <> "` is declared in multiple constructors of this type")))
+  where
+    fieldNamesOf (Abs.ConDefRec _ rfs) =
+      [ fname | Abs.RFType (Abs.VarId (_, fname)) _ <- rfs ]
+    fieldNamesOf (Abs.ConDefRecElide rfs) =
+      [ fname | Abs.RFType (Abs.VarId (_, fname)) _ <- rfs ]
+    fieldNamesOf (Abs.ConDef _ _) = []
+
+    findDups :: [Text] -> [Text]
+    findDups xs =
+      Map.keys (Map.filter (> 1) (foldr (\x m -> Map.insertWith (+) x (1 :: Int) m) Map.empty xs))
+
 -- | Two-pass registration of data declarations.
 --
 -- Pass 1: collect every type-constructor name with its arity (so
@@ -327,11 +517,19 @@ processDataDecls env0 decls = do
     registerTyCons _ (_ : _) = error "registerTyCons: non-DData reached (input should be pre-filtered)"
 
     registerCons env [] = pure env
-    registerCons env (Abs.DData (Abs.ConId (_, tcName)) params conDefs : ds) = do
+    registerCons env (Abs.DData (Abs.ConId (pos, tcName)) params conDefs : ds) = do
       let paramNames = [ n | Abs.VarId (_, n) <- params ]
           paramMap = Map.fromList (zip paramNames [0 ..])
-      env' <- foldM (registerCon tcName paramMap) env conDefs
-      let cons = [ cn | Abs.ConDef (Abs.ConId (_, cn)) _ <- conDefs ]
+      -- Normalize elision (ConDefRecElide -> ConDefRec) and reject
+      -- elision in multi-constructor decls.
+      conDefs' <- normalizeElision (Just pos) tcName conDefs
+      -- Reject same field name across constructors of this decl.
+      checkFieldNameUniqueness (Just pos) conDefs'
+      env' <- foldM (registerCon tcName paramMap) env conDefs'
+      -- Collect positional constructor names for tcCons (record constructors
+      -- are NOT included in tcCons because they don't appear in pattern
+      -- applications via the positional namespace).
+      let cons = [ cn | Abs.ConDef (Abs.ConId (_, cn)) _ <- conDefs' ]
           tcInfo = case lookupTyCon tcName env' of
             Just t  -> t { tcCons = cons }
             Nothing -> error "registerCons: tycon vanished"
@@ -353,6 +551,25 @@ processDataDecls env0 decls = do
               scheme = Scheme quantifiers body
               info = ConInfo scheme arity tcName
           pure (extendCon cname info env)
+
+    registerCon _tcName paramMap env (Abs.ConDefRec (Abs.ConId (pos, cname)) fields) =
+      case lookupRecordCon cname env of
+        Just _ -> throwError (DuplicateCon (Just pos) cname)
+        Nothing -> do
+          fieldsCT <- forM fields $ \(Abs.RFType (Abs.VarId (_, fname)) ty) -> do
+            ct <- translateConArg env paramMap ty
+            pure (fname, ct)
+          let paramCount = Map.size paramMap
+              quantifiers = [ (i, KStar) | i <- [0 .. paramCount - 1] ]
+              info = RecordConInfo
+                { rcTag    = cname
+                , rcFields = fieldsCT
+                , rcParams = quantifiers
+                }
+          pure (extendRecordCon cname info env)
+
+    registerCon _ _ _ (Abs.ConDefRecElide _) =
+      error "registerCon: ConDefRecElide should have been normalized away by normalizeElision"
 
     translateConArg env paramMap = walkArg
       where
@@ -464,6 +681,97 @@ inferAtomPat (Abs.APList (p : ps)) = do
   pure (TCon TcList [firstT], firstBinds ++ restBinds)
 inferAtomPat (Abs.APParen p) = inferPat p
 
+-- Strict record pattern: PRecord T { f1 = p1, ..., fn = pn }
+-- All declared fields must be present; no extras; produces a closed row.
+inferAtomPat (Abs.PRecord (Abs.ConId (pos, conName)) fieldPats) = do
+  env <- currentEnv
+  conInfo <- case lookupRecordCon conName env of
+    Just info -> pure info
+    Nothing -> case lookupCon conName env of
+      Just _  -> throwError (RecordConstructorNeedsBraces (Just pos) conName)
+      Nothing -> throwError (UnknownCon (Just pos) conName)
+  let declaredMap    = Map.fromList (rcFields conInfo)
+      declaredNames  = Set.fromList (Map.keys declaredMap)
+      providedFields = [ (fname, fpat)
+                       | Abs.RFPat (Abs.VarId (_, fname)) fpat <- fieldPats ]
+      providedNames  = Set.fromList (map fst providedFields)
+      extras         = Set.difference providedNames declaredNames
+      missing        = Set.difference declaredNames providedNames
+  unless (Set.null extras) $
+    throwError (UnknownField (Just pos) conName (Set.findMin extras))
+  unless (Set.null missing) $
+    throwError (UnknownField (Just pos) conName (Set.findMin missing))
+  paramSubst <- instantiateParamSubst (rcParams conInfo)
+  rowEntries <- forM (rcFields conInfo) $ \(fname, fcty) -> do
+    let declaredFieldT = substCTypeWith paramSubst fcty
+    case lookup fname providedFields of
+      Just p -> do
+        (patT, patBinds) <- inferPat p
+        unify (Just pos) patT declaredFieldT
+        pure (fname, declaredFieldT, patBinds)
+      Nothing -> error "PRecord: missing field not caught above (impossible)"
+  let row   = foldr (\(n, t, _) acc -> RowExtend n t acc) RowEmpty rowEntries
+      patT  = TRecord conName row
+      binds = concatMap (\(_, _, b) -> b) rowEntries
+  pure (patT, binds)
+
+-- Open record pattern with anonymous row tail: PRecordOpen T { fs, .. }
+-- Provided fields must be a subset of declared; produces an open row (fresh RowVar tail).
+inferAtomPat (Abs.PRecordOpen (Abs.ConId (pos, conName)) fieldPats Abs.PRTAnon) = do
+  env <- currentEnv
+  conInfo <- case lookupRecordCon conName env of
+    Just info -> pure info
+    Nothing -> case lookupCon conName env of
+      Just _  -> throwError (RecordConstructorNeedsBraces (Just pos) conName)
+      Nothing -> throwError (UnknownCon (Just pos) conName)
+  let declaredNames  = Set.fromList (map fst (rcFields conInfo))
+      providedFields = [ (fname, fpat)
+                       | Abs.RFPat (Abs.VarId (_, fname)) fpat <- fieldPats ]
+      providedNames  = Set.fromList (map fst providedFields)
+      extras         = Set.difference providedNames declaredNames
+  unless (Set.null extras) $
+    throwError (UnknownField (Just pos) conName (Set.findMin extras))
+  paramSubst <- instantiateParamSubst (rcParams conInfo)
+  rowEntries <- forM (rcFields conInfo) $ \(fname, fcty) -> do
+    let declaredFieldT = substCTypeWith paramSubst fcty
+    case lookup fname providedFields of
+      Just p -> do
+        (patT, patBinds) <- inferPat p
+        unify (Just pos) patT declaredFieldT
+        pure (fname, declaredFieldT, patBinds)
+      Nothing -> pure (fname, declaredFieldT, [])
+  rowVarTail <- freshRVar
+  let row   = foldr (\(n, t, _) acc -> RowExtend n t acc) rowVarTail rowEntries
+      patT  = TRecord conName row
+      binds = concatMap (\(_, _, b) -> b) rowEntries
+  pure (patT, binds)
+
+-- Open record pattern with named row tail: deferred to v2.
+inferAtomPat (Abs.PRecordOpen (Abs.ConId (pos, _)) _ (Abs.PRTNamed (Abs.VarId (_, binder)))) =
+  throwError (NamedRowTailCaptureDeferred (Just pos) binder)
+
+-- Wild record pattern with anonymous row tail: PRecordWild T { .. }
+-- No fields are bound; produces an open row with fresh RowVar tail.
+inferAtomPat (Abs.PRecordWild (Abs.ConId (pos, conName)) Abs.PRTAnon) = do
+  env <- currentEnv
+  conInfo <- case lookupRecordCon conName env of
+    Just info -> pure info
+    Nothing -> case lookupCon conName env of
+      Just _  -> throwError (RecordConstructorNeedsBraces (Just pos) conName)
+      Nothing -> throwError (UnknownCon (Just pos) conName)
+  paramSubst <- instantiateParamSubst (rcParams conInfo)
+  declaredEntries <- forM (rcFields conInfo) $ \(fname, fcty) -> do
+    fieldT <- pure (substCTypeWith paramSubst fcty)
+    pure (fname, fieldT)
+  rowVarTail <- freshRVar
+  let row  = foldr (\(n, t) acc -> RowExtend n t acc) rowVarTail declaredEntries
+      patT = TRecord conName row
+  pure (patT, [])
+
+-- Wild record pattern with named row tail: deferred to v2.
+inferAtomPat (Abs.PRecordWild (Abs.ConId (pos, _)) (Abs.PRTNamed (Abs.VarId (_, binder)))) =
+  throwError (NamedRowTailCaptureDeferred (Just pos) binder)
+
 -- | Peel n argument types off a constructor function type, returning
 -- (arg types, result type). The constructor type must have at least n arrows.
 splitConType :: Type s -> Int -> TC s ([Type s], Type s)
@@ -485,6 +793,195 @@ splitConType ty n = do
 inferExpr :: Abs.Exp -> TC s (Type s)
 inferExpr e = inferExprW Map.empty e
 
+-- | Type-infer an expression with an optional expected type. The expected
+-- type informs bidirectional record construction: ERecord and ERecordExt
+-- consult it to allow extra fields that match the expected row extension.
+-- All other AST shapes fall back to pure inferExprW and ignore the hint.
+inferExprWChecked :: Map.Map Text (Type s) -> Maybe (Type s) -> Abs.Exp -> TC s (Type s)
+inferExprWChecked mono Nothing e = inferExprW mono e
+
+-- ERecord with expected type: allow extra fields matching the expected
+-- extension row (fields beyond the declared record fields).
+inferExprWChecked mono (Just expected) (Abs.ERecord (Abs.ConId (pos, conName)) fieldExprs) = do
+  env <- currentEnv
+  conInfo <- case lookupRecordCon conName env of
+    Just info -> pure info
+    Nothing -> throwError (UnknownCon (Just pos) conName)
+  -- Force the expected type; check if it's a TRecord with the same tag.
+  expected' <- force expected
+  case expected' of
+    TRecord expTag expRow | expTag == conName -> do
+      -- Collect extension labels: labels in the expected row beyond the
+      -- declared fields. These are the extras the caller advertises.
+      let declaredFields = rcFields conInfo
+          declaredNames  = Set.fromList (map fst declaredFields)
+      extLabels <- collectRowLabels expRow
+      let extSet = Set.fromList extLabels `Set.difference` declaredNames
+      -- Run the extended record inference.
+      inferERecordWithExt pos conName conInfo fieldExprs extSet (Just expRow)
+    _ ->
+      -- Expected type is not a compatible TRecord: fall back to strict.
+      inferExprW mono (Abs.ERecord (Abs.ConId (pos, conName)) fieldExprs)
+  where
+    inferERecordWithExt pos' conName' conInfo' fieldExprs' extSet mExpRow = do
+      let declaredFields = rcFields conInfo'
+          declaredNames  = Set.fromList (map fst declaredFields)
+          allowedNames   = Set.union declaredNames extSet
+          providedPairs  = [ (fname, fexp)
+                           | Abs.RFExpr (Abs.VarId (_, fname)) fexp <- fieldExprs' ]
+          providedNames  = Set.fromList (map fst providedPairs)
+      -- Check: no extra fields beyond declared + extension.
+      let extras = Set.difference providedNames allowedNames
+      unless (Set.null extras) $
+        throwError (UnknownField (Just pos') conName' (Set.findMin extras))
+      -- Check: all declared fields provided.
+      let missing = Set.difference declaredNames providedNames
+      unless (Set.null missing) $
+        throwError (UnknownField (Just pos') conName'
+          (Tx.pack ("missing field: " <> Tx.unpack (Set.findMin missing))))
+      -- Instantiate record type parameters.
+      paramSubst <- instantiateParamSubst (rcParams conInfo')
+      -- Infer + unify declared fields.
+      declaredRowEntries <- forM declaredFields $ \(fname, fcty) -> do
+        fieldT <- pure (substCTypeWith paramSubst fcty)
+        let mExpr = lookup fname providedPairs
+        case mExpr of
+          Just e -> do
+            actualT <- inferExprW mono e
+            unify (Just pos') actualT fieldT
+            pure (fname, fieldT)
+          Nothing -> error "inferERecordWithExt: missing declared field not caught above"
+      -- Infer + unify extension fields against the expected row.
+      extRowEntries <- forM (filter (\(n, _) -> Set.member n extSet) providedPairs) $ \(fname, fexp) -> do
+        extFieldT <- case mExpRow of
+          Just expRow -> do
+            -- Look up the expected type of this extension field from the
+            -- expected row. If not found (shouldn't happen given extSet), use a fresh TVar.
+            mft <- lookupRowLabel fname expRow
+            case mft of
+              Just ft -> pure ft
+              Nothing -> freshTVar KStar
+          Nothing -> freshTVar KStar
+        actualT <- inferExprW mono fexp
+        unify (Just pos') actualT extFieldT
+        pure (fname, extFieldT)
+      -- Build the result row: declared fields + extension fields.
+      let allEntries = declaredRowEntries ++ extRowEntries
+          row = foldr (\(l, t) acc -> RowExtend l t acc) RowEmpty allEntries
+      pure (TRecord conName' row)
+
+-- ERecordExt with expected type: allow trailing fields matching the expected
+-- extension (beyond the spread source's declared row).
+inferExprWChecked mono (Just expected) (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing) = do
+  env <- currentEnv
+  conInfo <- case lookupRecordCon conName env of
+    Nothing -> throwError (UnknownCon (Just pos) conName)
+    Just ci -> pure ci
+  -- Force expected type; if it's a TRecord with matching tag, extract its row.
+  expected' <- force expected
+  case expected' of
+    TRecord expTag expRow | expTag == conName -> do
+      -- Infer the spread type.
+      spreadT <- inferExprW mono spreadExpr
+      -- Constrain the spread to be TRecord conName with a fresh open row.
+      -- This handles the case where the spread is still a TVar (e.g., a
+      -- function parameter whose type is being inferred from the sig).
+      spreadRowVar <- freshRVar
+      let expectedSpreadT = TRecord conName spreadRowVar
+      unify (Just pos) spreadT expectedSpreadT
+      spreadT' <- force spreadT
+      -- After unification, check nominal tag consistency.
+      case spreadT' of
+        TRecord tag _
+          | tag == conName -> pure ()
+          | otherwise -> throwError (NominalMismatch (Just pos) conName tag)
+        _ -> do
+          ct <- freeze spreadT'
+          throwError (NotARecord (Just pos) ct)
+      let spreadRow = case spreadT' of
+            TRecord _ row -> row
+            _             -> error "ERecordExt hint: spreadT' shape changed (impossible)"
+      -- Use the declared fields from conInfo as the known "base" spread set.
+      -- The spread must have at least these fields (nominally). Any trailing
+      -- field that matches a declared field is an override; extras come from
+      -- the expected extension row.
+      let declaredNames = Set.fromList (map fst (rcFields conInfo))
+      -- Collect extension labels from the expected row beyond declared fields.
+      expLabels <- collectRowLabels expRow
+      let extSet = Set.fromList expLabels `Set.difference` declaredNames
+      -- Process trailing fields.
+      let trailingPairs = case mTrailing of
+            Abs.TFNone -> []
+            Abs.TFSome rfs ->
+              [ (fname, fexp)
+              | Abs.RFExpr (Abs.VarId (_, fname)) fexp <- rfs ]
+      -- Partition trailing into overrides (in spread/declared) and additions (in ext).
+      (overrides, additions) <- partitionTrailing declaredNames extSet pos conName trailingPairs
+      -- Verify overrides match the spread's row type.
+      forM_ overrides $ \(fname, fexp) -> do
+        (declaredT, _rest) <- rewriteRowStrict (Just pos) fname spreadRow
+        actualT <- inferExprW mono fexp
+        unify (Just pos) actualT declaredT
+      -- Infer + unify additions against the expected extension row.
+      extEntries <- forM additions $ \(fname, fexp) -> do
+        extFieldT <- do
+          mft <- lookupRowLabel fname expRow
+          case mft of
+            Just ft -> pure ft
+            Nothing -> freshTVar KStar
+        actualT <- inferExprW mono fexp
+        unify (Just pos) actualT extFieldT
+        pure (fname, extFieldT)
+      -- Build result: spread row + extension fields appended.
+      let resultRow = foldr (\(l, t) acc -> RowExtend l t acc) spreadRow extEntries
+      pure (TRecord conName resultRow)
+    _ ->
+      -- Not a compatible expected type: fall back to strict spread.
+      inferExprW mono (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing)
+
+-- All other shapes: ignore the hint.
+inferExprWChecked mono (Just _) e = inferExprW mono e
+
+-- | Collect all label names from a (possibly open) row, stopping at RowEmpty
+-- or RowVar. Used for extension-field detection.
+collectRowLabels :: Row s -> TC s [Text]
+collectRowLabels row = do
+  row' <- forceRow row
+  case row' of
+    RowEmpty        -> pure []
+    RowVar _        -> pure []  -- open row: no labels to inspect
+    RowExtend l _ r -> do
+      rest <- collectRowLabels r
+      pure (l : rest)
+
+-- | Look up a single label in a row, returning its type if found.
+lookupRowLabel :: Text -> Row s -> TC s (Maybe (Type s))
+lookupRowLabel label row = do
+  row' <- forceRow row
+  case row' of
+    RowEmpty        -> pure Nothing
+    RowVar _        -> pure Nothing
+    RowExtend l t r
+      | l == label -> pure (Just t)
+      | otherwise  -> lookupRowLabel label r
+
+-- | Split trailing fields into overrides (present in spread) and additions
+-- (in extension set). Fields in neither produce UnknownField.
+partitionTrailing
+  :: Set.Set Text
+  -> Set.Set Text
+  -> (Int, Int)
+  -> Text
+  -> [(Text, Abs.Exp)]
+  -> TC s ([(Text, Abs.Exp)], [(Text, Abs.Exp)])
+partitionTrailing spreadSet extSet pos conName pairs =
+  foldM step ([], []) pairs
+  where
+    step (ovs, adds) (fname, fexp)
+      | Set.member fname spreadSet = pure ((fname, fexp) : ovs, adds)
+      | Set.member fname extSet    = pure (ovs, (fname, fexp) : adds)
+      | otherwise = throwError (UnknownField (Just pos) conName fname)
+
 -- Worker that carries a map of monomorphic (lambda/pattern) bindings.
 -- These are looked up directly without instantiation, preserving the
 -- identity of the mutable TVar across all uses in the expression.
@@ -505,7 +1002,9 @@ inferExprW _ (Abs.ECon (Abs.ConId (pos, name))) = do
   env <- currentEnv
   case lookupCon name env of
     Just info -> instantiate (conScheme info)
-    Nothing -> throwError (UnknownCon (Just pos) name)
+    Nothing -> case lookupRecordCon name env of
+      Just _  -> throwError (RecordConstructorNotAValue (Just pos) name)
+      Nothing -> throwError (UnknownCon (Just pos) name)
 inferExprW mono (Abs.EParen e) = inferExprW mono e
 inferExprW mono (Abs.EParenOp (Abs.VarSym (pos, name))) =
   case Map.lookup name mono of
@@ -516,6 +1015,14 @@ inferExprW mono (Abs.EParenOp (Abs.VarSym (pos, name))) =
         Just s -> instantiate s
         Nothing -> throwError (UnknownVar (Just pos) name)
 inferExprW mono (Abs.EApp f x) = do
+  -- Detect record constructor used in positional application and reject it.
+  case f of
+    Abs.ECon (Abs.ConId (pos, name)) -> do
+      env <- currentEnv
+      case lookupRecordCon name env of
+        Just _  -> throwError (RecordConstructorNeedsBraces (Just pos) name)
+        Nothing -> pure ()
+    _ -> pure ()
   fT <- inferExprW mono f
   xT <- inferExprW mono x
   rT <- freshTVar KStar
@@ -542,7 +1049,7 @@ inferExprW mono (Abs.ELam atomPats body) = do
   patResults <- mapM inferAtomPat atomPats
   let paramTys = map fst patResults
       binds = concatMap snd patResults
-      mono' = foldl (\m (n, t) -> Map.insert n t m) mono binds
+      mono' = foldl' (\m (n, t) -> Map.insert n t m) mono binds
   bodyT <- inferExprW mono' body
   pure (foldr (\pT acc -> TArr pT RowEmpty acc) bodyT paramTys)
 inferExprW mono (Abs.EExpr head_ tails) = do
@@ -556,17 +1063,114 @@ inferExprW mono (Abs.EExpr head_ tails) = do
       r1 <- freshTVar KStar
       unify Nothing opTy (TArr fT RowEmpty (TArr rhsT RowEmpty r1))
       applyTails r1 rest
-inferExprW _ (Abs.EProj _ (Abs.VarId (pos, _))) =
-  throwError (UnsupportedFeature (Just pos)
-    (Tx.pack "x.y projection/module access not supported in v1"))
+inferExprW mono (Abs.EProj e (Abs.VarId (pos, label))) = do
+  eT <- inferExprW mono e
+  eT' <- force eT
+  case eT' of
+    TRecord _ row -> do
+      (fieldT, _rest) <- rewriteRowStrict (Just pos) label row
+      pure fieldT
+    _ -> do
+      cT <- freeze eT'
+      throwError (NotARecord (Just pos) cT)
 inferExprW _ (Abs.EProjC _ (Abs.ConId (pos, _))) =
   throwError (UnsupportedFeature (Just pos)
     (Tx.pack "x.Y projection/module access not supported in v1"))
+
+-- | Record construction: Point { x = 1, y = 2 }
+-- Pure inference mode: strict — extra fields (not in the declared row) are
+-- rejected. All declared fields must be provided.
+inferExprW mono (Abs.ERecord (Abs.ConId (pos, conName)) fieldExprs) = do
+  env <- currentEnv
+  conInfo <- case lookupRecordCon conName env of
+    Just info -> pure info
+    Nothing -> throwError (UnknownCon (Just pos) conName)
+  let declaredFields = rcFields conInfo
+      declaredNames  = Set.fromList (map fst declaredFields)
+      providedPairs  = [ (fname, fexp)
+                       | Abs.RFExpr (Abs.VarId (_, fname)) fexp <- fieldExprs ]
+      providedNames  = Set.fromList (map fst providedPairs)
+  -- Check: no extra fields provided that are not in the declared row.
+  let extras = Set.difference providedNames declaredNames
+  unless (Set.null extras) $
+    throwError (UnknownField (Just pos) conName (Set.findMin extras))
+  -- Check: all declared fields provided.
+  let missing = Set.difference declaredNames providedNames
+  unless (Set.null missing) $
+    throwError (UnknownField (Just pos) conName
+      (Tx.pack ("missing field: " <> Tx.unpack (Set.findMin missing))))
+  -- Instantiate the record's type parameters: each rcParams CTGen index
+  -- maps to a fresh TVar.
+  paramSubst <- instantiateParamSubst (rcParams conInfo)
+  -- For each declared field: instantiate its CType, infer the provided
+  -- expression, unify, and collect the row entry.
+  rowEntries <- forM declaredFields $ \(fname, fcty) -> do
+    fieldT <- pure (substCTypeWith paramSubst fcty)
+    let mExpr = lookup fname providedPairs
+    case mExpr of
+      Just e -> do
+        actualT <- inferExprW mono e
+        unify (Just pos) actualT fieldT
+        pure (fname, fieldT)
+      Nothing -> error "ERecord: missing field not caught above (invariant violation)"
+  let row = foldr (\(l, t) acc -> RowExtend l t acc) RowEmpty rowEntries
+  pure (TRecord conName row)
+
+-- | Record spread construction: Point { ..p } or Point { ..p, x = 99 }
+-- The spread expression must be a TRecord with the same nominal tag.
+-- Trailing fields override the corresponding fields from the spread.
+-- In v1 (all spread sources have concrete rows), we look up each trailing
+-- field in the spread's row via rewriteRowStrict and unify the types.
+inferExprW mono (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing) = do
+  env <- currentEnv
+  -- Validate the constructor is known as a record constructor.
+  case lookupRecordCon conName env of
+    Nothing -> throwError (UnknownCon (Just pos) conName)
+    Just _  -> pure ()
+  -- Infer the spread expression type.
+  spreadT <- inferExprW mono spreadExpr
+  spreadT' <- force spreadT
+  -- The spread must be a TRecord with the same nominal tag.
+  case spreadT' of
+    TRecord tag _
+      | tag == conName -> pure ()
+      | otherwise -> throwError (NominalMismatch (Just pos) conName tag)
+    _ -> do
+      ct <- freeze spreadT'
+      throwError (NotARecord (Just pos) ct)
+  -- Extract trailing fields (if any).
+  let trailingPairs = case mTrailing of
+        Abs.TFNone -> []
+        Abs.TFSome rfs ->
+          [ (fname, fexp)
+          | Abs.RFExpr (Abs.VarId (_, fname)) fexp <- rfs ]
+  -- For each trailing field: look it up in the spread's row via
+  -- rewriteRowStrict (concrete-row path, Task 4 guarantee), infer the
+  -- provided expression's type, and unify against the declared field type.
+  -- We use rewriteRowStrict so that any field not in the spread's row
+  -- surfaces as UnknownField (strict override semantics).
+  -- Extract the spread's row for field lookup.
+  let spreadRow = case spreadT' of
+        TRecord _ row -> row
+        _             -> error "ERecordExt: spreadT' shape changed (impossible)"
+  forM_ trailingPairs $ \(fname, fexp) -> do
+    (declaredT, _rest) <- rewriteRowStrict (Just pos) fname spreadRow
+    actualT <- inferExprW mono fexp
+    unify (Just pos) actualT declaredT
+  -- The result type is the spread's type: overrides don't change the
+  -- nominal row for concrete-row spreads (all overriding fields must match
+  -- the declared types, which we have just verified via unify above).
+  pure spreadT'
+
 inferExprW mono (Abs.ELet localDecls body) =
   inferLetGroup mono localDecls (\m -> inferExprW m body)
 inferExprW mono (Abs.ECase scrutinee alts) = do
   sT <- inferExprW mono scrutinee
   rT <- freshTVar KStar
+  -- Check coverage BEFORE inferring alts: the strict-pattern alts will
+  -- unify the scrutinee's row variable to RowEmpty, destroying the open-tail
+  -- information we need for the non-exhaustive warning.
+  checkRecordPatternCoverage (expPos scrutinee) sT alts
   mapM_ (inferAlt mono sT rT) alts
   pure rT
 
@@ -586,6 +1190,62 @@ lookupOpNameW mono pos name =
       case lookupVar name env of
         Just s -> instantiate s
         Nothing -> throwError (UnknownVar (Just pos) name)
+
+-- ---------------------------------------------------------------------------
+-- Pattern coverage check
+-- ---------------------------------------------------------------------------
+
+-- | Emit 'NonExhaustiveRecordPattern' when a case expression scrutinises a
+-- record whose row is open (has a row-variable tail) but every arm is a
+-- strict pattern (no '..' / wildcard arm).  The strict arms remain reachable
+-- because the row variable can be instantiated to RowEmpty; only the
+-- non-exhaustive warning is emitted.
+checkRecordPatternCoverage
+  :: Abs.BNFC'Position -> Type s -> [Abs.Alt] -> TC s ()
+checkRecordPatternCoverage sp scrutT alts = do
+  scrutT' <- force scrutT
+  case scrutT' of
+    TRecord conTag row -> do
+      open <- hasRowVarTail row
+      when open $ do
+        let allStrict = all isStrictAlt alts
+        when allStrict $
+          addWarning (NonExhaustiveRecordPattern sp conTag)
+    _ -> pure ()
+  where
+    -- Walk the row spine to its tail; return True if the tail is a RowVar.
+    hasRowVarTail :: Row s -> TC s Bool
+    hasRowVarTail RowEmpty = pure False
+    hasRowVarTail (RowExtend _ _ rest) = do
+      rest' <- forceRow rest
+      hasRowVarTail rest'
+    hasRowVarTail (RowVar _) = pure True
+
+    -- Return True iff the arm's outermost pattern is a strict record pattern.
+    -- Open arms (PRecordOpen with '..'), wild arms (PRecordWild), and any
+    -- other non-record pattern break the all-strict condition and satisfy
+    -- coverage.
+    isStrictAlt :: Abs.Alt -> Bool
+    isStrictAlt (Abs.AltC pat _ _) = isStrictPat pat
+
+    isStrictPat :: Abs.Pat -> Bool
+    isStrictPat (Abs.PAtom ap) = isStrictAtomPat ap
+    isStrictPat _              = False
+
+    isStrictAtomPat :: Abs.AtomPat -> Bool
+    isStrictAtomPat (Abs.PRecord _ _) = True
+    isStrictAtomPat _                 = False
+
+-- | Extract a best-effort source position from a scrutinee expression.
+-- Returns Nothing when the expression has no recoverable position.
+expPos :: Abs.Exp -> Abs.BNFC'Position
+expPos (Abs.EVar (Abs.VarId (p, _)))     = Just p
+expPos (Abs.EApp e _)                    = expPos e
+expPos (Abs.EProj e _)                   = expPos e
+expPos (Abs.EProjC e _)                  = expPos e
+expPos (Abs.ELitI (Abs.WokInt (p, _)))   = Just p
+expPos (Abs.EParen e)                    = expPos e
+expPos _                                 = Nothing
 
 -- ---------------------------------------------------------------------------
 -- Let/where inference helpers
@@ -622,7 +1282,7 @@ inferLetGroup mono decls k = do
   unified <- enterLevel $ do
     placeholders <- mapM (allocatePlaceholderTVar sigMap) groups
     let monoRec = foldr (\(n, tv, _) m -> Map.insert n tv m) mono placeholders
-    mapM (unifyGroupWith monoRec) placeholders
+    mapM (unifyGroupWith monoRec sigMap) placeholders
   -- Phase 2: back at outer level, generalize or check sig.
   results <- mapM (finalizeGroup sigMap) unified
   -- Bodyless sigs in this let block become visible bindings with the
@@ -695,12 +1355,16 @@ allocatePlaceholderTVar _sigMap (name, eqns) = do
 
 -- | Inside level+1: type all equations, unify with the placeholder TVar.
 -- Returns (name, placeholderTVar) ready for generalization.
+-- The sigMap is threaded so that sig-driven bidirectional checking can be
+-- applied to the bodies (e.g., ERecord with an extension row).
 unifyGroupWith
   :: Map.Map Text (Type s)
+  -> Map.Map Text Scheme
   -> (Text, Type s, [Abs.LocalDecl])
   -> TC s (Text, Type s)
-unifyGroupWith monoRec (name, tv, eqns) = do
-  eqTypes <- mapM (typeEquationWith monoRec) eqns
+unifyGroupWith monoRec sigMap (name, tv, eqns) = do
+  let mSig = Map.lookup name sigMap
+  eqTypes <- mapM (typeEquationWith monoRec mSig) eqns
   case eqTypes of
     [] -> error ("unifyGroupWith: no equations for " ++ show name)
     (t : ts) -> do
@@ -723,6 +1387,7 @@ hasOuterScopeVar outer = go
           if a' then pure True else do
             r' <- goR r
             if r' then pure True else go b
+        TRecord _ row -> goR row
         TVar ref -> do
           tv <- liftST $ readSTRef ref
           case tv of
@@ -770,19 +1435,58 @@ finalizeGroup sigMap (name, tv) =
 
 -- | Type one equation, using the given recursive mono-map as the base
 -- (so mutually-recursive names are visible). Pattern bindings extend it.
-typeEquationWith :: Map.Map Text (Type s) -> Abs.LocalDecl -> TC s (Type s)
-typeEquationWith monoRec (Abs.LDEqn lhs body mw) = do
+-- The optional sig scheme is used for bidirectional checking: when the
+-- equation has no parameters, the sig is instantiated and threaded as a
+-- hint to the body so that ERecord/ERecordExt can accept extension fields.
+typeEquationWith :: Map.Map Text (Type s) -> Maybe Scheme -> Abs.LocalDecl -> TC s (Type s)
+typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
   let atoms = lhsAtomPats lhs
   patResults <- mapM inferAtomPat atoms
   let pTys  = map fst patResults
       binds = concatMap snd patResults
       mono  = foldr (\(n, t) m -> Map.insert n t m) monoRec binds
+  -- Derive the expected body type from the sig by peeling off one arrow for
+  -- each pattern parameter. Also unify each argument's sig type with the
+  -- pattern TVar so that field access inside the body can see the record type.
+  mBodyHint <- case mSig of
+    Nothing -> pure Nothing
+    Just sig -> do
+      sigT <- instantiate sig
+      mResult <- peelArrowsWithArgUnify sigT pTys
+      pure mResult
   let withWhere k = case mw of
         Abs.NoWhere -> k mono
         Abs.WithWh ds -> inferLetGroup mono ds k
-  bodyT <- withWhere (\m -> inferExprW m body)
+  bodyT <- withWhere (\m -> inferExprWChecked m mBodyHint body)
   pure (foldr (\pT acc -> TArr pT RowEmpty acc) bodyT pTys)
-typeEquationWith _ Abs.LDSig{} = error "typeEquationWith: signature in equation list"
+typeEquationWith _ _ Abs.LDSig{} = error "typeEquationWith: signature in equation list"
+
+-- | Peel @n@ arrow types off a Type, returning the result type.
+-- Returns Nothing if the type has fewer than n arrows (or isn't an arrow).
+-- Used to derive the expected body type from a sig with n parameters.
+peelArrows :: Type s -> Int -> TC s (Maybe (Type s))
+peelArrows ty 0 = pure (Just ty)
+peelArrows ty n = do
+  ty' <- force ty
+  case ty' of
+    TArr _ _ b -> peelArrows b (n - 1)
+    _          -> pure Nothing  -- sig arity doesn't match pattern count
+
+-- | Like 'peelArrows' but also unifies each peeled argument type with the
+-- corresponding element of @pTys@. This ensures that pattern-bound variables
+-- carry the concrete type from the signature before the body is checked,
+-- enabling field access (p.x) and other type-directed operations to see the
+-- record structure without waiting for the post-body unification pass.
+-- Returns Nothing when sig arity does not match, just like 'peelArrows'.
+peelArrowsWithArgUnify :: Type s -> [Type s] -> TC s (Maybe (Type s))
+peelArrowsWithArgUnify ty [] = pure (Just ty)
+peelArrowsWithArgUnify ty (pTy : rest) = do
+  ty' <- force ty
+  case ty' of
+    TArr a _ b -> do
+      unify Nothing pTy a
+      peelArrowsWithArgUnify b rest
+    _ -> pure Nothing  -- sig arity does not match pattern count
 
 lhsAtomPats :: Abs.FunLHS -> [Abs.AtomPat]
 lhsAtomPats (Abs.LHSPre _ aps) = aps
@@ -803,15 +1507,6 @@ data TypedDecl = TypedDecl
   }
   deriving (Eq, Show)
 
--- | Non-fatal diagnostics surfaced by the typechecker.
-data Warning
-  = BodylessBinding Text BNFC'Position
-    -- ^ A signature (LDSig/DSig) had no matching equation. The binding
-    -- still enters the env (with its declared scheme verbatim); this
-    -- warning fires only for UserFile-origin modules. Std.Base
-    -- (Embedded) is silent because primitive operator schemes live there.
-  deriving (Eq, Show)
-
 -- | Pipeline entry parameterised by the seed env and module origin.
 -- The seed env is the irreducible pre-env (from Builtins) overlaid with
 -- every imported module's exported env, as composed by the module loader.
@@ -821,7 +1516,9 @@ inferProgramWith
   :: Env -> Origin -> Abs.Module
   -> Either TypeError (Env, [TypedDecl], [Warning])
 inferProgramWith seedEnv origin (Abs.Module decls) =
-  runTC seedEnv (inferProgramTC seedEnv origin decls)
+  case runTC seedEnv (inferProgramTC seedEnv origin decls) of
+    Left err              -> Left err
+    Right ((env, tds), ws) -> Right (env, tds, ws)
 
 -- | Back-compat: keep the v1 signature so existing direct callers
 -- (test harness, smoke tests) continue to work. Uses the hand-coded
@@ -833,7 +1530,7 @@ inferProgram m =
     Right (env, decls, _warnings) -> Right (env, decls)
 
 inferProgramTC
-  :: Env -> Origin -> [Abs.Decl] -> TC s (Env, [TypedDecl], [Warning])
+  :: Env -> Origin -> [Abs.Decl] -> TC s (Env, [TypedDecl])
 inferProgramTC seedEnv origin decls = do
   -- Pass 1: register data declarations against the seed env (which is
   -- the irreducible pre-env overlaid with imports for the loader path,
@@ -841,12 +1538,14 @@ inferProgramTC seedEnv origin decls = do
   env1 <- processDataDecls seedEnv decls
   -- Convert top-level decls to LocalDecl form for reuse of inferLetGroup
   let localDecls = concatMap toLocalDecl decls
-  -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup
+  -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup.
+  -- Warnings (BodylessBinding, RowShadow, …) are emitted into the TC
+  -- monad's warning channel via addWarning; they are collected by runTC.
   withEnv (const env1) $ do
-    (schemes, warnings) <- inferTopLetGroup origin localDecls
+    schemes <- inferTopLetGroup origin localDecls
     env2 <- currentEnv
     let finalEnv = foldr (\(n, s) e -> extendVar n s e) env2 schemes
-    pure (finalEnv, [ TypedDecl n s | (n, s) <- schemes ], warnings)
+    pure (finalEnv, [ TypedDecl n s | (n, s) <- schemes ])
 
 -- | Convert a top-level Decl to zero or more LocalDecls so we can reuse
 -- the existing inferLetGroup machinery.
@@ -856,10 +1555,12 @@ toLocalDecl (Abs.DSig sn extras ty) = [Abs.LDSig sn extras ty]
 toLocalDecl _ = []
 
 -- | Type the top-level declarations as one big mutually-recursive let,
--- returning the list of (name, scheme) pairs in binding order plus any
--- non-fatal warnings (e.g. bodyless top-level sigs in UserFile origin).
+-- returning the list of (name, scheme) pairs in binding order. Non-fatal
+-- warnings (e.g. bodyless top-level sigs in UserFile origin) are emitted
+-- into the TC monad's warning channel via 'addWarning' and collected by
+-- 'runTC'.
 inferTopLetGroup
-  :: Origin -> [Abs.LocalDecl] -> TC s ([(Text, Scheme)], [Warning])
+  :: Origin -> [Abs.LocalDecl] -> TC s [(Text, Scheme)]
 inferTopLetGroup origin localDecls = do
   let (sigs, eqns) = partitionLocalDecls localDecls
   sigMap <- buildSigMap sigs
@@ -880,7 +1581,7 @@ inferTopLetGroup origin localDecls = do
   unified <- withEnv extendSigOnly $ enterLevel $ do
     placeholders <- mapM (allocatePlaceholderTVar sigMap) groups
     let monoRec = foldr (\(n, tv, _) m -> Map.insert n tv m) Map.empty placeholders
-    mapM (unifyGroupWith monoRec) placeholders
+    mapM (unifyGroupWith monoRec sigMap) placeholders
   results <- withEnv extendSigOnly $ mapM (finalizeGroup sigMap) unified
   -- Top level has no outer scope, so finalizeGroup should never report
   -- escape for a top-level binding. If it does, the inferrer's invariants
@@ -894,11 +1595,11 @@ inferTopLetGroup origin localDecls = do
       ++ Tx.unpack n)
   -- Emit a warning only for UserFile origin so Std.Base (Embedded) primitive
   -- schemes stay silent.
-  let warnings = case origin of
-        Embedded   -> []
-        UserFile _ -> [ BodylessBinding n (sigPos sigs n)
-                      | n <- sigOnlyNames ]
-  pure (topResults ++ sigOnlyBindings, warnings)
+  case origin of
+    Embedded   -> pure ()
+    UserFile _ -> forM_ sigOnlyNames $ \n ->
+      addWarning (BodylessBinding n (sigPos sigs n))
+  pure (topResults ++ sigOnlyBindings)
 
 -- | Find the BNFC'Position of the LDSig that declared @name@. Multi-name
 -- sigs share the head LDSig's position.
@@ -965,6 +1666,8 @@ prettyCType (CTCon (TcUser n) xs) =
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTRecord tag row) =
+  Tx.concat [tag, Tx.pack " { ", prettyCRow row, Tx.pack " }"]
 prettyCType (CTArr a CREmpty b) =
   Tx.concat [prettyCTypeArg a, Tx.pack " -> ", prettyCType b]
 prettyCType (CTArr a r b) =

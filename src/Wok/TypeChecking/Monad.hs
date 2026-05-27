@@ -7,6 +7,7 @@ module Wok.TypeChecking.Monad
   ( TC
   , TCCtx (..)
   , runTC
+  , runTC_
   , liftST
   , currentLevel
   , currentEnv
@@ -16,23 +17,27 @@ module Wok.TypeChecking.Monad
   , enterLevel
   , withEnv
   , extendVarTC
+  , addWarning
   ) where
 
 import Control.Monad.Except (ExceptT, MonadError, runExceptT)
 import Control.Monad.Reader (MonadReader, ReaderT, asks, local, runReaderT)
 import Control.Monad.Trans (lift)
 import Control.Monad.ST (ST, runST)
-import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef)
+import Data.STRef (STRef, modifySTRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
 import Data.Text (Text)
 import Wok.TypeChecking.Env (Env, extendVar)
-import Wok.TypeChecking.Error (TypeError)
+import Wok.TypeChecking.Error (TypeError, Warning)
 import Wok.TypeChecking.Types
   ( Kind, Level (..), RVar (..), Row (..), Scheme, TVar (..), Type (..) )
 
 data TCCtx s = TCCtx
-  { ctxFresh :: STRef s Int
-  , ctxLevel :: Level
-  , ctxEnv :: Env
+  { ctxFresh    :: STRef s Int
+  , ctxLevel    :: Level
+  , ctxEnv      :: Env
+  , ctxWarnings :: STRef s [Warning]
+    -- ^ Accumulated non-fatal warnings. Prepended in emission order;
+    -- 'runTC' reverses to restore source order.
   }
 
 newtype TC s a = TC { unTC :: ReaderT (TCCtx s) (ExceptT TypeError (ST s)) a }
@@ -45,11 +50,20 @@ newtype TC s a = TC { unTC :: ReaderT (TCCtx s) (ExceptT TypeError (ST s)) a }
 liftST :: ST s a -> TC s a
 liftST = TC . lift . lift
 
-runTC :: Env -> (forall s. TC s a) -> Either TypeError a
+-- | Run a TC action. Returns @Right (result, warnings)@ on success,
+-- or @Left TypeError@ on the first fatal error. Warnings are returned
+-- in emission order (source order).
+runTC :: Env -> (forall s. TC s a) -> Either TypeError (a, [Warning])
 runTC env action = runST $ do
   freshRef <- newSTRef 0
-  let ctx = TCCtx freshRef (Level 0) env
-  runExceptT (runReaderT (unTC action) ctx)
+  warnsRef <- newSTRef []
+  let ctx = TCCtx freshRef (Level 0) env warnsRef
+  result <- runExceptT (runReaderT (unTC action) ctx)
+  case result of
+    Left err -> pure (Left err)
+    Right a  -> do
+      ws <- readSTRef warnsRef
+      pure (Right (a, reverse ws))
 
 currentLevel :: TC s Level
 currentLevel = asks ctxLevel
@@ -88,3 +102,14 @@ withEnv f = local $ \c -> c { ctxEnv = f (ctxEnv c) }
 
 extendVarTC :: Text -> Scheme -> TC s a -> TC s a
 extendVarTC name sch = withEnv (extendVar name sch)
+
+-- | Like 'runTC' but discards warnings. Convenient for callers that only
+-- care about the result or the error (e.g. unit tests for unification).
+runTC_ :: Env -> (forall s. TC s a) -> Either TypeError a
+runTC_ env action = fmap fst (runTC env action)
+
+-- | Append a non-fatal warning to the accumulated list.
+addWarning :: Warning -> TC s ()
+addWarning w = do
+  ref <- asks ctxWarnings
+  liftST $ modifySTRef' ref (w :)

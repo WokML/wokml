@@ -1,0 +1,2 @@
+sumCoords : Point { x,y, } -> U64
+sumCoordsOpen : forall a. Point { x,y,r0 } -> U64

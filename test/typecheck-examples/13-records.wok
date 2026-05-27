@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+
+data Point = Point { x : U64, y : U64 }
+
+origin : Point
+origin = Point { x = 0, y = 0 }
+
+getX : Point -> U64
+getX p = p.x
+
+getY : Point -> U64
+getY p = p.y
+
+moveBy : U64 -> U64 -> Point -> Point
+moveBy dx dy p = Point { x = p.x + dx, y = p.y + dy }

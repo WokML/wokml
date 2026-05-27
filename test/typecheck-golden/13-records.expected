@@ -1,0 +1,4 @@
+getX : Point { x,y, } -> U64
+getY : Point { x,y, } -> U64
+moveBy : U64 -> U64 -> Point { x,y, } -> Point { x,y, }
+origin : Point { x,y, }
