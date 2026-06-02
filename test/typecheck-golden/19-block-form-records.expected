@@ -1,0 +1,10 @@
+flipWH : Rect { width,height, } -> Rect { width,height, }
+getRadius : U64
+getSide : U64
+getWidth : U64
+mixed : Rect { width,height, }
+mkRect : U64 -> U64 -> Rect { width,height, }
+somePoint : Rect { width,height, }
+trailingCommas : Rect { width,height, }
+unitCircle : Circle { radius, }
+unitSquare : Square { side, }

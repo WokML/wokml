@@ -4,6 +4,7 @@ module Wok.TypeChecking.Env
   , ConInfo (..)
   , TyConInfo (..)
   , RecordConInfo (..)
+  , EffectInfo (..)
   , EnvNs (..)
   , emptyEnv
   , overlayEnvs
@@ -11,10 +12,12 @@ module Wok.TypeChecking.Env
   , lookupCon
   , lookupTyCon
   , lookupRecordCon
+  , lookupEffect
   , extendVar
   , extendCon
   , extendTyCon
   , extendRecordCon
+  , extendEffect
   ) where
 
 import Data.Map.Strict (Map)
@@ -51,20 +54,30 @@ data RecordConInfo = RecordConInfo
   }
   deriving (Eq, Show)
 
+-- | A declared algebraic effect: its type parameters and its operations.
+-- Operations are transparent (auto-resume) in v1; an op's 'Scheme' is its
+-- declared type (e.g. @read : String -> String@).
+data EffectInfo = EffectInfo
+  { eiParams :: [(Int, Kind)]      -- ^ universally-quantified params (e.g. @State a@)
+  , eiOps    :: Map Text Scheme    -- ^ operation name -> operation type scheme
+  }
+  deriving (Eq, Show)
+
 data Env = Env
   { envVars       :: Map Text Scheme
   , envCons       :: Map Text ConInfo
   , envTyCons     :: Map Text TyConInfo
   , envRecordCons :: Map Text RecordConInfo
+  , envEffects    :: Map Text EffectInfo
   }
   deriving (Eq, Show)
 
 emptyEnv :: Env
-emptyEnv = Env Map.empty Map.empty Map.empty Map.empty
+emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty
 
--- | Tag for which of the four Env namespaces a name lives in.
+-- | Tag for which of the five Env namespaces a name lives in.
 -- Used by 'overlayEnvs' to attribute collisions.
-data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon
+data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect
   deriving (Eq, Ord, Show)
 
 -- | Left-biased union of two 'Env's. On any name collision in any of
@@ -78,17 +91,20 @@ data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon
 -- level since we reject any actual overlap rather than silently picking
 -- a side.
 overlayEnvs :: Env -> Env -> Either [(EnvNs, Text)] Env
-overlayEnvs (Env v1 c1 tc1 rc1) (Env v2 c2 tc2 rc2) =
+overlayEnvs (Env v1 c1 tc1 rc1 ef1) (Env v2 c2 tc2 rc2 ef2) =
   let varClash = Map.keys (Map.intersection v1 v2)
       conClash = Map.keys (Map.intersection c1 c2)
       tcClash  = Map.keys (Map.intersection tc1 tc2)
       rcClash  = Map.keys (Map.intersection rc1 rc2)
+      efClash  = Map.keys (Map.intersection ef1 ef2)
       clashes  =  [ (NsVar,       k) | k <- varClash ]
                ++ [ (NsCon,       k) | k <- conClash ]
                ++ [ (NsTyCon,     k) | k <- tcClash  ]
                ++ [ (NsRecordCon, k) | k <- rcClash  ]
+               ++ [ (NsEffect,    k) | k <- efClash  ]
   in case clashes of
-       [] -> Right (Env (Map.union v1 v2) (Map.union c1 c2) (Map.union tc1 tc2) (Map.union rc1 rc2))
+       [] -> Right (Env (Map.union v1 v2) (Map.union c1 c2) (Map.union tc1 tc2)
+                        (Map.union rc1 rc2) (Map.union ef1 ef2))
        _  -> Left clashes
 
 lookupVar :: Text -> Env -> Maybe Scheme
@@ -114,3 +130,9 @@ lookupRecordCon k = Map.lookup k . envRecordCons
 
 extendRecordCon :: Text -> RecordConInfo -> Env -> Env
 extendRecordCon k v e = e { envRecordCons = Map.insert k v (envRecordCons e) }
+
+lookupEffect :: Text -> Env -> Maybe EffectInfo
+lookupEffect k = Map.lookup k . envEffects
+
+extendEffect :: Text -> EffectInfo -> Env -> Env
+extendEffect k v e = e { envEffects = Map.insert k v (envEffects e) }

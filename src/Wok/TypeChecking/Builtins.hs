@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | The irreducible pre-environment. Everything spellable in Wok lives
 -- in Std.Base (loaded by Wok.Loader before user code). Only the tycons
 -- that cannot be expressed in surface Wok stay here:

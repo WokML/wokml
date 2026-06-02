@@ -18,13 +18,16 @@ module Wok.TypeChecking.Monad
   , withEnv
   , extendVarTC
   , addWarning
+  , currentEffRow
+  , withEffRow
   ) where
 
 import Control.Monad.Except (ExceptT, MonadError, runExceptT)
 import Control.Monad.Reader (MonadReader, ReaderT, asks, local, runReaderT)
 import Control.Monad.Trans (lift)
 import Control.Monad.ST (ST, runST)
-import Data.STRef (STRef, modifySTRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
+import Data.List (nub)
+import Data.STRef (STRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
 import Data.Text (Text)
 import Wok.TypeChecking.Env (Env, extendVar)
 import Wok.TypeChecking.Error (TypeError, Warning)
@@ -38,6 +41,11 @@ data TCCtx s = TCCtx
   , ctxWarnings :: STRef s [Warning]
     -- ^ Accumulated non-fatal warnings. Prepended in emission order;
     -- 'runTC' reverses to restore source order.
+  , ctxEffRow   :: Maybe (STRef s (Row s))
+    -- ^ The ambient effect row of the function equation currently being
+    -- checked: an open-tailed 'Row' that operation calls and effectful
+    -- applications extend. 'Nothing' outside any equation body (e.g. while
+    -- translating signatures or at the top level), where effects are ignored.
   }
 
 newtype TC s a = TC { unTC :: ReaderT (TCCtx s) (ExceptT TypeError (ST s)) a }
@@ -57,19 +65,33 @@ runTC :: Env -> (forall s. TC s a) -> Either TypeError (a, [Warning])
 runTC env action = runST $ do
   freshRef <- newSTRef 0
   warnsRef <- newSTRef []
-  let ctx = TCCtx freshRef (Level 0) env warnsRef
+  let ctx = TCCtx freshRef (Level 0) env warnsRef Nothing
   result <- runExceptT (runReaderT (unTC action) ctx)
   case result of
     Left err -> pure (Left err)
     Right a  -> do
       ws <- readSTRef warnsRef
-      pure (Right (a, reverse ws))
+      -- Dedup structurally-identical warnings: the same shadow can be reached
+      -- through more than one unification (e.g. a record value unified against
+      -- a placeholder and again against its declared sig), and each path may
+      -- re-emit the identical 'RowShadow'. 'nub' keeps one per (pos,label,...),
+      -- preserving source order; distinct warnings differ in their fields.
+      pure (Right (a, nub (reverse ws)))
 
 currentLevel :: TC s Level
 currentLevel = asks ctxLevel
 
 currentEnv :: TC s Env
 currentEnv = asks ctxEnv
+
+-- | The ambient effect row of the equation being checked, if any.
+currentEffRow :: TC s (Maybe (STRef s (Row s)))
+currentEffRow = asks ctxEffRow
+
+-- | Run an action with the given ambient effect-row cell installed. Operation
+-- calls and effectful applications inside the action extend that cell.
+withEffRow :: STRef s (Row s) -> TC s a -> TC s a
+withEffRow ref = local (\c -> c { ctxEffRow = Just ref })
 
 freshUniq :: TC s Int
 freshUniq = do

@@ -1,0 +1,2 @@
+add : U64 -> U64 -> U64
+compose2 : forall a b c. (a -> b) -> (c -> a) -> c -> b

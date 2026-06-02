@@ -6,6 +6,7 @@ module Wok.TypeChecking.Infer
   , instantiate
   , translateSig
   , processDataDecls
+  , processEffectDecls
   , inferPat
   , inferExpr
   , inferProgram
@@ -25,7 +26,7 @@ import Data.List (foldl')
 import qualified Data.List
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.STRef (STRef, modifySTRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
+import Data.STRef (STRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
 import qualified Data.Text as Tx
 import Data.Text (Text)
 import qualified GeneratedParser.Wok.Abs as Abs
@@ -33,12 +34,12 @@ import GeneratedParser.Wok.Abs (BNFC'Position)
 import Wok.SourceOrigin (Origin (..))
 import qualified Wok.TypeChecking.Builtins as Builtins
 import Wok.TypeChecking.Env
-  ( ConInfo (..), Env, RecordConInfo (..), TyConInfo (..)
-  , extendCon, extendRecordCon, extendTyCon, extendVar
-  , lookupCon, lookupRecordCon, lookupTyCon, lookupVar )
+  ( ConInfo (..), Env, EffectInfo (..), RecordConInfo (..), TyConInfo (..)
+  , extendCon, extendEffect, extendRecordCon, extendTyCon, extendVar
+  , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
 import Wok.TypeChecking.Error (TypeError (..), Warning (..))
-import Wok.TypeChecking.Monad (TC, addWarning, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, withEnv)
-import Wok.TypeChecking.Unify (force, forceRow, freeze, unify, rewriteRowStrict)
+import Wok.TypeChecking.Monad (TC, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, withEffRow, withEnv)
+import Wok.TypeChecking.Unify (force, forceRow, freeze, rewriteRow, unify, rewriteRowStrict)
 import Wok.TypeChecking.Types
   ( CRow (..), CType (..), Kind (..), Level (..), RVar (..), Row (..)
   , Scheme (..), TyCon (..), TVar (..), Type (..) )
@@ -241,6 +242,50 @@ freezeSig (Scheme vars body) = do
 -- to specialised TyCon tags; user names become TcUser.
 -- Record-form TyCons (registered in envRecordCons with matching name)
 -- produce CTRecord with the closed row of declared fields.
+-- | An anonymous @..@ row tail (effect 'Abs.ERWildOnly' or record 'Abs.RCWild')
+-- is a fresh, single-use variable, so it cannot thread between positions. It is
+-- therefore allowed only in COVARIANT (result) positions of a signature, and
+-- rejected in CONTRAVARIANT (parameter) positions, where a consumed callback's
+-- effects (or a consumed record's extra fields) could only be dropped. Named
+-- tails (@eff e@ / @row r@) thread and are allowed in any position. Polarity
+-- flips on the domain of each arrow. This is the spec's "@..@ cannot thread"
+-- rule (e.g. @mapEff : (a -> b with ..) -> [a] -> [b] with ..@ is rejected),
+-- enforced structurally on the signature.
+-- The error is anchored at @sp@ (the enclosing signature's name position): the
+-- @..@ token itself is nullary in the AST and carries no position.
+checkAnonTailPolarity :: BNFC'Position -> Abs.Type -> TC s ()
+checkAnonTailPolarity sp = goT True
+  where
+    -- @pos@ True = covariant (.. allowed); False = contravariant (.. rejected).
+    goT :: Bool -> Abs.Type -> TC s ()
+    goT pos t = case t of
+      Abs.TFun a b         -> goT (not pos) a >> goT pos b
+      Abs.TWith a b eff     -> goT (not pos) a >> goT pos b >> goRow pos eff
+      Abs.TExtend lhs _ rc  -> goT pos lhs >> goRC pos rc
+      Abs.TApp f x          -> goT pos f >> goT pos x
+      Abs.TList inner       -> goT pos inner
+      Abs.TTuple a others   -> mapM_ (goT pos) (a : others)
+      Abs.TParen t'         -> goT pos t'
+      Abs.TCon _            -> pure ()
+      Abs.TVar _            -> pure ()
+      Abs.TUnit             -> pure ()
+
+    goRow :: Bool -> Abs.EffectRow -> TC s ()
+    goRow pos r = case r of
+      Abs.EROne atom         -> goAtom pos atom
+      Abs.ERPlus atom _ rest -> goAtom pos atom >> goRow pos rest
+      Abs.ERVarOnly _        -> pure ()                  -- named eff var: threads
+      Abs.ERWildOnly         -> unless pos $ throwError (AnonRowTailInParam sp)
+
+    goAtom :: Bool -> Abs.EffectAtom -> TC s ()
+    goAtom pos (Abs.ERAtom _ typeArgs) = mapM_ (goT pos) typeArgs
+
+    goRC :: Bool -> Abs.RowContrib -> TC s ()
+    goRC pos rc = case rc of
+      Abs.RCAnon fields -> mapM_ (\(Abs.RFType _ fty) -> goT pos fty) fields
+      Abs.RCVar _       -> pure ()                       -- named row var: threads
+      Abs.RCWild        -> unless pos $ throwError (AnonRowTailInParam sp)
+
 translateSig :: Env -> Abs.Type -> TC s Scheme
 translateSig env ty = do
   seenRef    <- liftST $ newSTRef (Map.empty :: Map.Map Text Int)
@@ -329,6 +374,13 @@ translateSig env ty = do
           pure (CTCon (TcTuple (1 + length others)) ts)
         goT (Abs.TParen t') = goT t'
         goT Abs.TUnit = pure (CTCon TcUnit [])
+        -- `a -> b with E`: the effect row E rides the arrow's row slot.
+        -- `with` binds looser than `->`, so for a chain `A -> B -> C with E`
+        -- the parse is `TFun A (TWith B C E)` -- E attaches to the INNERMOST
+        -- arrow (`B -> C`), which is where a fully-applied curried function
+        -- actually performs its effects.
+        goT (Abs.TWith a b effRow) =
+          CTArr <$> goT a <*> goEffectRow effRow <*> goT b
         -- Type-level extension: `T + { fields }` or `T + row r`.
         -- Only `+` is accepted as the type-level operator; anything else
         -- is rejected with NonPlusTypeOp.
@@ -355,6 +407,61 @@ translateSig env ty = do
           case Map.lookup rname rowSeen of
             Just i  -> pure (CRGen i)
             Nothing -> CRGen <$> allocSlot rowSeenRef rname
+        -- Anonymous record tail `Point + ..`: a fresh, single-use row var.
+        goRC Abs.RCWild = CRGen <$> freshAnonRowSlot
+
+        -- Translate a `with` clause's effect row into a CRow. An effect label
+        -- is the effect's nominal name; the label's field type carries the
+        -- effect's type argument(s) (unit when none).
+        -- (No local type signature: like its sibling helpers it must share the
+        -- enclosing `walk`'s `s`; an explicit sig would bind a fresh rigid `s`.)
+        goEffectRow (Abs.EROne atom) = do
+          (lbl, fieldCT) <- goEffectAtom atom
+          pure (CRExtend lbl fieldCT CREmpty)
+        -- The VarSym between atoms is the literal `+` (grammar reuses VarSym
+        -- exactly as TExtend does); only `+` is meaningful and the rest of the
+        -- row continues after it.
+        goEffectRow (Abs.ERPlus atom (Abs.VarSym (pos, sym)) rest) = do
+          unless (sym == Tx.pack "+") $ throwError (NonPlusTypeOp (Just pos) sym)
+          (lbl, fieldCT) <- goEffectAtom atom
+          restRow <- goEffectRow rest
+          pure (CRExtend lbl fieldCT restRow)
+        -- Named open effect tail `eff e`: a shared KEffect row variable. Keyed
+        -- under an "eff:"-prefixed name so it can never collide with a record
+        -- `row e` of the same spelling (which uses the bare name).
+        goEffectRow (Abs.ERVarOnly (Abs.VarId (_, name))) = do
+          let key = Tx.pack "eff:" <> name
+          rowSeen <- liftST (readSTRef rowSeenRef)
+          case Map.lookup key rowSeen of
+            Just i  -> pure (CRGen i)
+            Nothing -> CRGen <$> allocSlot rowSeenRef key
+        -- Anonymous open effect tail `..`: a fresh, single-use row var.
+        goEffectRow Abs.ERWildOnly = CRGen <$> freshAnonRowSlot
+
+        -- An effect atom `E t1..tn` -> (label "E", field type). The field type
+        -- is unit for a no-arg effect, the single arg for one, a tuple for
+        -- several. The effect name must already be declared.
+        goEffectAtom (Abs.ERAtom (Abs.ConId (pos, name)) typeArgs) =
+          case lookupEffect name env' of
+            Nothing -> throwError (MissingEffectDecl (Just pos) name)
+            Just _  -> do
+              argCTs <- mapM goT typeArgs
+              let fieldCT = case argCTs of
+                    []  -> CTCon TcUnit []
+                    [t] -> t
+                    ts  -> CTCon (TcTuple (length ts)) ts
+              pure (name, fieldCT)
+
+        -- Allocate a fresh anonymous row-variable slot. Each call mints a
+        -- distinct index and records it in rowSeenRef under a unique synthetic
+        -- key (so it is quantified as a KEffect var like any row var) that no
+        -- source name can collide with. Two `..` tails get distinct keys, so
+        -- they are unrelated -- they cannot thread like a named `eff e`/`row r`.
+        freshAnonRowSlot = liftST $ do
+          n <- readSTRef nextRef
+          writeSTRef nextRef (n + 1)
+          modifySTRef' rowSeenRef (Map.insert (Tx.pack (".." <> show n)) n)
+          pure n
 
         -- Build a CRow from a list of (field name, CType) pairs
         -- (in declaration order, outermost label first).
@@ -571,45 +678,100 @@ processDataDecls env0 decls = do
     registerCon _ _ _ (Abs.ConDefRecElide _) =
       error "registerCon: ConDefRecElide should have been normalized away by normalizeElision"
 
-    translateConArg env paramMap = walkArg
-      where
-        walkArg (Abs.TVar (Abs.VarId (pos, name))) =
-          case Map.lookup name paramMap of
-            Just i -> pure (CTGen i)
-            Nothing -> throwError (UnknownTyCon (Just pos) name)
-        walkArg (Abs.TFun a b) =
-          CTArr <$> walkArg a <*> pure CREmpty <*> walkArg b
-        walkArg (Abs.TCon mp) = do
+-- | Translate a constructor-argument, record-field, or effect-operation type
+-- into a closed 'CType'. The user's declared type parameters resolve (via
+-- @paramMap@) to 'CTGen' slots; other names resolve to in-scope type
+-- constructors. Shared by 'processDataDecls' and 'processEffectDecls'.
+--
+-- A @with@ clause on the type (effect-carrying field/op types) is NOT handled
+-- here; such types are a later feature and reach the non-exhaustive fall through.
+translateConArg :: Env -> Map.Map Text Int -> Abs.Type -> TC s CType
+translateConArg env paramMap ty = do
+  -- Apply the same `..`-polarity rule signatures get (spec 145/142), so an
+  -- anonymous tail can never reach a parameter position via a data-field or
+  -- operation type either. Today 'walkArg' rejects `with`/`+` wholesale, but
+  -- routing through this check keeps the rule enforced uniformly and closes the
+  -- loophole that would open if 'walkArg' later supported those forms.
+  checkAnonTailPolarity Nothing ty
+  walkArg ty
+  where
+    walkArg (Abs.TVar (Abs.VarId (pos, name))) =
+      case Map.lookup name paramMap of
+        Just i -> pure (CTGen i)
+        Nothing -> throwError (UnknownTyCon (Just pos) name)
+    walkArg (Abs.TFun a b) =
+      CTArr <$> walkArg a <*> pure CREmpty <*> walkArg b
+    walkArg (Abs.TCon mp) = do
+      let n = modPathText mp
+          p = modPathPos mp
+      case lookupTyCon n env of
+        Just info
+          | tcArity info == 0 -> pure (CTCon (resolveTyCon n) [])
+          | otherwise -> throwError (ArityMismatch (Just p) n (tcArity info) 0)
+        Nothing -> throwError (UnknownTyCon (Just p) n)
+    walkArg (Abs.TApp f x) = do
+      let (h, args) = collectApp f x
+      case h of
+        Abs.TCon mp -> do
           let n = modPathText mp
               p = modPathPos mp
           case lookupTyCon n env of
             Just info
-              | tcArity info == 0 -> pure (CTCon (resolveTyCon n) [])
-              | otherwise -> throwError (ArityMismatch (Just p) n (tcArity info) 0)
+              | tcArity info == length args ->
+                  CTCon (resolveTyCon n) <$> mapM walkArg args
+              | otherwise -> throwError
+                  (ArityMismatch (Just p) n (tcArity info) (length args))
             Nothing -> throwError (UnknownTyCon (Just p) n)
-        walkArg (Abs.TApp f x) = do
-          let (h, args) = collectApp f x
-          case h of
-            Abs.TCon mp -> do
-              let n = modPathText mp
-                  p = modPathPos mp
-              case lookupTyCon n env of
-                Just info
-                  | tcArity info == length args ->
-                      CTCon (resolveTyCon n) <$> mapM walkArg args
-                  | otherwise -> throwError
-                      (ArityMismatch (Just p) n (tcArity info) (length args))
-                Nothing -> throwError (UnknownTyCon (Just p) n)
-            _ -> throwError (UnsupportedFeature Nothing
-                              (Tx.pack "non-tycon type application in constructor"))
-        walkArg (Abs.TList inner) = do
-          c <- walkArg inner
-          pure (CTCon TcList [c])
-        walkArg (Abs.TTuple a others) = do
-          ts <- mapM walkArg (a : others)
-          pure (CTCon (TcTuple (1 + length others)) ts)
-        walkArg (Abs.TParen t') = walkArg t'
-        walkArg Abs.TUnit = pure (CTCon TcUnit [])
+        _ -> throwError (UnsupportedFeature Nothing
+                          (Tx.pack "non-tycon type application in constructor"))
+    walkArg (Abs.TList inner) = do
+      c <- walkArg inner
+      pure (CTCon TcList [c])
+    walkArg (Abs.TTuple a others) = do
+      ts <- mapM walkArg (a : others)
+      pure (CTCon (TcTuple (1 + length others)) ts)
+    walkArg (Abs.TParen t') = walkArg t'
+    walkArg Abs.TUnit = pure (CTCon TcUnit [])
+    walkArg other = throwError (UnsupportedFeature Nothing
+      (Tx.pack ("unsupported type in constructor/operation: " <> show other)))
+
+-- ---------------------------------------------------------------------------
+-- Effect declaration processing
+-- ---------------------------------------------------------------------------
+
+-- | Register @effect@ declarations into the env's effect namespace.
+--
+-- @effect E p1..pn = { op1 : T1, ... }@ becomes an 'EffectInfo' whose
+-- operations are schemes quantified over the effect's type parameters. An
+-- operation's type is translated like a record-field type ('translateConArg'),
+-- so it may mention the effect's parameters and in-scope type constructors.
+-- (Operation types carrying their own @with@ clause are a later feature.)
+processEffectDecls :: Env -> [Abs.Decl] -> TC s Env
+processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
+  where
+    effectDecls = [ d | d@(Abs.DEffect{}) <- decls ]
+
+    registerEffect env (Abs.DEffect (Abs.ConId (pos, name)) params fields) =
+      case lookupEffect name env of
+        Just _  -> throwError (DuplicateTyCon (Just pos) name)
+        Nothing -> do
+          let paramNames  = [ n | Abs.VarId (_, n) <- params ]
+              paramMap    = Map.fromList (zip paramNames [0 ..])
+              paramCount  = length paramNames
+              quantifiers = [ (i, KStar) | i <- [0 .. paramCount - 1] ]
+          opMap <- foldM (registerOp env paramMap (Just pos) quantifiers name)
+                         Map.empty fields
+          pure (extendEffect name (EffectInfo quantifiers opMap) env)
+    registerEffect _ _ =
+      error "processEffectDecls: non-DEffect reached (input should be pre-filtered)"
+
+    registerOp env paramMap pos quantifiers ename acc
+               (Abs.RFType (Abs.VarId (_, opName)) ty) =
+      case Map.lookup opName acc of
+        Just _  -> throwError (DuplicateOperation pos ename opName)
+        Nothing -> do
+          ct <- translateConArg env paramMap ty
+          pure (Map.insert opName (Scheme quantifiers ct) acc)
 
 -- ---------------------------------------------------------------------------
 -- Pattern inference
@@ -1026,7 +1188,17 @@ inferExprW mono (Abs.EApp f x) = do
   fT <- inferExprW mono f
   xT <- inferExprW mono x
   rT <- freshTVar KStar
-  unify Nothing fT (TArr xT RowEmpty rT)
+  effRow <- freshRVar
+  -- The applied arrow may carry an effect row; unify with a fresh row var so we
+  -- can read whatever effects the callee performs, then fold those concrete
+  -- effects into the enclosing equation's ambient row. Pure callees add
+  -- nothing. Afterwards CLOSE this per-application row: under (A) the call site
+  -- commits to the effects observed here, so the row variable does not escape
+  -- into the inferred type (an inferred higher-order function stays pure unless
+  -- its sig says `with eff e`).
+  unify Nothing fT (TArr xT effRow rT)
+  emitRow Nothing effRow
+  closeRow effRow
   pure rT
 inferExprW mono (Abs.EIf c a b) = do
   cT <- inferExprW mono c
@@ -1050,8 +1222,19 @@ inferExprW mono (Abs.ELam atomPats body) = do
   let paramTys = map fst patResults
       binds = concatMap snd patResults
       mono' = foldl' (\m (n, t) -> Map.insert n t m) mono binds
-  bodyT <- inferExprW mono' body
-  pure (foldr (\pT acc -> TArr pT RowEmpty acc) bodyT paramTys)
+  -- A lambda is a function: the effects its body performs happen when the
+  -- lambda is APPLIED, so they belong to the lambda's own (innermost) arrow,
+  -- NOT to the enclosing equation. Install a fresh ambient, collect the body's
+  -- effects there, close it (closed-by-default, like an equation), and ride it
+  -- on the lambda's innermost arrow via 'arrowsWithEffect'. Without this the
+  -- body's operation calls would leak into the enclosing equation's row and the
+  -- lambda value would be typed as a pure arrow.
+  ambient0 <- freshRVar
+  effRef <- liftST (newSTRef ambient0)
+  bodyT <- withEffRow effRef (inferExprW mono' body)
+  ambient <- liftST (readSTRef effRef)
+  closeRow ambient
+  pure (arrowsWithEffect paramTys bodyT ambient)
 inferExprW mono (Abs.EExpr head_ tails) = do
   hT <- inferExprW mono head_
   applyTails hT tails
@@ -1063,16 +1246,33 @@ inferExprW mono (Abs.EExpr head_ tails) = do
       r1 <- freshTVar KStar
       unify Nothing opTy (TArr fT RowEmpty (TArr rhsT RowEmpty r1))
       applyTails r1 rest
-inferExprW mono (Abs.EProj e (Abs.VarId (pos, label))) = do
-  eT <- inferExprW mono e
-  eT' <- force eT
-  case eT' of
-    TRecord _ row -> do
-      (fieldT, _rest) <- rewriteRowStrict (Just pos) label row
-      pure fieldT
-    _ -> do
-      cT <- freeze eT'
-      throwError (NotARecord (Just pos) cT)
+-- Operation invocation `E.op`: when the head is a constructor naming a
+-- declared effect and @op@ is one of its operations, this is an operation
+-- reference, not record-field access. Its type is the operation's scheme; it
+-- contributes the effect @E@ to the enclosing equation's ambient row.
+inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (pos, label))) = do
+  env <- currentEnv
+  case lookupEffect ename env of
+    Just eInfo
+      | Just opScheme <- Map.lookup label (eiOps eInfo) -> do
+          -- Instantiate the effect's parameters once; reuse the same
+          -- substitution for the op's type AND the effect-row label's carried
+          -- type, so e.g. `State a`'s `get : () -> a` ties `a` to the `State a`
+          -- in the row.
+          paramSubst <- instantiateParamSubst (eiParams eInfo)
+          let opTy    = substCTypeWith paramSubst (schemeBody opScheme)
+              labelTy = case eiParams eInfo of
+                []      -> TCon TcUnit []
+                [(i,_)] -> Map.findWithDefault (TCon TcUnit []) i paramSubst
+                ps      -> TCon (TcTuple (length ps))
+                             [ Map.findWithDefault (TCon TcUnit []) i paramSubst
+                             | (i, _) <- ps ]
+          emitEffect (Just pos) ename labelTy
+          pure opTy
+      | otherwise -> throwError (UnknownOperation (Just pos) ename label)
+    Nothing -> inferProjection mono headE pos label
+inferExprW mono (Abs.EProj e (Abs.VarId (pos, label))) =
+  inferProjection mono e pos label
 inferExprW _ (Abs.EProjC _ (Abs.ConId (pos, _))) =
   throwError (UnsupportedFeature (Just pos)
     (Tx.pack "x.Y projection/module access not supported in v1"))
@@ -1173,6 +1373,179 @@ inferExprW mono (Abs.ECase scrutinee alts) = do
   checkRecordPatternCoverage (expPos scrutinee) sT alts
   mapM_ (inferAlt mono sT rT) alts
   pure rT
+-- Handler: `handle EXPR of { E.op args -> body ... ; return v -> r }`.
+-- v1 (transparent operations, no resume): infer EXPR under a fresh sub-ambient
+-- effect row; the handled effects are those named by the arm heads; every
+-- operation of each handled effect must have an arm (coverage); each arm body
+-- has the operation's RESULT type and is checked under the OUTER ambient (so an
+-- arm may itself perform effects -- effect translation); the optional `return`
+-- arm transforms the final value. The result effect row is EXPR's effects minus
+-- the handled ones, joined into the enclosing ambient.
+inferExprW mono (Abs.EHandle e arms) = inferHandler mono e arms
+
+inferHandler :: Map.Map Text (Type s) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s)
+inferHandler mono e arms = do
+  env <- currentEnv
+  -- Split arms into operation arms and an optional return arm.
+  let opArms = [ (en, op, ps, body, pos)
+               | Abs.HArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body <- arms ]
+      retArms = [ (pos, v, body) | Abs.HReturn (Abs.VarId (pos, v)) body <- arms ]
+  -- At most one `return` arm is allowed; reject a second rather than silently
+  -- ignoring it.
+  case retArms of
+    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
+    _                      -> pure ()
+  -- Infer the handled expression under a fresh sub-ambient row so we can see
+  -- exactly which effects it performs.
+  subAmbient0 <- freshRVar
+  subRef <- liftST (newSTRef subAmbient0)
+  exprT <- withEffRow subRef (inferExprW mono e)
+  -- The handled effects are the distinct effect names mentioned by arm heads.
+  let handledEffects = Data.List.nub [ en | (en, _, _, _, _) <- opArms ]
+  -- Coverage: every operation of each handled effect must have an arm.
+  forM_ handledEffects $ \en ->
+    case lookupEffect en env of
+      Nothing -> case opArms of
+        ((_, _, _, _, pos) : _) -> throwError (MissingEffectDecl (Just pos) en)
+        []                      -> throwError (MissingEffectDecl Nothing en)
+      Just eInfo -> do
+        let declaredOps = Map.keys (eiOps eInfo)
+            handledOps  = [ op | (en', op, _, _, _) <- opArms, en' == en ]
+            missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
+        unless (null missing) $ do
+          let pos = case [ p | (en', _, _, _, p) <- opArms, en' == en ] of
+                      (p : _) -> Just p
+                      []      -> Nothing
+          throwError (HandlerCoverage pos en missing)
+  -- Type each operation arm: bind its argument patterns to the op's argument
+  -- types and check its body against the op's RESULT type. Arm bodies run under
+  -- the OUTER ambient (the current one), so effects performed inside an arm
+  -- (effect translation) flow to the enclosing computation.
+  forM_ opArms $ \(en, op, ps, body, pos) ->
+    case lookupEffect en env of
+      Nothing -> throwError (MissingEffectDecl (Just pos) en)
+      Just eInfo -> case Map.lookup op (eiOps eInfo) of
+        Nothing -> throwError (UnknownOperation (Just pos) en op)
+        Just opScheme -> do
+          paramSubst <- instantiateParamSubst (eiParams eInfo)
+          let opTy = substCTypeWith paramSubst (schemeBody opScheme)
+          -- Peel the op's argument types onto the arm's argument patterns.
+          patResults <- mapM inferAtomPat ps
+          let pTys  = map fst patResults
+              binds = concatMap snd patResults
+              mono' = foldr (\(n, t) m -> Map.insert n t m) mono binds
+          mResult <- peelArrowsWithArgUnify opTy pTys
+          resultTy <- case mResult of
+            Just r  -> pure r
+            Nothing -> throwError (UnknownOperation (Just pos) en op)
+          bodyT <- inferExprW mono' body
+          unify (Just pos) bodyT resultTy
+  -- Discharge the handled effects from the handled expression's row, leaving
+  -- the residual effects to flow outward.
+  subRow <- liftST (readSTRef subRef)
+  residual <- dischargeEffects subRow handledEffects
+  emitRow Nothing residual
+  -- Apply the optional return arm to compute the handle's result type.
+  case retArms of
+    []               -> pure exprT
+    ((_, v, rb) : _) -> do
+      let mono' = Map.insert v exprT mono
+      inferExprW mono' rb
+
+-- | Remove the given effect labels from a row (each label dropped once per
+-- occurrence is unnecessary in v1 -- effects are not duplicated by inference --
+-- so we drop ALL occurrences of each handled label). Returns the residual row
+-- of effects that were not handled.
+dischargeEffects :: Row s -> [Text] -> TC s (Row s)
+dischargeEffects row handled = do
+  row' <- forceRow row
+  case row' of
+    RowEmpty            -> pure RowEmpty
+    RowVar _            -> pure row'  -- open tail: nothing concrete to drop
+    RowExtend l t rest  -> do
+      rest' <- dischargeEffects rest handled
+      if l `elem` handled
+        then pure rest'
+        else pure (RowExtend l t rest')
+
+-- | Ordinary record field projection `e.label`: the original (pre-effects)
+-- 'EProj' behaviour, factored out so the operation-call case can fall back to
+-- it when the head constructor is not a declared effect.
+inferProjection :: Map.Map Text (Type s) -> Abs.Exp -> (Int, Int) -> Text -> TC s (Type s)
+inferProjection mono e pos label = do
+  eT <- inferExprW mono e
+  eT' <- force eT
+  case eT' of
+    TRecord _ row -> do
+      (fieldT, _rest) <- rewriteRowStrict (Just pos) label row
+      pure fieldT
+    _ -> do
+      cT <- freeze eT'
+      throwError (NotARecord (Just pos) cT)
+
+-- ---------------------------------------------------------------------------
+-- Effect flow (Task 6)
+-- ---------------------------------------------------------------------------
+
+-- | Add one effect label to the ambient effect row of the enclosing equation.
+--
+-- Uses 'rewriteRow', which on an OPEN row (the usual case during inference)
+-- grows the row by the label, and on a closed row demands the label be present
+-- already. So:
+--   * an inferred function's ambient stays open and accumulates exactly the
+--     effects it uses, then is closed at the binding boundary;
+--   * a function whose declared sig fixed a closed effect row rejects any
+--     operation/effect not in that row -- surfaced as 'UndischargedEffect'.
+-- Effects emitted outside any equation body (ambient = Nothing) are ignored;
+-- that only happens where no row is meaningful (top-level value sigs, etc.).
+emitEffect :: BNFC'Position -> Text -> Type s -> TC s ()
+emitEffect sp label argTy = do
+  mref <- currentEffRow
+  case mref of
+    Nothing  -> pure ()
+    Just ref -> do
+      ambient <- liftST (readSTRef ref)
+      reachable <- effectReachable label ambient
+      if reachable
+        then do
+          -- Present already, or the ambient has an open tail we may grow.
+          -- 'rewriteRow' bubbles @label@ to the head (growing an open tail in
+          -- place); unify the label's carried type so a parameterised effect
+          -- (e.g. State a) stays consistent across its uses.
+          (labelTy, _rest) <- rewriteRow sp label ambient
+          unify sp labelTy argTy
+        else
+          -- Closed ambient (from a declared sig) that does not list this effect
+          -- and has no open tail to grow: the operation's effect is undischarged
+          -- by the signature.
+          throwError (UndischargedEffect sp label)
+
+-- | Is effect @label@ reachable in @row@ -- either already present, or the row
+-- ends in an open variable that could be grown to include it? A closed row
+-- (terminating in 'RowEmpty') that lacks the label is NOT reachable.
+effectReachable :: Text -> Row s -> TC s Bool
+effectReachable label row = do
+  row' <- forceRow row
+  case row' of
+    RowEmpty            -> pure False
+    RowVar _            -> pure True  -- open tail: can grow to include label
+    RowExtend l _ rest
+      | l == label      -> pure True
+      | otherwise       -> effectReachable label rest
+
+-- | Add a whole (concrete) effect row into the ambient row -- used when an
+-- application calls a function whose own effect row carries labels. Open tails
+-- contribute nothing (they unify into the ambient's open tail); each concrete
+-- label is emitted via 'emitEffect'.
+emitRow :: BNFC'Position -> Row s -> TC s ()
+emitRow sp row = do
+  row' <- forceRow row
+  case row' of
+    RowEmpty           -> pure ()
+    RowVar _           -> pure ()  -- open tail: no concrete effects to add
+    RowExtend l t rest -> do
+      emitEffect sp l t
+      emitRow sp rest
 
 -- | Look up an infix operator; monomorphic bindings are checked first.
 inferInfixOpW :: Map.Map Text (Type s) -> Abs.InfixOp -> TC s (Type s)
@@ -1277,14 +1650,24 @@ inferLetGroup mono decls k = do
   let (sigs, eqns) = partitionLocalDecls decls
   sigMap <- buildSigMap sigs
   let groups = groupEquations eqns
+      -- A binding WITH a declared signature is visible via that signature, so
+      -- every reference to it -- recursive self-references and uses by group
+      -- mates alike -- instantiates the scheme polymorphically. Only UNSIGNED
+      -- bindings are referenced through their monomorphic placeholder. (Routing
+      -- a signed binding through the placeholder let its signature's
+      -- skolemised variable escape into a group-mate's use; see RigidEscape.)
+      extendSig e = foldr (\(n, s) e' -> extendVar n s e') e (Map.toList sigMap)
   -- Phase 1: inside level+1, allocate placeholders and unify all equation
   -- types. Returns (name, placeholderTVar, hasSig) after unification.
-  unified <- enterLevel $ do
+  unified <- withEnv extendSig $ enterLevel $ do
     placeholders <- mapM (allocatePlaceholderTVar sigMap) groups
-    let monoRec = foldr (\(n, tv, _) m -> Map.insert n tv m) mono placeholders
+    let monoRec = foldr (\(n, tv, _) m -> if Map.member n sigMap
+                                            then m
+                                            else Map.insert n tv m)
+                        mono placeholders
     mapM (unifyGroupWith monoRec sigMap) placeholders
   -- Phase 2: back at outer level, generalize or check sig.
-  results <- mapM (finalizeGroup sigMap) unified
+  results <- withEnv extendSig $ mapM (finalizeGroup sigMap) unified
   -- Bodyless sigs in this let block become visible bindings with the
   -- declared scheme verbatim (NO freezeSig). Warnings are NOT emitted
   -- here in v1 -- let-block bodyless diagnostics are deferred to a
@@ -1311,6 +1694,9 @@ buildSigMap :: [Abs.LocalDecl] -> TC s (Map.Map Text Scheme)
 buildSigMap [] = pure Map.empty
 buildSigMap (Abs.LDSig sn extras ty : rest) = do
   env <- currentEnv
+  -- Reject anonymous `..` tails in parameter positions (spec 145/142),
+  -- anchored at the signature name since `..` carries no position itself.
+  checkAnonTailPolarity (Just (sigNamePos sn)) ty
   s <- translateSig env ty
   let names = sigNameText sn : [ sigNameText x | Abs.SNCons x <- extras ]
   m <- buildSigMap rest
@@ -1445,35 +1831,117 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
   let pTys  = map fst patResults
       binds = concatMap snd patResults
       mono  = foldr (\(n, t) m -> Map.insert n t m) monoRec binds
-  -- Derive the expected body type from the sig by peeling off one arrow for
-  -- each pattern parameter. Also unify each argument's sig type with the
-  -- pattern TVar so that field access inside the body can see the record type.
-  mBodyHint <- case mSig of
-    Nothing -> pure Nothing
+  -- Instantiate the sig once (shared by the body hint and the effect-row seed).
+  -- Derive the expected body type by peeling off one arrow per pattern
+  -- parameter, unifying each argument's sig type with the pattern TVar so field
+  -- access inside the body sees the record type. Also capture the effect row on
+  -- the INNERMOST arrow -- the n-th, where n is the number of pattern parameters
+  -- -- which is where a fully-applied curried function performs its effects and
+  -- where the parser attaches a trailing `with E`. Used as the ambient seed.
+  (mBodyHint, mSigEffRow) <- case mSig of
+    Nothing -> pure (Nothing, Nothing)
     Just sig -> do
       sigT <- instantiate sig
+      effRow <- effRowAtDepth (length pTys) sigT
       mResult <- peelArrowsWithArgUnify sigT pTys
-      pure mResult
+      pure (mResult, effRow)
   let withWhere k = case mw of
         Abs.NoWhere -> k mono
         Abs.WithWh ds -> inferLetGroup mono ds k
-  bodyT <- withWhere (\m -> inferExprWChecked m mBodyHint body)
-  pure (foldr (\pT acc -> TArr pT RowEmpty acc) bodyT pTys)
+  -- Effect-row discipline depends on whether this equation has parameters:
+  --
+  --   * WITH parameters: it is a function. Its effects happen when it is
+  --     applied, so they ride its OUTERMOST arrow (`A -> B -> C with E` = the
+  --     whole chain performs E). Install a fresh ambient that the body extends,
+  --     then close it (open tail -> RowEmpty) so an inferred function commits
+  --     to exactly the effects it uses -- the (A) "closed by default" rule.
+  --
+  --   * WITHOUT parameters: it is a value that evaluates in place, so any
+  --     effects it performs belong to the ENCLOSING computation. Inherit the
+  --     enclosing ambient (if any) rather than installing/closing a new one;
+  --     this is what lets `both u = let a = useIO () in useLog ()` collect both
+  --     IO (from the let-bound value) and Logger.
+  case pTys of
+    [] -> do
+      menc <- currentEffRow
+      case menc of
+        Just _  -> do
+          bodyT <- withWhere (\m -> inferExprWChecked m mBodyHint body)
+          pure bodyT
+        Nothing -> do
+          -- Top-level zero-arg binding: no enclosing ambient. Use a local one
+          -- and close it; a top-level value performing effects has nowhere to
+          -- discharge them, so closing to its concrete effects is correct.
+          ambient0 <- freshRVar
+          effRef <- liftST (newSTRef ambient0)
+          bodyT <- withEffRow effRef (withWhere (\m -> inferExprWChecked m mBodyHint body))
+          ambient <- liftST (readSTRef effRef)
+          closeRow ambient
+          pure bodyT
+    _ -> do
+      -- Seed the ambient from the declared sig's effect row when there is one,
+      -- so the body is checked AGAINST the declared effects: a closed sig row
+      -- (e.g. `with IO`, or no `with` => empty) rejects any operation it does
+      -- not list, at the call site, as UndischargedEffect. With no sig, start
+      -- open and infer the effects.
+      --
+      -- `closeRow ambient` below runs unconditionally. When the sig row is open
+      -- (`+ eff e` / `..`) this closes only THIS instantiation's tail; the
+      -- binding's stored/printed scheme is the declared sig, whose open tail is
+      -- preserved, and the closed instance still validates as an instantiation
+      -- of it. So row polymorphism survives -- closing here only commits the
+      -- throwaway body-checking copy.
+      ambient0 <- case mSigEffRow of
+        Just r  -> pure r
+        Nothing -> freshRVar
+      effRef <- liftST (newSTRef ambient0)
+      bodyT <- withEffRow effRef (withWhere (\m -> inferExprWChecked m mBodyHint body))
+      ambient <- liftST (readSTRef effRef)
+      closeRow ambient
+      pure (arrowsWithEffect pTys bodyT ambient)
 typeEquationWith _ _ Abs.LDSig{} = error "typeEquationWith: signature in equation list"
 
--- | Peel @n@ arrow types off a Type, returning the result type.
--- Returns Nothing if the type has fewer than n arrows (or isn't an arrow).
--- Used to derive the expected body type from a sig with n parameters.
-peelArrows :: Type s -> Int -> TC s (Maybe (Type s))
-peelArrows ty 0 = pure (Just ty)
-peelArrows ty n = do
-  ty' <- force ty
-  case ty' of
-    TArr _ _ b -> peelArrows b (n - 1)
-    _          -> pure Nothing  -- sig arity doesn't match pattern count
+-- | The effect row on the @n@-th arrow (1-indexed) of an instantiated sig type.
+-- A curried equation @f x y = body@ performs its effects only when fully
+-- applied, so the effect row sits on the INNERMOST arrow -- the @n@-th, where
+-- @n@ is the number of pattern parameters -- which is also where the parser
+-- attaches a trailing @with E@. 'Nothing' when there are fewer than @n@ arrows
+-- (a zero-parameter value, or @n <= 0@).
+effRowAtDepth :: Int -> Type s -> TC s (Maybe (Row s))
+effRowAtDepth n ty
+  | n <= 0    = pure Nothing
+  | otherwise = do
+      ty' <- force ty
+      case ty' of
+        TArr _ row rest
+          | n == 1    -> pure (Just row)
+          | otherwise -> effRowAtDepth (n - 1) rest
+        _ -> pure Nothing
 
--- | Like 'peelArrows' but also unifies each peeled argument type with the
--- corresponding element of @pTys@. This ensures that pattern-bound variables
+-- | Close an effect row: force it and, if it ends in an open row variable,
+-- bind that tail to 'RowEmpty'. Concrete labels are preserved.
+closeRow :: Row s -> TC s ()
+closeRow row = do
+  row' <- forceRow row
+  case row' of
+    RowEmpty            -> pure ()
+    RowExtend _ _ rest  -> closeRow rest
+    RowVar ref          -> liftST $ writeSTRef ref (RLink RowEmpty)
+
+-- | Build the curried function type for an equation, placing the equation's
+-- ambient effect row on the INNERMOST arrow -- the one crossed when the
+-- function is fully applied, where a curried `f x y = body` performs its
+-- effects and where the parser attaches a trailing `with E`. Intermediate
+-- arrows carry an empty row. A zero-parameter binding has no arrow to carry a
+-- row; effects there flow through the body's own type instead.
+arrowsWithEffect :: [Type s] -> Type s -> Row s -> Type s
+arrowsWithEffect []         body _   = body
+arrowsWithEffect [p]        body row = TArr p row body
+arrowsWithEffect (p : rest) body row = TArr p RowEmpty (arrowsWithEffect rest body row)
+
+-- | Peel one arrow type per element of @pTys@ off a Type, returning the
+-- result type, and unify each peeled argument type with the corresponding
+-- element of @pTys@. This ensures that pattern-bound variables
 -- carry the concrete type from the signature before the body is checked,
 -- enabling field access (p.x) and other type-directed operations to see the
 -- record structure without waiting for the post-body unification pass.
@@ -1535,13 +2003,14 @@ inferProgramTC seedEnv origin decls = do
   -- Pass 1: register data declarations against the seed env (which is
   -- the irreducible pre-env overlaid with imports for the loader path,
   -- or just Builtins.initialEnv for the back-compat path).
-  env1 <- processDataDecls seedEnv decls
+  env1  <- processDataDecls seedEnv decls
+  env1e <- processEffectDecls env1 decls
   -- Convert top-level decls to LocalDecl form for reuse of inferLetGroup
   let localDecls = concatMap toLocalDecl decls
   -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup.
   -- Warnings (BodylessBinding, RowShadow, …) are emitted into the TC
   -- monad's warning channel via addWarning; they are collected by runTC.
-  withEnv (const env1) $ do
+  withEnv (const env1e) $ do
     schemes <- inferTopLetGroup origin localDecls
     env2 <- currentEnv
     let finalEnv = foldr (\(n, s) e -> extendVar n s e) env2 schemes
@@ -1572,17 +2041,23 @@ inferTopLetGroup origin localDecls = do
                             , Map.member n sigMap
                             , not (Set.member n coveredEqn) ]
       sigOnlyBindings = [ (n, sigMap Map.! n) | n <- sigOnlyNames ]
-  -- Top-level bodyless sigs are in scope when peer equations are typechecked
-  -- (mirrors the let-block path in inferLetGroup, which extends the env with
-  -- sigOnlyBindings via `extend2` before recursing). Without this, an equation
-  -- like `add x y = x + y` next to a bodyless `(+) : U64 -> U64 -> U64`
-  -- would fail UnknownVar at the `+` reference.
-  let extendSigOnly env = foldr (\(n, s) e -> extendVar n s e) env sigOnlyBindings
-  unified <- withEnv extendSigOnly $ enterLevel $ do
+  -- Every binding that has a declared signature -- bodyless OR with a body --
+  -- is in scope as its declared scheme while peer equations are typechecked, so
+  -- references instantiate it polymorphically. Two reasons: (1) a bodyless sig
+  -- like `(+) : U64 -> U64 -> U64` must be visible to `add x y = x + y`;
+  -- (2) routing a SIGNED-with-body binding through its monomorphic placeholder
+  -- instead let its signature's skolemised variable escape into a group-mate's
+  -- use (RigidEscape) -- so signed bindings are referenced via the scheme, and
+  -- only UNSIGNED bindings use the placeholder.
+  let extendSig env = foldr (\(n, s) e -> extendVar n s e) env (Map.toList sigMap)
+  unified <- withEnv extendSig $ enterLevel $ do
     placeholders <- mapM (allocatePlaceholderTVar sigMap) groups
-    let monoRec = foldr (\(n, tv, _) m -> Map.insert n tv m) Map.empty placeholders
+    let monoRec = foldr (\(n, tv, _) m -> if Map.member n sigMap
+                                            then m
+                                            else Map.insert n tv m)
+                        Map.empty placeholders
     mapM (unifyGroupWith monoRec sigMap) placeholders
-  results <- withEnv extendSigOnly $ mapM (finalizeGroup sigMap) unified
+  results <- withEnv extendSig $ mapM (finalizeGroup sigMap) unified
   -- Top level has no outer scope, so finalizeGroup should never report
   -- escape for a top-level binding. If it does, the inferrer's invariants
   -- are violated -- fail loudly rather than silently emitting a Scheme []
@@ -1673,10 +2148,10 @@ prettyCType (CTArr a CREmpty b) =
 prettyCType (CTArr a r b) =
   Tx.concat
     [ prettyCTypeArg a
-    , Tx.pack " -<"
-    , prettyCRow r
-    , Tx.pack ">- "
+    , Tx.pack " -> "
     , prettyCType b
+    , Tx.pack " with "
+    , prettyEffectRow r
     ]
 
 prettyCTypeArg :: CType -> Text
@@ -1693,3 +2168,17 @@ prettyCRow :: CRow -> Text
 prettyCRow CREmpty = Tx.empty
 prettyCRow (CRExtend l _ rest) = Tx.concat [l, Tx.pack ",", prettyCRow rest]
 prettyCRow (CRGen i) = Tx.concat [Tx.pack "r", Tx.pack (show i)]
+
+-- | Render an arrow's effect row in surface @with@ form: effect labels joined
+-- by @ + @, with an open tail printed as @eff <var>@. The arrow's row slot only
+-- ever carries effects (record rows are printed by 'prettyCRow' within
+-- 'CTRecord'); the row-variable name uses the same 'varName' scheme as the
+-- enclosing scheme's quantifiers so the two agree.
+prettyEffectRow :: CRow -> Text
+prettyEffectRow = go True
+  where
+    go _ CREmpty = Tx.empty
+    go first (CRExtend l _ rest) = Tx.concat [lead first, l, go False rest]
+    go first (CRGen i) = Tx.concat [lead first, Tx.pack "eff ", varName i]
+    lead first = if first then Tx.empty else Tx.pack " + "
+

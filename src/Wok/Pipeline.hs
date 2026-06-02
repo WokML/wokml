@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | The per-module typecheck fold shared by `app/Main.hs` and the test
 -- harness. Given a list of LoadedModules in topo order plus the entry
 -- module's name (from `Wok.Loader.loadProgram`), thread the per-module

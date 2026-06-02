@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+effect IO = { write : String -> () }
+
+-- Declared pure (no with-clause) but the body performs IO. Rejected: the body's
+-- effect row cannot be reconciled with the declared empty row.
+bad : String -> ()
+bad s = IO.write s

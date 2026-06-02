@@ -1,0 +1,71 @@
+module Main
+import Std.Base
+
+-- Block-form `data` decl: fields separated by newlines, no commas.
+data Shape
+  = Circle {
+      radius : U64
+    }
+  | Square {
+      side : U64
+    }
+  | Rect {
+      width : U64
+      height : U64
+    }
+
+-- Block-form construction: newline-separated fields, no commas.
+somePoint : Rect
+somePoint = Rect {
+  width = 4
+  height = 3
+}
+
+-- Block-form construction across other constructors.
+unitCircle : Circle
+unitCircle = Circle {
+  radius = 1
+}
+
+unitSquare : Square
+unitSquare = Square {
+  side = 1
+}
+
+-- Field access still works on block-built records.
+getWidth = somePoint.width
+getRadius = unitCircle.radius
+getSide = unitSquare.side
+
+-- Block form inside a function body.
+mkRect : U64 -> U64 -> Rect
+mkRect w h = Rect {
+  width = w
+  height = h
+}
+
+-- Mixed: some fields comma-separated mid-line, others newline-separated.
+mixed : Rect
+mixed = Rect {
+  width = 7, height = 8
+}
+
+-- Trailing literal commas on each field, then a newline. The pre-pass
+-- must NOT add a second comma here (regression test for the prev-token
+-- comma guard).
+trailingCommas : Rect
+trailingCommas = Rect {
+  width = 5,
+  height = 6,
+}
+
+-- Block-form record extension via `..` spread, with extra newline-separated
+-- fields.  The trigger here is the `{` after the ConId; the inner `..`
+-- and the explicit `,` after the spread are passed through, and the
+-- pre-pass inserts a virtual comma before `height` on the next line.
+flipWH : Rect -> Rect
+flipWH r = Rect {
+  ..r,
+  width = r.height
+  height = r.width
+}

@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+effect IO = { read : String -> String, write : String -> () }
+effect Logger = { log : String -> () }
+
+-- An operation call makes the effect appear in the caller's inferred row.
+-- The open `+ ..` tail keeps the row polymorphic, so callers may add effects.
+shout : String -> () with IO + ..
+shout s = IO.write s
+
+-- Inferred (no sig): the effect is discovered from the body.
+echo s = IO.write (IO.read s)
+
+-- Composition: calling two differently-effectful functions unions the effects.
+useLog : () -> () with Logger
+useLog u = Logger.log "hi"
+
+both u = let a = shout "x" in useLog ()

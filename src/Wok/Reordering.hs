@@ -217,6 +217,7 @@ reorderDecl :: FixityTable -> Decl -> Either [ReorderError] Decl
 reorderDecl t (DEqn lhs e mw) = DEqn lhs <$> reorderExp t e <*> reorderMW t mw
 reorderDecl _ d@(DSig{})      = Right d
 reorderDecl _ d@(DData{})     = Right d
+reorderDecl _ d@(DEffect{})   = Right d  -- operation types contain no exprs to reorder
 reorderDecl _ d@(DFixity{})   = Right d
 reorderDecl _ d@(DModule{})   = Right d
 reorderDecl _ d@(DImport{})   = Right d

@@ -62,9 +62,32 @@ data TypeError
   | AnonRecordNotInRowContrib SourceSpan
     -- ^ An anonymous record literal was used outside of a row contribution context.
     -- E.g. "anonymous record { ... } only allowed as the RHS of +".
+  | AnonRowTailInParam SourceSpan
+    -- ^ An anonymous @..@ row tail (effect or record) appears in a
+    -- contravariant (parameter) position, where it cannot thread and could
+    -- only drop effects/fields. Use a named tail (@eff e@ / @row r@) to carry
+    -- it through. E.g. @(a -> b with ..) -> ...@ is rejected; use @eff e@.
   | NotARecord SourceSpan CType
     -- ^ Field access was attempted on a value whose type is not a record.
+    -- Algebraic-effects (v1) errors.
+  | MissingEffectDecl SourceSpan Text
+    -- ^ @with FooBar@ where @FooBar@ is not a declared effect.
+  | UndischargedEffect SourceSpan Text
+    -- ^ An operation of effect @E@ is used but @E@ is absent from a closed
+    -- effect row (the enclosing function's @with@ clause lacks it).
+  | UnknownOperation SourceSpan Text Text
+    -- ^ @E.op@ where @op@ is not an operation of effect @E@ (effect, op).
+  | DuplicateOperation SourceSpan Text Text
+    -- ^ Two operations with the same name in one effect decl (effect, op).
+  | HandlerCoverage SourceSpan Text [Text]
+    -- ^ A handler omits operations of the handled effect (effect, missing ops).
+  | DuplicateReturnArm SourceSpan
+    -- ^ A handler has more than one @return@ arm; only one is allowed.
   deriving (Show)
+  -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
+  -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint
+  -- grammar productions (EffectRow vs RowContrib), so a domain mix is a parse
+  -- error.
 
 -- | Non-fatal diagnostics emitted by the typechecker.
 data Warning

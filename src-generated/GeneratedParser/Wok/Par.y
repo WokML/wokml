@@ -42,34 +42,42 @@ import qualified Data.Text
   'case'     { PT _ (TS _ 16)    }
   'class'    { PT _ (TS _ 17)    }
   'contract' { PT _ (TS _ 18)    }
-  'data'     { PT _ (TS _ 19)    }
-  'deriving' { PT _ (TS _ 20)    }
-  'do'       { PT _ (TS _ 21)    }
-  'else'     { PT _ (TS _ 22)    }
-  'fixity'   { PT _ (TS _ 23)    }
-  'forall'   { PT _ (TS _ 24)    }
-  'if'       { PT _ (TS _ 25)    }
-  'import'   { PT _ (TS _ 26)    }
-  'in'       { PT _ (TS _ 27)    }
-  'instance' { PT _ (TS _ 28)    }
-  'left'     { PT _ (TS _ 29)    }
-  'let'      { PT _ (TS _ 30)    }
-  'local'    { PT _ (TS _ 31)    }
-  'looser'   { PT _ (TS _ 32)    }
-  'module'   { PT _ (TS _ 33)    }
-  'of'       { PT _ (TS _ 34)    }
-  'record'   { PT _ (TS _ 35)    }
-  'right'    { PT _ (TS _ 36)    }
-  'row'      { PT _ (TS _ 37)    }
-  'than'     { PT _ (TS _ 38)    }
-  'then'     { PT _ (TS _ 39)    }
-  'tighter'  { PT _ (TS _ 40)    }
-  'type'     { PT _ (TS _ 41)    }
-  'use'      { PT _ (TS _ 42)    }
-  'where'    { PT _ (TS _ 43)    }
-  '{'        { PT _ (TS _ 44)    }
-  '|'        { PT _ (TS _ 45)    }
-  '}'        { PT _ (TS _ 46)    }
+  'ctl'      { PT _ (TS _ 19)    }
+  'data'     { PT _ (TS _ 20)    }
+  'deriving' { PT _ (TS _ 21)    }
+  'do'       { PT _ (TS _ 22)    }
+  'eff'      { PT _ (TS _ 23)    }
+  'effect'   { PT _ (TS _ 24)    }
+  'else'     { PT _ (TS _ 25)    }
+  'fixity'   { PT _ (TS _ 26)    }
+  'forall'   { PT _ (TS _ 27)    }
+  'fun'      { PT _ (TS _ 28)    }
+  'handle'   { PT _ (TS _ 29)    }
+  'if'       { PT _ (TS _ 30)    }
+  'import'   { PT _ (TS _ 31)    }
+  'in'       { PT _ (TS _ 32)    }
+  'instance' { PT _ (TS _ 33)    }
+  'left'     { PT _ (TS _ 34)    }
+  'let'      { PT _ (TS _ 35)    }
+  'local'    { PT _ (TS _ 36)    }
+  'looser'   { PT _ (TS _ 37)    }
+  'module'   { PT _ (TS _ 38)    }
+  'of'       { PT _ (TS _ 39)    }
+  'record'   { PT _ (TS _ 40)    }
+  'resume'   { PT _ (TS _ 41)    }
+  'return'   { PT _ (TS _ 42)    }
+  'right'    { PT _ (TS _ 43)    }
+  'row'      { PT _ (TS _ 44)    }
+  'than'     { PT _ (TS _ 45)    }
+  'then'     { PT _ (TS _ 46)    }
+  'tighter'  { PT _ (TS _ 47)    }
+  'type'     { PT _ (TS _ 48)    }
+  'use'      { PT _ (TS _ 49)    }
+  'where'    { PT _ (TS _ 50)    }
+  'with'     { PT _ (TS _ 51)    }
+  '{'        { PT _ (TS _ 52)    }
+  '|'        { PT _ (TS _ 53)    }
+  '}'        { PT _ (TS _ 54)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -105,6 +113,7 @@ Decl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.DEqn $1 $3 $4 }
   | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
   | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
+  | 'effect' ConId ListVarId '=' '{' ListRecordFieldType '}' { GeneratedParser.Wok.Abs.DEffect $2 $3 $6 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
   | 'module' ModPath { GeneratedParser.Wok.Abs.DModule $2 }
   | 'import' ModPath { GeneratedParser.Wok.Abs.DImport $2 }
@@ -134,6 +143,9 @@ ReservedKw
   | 'do' { GeneratedParser.Wok.Abs.ReservedKw_do }
   | 'record' { GeneratedParser.Wok.Abs.ReservedKw_record }
   | 'row' { GeneratedParser.Wok.Abs.ReservedKw_row }
+  | 'fun' { GeneratedParser.Wok.Abs.ReservedKw_fun }
+  | 'ctl' { GeneratedParser.Wok.Abs.ReservedKw_ctl }
+  | 'resume' { GeneratedParser.Wok.Abs.ReservedKw_resume }
 
 SigName :: { GeneratedParser.Wok.Abs.SigName }
 SigName
@@ -182,19 +194,27 @@ AtomPat
   | '(' ')' { GeneratedParser.Wok.Abs.PUnit }
   | ConId '{' '}' { GeneratedParser.Wok.Abs.PRecord $1 [] }
   | ConId '{' NEListRecordFieldPat '}' { GeneratedParser.Wok.Abs.PRecord $1 (reverse $3) }
-  | ConId '{' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordWild $1 $3 }
   | ConId '{' NEListRecordFieldPat ',' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordOpen $1 (reverse $3) $5 }
+  | ConId '{' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordWild $1 $3 }
 
 RecordFieldPat :: { GeneratedParser.Wok.Abs.RecordFieldPat }
 RecordFieldPat
   : VarId '=' Pat { GeneratedParser.Wok.Abs.RFPat $1 $3 }
 
--- Left-recursive list to avoid shift/reduce conflict with the trailing ',' PatRowTail
--- in PRecordOpen. The list is built in reverse order and reversed in the action.
+ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
+ListRecordFieldPat
+  : {- empty -} { [] }
+  | RecordFieldPat { (:[]) $1 }
+  | RecordFieldPat ',' ListRecordFieldPat { (:) $1 $3 }
+
+-- PATCH: left-recursive NEListRecordFieldPat to avoid the shift/reduce conflict
+--        with the trailing comma before `..` in PRecordOpen. The list is built
+--        in reversed order and reversed in the PRecordOpen action.
+--        See grammar/Wok.cf POST-REGEN NOTE.
 NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
 NEListRecordFieldPat
-  : RecordFieldPat { (:[]) $1 }
-  | NEListRecordFieldPat ',' RecordFieldPat { (:) $3 $1 }
+  : RecordFieldPat { [$1] }
+  | NEListRecordFieldPat ',' RecordFieldPat { $3 : $1 }
 
 PatRowTail :: { GeneratedParser.Wok.Abs.PatRowTail }
 PatRowTail
@@ -213,8 +233,20 @@ ListPat
 
 Type :: { GeneratedParser.Wok.Abs.Type }
 Type
-  : Type1 '->' Type { GeneratedParser.Wok.Abs.TFun $1 $3 }
+  : Type1 '->' Type 'with' EffectRow { GeneratedParser.Wok.Abs.TWith $1 $3 $5 }
+  | Type1 '->' Type { GeneratedParser.Wok.Abs.TFun $1 $3 }
   | Type1 { $1 }
+
+EffectAtom :: { GeneratedParser.Wok.Abs.EffectAtom }
+EffectAtom
+  : ConId ListType2 { GeneratedParser.Wok.Abs.ERAtom $1 $2 }
+
+EffectRow :: { GeneratedParser.Wok.Abs.EffectRow }
+EffectRow
+  : EffectAtom { GeneratedParser.Wok.Abs.EROne $1 }
+  | EffectAtom VarSym EffectRow { GeneratedParser.Wok.Abs.ERPlus $1 $2 $3 }
+  | 'eff' VarId { GeneratedParser.Wok.Abs.ERVarOnly $2 }
+  | '..' { GeneratedParser.Wok.Abs.ERWildOnly }
 
 Type1 :: { GeneratedParser.Wok.Abs.Type }
 Type1
@@ -235,6 +267,7 @@ RowContrib :: { GeneratedParser.Wok.Abs.RowContrib }
 RowContrib
   : '{' ListRecordFieldType '}' { GeneratedParser.Wok.Abs.RCAnon $2 }
   | 'row' VarId { GeneratedParser.Wok.Abs.RCVar $2 }
+  | '..' { GeneratedParser.Wok.Abs.RCWild }
 
 ListType :: { [GeneratedParser.Wok.Abs.Type] }
 ListType
@@ -324,6 +357,7 @@ Exp2
   | 'let' '{' ListLocalDecl '}' 'in' Exp { GeneratedParser.Wok.Abs.ELet $3 $6 }
   | 'case' Exp 'of' '{' ListAlt '}' { GeneratedParser.Wok.Abs.ECase $2 $5 }
   | 'if' Exp 'then' Exp 'else' Exp { GeneratedParser.Wok.Abs.EIf $2 $4 $6 }
+  | 'handle' Exp 'of' '{' ListHandlerArm '}' { GeneratedParser.Wok.Abs.EHandle $2 $5 }
 
 MaybeTrailing :: { GeneratedParser.Wok.Abs.MaybeTrailing }
 MaybeTrailing
@@ -339,6 +373,17 @@ ListRecordFieldExpr
   : {- empty -} { [] }
   | RecordFieldExpr { (:[]) $1 }
   | RecordFieldExpr ',' ListRecordFieldExpr { (:) $1 $3 }
+
+HandlerArm :: { GeneratedParser.Wok.Abs.HandlerArm }
+HandlerArm
+  : ConId '.' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HArm $1 $3 $4 $6 }
+  | 'return' VarId '->' Exp { GeneratedParser.Wok.Abs.HReturn $2 $4 }
+
+ListHandlerArm :: { [GeneratedParser.Wok.Abs.HandlerArm] }
+ListHandlerArm
+  : {- empty -} { [] }
+  | HandlerArm { (:[]) $1 }
+  | HandlerArm ';' ListHandlerArm { (:) $1 $3 }
 
 ListExp :: { [GeneratedParser.Wok.Abs.Exp] }
 ListExp

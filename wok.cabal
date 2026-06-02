@@ -10,8 +10,31 @@ build-type:         Simple
 extra-doc-files:    CHANGELOG.md
 data-files:         prelude/Std/Base.wok
 
+-- Plain -Wall, used by the generated parser sublibrary (BNFC/alex/happy
+-- output carries unavoidable warnings, so it must NOT be -Werror).
 common warnings
     ghc-options: -Wall
+
+-- Strict warnings for hand-written code: -Wall plus exhaustiveness checks,
+-- all promoted to errors. -Wincomplete-patterns is deliberately added because
+-- it is NOT part of -Wall; its absence let a non-exhaustive `reorderDecl`
+-- (missing the DEffect case) compile cleanly and crash at runtime.
+common strict
+    default-language: GHC2024
+    default-extensions:
+        Strict
+        StrictData
+        LambdaCase
+        OverloadedStrings
+    ghc-options:
+        -Wall
+        -Werror
+        -Wincomplete-patterns
+        -Wincomplete-uni-patterns
+        -funbox-strict-fields
+
+common executable-flags
+  ghc-options:         -threaded -rtsopts "-with-rtsopts=-N -A4m -n2m"
 
 -- Generated BNFC + alex + happy parser modules. Kept in a separate
 -- internal sublibrary because alex's lexer relies on laziness in its
@@ -46,7 +69,7 @@ library wok-generated
 -- monotonic counters, complete tree walks), so Strict/StrictData
 -- is a uniform improvement.
 library
-    import:           warnings
+    import:           strict
     exposed-modules:
         Wok.Loader
         Wok.Parsing
@@ -76,16 +99,9 @@ library
         transformers,
         wok:wok-generated
     hs-source-dirs:   src
-    default-language: GHC2024
-    default-extensions:
-        Strict
-        StrictData
-        LambdaCase
-    ghc-options:
-        -funbox-strict-fields
 
 executable wok
-    import:           warnings
+    import:           strict, executable-flags
     main-is:          Main.hs
     build-depends:
         base ^>=4.20,
@@ -93,10 +109,9 @@ executable wok
         containers,
         text
     hs-source-dirs:   app
-    default-language: GHC2024
 
 test-suite wok-tests
-    import:           warnings
+    import:           strict
     type:             exitcode-stdio-1.0
     main-is:          Spec.hs
     build-depends:
@@ -113,4 +128,3 @@ test-suite wok-tests
         mtl,
         text
     hs-source-dirs:   test
-    default-language: GHC2024

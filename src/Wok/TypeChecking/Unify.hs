@@ -257,8 +257,8 @@ unify sp a b = do
   b' <- force b
   case (a', b') of
     (TVar r1, TVar r2) | r1 == r2 -> pure ()
-    (TVar r, t) -> unifyVar sp r t
-    (t, TVar r) -> unifyVar sp r t
+    (TVar r, t) -> unifyVar sp r t >> warnIfRecordShadow sp t
+    (t, TVar r) -> unifyVar sp r t >> warnIfRecordShadow sp t
     (TCon c1 ts1, TCon c2 ts2)
       | c1 == c2, length ts1 == length ts2 -> zipWithM_ (unify sp) ts1 ts2
     (TArr a1 e1 b1, TArr a2 e2 b2) -> do
@@ -342,6 +342,19 @@ unifyRow sp r1 r2 = do
       cr1 <- freezeRow r1'
       cr2 <- freezeRow r2'
       throwError (RowMismatch sp cr1 cr2)
+
+-- | When a type variable is bound to a record type, scan that record's row for
+-- shadowed labels. This catches collisions introduced indirectly -- e.g. a
+-- row-polymorphic function applied to an argument that already carries a label
+-- the function adds, where the duplicate ends up in a result record that is
+-- never itself unified against another 'TRecord' (so the 'unify' TRecord~TRecord
+-- path would miss it). No-op for non-records and for records without duplicates.
+warnIfRecordShadow :: SourceSpan -> Type s -> TC s ()
+warnIfRecordShadow sp t = do
+  t' <- force t
+  case t' of
+    TRecord _ row -> warnOnShadow sp row
+    _             -> pure ()
 
 -- | After row unification, walk the (now-resolved) row and emit a
 -- 'RowShadow' warning for each label that appears more than once.

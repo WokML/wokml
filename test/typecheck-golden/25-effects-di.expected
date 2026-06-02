@@ -1,0 +1,3 @@
+greet : () -> () with Logger
+logToIO : forall b a. (() -> b with Logger + eff a) -> b with IO + eff a
+runIO : forall b a. (() -> b with IO + eff a) -> b with eff a

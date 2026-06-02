@@ -1,0 +1,1 @@
+typecheck: typecheck in Main: MissingEffectDecl (Just (5,21)) "FooBar"

@@ -1,0 +1,20 @@
+module Main;
+effect IO =
+{
+  read : String -> String, write : String -> ()
+};
+effect State a =
+{
+  get : () -> a, set : a -> ()
+};
+greet : String -> () with IO;
+runIO : (() -> a with IO + eff e) -> a with eff e;
+logIt : () -> () with IO + ..;
+both : () -> () with IO + State U64;
+handleDemo comp = handle (comp ()) of
+{
+  IO . read p -> readDisk p;
+  IO . write m -> printStdout m;
+  return v -> v
+}
+

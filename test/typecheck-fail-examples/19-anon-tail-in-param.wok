@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+effect IO = { read : String -> String, write : String -> () }
+
+-- An anonymous `..` tail cannot thread (each `..` is a fresh, single-use row
+-- variable), so it is rejected in a parameter (contravariant) position, where a
+-- consumed callback's effects could only be dropped. The fix is to name the
+-- tail with `eff e` so it threads input to output.
+relay : (() -> a with IO + ..) -> a with IO + ..
+relay f = f ()

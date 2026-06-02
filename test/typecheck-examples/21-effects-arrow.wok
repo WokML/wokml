@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+effect IO = { read : String -> String, write : String -> () }
+effect Logger = { log : String -> () }
+
+-- Effect-annotated arrows, all four forms.
+greet : String -> () with IO                          -- closed, single effect
+multi : () -> () with IO + Logger                      -- closed, multiple effects
+runIO : (() -> a with IO + eff e) -> a with eff e       -- named open tail (threads)
+logIt : () -> () with IO + ..                           -- anonymous open tail
+
+-- Bodyless: these are sig-only declarations (warnings are silent for the
+-- Embedded test origin), so the golden captures their declared types verbatim.

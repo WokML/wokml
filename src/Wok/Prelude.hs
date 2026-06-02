@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | The Std.Base Prelude source, loaded at runtime.
 --
 -- The text of prelude/Std/Base.wok is shipped as a cabal data-file and

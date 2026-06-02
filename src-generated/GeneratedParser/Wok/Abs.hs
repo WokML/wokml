@@ -21,6 +21,7 @@ data Decl
     = DEqn FunLHS Exp MaybeWhere
     | DSig SigName [SigNameComma] Type
     | DData ConId [VarId] [ConDef]
+    | DEffect ConId [VarId] [RecordFieldType]
     | DFixity FixName FixAssoc [FixRel]
     | DModule ModPath
     | DImport ModPath
@@ -42,6 +43,9 @@ data ReservedKw
     | ReservedKw_do
     | ReservedKw_record
     | ReservedKw_row
+    | ReservedKw_fun
+    | ReservedKw_ctl
+    | ReservedKw_resume
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data SigName = SNBare VarId | SNParen VarSym
@@ -88,7 +92,8 @@ data PatRowTail = PRTNamed VarId | PRTAnon
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data Type
-    = TFun Type Type
+    = TWith Type Type EffectRow
+    | TFun Type Type
     | TApp Type Type
     | TVar VarId
     | TCon ModPath
@@ -99,7 +104,17 @@ data Type
     | TExtend Type VarSym RowContrib
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
-data RowContrib = RCAnon [RecordFieldType] | RCVar VarId
+data EffectAtom = ERAtom ConId [Type]
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data EffectRow
+    = EROne EffectAtom
+    | ERPlus EffectAtom VarSym EffectRow
+    | ERVarOnly VarId
+    | ERWildOnly
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data RowContrib = RCAnon [RecordFieldType] | RCVar VarId | RCWild
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data ConDef
@@ -141,6 +156,7 @@ data Exp
     | ELet [LocalDecl] Exp
     | ECase Exp [Alt]
     | EIf Exp Exp Exp
+    | EHandle Exp [HandlerArm]
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixTail = ITail InfixOp Exp
@@ -153,6 +169,10 @@ data MaybeTrailing = TFNone | TFSome [RecordFieldExpr]
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data RecordFieldExpr = RFExpr VarId Exp
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data HandlerArm
+    = HArm ConId VarId [AtomPat] Exp | HReturn VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl

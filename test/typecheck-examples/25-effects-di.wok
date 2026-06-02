@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+
+-- Dependency injection via handlers. `greet` depends on the Logger capability,
+-- not on any concrete backend. A handler translates Logger into IO; an outer
+-- handler discharges IO. Each handler discharges one effect and may introduce
+-- others, exactly as the inferred rows show. The `eff e` tail rides through
+-- every handler so callers that perform further effects are not shut out.
+effect Logger = { log : String -> () }
+effect IO = { write : String -> () }
+
+greet : () -> () with Logger
+greet u = Logger.log "hello"
+
+-- Translate Logger -> IO: discharges Logger, the arm introduces IO, and the
+-- `eff e` tail is preserved.
+logToIO : (() -> a with Logger + eff e) -> a with IO + eff e
+logToIO c = handle (c ()) of
+  Logger.log m -> IO.write m
+  return v -> v
+
+-- Discharge IO entirely: only the `eff e` tail remains in the result row.
+runIO : (() -> a with IO + eff e) -> a with eff e
+runIO c = handle (c ()) of
+  IO.write m -> ()
+  return v -> v

@@ -1,0 +1,2 @@
+runIO : forall b a. (() -> b with IO + eff a) -> b with eff a
+runIO2 : forall b a. (() -> b with IO + eff a) -> b with eff a

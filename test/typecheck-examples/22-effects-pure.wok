@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+-- A function with no `with` clause and no operation calls is pure: its inferred
+-- type is a plain arrow with no effect row, even when effects are declared in
+-- the same module.
+effect IO = { write : String -> () }
+
+add : U64 -> U64 -> U64
+add x y = x + y
+
+compose2 = \f g x -> f (g x)

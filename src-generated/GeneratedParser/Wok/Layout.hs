@@ -28,19 +28,19 @@ data LayoutDelimiters
 
 layoutWords :: [(TokSymbol, LayoutDelimiters)]
 layoutWords =
-  [ ( TokSymbol "let" 30
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 44)) (Just (TokSymbol "}" 46))
+  [ ( TokSymbol "let" 35
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
     )
-  , ( TokSymbol "where" 43
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 44)) (Just (TokSymbol "}" 46))
+  , ( TokSymbol "where" 50
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
     )
-  , ( TokSymbol "of" 34
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 44)) (Just (TokSymbol "}" 46))
+  , ( TokSymbol "of" 39
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
     )
   ]
 
 layoutStopWords :: [TokSymbol]
-layoutStopWords = [TokSymbol "in" 27]
+layoutStopWords = [TokSymbol "in" 32]
 
 -- layout separators
 
@@ -95,17 +95,14 @@ resolveLayout topLayout =
 
   -- Handling explicit blocks:
   res pt st (t0 : ts)
-    -- Layout open brace: belongs to the just-seen layout word (`let {`,
-    -- `where {`, `of {`). Do NOT insert a separator -- the open brace
-    -- is the body of the preceding layout-word's block, not a new decl.
+    -- PATCH (see grammar/Wok.cf POST-REGEN NOTE): split the combined
+    -- isLayoutOpen || isParenOpen branch. Layout-open braces are the body of the
+    -- preceding layout word (`let {`, `where {`, `of {`) and must NOT get a
+    -- separator. Paren-open can start a top-level decl (e.g. a bodyless operator
+    -- sig `(+) : ...`), so it needs maybeInsertSeparator like a plain id. The
+    -- binder must be `pt`, not `_`.
     | isLayoutOpen t0
       = t0 : res (Just t0) (Explicit : st) ts
-    -- Paren open: in surface Wok this can start a top-level decl (e.g.
-    -- a bodyless operator sig like `(+) : U64 -> U64 -> U64`). Insert
-    -- a separator if the previous token sits on a different layout-
-    -- column line, mirroring how plain identifiers get separated. The
-    -- auto-generated BNFC filter omitted this call, so paren-leading
-    -- decls following any other decl failed to parse.
     | isParenOpen t0
       = maybeInsertSeparator pt t0 st $
         t0 : res (Just t0) (Explicit : st) ts

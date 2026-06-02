@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: OccursCheck Nothing 1 (CTGen 1)
+typecheck: typecheck in Main: OccursCheck Nothing 2 (CTGen 2)

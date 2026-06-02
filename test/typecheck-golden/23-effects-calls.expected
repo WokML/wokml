@@ -1,0 +1,4 @@
+both : forall a. a -> () with IO + Logger
+echo : String -> () with IO
+shout : forall a. String -> () with IO + eff a
+useLog : () -> () with Logger

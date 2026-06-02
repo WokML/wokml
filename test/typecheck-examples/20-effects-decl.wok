@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+-- Effect declarations: inline, block-form, and parameterized. No values use
+-- them yet; this fixture pins that declarations alone typecheck and that an
+-- effect-free function in the same module is unaffected.
+effect IO =
+  { read  : String -> String
+  , write : String -> ()
+  }
+
+effect Logger = {
+  log : String -> ()
+}
+
+effect State a = {
+  get : () -> a
+  set : a -> ()
+}
+
+double : U64 -> U64
+double n = n + n

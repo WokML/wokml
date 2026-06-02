@@ -1,0 +1,5 @@
+module Main
+import Std.Base
+
+-- `FooBar` is not a declared effect, so the with-clause is rejected.
+bad : () -> () with FooBar

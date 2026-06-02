@@ -1,0 +1,4 @@
+greet : String -> () with IO
+logIt : forall a. () -> () with IO + eff a
+multi : () -> () with IO + Logger
+runIO : forall b a. (() -> b with IO + eff a) -> b with eff a

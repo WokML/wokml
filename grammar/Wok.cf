@@ -63,6 +63,7 @@ Module.   Module ::= [Decl] ;
 DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
 DSig.     Decl ::= SigName [SigNameComma] ":" Type ;   -- multi-name sig; name may be VarId or (VarSym)
 DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
+DEffect.  Decl ::= "effect" ConId [VarId] "=" "{" [RecordFieldType] "}" ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 
 separator Decl ";" ;
@@ -84,7 +85,8 @@ DLocal.   Decl ::= "local" Decl ;
 -- these words to the lexer's reserved set, keeping them out of VarId. When a
 -- feature ships, move its word out of here into that feature's real production.
 rules     ReservedKw ::= "contract" | "type" | "class" | "instance"
-                       | "deriving" | "forall" | "do" | "record" | "row" ;
+                       | "deriving" | "forall" | "do" | "record" | "row"
+                       | "fun" | "ctl" | "resume" ;
 DReserved. Decl ::= ReservedKw ;
 
 -- Helper: comma-separated additional names for multi-name sigs (`f, (+), h : T`).
@@ -180,8 +182,32 @@ separator Pat "," ;
 --   spec's `AppType` = our `Type1`
 --   spec's `AtomType`= our `Type2`
 
-TFun.     Type  ::= Type1 "->" Type ;      -- right-assoc function arrow
+-- `with` binds looser than `->`. The arrow keeps its ORIGINAL precedence shape
+-- (`TFun. Type ::= Type1 "->" Type`, right-associative, recursing on `Type`) so
+-- BNFC's pretty-printer parenthesizes arrow result types exactly as before --
+-- renumbering the arrow makes the printer wrap results in spurious parens
+-- (`Int -> (Int)`), breaking round-trips.
+--
+-- `with` attaches at the same `Type` level: TWith puts a trailing `with E` after
+-- a `Type1 "->" Type` arrow. Because both TWith and TFun start with the same
+-- `Type1 "->" Type` prefix, the parser defers the `with`-vs-end decision until
+-- after the arrow body, so a trailing `with E` binds to the whole arrow chain.
+TWith.    Type  ::= Type1 "->" Type "with" EffectRow ;
+TFun.     Type  ::= Type1 "->" Type ;       -- right-assoc function arrow
 _.        Type  ::= Type1 ;
+
+-- Effect rows (right operand of `with`).
+--
+-- The `+` separator is captured via `VarSym`, NOT a literal "+", for the same
+-- reason TExtend does it: a literal "+" would promote `+` into a reserved
+-- symbol and pull it out of VarSym, breaking `fixity + left`, the type-level
+-- `a + b` extension, and every `+` operator in source. The elaborator restricts
+-- this VarSym to the literal "+".
+ERAtom.     EffectAtom ::= ConId [Type2] ;
+EROne.      EffectRow ::= EffectAtom ;
+ERPlus.     EffectRow ::= EffectAtom VarSym EffectRow ;
+ERVarOnly.  EffectRow ::= "eff" VarId ;
+ERWildOnly. EffectRow ::= ".." ;
 
 TApp.     Type1 ::= Type1 Type2 ;          -- left-assoc type application
 _.        Type1 ::= Type2 ;
@@ -207,6 +233,7 @@ TExtend.       Type1 ::= Type1 VarSym RowContrib ;
 -- live only here.
 RCAnon.        RowContrib ::= "{" [RecordFieldType] "}" ;
 RCVar.         RowContrib ::= "row" VarId ;
+RCWild.        RowContrib ::= ".." ;
 
 separator Type "," ;
 
@@ -292,6 +319,12 @@ ELet.     Exp2 ::= "let" "{" [LocalDecl] "}" "in" Exp ;
 -- semantic pass should reject non-exhaustive empty alternatives.
 ECase.    Exp2 ::= "case" Exp "of" "{" [Alt] "}" ;
 EIf.      Exp2 ::= "if" Exp "then" Exp "else" Exp ;
+-- Effect handlers. `of` is already a layout keyword, so the `{ ... }` block
+-- is indentation-driven like `case ... of`.
+EHandle.  Exp2 ::= "handle" Exp "of" "{" [HandlerArm] "}" ;
+HArm.     HandlerArm ::= ConId "." VarId [AtomPat] "->" Exp ;
+HReturn.  HandlerArm ::= "return" VarId "->" Exp ;
+separator HandlerArm ";" ;
 
 separator Exp "," ;   -- shared by EList and ETuple bodies
 

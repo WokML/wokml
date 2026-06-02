@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+effect IO = { read : String -> String, write : String -> () }
+
+-- The handler omits an arm for IO.write, so it does not cover the IO effect.
+-- Rejected with HandlerCoverage.
+runIO comp = handle (comp ()) of
+  IO.read p -> p

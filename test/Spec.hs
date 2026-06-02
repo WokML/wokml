@@ -17,7 +17,6 @@ import Wok.Parsing (parse)
 import Wok.Reordering
 import qualified Wok.TypeChecking.Types as Ty
 import qualified Wok.TypeChecking.Env as TE
-import Wok.TypeChecking.Env (emptyEnv, overlayEnvs)
 import qualified Wok.TypeChecking.Error as TErr
 import qualified Wok.TypeChecking.Monad as TM
 import qualified Wok.TypeChecking.Unify as U
@@ -62,6 +61,14 @@ main = do
     , builtinsTests
     , translateTests
     , dataTests
+    , effectDeclTests
+    , effectSigTests
+    , effectGrammarTests
+    , effectOpTests
+    , effectHandlerTests
+    , effectPressureTests
+    , closedByDefaultTests
+    , lambdaEffectScopingTests
     , patternTests
     , exprBasicTests
     , exprLetTests
@@ -541,6 +548,20 @@ envOverlayTests = testGroup "envOverlay"
            Left collisions -> collisions @?= [(TE.NsCon, T.pack "True")]
            Right _ -> assertFailure "expected Left"
 
+  , testCase "extendEffect then lookupEffect round-trips" $
+      let ei  = TE.EffectInfo []
+                  (Map.fromList [(T.pack "read", Ty.Scheme [] (Ty.CTCon Ty.TcString []))])
+          env = TE.extendEffect (T.pack "IO") ei TE.emptyEnv
+      in TE.lookupEffect (T.pack "IO") env @?= Just ei
+
+  , testCase "effect collision returns Left with NsEffect" $
+      let ei = TE.EffectInfo [] Map.empty
+          a  = TE.extendEffect (T.pack "IO") ei TE.emptyEnv
+          b  = TE.extendEffect (T.pack "IO") ei TE.emptyEnv
+      in case TE.overlayEnvs a b of
+           Left collisions -> collisions @?= [(TE.NsEffect, T.pack "IO")]
+           Right _ -> assertFailure "expected Left"
+
   , testCase "collisions across multiple namespaces are all reported" $
       let s = Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])
           tci = TE.TyConInfo Ty.KStar 0 []
@@ -835,6 +856,643 @@ generalizeTests = testGroup "Wok.TypeChecking.Infer (generalize/instantiate)"
            Right True -> pure ()
            Right False -> assertFailure "expected shared TVar refs but they differed"
            Left e -> assertFailure (show e)
+  ]
+
+-- | Parse, reorder, and typecheck a whole module; assert it succeeds.
+assertModuleTypechecks :: Text -> Assertion
+assertModuleTypechecks src =
+  case parse src of
+    Left err -> assertFailure ("parse: " ++ err)
+    Right ast -> case reorderModule ast of
+      Left es -> assertFailure ("reorder: " ++ show es)
+      Right rm -> case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+        Left e        -> assertFailure ("typecheck: " ++ show e)
+        Right _       -> pure ()
+
+-- | Parse, reorder, and typecheck a module; assert it fails with an error
+-- matching the predicate.
+assertModuleFailsWith :: (TErr.TypeError -> Bool) -> Text -> Assertion
+assertModuleFailsWith p src =
+  case parse src of
+    Left err -> assertFailure ("parse: " ++ err)
+    Right ast -> case reorderModule ast of
+      Left es -> assertFailure ("reorder: " ++ show es)
+      Right rm -> case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+        Left e | p e       -> pure ()
+               | otherwise -> assertFailure ("wrong error: " ++ show e)
+        Right _            -> assertFailure "expected a type error, got success"
+
+effectDeclTests :: TestTree
+effectDeclTests = testGroup "Wok.TypeChecking.EffectDecl"
+  [ testCase "inline effect decl typechecks" $
+      assertModuleTypechecks $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect IO = { read : String -> String, write : String -> () }"
+        ]
+
+  , testCase "block-form effect decl typechecks" $
+      assertModuleTypechecks $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect IO = {"
+        , T.pack "  read : String -> String"
+        , T.pack "  write : String -> ()"
+        , T.pack "}"
+        ]
+
+  , testCase "parameterized effect decl (State a) typechecks" $
+      assertModuleTypechecks $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect State a = {"
+        , T.pack "  get : () -> a"
+        , T.pack "  set : a -> ()"
+        , T.pack "}"
+        ]
+
+  , testCase "duplicate operation name is rejected" $
+      assertModuleFailsWith isDuplicateOperation $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect IO = { read : String -> String, read : String -> () }"
+        ]
+
+  , -- #7: the `..`-polarity rule applies to OPERATION types too, not just
+    -- top-level signatures -- an anonymous tail in a parameter position is
+    -- rejected here as well, so `..` cannot escape the check via an op type.
+    testCase "anonymous .. in an operation parameter is rejected" $
+      assertModuleFailsWith isAnonRowTailInParam $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect IO = { write : String -> () }"
+        , T.pack "effect Weird = { run : (() -> () with IO + ..) -> () }"
+        ]
+
+  , -- #7 (data-field path): the same chokepoint (translateConArg) also covers
+    -- record-field types, so an anonymous `..` in a field's function-parameter
+    -- position is rejected too -- `..` cannot escape via a data declaration.
+    testCase "anonymous .. in a data-field parameter is rejected" $
+      assertModuleFailsWith isAnonRowTailInParam $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect IO = { write : String -> () }"
+        , T.pack "data Box = Box { f : (() -> () with IO + ..) -> () }"
+        ]
+  ]
+  where
+    isDuplicateOperation TErr.DuplicateOperation{} = True
+    isDuplicateOperation _                         = False
+    isAnonRowTailInParam TErr.AnonRowTailInParam{} = True
+    isAnonRowTailInParam _                         = False
+
+-- | Typecheck a module and return the inferred scheme of a top-level name,
+-- rendered via prettyScheme. Exercises with-clause translation + printing.
+schemeOf :: [Text] -> Text -> Either String Text
+schemeOf declLines name =
+  let src = T.unlines (T.pack "module Main" : declLines)
+  in case parse src of
+       Left err -> Left ("parse: " ++ err)
+       Right ast -> case reorderModule ast of
+         Left es -> Left ("reorder: " ++ show es)
+         Right rm -> case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+           Left e -> Left ("typecheck: " ++ show e)
+           Right (env, _, _) -> case TE.lookupVar name env of
+             Just sch -> Right (TC.prettyScheme sch)
+             Nothing  -> Left ("not registered: " ++ T.unpack name)
+
+effectSigTests :: TestTree
+effectSigTests = testGroup "Wok.TypeChecking.EffectSig"
+  [ testCase "closed single effect: with IO" $
+      schemeOf
+        [ T.pack "effect IO = { read : String -> String, write : String -> () }"
+        , T.pack "greet : String -> () with IO"
+        ]
+        (T.pack "greet")
+        @?= Right (T.pack "String -> () with IO")
+
+  , testCase "multiple effects: with IO + Logger" $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "effect Logger = { log : String -> () }"
+        , T.pack "multi : () -> () with IO + Logger"
+        ]
+        (T.pack "multi")
+        @?= Right (T.pack "() -> () with IO + Logger")
+
+  , testCase "named tail shared across positions: with IO + eff e" $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "runIO : (() -> a with IO + eff e) -> a with eff e"
+        ]
+        (T.pack "runIO")
+        @?= Right (T.pack "forall b a. (() -> b with IO + eff a) -> b with eff a")
+
+  , testCase "anonymous tail: with IO + .." $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "logIt : () -> () with IO + .."
+        ]
+        (T.pack "logIt")
+        @?= Right (T.pack "forall a. () -> () with IO + eff a")
+
+  , testCase "parameterized effect atom (State U64)" $
+      schemeOf
+        [ T.pack "effect State a = { get : () -> a, set : a -> () }"
+        , T.pack "stateful : () -> U64 with State U64"
+        ]
+        (T.pack "stateful")
+        @?= Right (T.pack "() -> U64 with State")
+
+  , testCase "undeclared effect in with-clause is rejected" $
+      case schemeOf [T.pack "bad : () -> () with FooBar"] (T.pack "bad") of
+        Left msg -> assertBool ("expected MissingEffectDecl, got: " ++ msg)
+                      ("MissingEffectDecl" `isInfixOfStr` msg)
+        Right s  -> assertFailure ("expected error, got: " ++ T.unpack s)
+
+  , testCase "eff and row vars of the same name do not collapse" $
+      case schemeOf
+             [ T.pack "data Point = Point { x : U64, y : U64 }"
+             , T.pack "effect IO = { write : String -> () }"
+             , T.pack "mix : Point + row r -> () with IO + eff r"
+             ]
+             (T.pack "mix") of
+        Left msg -> assertFailure ("expected success, got: " ++ msg)
+        Right _  -> pure ()
+  ]
+  where
+    isInfixOfStr needle hay = T.pack needle `T.isInfixOf` T.pack hay
+
+-- The eff/row domain split is enforced by the grammar, not the typechecker:
+-- `eff` only appears in an EffectRow (right of `with`) and `row` only in a
+-- RowContrib (right of type-level `+`). Mixing them is therefore a parse error.
+-- These tests lock that invariant (so there is no need for a RowDomainMismatch
+-- type error).
+effectGrammarTests :: TestTree
+effectGrammarTests = testGroup "effect/row domain split (grammar)"
+  [ testCase "an eff var in a record tail fails to parse" $
+      assertParseFails (T.pack "module Main\nf : Point + eff e -> ()\n")
+  , testCase "a row var in a with-clause fails to parse" $
+      assertParseFails $ T.unlines
+        [ T.pack "module Main"
+        , T.pack "effect IO = { write : String -> () }"
+        , T.pack "g : () -> () with row r"
+        ]
+  ]
+  where
+    assertParseFails src = case parse src of
+      Left _  -> pure ()
+      Right _ -> assertFailure "expected a parse error, got a successful parse"
+
+effectOpTests :: TestTree
+effectOpTests = testGroup "Wok.TypeChecking.EffectOp"
+  [ testCase "calling an operation infers its effect" $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "shout s = IO.write s"
+        ]
+        (T.pack "shout")
+        @?= Right (T.pack "String -> () with IO")
+
+  , testCase "declared with IO + IO body typechecks" $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "greet : String -> () with IO"
+        , T.pack "greet s = IO.write s"
+        ]
+        (T.pack "greet")
+        @?= Right (T.pack "String -> () with IO")
+
+  , testCase "calling two effectful functions unions their effects" $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "effect Logger = { log : String -> () }"
+        , T.pack "useIO : () -> () with IO"
+        , T.pack "useIO u = IO.write \"x\""
+        , T.pack "useLog : () -> () with Logger"
+        , T.pack "useLog u = Logger.log \"y\""
+        , T.pack "both u = let a = useIO () in useLog ()"
+        ]
+        (T.pack "both")
+        @?= Right (T.pack "forall a. a -> () with IO + Logger")
+
+  , testCase "pure-declared body calling an operation is rejected" $
+      case schemeOf
+             [ T.pack "effect IO = { write : String -> () }"
+             , T.pack "bad : String -> ()"
+             , T.pack "bad s = IO.write s"
+             ]
+             (T.pack "bad") of
+        Left _  -> pure ()  -- rejected (RowMismatch / UndischargedEffect)
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , testCase "unknown operation of a declared effect is rejected" $
+      case schemeOf
+             [ T.pack "effect IO = { write : String -> () }"
+             , T.pack "bad s = IO.read s"
+             ]
+             (T.pack "bad") of
+        Left msg -> assertBool ("expected UnknownOperation, got: " ++ msg)
+                      (T.pack "UnknownOperation" `T.isInfixOf` T.pack msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  ]
+
+effectHandlerTests :: TestTree
+effectHandlerTests = testGroup "Wok.TypeChecking.EffectHandler"
+  [ testCase "runIO discharges IO from the result row" $
+      schemeOf
+        [ T.pack "effect IO = { read : String -> String, write : String -> () }"
+        , T.pack "runIO comp = handle (comp ()) of"
+        , T.pack "  IO.read p -> p"
+        , T.pack "  IO.write m -> ()"
+        , T.pack "  return v -> v"
+        ]
+        (T.pack "runIO")
+        @?= Right (T.pack "forall a. (() -> a) -> a")
+
+  , testCase "effect-translating handler: Logger discharged, IO introduced" $
+      schemeOf
+        [ T.pack "effect Logger = { log : String -> () }"
+        , T.pack "effect IO = { write : String -> () }"
+        , T.pack "logToIO c = handle (c ()) of"
+        , T.pack "  Logger.log m -> IO.write m"
+        , T.pack "  return v -> v"
+        ]
+        (T.pack "logToIO")
+        @?= Right (T.pack "forall a. (() -> a) -> a with IO")
+
+  , testCase "non-exhaustive handler is rejected (HandlerCoverage)" $
+      case schemeOf
+             [ T.pack "effect IO = { read : String -> String, write : String -> () }"
+             , T.pack "runIO comp = handle (comp ()) of"
+             , T.pack "  IO.read p -> p"
+             ]
+             (T.pack "runIO") of
+        Left msg -> assertBool ("expected HandlerCoverage, got: " ++ msg)
+                      (T.pack "HandlerCoverage" `T.isInfixOf` T.pack msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , testCase "handler with no return arm: result is the handled type" $
+      schemeOf
+        [ T.pack "effect IO = { write : String -> () }"
+        , T.pack "runIO comp = handle (comp ()) of"
+        , T.pack "  IO.write m -> ()"
+        ]
+        (T.pack "runIO")
+        @?= Right (T.pack "forall a. (() -> a) -> a")
+  ]
+
+-- Adversarial coverage for the effect system: the spec's acceptance criteria
+-- that the happy-path fixtures do NOT exercise -- partial discharge, the
+-- single-use-vs-threading rule (spec 136-151), multi-effect handlers, operation
+-- mismatches, and the two known spec/impl divergences (handler effect-presence,
+-- main row emptiness) pinned as characterization so a future change is forced
+-- to update them deliberately.
+effectPressureTests :: TestTree
+effectPressureTests = testGroup "Wok.TypeChecking.EffectPressure"
+  [ testGroup "discharge"
+      [ testCase "handler discharges only the handled effect; residual flows out" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "effect Logger = { log : String -> () }"
+            , "partial : (() -> a with IO + Logger + eff e) -> a with Logger + eff e"
+            , "partial comp = handle (comp ()) of"
+            , "  IO.write m -> ()"
+            , "  return v -> v"
+            ]
+            "partial"
+            @?= Right "forall b a. (() -> b with IO + Logger + eff a) -> b with Logger + eff a"
+
+      , testCase "one handler discharges two effects at once" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "effect Logger = { log : String -> () }"
+            , "runBoth : (() -> a with IO + Logger + eff e) -> a with eff e"
+            , "runBoth comp = handle (comp ()) of"
+            , "  IO.write m -> ()"
+            , "  Logger.log m -> ()"
+            , "  return v -> v"
+            ]
+            "runBoth"
+            @?= Right "forall b a. (() -> b with IO + Logger + eff a) -> b with eff a"
+      ]
+
+  , testGroup "threading rule (.. is single-use; eff e threads)"
+      [ -- spec 145: an anonymous `..` cannot thread, so it is rejected in a
+        -- parameter (contravariant) position -- here the callback's `IO + ..`.
+        -- A callback's effects could only be dropped via an anonymous tail;
+        -- the user must name it (`eff e`) to carry them through.
+        testCase "anonymous .. in a callback parameter is rejected (spec 145)" $
+          schemeRejected
+            [ "effect IO = { write : String -> () }"
+            , "relay : (() -> a with IO + ..) -> a with IO + .."
+            , "relay f = f ()"
+            ]
+            "relay"
+
+      , testCase "named eff e threads a param tail to the result (accepted)" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "relay : (() -> a with IO + eff e) -> a with IO + eff e"
+            , "relay f = f ()"
+            ]
+            "relay"
+            @?= Right "forall b a. (() -> b with IO + eff a) -> b with IO + eff a"
+
+      , -- spec 142: the same rule for records -- an anonymous `..` record tail in
+        -- a parameter position is rejected; use `row r` (next test) to thread the
+        -- input's extra fields through to the output.
+        testCase "record .. in a parameter position is rejected (spec 142)" $
+          schemeRejected
+            [ "data Point = Point { x : U64, y : U64 }"
+            , "preserveBad : Point + .. -> Point + .."
+            , "preserveBad p = p"
+            ]
+            "preserveBad"
+
+      , testCase "record row r threads input tail to output (accepted)" $
+          case schemeOf
+                 [ "data Point = Point { x : U64, y : U64 }"
+                 , "preserveOk : Point + row r -> Point + row r"
+                 , "preserveOk p = p"
+                 ]
+                 "preserveOk" of
+            Left msg -> assertFailure ("expected success, got: " ++ msg)
+            Right _  -> pure ()
+      ]
+
+  , testGroup "operation calls"
+      [ testCase "two calls of the same effect union to a single label" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "twice u = let a = IO.write \"x\" in IO.write \"y\""
+            ]
+            "twice"
+            @?= Right "forall a. a -> () with IO"
+
+      , testCase "parameterized effect: get/set share the effect's type param" $
+          case schemeOf
+                 [ "effect State a = { get : () -> a, set : a -> () }"
+                 , "incr u = let n = State.get () in State.set n"
+                 ]
+                 "incr" of
+            Left msg -> assertFailure ("expected success, got: " ++ msg)
+            Right _  -> pure ()
+
+      , testCase "operation called with the wrong argument type is rejected" $
+          schemeRejected
+            [ "effect IO = { write : String -> () }"
+            , "bad : () -> () with IO"
+            , "bad u = IO.write 42"
+            ]
+            "bad"
+
+      , -- Regression guard for the multi-arg arrow-placement fix: the parser
+        -- attaches `with E` to the INNERMOST arrow (where a fully-applied
+        -- curried function performs its effects), and the body's ambient is now
+        -- seeded from that same arrow. A multi-arg effectful function therefore
+        -- typechecks (it was wrongly rejected with UndischargedEffect before).
+        testCase "multi-arg effectful function typechecks (effect on the innermost arrow)" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "f : U64 -> U64 -> () with IO"
+            , "f x y = IO.write \"x\""
+            ]
+            "f"
+            @?= Right "U64 -> U64 -> () with IO"
+
+      , testCase "three-arg effectful function typechecks (deeper innermost arrow)" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "g : U64 -> U64 -> U64 -> () with IO"
+            , "g x y z = IO.write \"x\""
+            ]
+            "g"
+            @?= Right "U64 -> U64 -> U64 -> () with IO"
+
+      , testCase "unsigned multi-arg effectful function infers the effect on the innermost arrow" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "h x y = IO.write x"
+            ]
+            "h"
+            @?= Right "forall a. String -> a -> () with IO"
+      ]
+
+  , testGroup "handler arms"
+      [ testCase "arm body type must match the operation's result type" $
+          schemeRejected
+            [ "effect IO = { read : String -> String }"
+            , "bad comp = handle (comp ()) of"
+            , "  IO.read p -> 42"
+            , "  return v -> v"
+            ]
+            "bad"
+      ]
+
+  , testGroup "known spec/impl divergences (characterization)"
+      [ -- Spec step 2 (handler typing): "each handled effect E must be present
+        -- in rho." The current impl is lenient -- handling an effect the
+        -- scrutinee never performs is silently accepted (the handled label is
+        -- simply not found to discharge). Pinned here as ACCEPTED; this flips to
+        -- a rejection if/when declaration-is-authority lands.
+        testCase "handling an absent effect is currently accepted (spec wants reject)" $
+          case schemeOf
+                 [ "effect IO = { write : String -> () }"
+                 , "effect Logger = { log : String -> () }"
+                 , "vacuous : () -> () with Logger"
+                 , "vacuous u = Logger.log \"x\""
+                 , "weird c = handle (vacuous ()) of"
+                 , "  IO.write m -> ()"
+                 , "  return v -> v"
+                 ]
+                 "weird" of
+            Left msg -> assertFailure
+                          ("currently expected to be ACCEPTED (lenient handler); got: " ++ msg)
+            Right _  -> pure ()
+
+        -- Spec line 230: "main must reduce to an empty effect row -- the
+        -- compiler rejects a program with an unwired capability." v1 does not
+        -- special-case main, so a main with a residual effect is accepted.
+      , testCase "main with an unhandled effect is currently accepted (spec wants reject)" $
+          assertModuleTypechecks $ T.unlines
+            [ T.pack "module Main"
+            , T.pack "effect IO = { write : String -> () }"
+            , T.pack "main : () -> () with IO"
+            , T.pack "main u = IO.write \"x\""
+            ]
+      ]
+  ]
+  where
+    schemeRejected decls name = case schemeOf decls name of
+      Left _  -> pure ()
+      Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+-- Maps the closed-by-default soundness boundary: the closed / inferred /
+-- first-order core never lets an effect escape a type (it propagates the effect
+-- into the caller's row, or rejects the call) -- but the `..` open-tail
+-- escape hatch can DROP a parameter's effect. These tests prove the default is
+-- sound and pin the single leak, so the link-tails redesign has a target.
+closedByDefaultTests :: TestTree
+closedByDefaultTests = testGroup "closed-by-default (soundness boundary)"
+  [ testGroup "sound: closed / inferred / first-order never drops an effect"
+      [ testCase "a function with no operation calls infers a pure (no `with`) type" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "k x y = x"
+            ]
+            "k"
+            @?= Right "forall a b. a -> b -> a"
+
+      , testCase "an effect propagates from a callee into an unsigned caller" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "useIO : () -> () with IO"
+            , "useIO u = IO.write \"x\""
+            , "caller u = useIO ()"
+            ]
+            "caller"
+            @?= Right "forall a. a -> () with IO"
+
+      , testCase "a pure-declared function that calls an effectful one is rejected" $
+          schemeRejected
+            [ "effect IO = { write : String -> () }"
+            , "useIO : () -> () with IO"
+            , "useIO u = IO.write \"x\""
+            , "pureCaller : () -> ()"
+            , "pureCaller u = useIO ()"
+            ]
+            "pureCaller"
+
+      , testCase "a closed effect row rejects an operation it does not list" $
+          schemeRejected
+            [ "effect IO = { write : String -> () }"
+            , "effect Logger = { log : String -> () }"
+            , "f : () -> () with IO"
+            , "f u = Logger.log \"x\""
+            ]
+            "f"
+
+      , testCase "an unsigned HOF defaults to a pure callback (effectful arg rejected)" $
+          schemeRejected
+            [ "effect IO = { write : String -> () }"
+            , "useIO : () -> () with IO"
+            , "useIO u = IO.write \"x\""
+            , "runThunk f = f ()"
+            , "bad u = runThunk useIO"
+            ]
+            "bad"
+      ]
+
+  , testGroup "higher-order effect application (after the signed-binding polymorphism fix)"
+      [ -- Once signed bindings are referenced via their instantiated signature
+        -- (not a monomorphic placeholder), combinators can finally be APPLIED to
+        -- concrete effectful arguments. The earlier RigidEscape over-rejection is
+        -- gone, and `eff e` threads soundly. This is the payoff of the fix.
+
+        -- Exact match: relaying a thunk performing exactly IO now type-checks.
+        testCase "an eff e combinator applies to a concrete thunk (over-rejection fixed)" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "useIO : () -> () with IO"
+            , "useIO u = IO.write \"x\""
+            , "relayE : (() -> a with IO + eff e) -> a with IO + eff e"
+            , "relayE f = f ()"
+            , "good u = relayE useIO"
+            ]
+            "good"
+            @?= Right "forall a. a -> () with IO"
+
+      , -- The same fix in the LET/WHERE path (inferLetGroup), not just top level
+        -- (inferTopLetGroup): a where-bound combinator applied to a concrete
+        -- thunk also works. Before the fix this RigidEscaped here too.
+        testCase "a where-bound eff e combinator applies to a concrete thunk" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "caller u = relayE useIO"
+            , "  where"
+            , "    relayE : (() -> a with IO + eff e) -> a with IO + eff e"
+            , "    relayE f = f ()"
+            , "    useIO : () -> () with IO"
+            , "    useIO v = IO.write \"x\""
+            ]
+            "caller"
+            @?= Right "forall a. a -> () with IO"
+
+      , -- A thunk with an effect beyond the concrete part: `eff e` THREADS it to
+        -- the caller's row -- the sound, intended behavior.
+        testCase "eff e threads an extra concrete effect to the caller (sound)" $
+          schemeOf
+            [ "effect IO = { write : String -> () }"
+            , "effect Logger = { log : String -> () }"
+            , "relayE : (() -> a with IO + eff e) -> a with IO + eff e"
+            , "relayE f = f ()"
+            , "useIL : () -> () with IO + Logger"
+            , "useIL u = let l = Logger.log \"x\" in IO.write \"y\""
+            , "good u = relayE useIL"
+            ]
+            "good"
+            @?= Right "forall a. a -> () with IO + Logger"
+
+      , -- spec 145 (now enforced): the `..` relay is rejected at its DEFINITION
+        -- (anonymous tail in the callback parameter), so the previously-reachable
+        -- silent drop of Logger is gone -- the program no longer type-checks at
+        -- all. `eff e` (above) is the sound way to thread a callback's effects.
+        testCase ".. relay is rejected at its definition, so no silent drop is reachable (spec 145)" $
+          schemeRejected
+            [ "effect IO = { write : String -> () }"
+            , "effect Logger = { log : String -> () }"
+            , "relay : (() -> a with IO + ..) -> a with IO + .."
+            , "relay f = f ()"
+            , "useIL : () -> () with IO + Logger"
+            , "useIL u = let l = Logger.log \"x\" in IO.write \"y\""
+            , "bad u = relay useIL"
+            ]
+            "bad"
+      ]
+  ]
+  where
+    schemeRejected decls name = case schemeOf decls name of
+      Left _  -> pure ()
+      Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+-- A lambda is a function: the effects its body performs belong to the lambda's
+-- own arrow (performed when it is applied), not to the enclosing equation.
+-- Before the fix, a lambda body's operation calls leaked into the enclosing
+-- binding's effect row and the lambda value was typed as a pure arrow.
+lambdaEffectScopingTests :: TestTree
+lambdaEffectScopingTests = testGroup "lambda effect scoping"
+  [ testCase "a lambda's effect rides its own arrow (matches the signature)" $
+      schemeOf
+        [ "effect IO = { write : String -> () }"
+        , "w : String -> () with IO"
+        , "w = \\v -> IO.write v"
+        ]
+        "w"
+        @?= Right "String -> () with IO"
+
+  , -- The decisive no-leak check: `mk` returns an effectful closure, so APPLYING
+    -- `mk` (merely building the closure) performs no effect and `safe` -- which
+    -- only builds it -- stays pure. Before the fix the lambda's IO leaked onto
+    -- `mk`'s arrow, making `mk u` effectful and rejecting `safe` with
+    -- UndischargedEffect.
+    testCase "a lambda's effect does NOT leak to the enclosing binding" $
+      schemeOf
+        [ "effect IO = { write : String -> () }"
+        , "mk u = \\v -> IO.write v"
+        , "safe : () -> ()"
+        , "safe u = let f = mk u in ()"
+        ]
+        "safe"
+        @?= Right "() -> ()"
+
+  , -- Regression for review finding #2 (same root cause): an equation with
+    -- FEWER pattern parameters than its signature's arrows, taking the rest via
+    -- a lambda body, now typechecks -- the lambda carries the declared effect on
+    -- the inner arrow, matching the signature.
+    testCase "equation with a lambda body and fewer params than sig arrows typechecks" $
+      schemeOf
+        [ "effect IO = { write : String -> () }"
+        , "f : U64 -> U64 -> () with IO"
+        , "f x = \\y -> IO.write \"z\""
+        ]
+        "f"
+        @?= Right "U64 -> U64 -> () with IO"
   ]
 
 dataTests :: TestTree
@@ -1648,7 +2306,9 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
           let labels = cRowLabels row
           -- score is prepended (outermost), x and y come from Point's fields
           length labels @?= 3
-          head labels @?= T.pack "score"
+          case labels of
+            (l0 : _) -> l0 @?= T.pack "score"
+            []       -> assertFailure "expected non-empty labels"
           T.pack "x" `elem` labels @? "expected x in row"
           T.pack "y" `elem` labels @? "expected y in row"
         Right other -> assertFailure ("expected CTRecord scheme, got: " ++ show other)
@@ -1680,7 +2340,6 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
           -- Exactly one KEffect slot (one row var `r`)
           let rowQs = [ i | (i, Ty.KEffect) <- qs ]
           length rowQs @?= 1
-        Right other -> assertFailure ("unexpected: " ++ show other)
 
   , testCase "non-plus operator rejected with NonPlusTypeOp" $ do
       -- Point - { score : U64 } should fail with NonPlusTypeOp
@@ -2059,8 +2718,10 @@ rowShadowTests = testGroup "RowShadow"
             ]
       (_, warnings) <- expectOKWithWarnings src
       let shadows = [ w | w@(TC.RowShadow _ lbl _ _) <- warnings, lbl == T.pack "tag" ]
-      assertBool ("expected at least one RowShadow on 'tag', got warnings: " ++ show warnings)
-                 (length shadows >= 1)
+      -- Exactly one, not duplicated: the same shadow is reachable through more
+      -- than one unification, but runTC dedups identical warnings (#3).
+      assertEqual ("expected exactly one RowShadow on 'tag', got warnings: " ++ show warnings)
+                  1 (length shadows)
 
   , testCase "collision program still typechecks (warning is informational)" $ do
       -- Same as above: must not fail with a TypeError
@@ -2187,6 +2848,27 @@ blockLayoutTests = testGroup "BlockLayout"
         [ "data Big = Big {"
         , "  name : String, age : U64"
         , "  score : U64"
+        , "}"
+        ]
+
+  , testCase "trailing comma + newline in value: no double comma" $
+      -- Regression: a literal `,` at end of one field's line must NOT
+      -- get a second virtual `,` inserted before the next field on the
+      -- following line.
+      shouldParse $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "p = Point {"
+        , "  x = 1,"
+        , "  y = 2"
+        , "}"
+        ]
+
+  , testCase "trailing comma on every field (incl. last) + newlines" $
+      shouldParse $ T.unlines
+        [ "data Point = Point { x : U64, y : U64 }"
+        , "p = Point {"
+        , "  x = 1,"
+        , "  y = 2,"
         , "}"
         ]
 

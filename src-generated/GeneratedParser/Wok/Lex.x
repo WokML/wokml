@@ -29,7 +29,7 @@ $u = [. \n]          -- universal: any character
 
 -- Symbols and non-identifier-like reserved words
 
-@rsyms = \= | \: | \; | \. | \( | \) | \, | \` | \: \: | \_ | \[ | \] | \{ | \} | \. \. | \- \> | \| | \\
+@rsyms = \= | \: | \{ | \} | \; | \. | \( | \) | \, | \` | \: \: | \_ | \[ | \] | \. \. | \- \> | \| | \\
 
 :-
 
@@ -183,30 +183,35 @@ eitherResIdent tv s = treeFind resWords
 -- | The keywords and symbols of the language organized as binary search tree.
 resWords :: BTree
 resWords =
-  b "forall" 24
-    (b "\\" 12
-       (b ".." 6
-          (b "," 3 (b ")" 2 (b "(" 1 N N) N) (b "." 5 (b "->" 4 N N) N))
-          (b ";" 9 (b "::" 8 (b ":" 7 N N) N) (b "[" 11 (b "=" 10 N N) N)))
-       (b "contract" 18
-          (b "`" 15
-             (b "_" 14 (b "]" 13 N N) N) (b "class" 17 (b "case" 16 N N) N))
-          (b "do" 21
-             (b "deriving" 20 (b "data" 19 N N) N)
-             (b "fixity" 23 (b "else" 22 N N) N))))
-    (b "right" 36
-       (b "let" 30
-          (b "in" 27
-             (b "import" 26 (b "if" 25 N N) N)
-             (b "left" 29 (b "instance" 28 N N) N))
-          (b "module" 33
-             (b "looser" 32 (b "local" 31 N N) N)
-             (b "record" 35 (b "of" 34 N N) N)))
-       (b "use" 42
-          (b "then" 39
-             (b "than" 38 (b "row" 37 N N) N)
-             (b "type" 41 (b "tighter" 40 N N) N))
-          (b "|" 45 (b "{" 44 (b "where" 43 N N) N) (b "}" 46 N N))))
+  b "fun" 28
+    (b "_" 14
+       (b ":" 7
+          (b "->" 4
+             (b ")" 2 (b "(" 1 N N) (b "," 3 N N)) (b ".." 6 (b "." 5 N N) N))
+          (b "[" 11
+             (b ";" 9 (b "::" 8 N N) (b "=" 10 N N))
+             (b "]" 13 (b "\\" 12 N N) N)))
+       (b "deriving" 21
+          (b "contract" 18
+             (b "case" 16 (b "`" 15 N N) (b "class" 17 N N))
+             (b "data" 20 (b "ctl" 19 N N) N))
+          (b "else" 25
+             (b "eff" 23 (b "do" 22 N N) (b "effect" 24 N N))
+             (b "forall" 27 (b "fixity" 26 N N) N))))
+    (b "return" 42
+       (b "let" 35
+          (b "in" 32
+             (b "if" 30 (b "handle" 29 N N) (b "import" 31 N N))
+             (b "left" 34 (b "instance" 33 N N) N))
+          (b "of" 39
+             (b "looser" 37 (b "local" 36 N N) (b "module" 38 N N))
+             (b "resume" 41 (b "record" 40 N N) N)))
+       (b "use" 49
+          (b "then" 46
+             (b "row" 44 (b "right" 43 N N) (b "than" 45 N N))
+             (b "type" 48 (b "tighter" 47 N N) N))
+          (b "{" 52
+             (b "with" 51 (b "where" 50 N N) N) (b "}" 54 (b "|" 53 N N) N))))
   where
   b s n = B bs (TS bs n)
     where

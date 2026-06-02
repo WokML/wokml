@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | Multi-module loader: parse + build fixity tables for the Std.Base
 -- prelude + every -I file + the entry, build a module map, validate
 -- the import dep graph, and return modules in topo order. Expression
