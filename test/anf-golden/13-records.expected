@@ -1,0 +1,19 @@
+origin =
+  let t = Point { x = 0, y = 0 }
+  t
+
+getX p =
+  let t = p.x
+  t
+
+getY p =
+  let t = p.y
+  t
+
+moveBy dx dy p =
+  let t.1 = p.x
+  let t.2 = +(t.1, dx)
+  let t.3 = p.y
+  let t.4 = +(t.3, dy)
+  let t.5 = Point { x = t.2, y = t.4 }
+  t.5

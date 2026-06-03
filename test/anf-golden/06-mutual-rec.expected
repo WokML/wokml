@@ -1,0 +1,19 @@
+even n =
+  case n of
+    0 ->
+      let t.1 = True
+      t.1
+    _ ->
+      let t.2 = -(n, 1)
+      let t.3 = odd(t.2)
+      t.3
+
+odd n =
+  case n of
+    0 ->
+      let t.1 = False
+      t.1
+    _ ->
+      let t.2 = -(n, 1)
+      let t.3 = even(t.2)
+      t.3

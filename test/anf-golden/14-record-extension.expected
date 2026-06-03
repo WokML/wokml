@@ -1,0 +1,19 @@
+getX p =
+  let t = p.x
+  t
+
+getXOpen p =
+  let t = p.x
+  t
+
+preserveExtras p.1 =
+  let p.2 = p.1.x
+  let p.3 = p.1.y
+  let t = Point { x = p.2, y = p.3 }
+  t
+
+flipXY p =
+  let t.1 = p.y
+  let t.2 = p.x
+  let t.3 = Point { x = t.1, y = t.2 }
+  t.3

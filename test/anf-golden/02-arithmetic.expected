@@ -1,0 +1,12 @@
+add x y =
+  let t = +(x, y)
+  t
+
+double n =
+  let t = *(n, 2)
+  t
+
+quad n =
+  let t.1 = double(n)
+  let t.2 = double(t.1)
+  t.2

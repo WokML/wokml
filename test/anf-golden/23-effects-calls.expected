@@ -1,0 +1,18 @@
+shout s =
+  let t = IO.write(s)
+  t
+
+echo s =
+  let t.1 = IO.read(s)
+  let t.2 = IO.write(t.1)
+  t.2
+
+useLog u =
+  let t = Logger.log("hi")
+  t
+
+both u =
+  let t.2 = shout("x")
+  let a = t.2
+  let t.1 = useLog(())
+  t.1

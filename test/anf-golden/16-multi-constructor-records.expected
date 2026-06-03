@@ -1,0 +1,23 @@
+unitCircle =
+  let t = Circle { radius = 1 }
+  t
+
+unitSquare =
+  let t = Square { side = 1 }
+  t
+
+aRect =
+  let t = Rect { width = 4, height = 3 }
+  t
+
+getRadius =
+  let t = unitCircle.radius
+  t
+
+getSide =
+  let t = unitSquare.side
+  t
+
+getWidth =
+  let t = aRect.width
+  t

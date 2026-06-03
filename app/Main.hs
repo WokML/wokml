@@ -8,6 +8,7 @@ import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
+import Wok.IR.Anf (prettyModule)
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
 import qualified Wok.TypeChecking as TC
@@ -17,40 +18,47 @@ import qualified Wok.TypeChecking as TC
 -- ----------------------------------------------------------------
 
 usage :: String
-usage = "usage: wok <entry.wok> [-I <file.wok>]..."
+usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf]"
+
+data CliMode = ModePrintSchemes | ModeDumpAnf
 
 main :: IO ()
 main = do
   args <- getArgs
   case parseCli args of
-    Left msg          -> hPutStrLn stderr msg >> exitFailure
-    Right (e, extras) -> runApp e extras
+    Left msg              -> hPutStrLn stderr msg >> exitFailure
+    Right (e, extras, md) -> runApp e extras md
 
-parseCli :: [String] -> Either String (FilePath, [FilePath])
-parseCli = go Nothing []
+parseCli :: [String] -> Either String (FilePath, [FilePath], CliMode)
+parseCli = go Nothing [] ModePrintSchemes
   where
-    go (Just e) xs []                = Right (e, reverse xs)
-    go Nothing  _  []                = Left usage
-    go _        _  ["-I"]            = Left ("-I requires an argument\n" ++ usage)
-    go e        xs ("-I" : f : rest) = go e (f : xs) rest
-    go Nothing  xs (a : rest)        = go (Just a) xs rest
-    go (Just _) _  (a : _)           =
+    go (Just e) xs md []                   = Right (e, reverse xs, md)
+    go Nothing  _  _  []                   = Left usage
+    go _        _  _  ["-I"]               = Left ("-I requires an argument\n" ++ usage)
+    go e        xs md ("-I" : f : rest)    = go e (f : xs) md rest
+    go e        xs _  ("--dump-anf" : rest) = go e xs ModeDumpAnf rest
+    go Nothing  xs md (a : rest)           = go (Just a) xs md rest
+    go (Just _) _  _  (a : _)             =
       Left ("unexpected extra positional: " ++ a ++ "\n" ++ usage)
 
 -- ----------------------------------------------------------------
 -- App
 -- ----------------------------------------------------------------
 
-runApp :: FilePath -> [FilePath] -> IO ()
-runApp entry extras = do
+runApp :: FilePath -> [FilePath] -> CliMode -> IO ()
+runApp entry extras mode = do
   loaded <- loadProgram entry extras
   case loaded of
     Left lerr -> hPutStrLn stderr (prettyLoaderError lerr) >> exitFailure
-    Right (entryName, ms) -> case Pipeline.typecheckProgram entryName ms of
-      Left msg -> hPutStrLn stderr msg >> exitFailure
-      Right (decls, warnings) -> do
-        mapM_ (hPutStrLn stderr . prettyWarning) warnings
-        mapM_ printDecl (sortBy (comparing TC.tdName) decls)
+    Right (entryName, ms) -> case mode of
+      ModeDumpAnf -> case Pipeline.elaborateProgram entryName ms of
+        Left msg  -> hPutStrLn stderr msg >> exitFailure
+        Right cm  -> TIO.putStrLn (prettyModule cm)
+      ModePrintSchemes -> case Pipeline.typecheckProgram entryName ms of
+        Left msg -> hPutStrLn stderr msg >> exitFailure
+        Right (decls, warnings) -> do
+          mapM_ (hPutStrLn stderr . prettyWarning) warnings
+          mapM_ printDecl (sortBy (comparing TC.tdName) decls)
   where
     printDecl (TC.TypedDecl n s) =
       TIO.putStrLn (n <> Tx.pack " : " <> TC.prettyScheme s)

@@ -1,0 +1,13 @@
+twice f x =
+  let t.1 = f(x)
+  let t.2 = f(t.1)
+  t.2
+
+compose f g x =
+  let t.1 = g(x)
+  let t.2 = f(t.1)
+  t.2
+
+apply f x =
+  let t = f(x)
+  t

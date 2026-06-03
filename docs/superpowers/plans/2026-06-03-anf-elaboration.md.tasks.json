@@ -1,0 +1,68 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-03-anf-elaboration.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Bootstrap modules and cabal wiring",
+      "status": "pending",
+      "description": "**Goal:** Three compiling empty modules registered in cabal; build stays green.\n\n**Files:** src/Wok/IR/Name.hs, src/Wok/IR/Anf.hs, src/Wok/IR/Elaborate.hs (create); wok.cabal (modify)\n\n**Verify:** cabal build\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Name.hs\",\"src/Wok/IR/Anf.hs\",\"src/Wok/IR/Elaborate.hs\",\"wok.cabal\"],\"verifyCommand\":\"cabal build\",\"acceptanceCriteria\":[\"three modules in cabal\",\"cabal build succeeds\",\"no new default-extensions\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Wok.IR.Name - opaque identity + deterministic supply",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Unique/Name/JoinId with identity-only equality and a pure fresh-name supply (State Int, no IORef).\n\n**Files:** src/Wok/IR/Name.hs; test/Spec.hs (group IRName)\n\n**Verify:** cabal test --test-options=\"-p IRName\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Name.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p IRName\\\"\",\"acceptanceCriteria\":[\"Name Eq/Ord on unique only\",\"fresh supply monotonic+deterministic\",\"same-hint diff-unique unequal\",\"no IORef/unsafePerformIO\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Wok.IR.Anf - ANF datatype + pretty-printer",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** ANF IR (ANF-by-construction: atoms/RHS/control-Expr split; join points; handlers with resume binder) plus a deterministic renderer for goldens.\n\n**Files:** src/Wok/IR/Anf.hs; test/Spec.hs (group Anf)\n\n**Verify:** cabal test --test-options=\"-p Anf\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Anf.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p Anf\\\"\",\"acceptanceCriteria\":[\"datatype matches design\",\"prettyExpr renders hand-built term stably\",\"binder hints disambiguate on collision only\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Elaboration scaffold + simple expressions",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Elab monad (Env + local scope + Fresh) and CPS ANF normalization for non-compound forms (lits, var, con, app spine, lam, if, tuple, list, paren).\n\n**Files:** src/Wok/IR/Elaborate.hs; test/Spec.hs (group ElaborateBasic)\n\n**Verify:** cabal test --test-options=\"-p ElaborateBasic\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Elaborate.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p ElaborateBasic\\\"\",\"acceptanceCriteria\":[\"Elab=ReaderT ElabCtx Fresh\",\"normName/normAtom combinator\",\"simple exprs elaborate to ANF\",\"app names its arguments\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: let, where, case, patterns, join points",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Binding/branching forms; join-point introduction for value-position branches; pattern compilation to nested Case.\n\n**Files:** src/Wok/IR/Elaborate.hs; test/Spec.hs (group ElaborateControl)\n\n**Verify:** cabal test --test-options=\"-p ElaborateControl\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Elaborate.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p ElaborateControl\\\"\",\"acceptanceCriteria\":[\"let/where -> Let/LetRec\",\"value-position case -> LetJoin+Jump\",\"patterns compile to Alts/nested Case\",\"if reuses case over True/False\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Records - construction, projection, patterns",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Desugar record forms to label-keyed RRecord/RProj and record patterns to AltCon over labelled fields, canonicalized to declared field order from envRecordCons.\n\n**Files:** src/Wok/IR/Elaborate.hs; test/Spec.hs (group ElaborateRecords)\n\n**Verify:** cabal test --test-options=\"-p ElaborateRecords\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Elaborate.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p ElaborateRecords\\\"\",\"acceptanceCriteria\":[\"ERecord -> RRecord declared-order\",\"ERecordExt spread+override\",\"EProj -> RProj label\",\"record patterns bind by label\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Effects - operation calls, handlers, operator chains",
+      "status": "pending",
+      "blockedBy": [5],
+      "description": "**Goal:** Desugar effect operations (EProj head in envEffects -> ROp), handlers (EHandle -> Handle/OpArm with resume binder), and operator chains (EExpr fold, EParenOp section).\n\n**Files:** src/Wok/IR/Elaborate.hs; test/Spec.hs (group ElaborateEffects)\n\n**Verify:** cabal test --test-options=\"-p ElaborateEffects\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Elaborate.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p ElaborateEffects\\\"\",\"acceptanceCriteria\":[\"E.op in envEffects -> ROp\",\"EHandle -> Handle+OpArm with resume\",\"EExpr folds to nested RApp\",\"EParenOp -> operator value\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Top-level module elaboration + pipeline wiring",
+      "status": "pending",
+      "blockedBy": [6],
+      "description": "**Goal:** elaborateModule :: Env -> Abs.Module -> CoreModule; expose elaborateProgram from Pipeline; add wok --dump-anf after successful typecheck.\n\n**Files:** src/Wok/IR/Elaborate.hs, src/Wok/Pipeline.hs, app/Main.hs; test/Spec.hs (group ElaborateModule)\n\n**Verify:** cabal run wok -- --dump-anf examples/types-tour.wok ; cabal test --test-options=\"-p ElaborateModule\"\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Elaborate.hs\",\"src/Wok/Pipeline.hs\",\"app/Main.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p ElaborateModule\\\"\",\"acceptanceCriteria\":[\"DEqn -> TopBind, decls feed Env only\",\"top-level mutual recursion works\",\"Pipeline exposes elaborateProgram\",\"wok --dump-anf prints ANF\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Golden ANF corpus",
+      "status": "pending",
+      "blockedBy": [7],
+      "description": "**Goal:** Pin ANF output for the existing success fixtures (typecheck -> elaborate -> prettyModule) so elaboration changes are reviewable.\n\n**Files:** test/Spec.hs (group 'anf golden'); test/anf-golden/*.expected (create)\n\n**Verify:** cabal test --test-options=\"-p 'anf golden'\" ; full cabal test green\n\n```json:metadata\n{\"files\":[\"test/Spec.hs\",\"test/anf-golden/\"],\"verifyCommand\":\"cabal test --test-options=\\\"-p 'anf golden'\\\"\",\"acceptanceCriteria\":[\"golden group over typecheck-examples\",\"--accept writes goldens, rerun clean\",\"goldens manually inspected for ANF/join/resume correctness\",\"full suite green\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-03T00:00:00Z"
+}

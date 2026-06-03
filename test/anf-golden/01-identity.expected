@@ -1,0 +1,9 @@
+myId x =
+  x
+
+myConst x y =
+  x
+
+myFlip f x y =
+  let t = f(y, x)
+  t

@@ -1,0 +1,9 @@
+add x y =
+  let t = +(x, y)
+  t
+
+compose2 =
+  let t.3 = \f g x -> let t.1 = g(x)
+  let t.2 = f(t.1)
+  t.2
+  t.3

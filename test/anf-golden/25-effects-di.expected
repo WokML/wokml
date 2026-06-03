@@ -1,0 +1,24 @@
+greet u =
+  let t = Logger.log("hello")
+  t
+
+logToIO c =
+  let t.1 = c(())
+  t.1
+  with {
+    return v -> v
+    Logger.log(m, resume) ->
+      let t.2 = IO.write(m)
+      let res = resume(t.2)
+      res
+  }
+
+runIO c =
+  let t = c(())
+  t
+  with {
+    return v -> v
+    IO.write(m, resume) ->
+      let res = resume(())
+      res
+  }

@@ -27,12 +27,14 @@ import qualified Wok.SourceOrigin as SO
 import qualified Wok.Prelude as Prelude
 import qualified Wok.Loader as Loader
 import qualified Wok.Pipeline as Pipeline
+import Wok.IR.Name (Unique (..), Name (..), runFresh, freshUnique, freshName)
+import qualified Wok.IR.Anf as Anf
+import Wok.IR.Elaborate (elaborateExprForTest, elaborateModule)
 import Control.Monad.Except (throwError)
 import Data.Bifunctor (first)
 import qualified Data.List
 import Data.List (sortBy)
 import Data.Ord (comparing)
-
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
 
 main :: IO ()
@@ -41,6 +43,7 @@ main = do
   resolveFiles       <- findByExtension [".wok"] "test/resolve-examples"
   typecheckFiles     <- findByExtension [".wok"] "test/typecheck-examples"
   typecheckBadFiles  <- findByExtension [".wok"] "test/typecheck-fail-examples"
+  anfFiles           <- findByExtension [".wok"] "test/typecheck-examples"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -87,6 +90,13 @@ main = do
     , rowShadowTests
     , patternCoverageTests
     , blockLayoutTests
+    , irNameTests
+    , anfTests
+    , elaborateBasicTests
+    , elaborateControlTests
+    , elaborateRecordsTests
+    , elaborateEffectsTests
+    , elaborateModuleTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -98,6 +108,10 @@ main = do
     , testGroup "typecheck fail golden"
         [ goldenVsString (takeBaseName f) (typecheckFailGoldenFor f) (typecheckFailHarness f)
         | f <- typecheckBadFiles
+        ]
+    , testGroup "anf golden"
+        [ goldenVsString (takeBaseName f) (anfGoldenFor f) (anfElaborateHarness f)
+        | f <- anfFiles
         ]
     ]
 
@@ -116,6 +130,10 @@ typecheckGoldenFor f =
 typecheckFailGoldenFor :: FilePath -> FilePath
 typecheckFailGoldenFor f =
   replaceDirectory (replaceExtension f ".expected") "test/typecheck-fail-golden"
+
+anfGoldenFor :: FilePath -> FilePath
+anfGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/anf-golden"
 
 typecheckSuccessHarness :: FilePath -> IO BL.ByteString
 typecheckSuccessHarness path = do
@@ -140,6 +158,16 @@ typecheckFailHarness path = do
       case Pipeline.typecheckProgram entryName ms of
         Left s  -> pure (BL.pack ("typecheck: " <> s <> "\n"))
         Right _ -> pure (BL.pack "UNEXPECTED SUCCESS\n")
+
+anfElaborateHarness :: FilePath -> IO BL.ByteString
+anfElaborateHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgram entryName ms of
+        Left s  -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
+        Right cm -> pure (BL.pack (T.unpack (Anf.prettyModule cm) <> "\n"))
 
 -- | The "extended" env an ordinary user module sees: B.initialEnv with the
 -- Std.Base prelude's decls layered on top. Used by unit tests that need to
@@ -2917,3 +2945,644 @@ blockLayoutTests = testGroup "BlockLayout"
         , "  } -> a"
         ]
   ]
+
+irNameTests :: TestTree
+irNameTests = testGroup "IRName"
+  [ testCase "same unique, different hint => equal" $
+      let (a, b) = runFresh $ do
+            u <- freshUnique
+            pure (Name (T.pack "x") u, Name (T.pack "y") u)
+      in a @?= b
+  , testCase "different unique => unequal" $
+      let (a, b) = runFresh $ do
+            x <- freshName (T.pack "x")
+            y <- freshName (T.pack "x")
+            pure (x, y)
+      in assertBool "distinct" (a /= b)
+  , testCase "supply is monotonic and deterministic" $
+      let us = runFresh (mapM (const freshUnique) [1 :: Int .. 3])
+      in us @?= [Unique 0, Unique 1, Unique 2]
+  ]
+
+anfTests :: TestTree
+anfTests = testGroup "Anf"
+  [ testCase "render: f x = let r = x in case r of { 0 -> 1; _ -> r }" $
+      let cm = runFresh $ do
+            nf <- freshName (T.pack "f")
+            nx <- freshName (T.pack "x")
+            nr <- freshName (T.pack "r")
+            let xBndr = Anf.Binder nx Anf.Unrestricted
+                rBndr = Anf.Binder nr Anf.Unrestricted
+                body  = Anf.Let rBndr
+                          (Anf.RAtom (Anf.AVar nx))
+                          (Anf.Case (Anf.AVar nr)
+                            [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 1)))
+                            , Anf.AltDefault (Anf.Ret (Anf.AVar nr))
+                            ])
+            pure $ Anf.CoreModule
+              [ Anf.TopBind nf [xBndr] body ]
+          expected = T.intercalate (T.pack "\n")
+            [ T.pack "f x ="
+            , T.pack "  let r = x"
+            , T.pack "  case r of"
+            , T.pack "    0 -> 1"
+            , T.pack "    _ -> r"
+            ]
+      in Anf.prettyModule cm @?= expected
+
+  , testCase "collision disambiguation: two distinct x binders get x.N suffixes" $
+      let (rendered0, rendered1) = runFresh $ do
+            nx0 <- freshName (T.pack "x")
+            nx1 <- freshName (T.pack "x")
+            let b0 = Anf.Binder nx0 Anf.Unrestricted
+                -- let x.N0 = x.N1 in x.N0
+                e  = Anf.Let b0 (Anf.RAtom (Anf.AVar nx1)) (Anf.Ret (Anf.AVar nx0))
+                txt = Anf.prettyExpr e
+                -- txt = "let X = Y\nZ"
+                -- first word after "let " is b0's rendering
+                -- last word of first line (after "= ") is nx1's rendering
+                ws  = T.words txt
+                -- ws = ["let", rb0, "=", rb1, ...]
+                rb0w = case drop 1 ws of { (w:_) -> w; [] -> T.pack "" }
+                rb1w = case drop 3 ws of { (w:_) -> w; [] -> T.pack "" }
+            pure (rb0w, rb1w)
+      in do
+        assertBool "both start with x" $
+          T.pack "x" `T.isPrefixOf` rendered0 && T.pack "x" `T.isPrefixOf` rendered1
+        assertBool "rendered names differ" (rendered0 /= rendered1)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Elaborate basic tests
+
+-- | Check whether an Expr matches the structural shape of:
+--   Let _ (RApp _ [ALit (LInt 1)]) (Let _ (RApp _ [AVar _]) (Ret (AVar _)))
+-- This corresponds to elaborating  f (g 1).
+isAppNamingShape :: Anf.Expr -> Bool
+isAppNamingShape
+  (Anf.Let _ (Anf.RApp _ [Anf.ALit (Anf.LInt 1)])
+    (Anf.Let _ (Anf.RApp _ [Anf.AVar _])
+      (Anf.Ret (Anf.AVar _)))) = True
+isAppNamingShape _ = False
+
+elaborateBasicTests :: TestTree
+elaborateBasicTests = testGroup "ElaborateBasic"
+  [ testCase "literal int -> Ret (ALit (LInt 1))" $
+      elaborateExprForTest TE.emptyEnv
+        (Abs.ELitI (Abs.WokInt ((0,0), T.pack "1")))
+        @?= Anf.Ret (Anf.ALit (Anf.LInt 1))
+
+  , testCase "literal string -> Ret (ALit (LStr ...))" $
+      elaborateExprForTest TE.emptyEnv
+        (Abs.ELitS "hello")
+        @?= Anf.Ret (Anf.ALit (Anf.LStr (T.pack "hello")))
+
+  , testCase "unit -> Ret (ALit LUnit)" $
+      elaborateExprForTest TE.emptyEnv Abs.EUnit
+        @?= Anf.Ret (Anf.ALit Anf.LUnit)
+
+  , testCase "application f (g 1) names its arguments" $
+      let -- f (g 1) encoded as EApp (EVar f) (EParen (EApp (EVar g) (ELitI 1)))
+          lit1  = Abs.ELitI (Abs.WokInt ((0,0), T.pack "1"))
+          g_app = Abs.EApp (Abs.EVar (Abs.VarId ((0,0), T.pack "g"))) lit1
+          expr  = Abs.EApp
+                    (Abs.EVar (Abs.VarId ((0,0), T.pack "f")))
+                    (Abs.EParen g_app)
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Let _ (RApp _ [ALit 1]) (Let _ (RApp _ [AVar _]) (Ret (AVar _))), got: "
+            <> show result)
+           (isAppNamingShape result)
+
+  , testCase "tuple (1, 2) -> Let _ (RCon Tuple2 [ALit 1, ALit 2]) (Ret (AVar _))" $
+      let expr = Abs.ETuple
+                   (Abs.ELitI (Abs.WokInt ((0,0), T.pack "1")))
+                   [Abs.ELitI (Abs.WokInt ((0,0), T.pack "2"))]
+          result = elaborateExprForTest TE.emptyEnv expr
+      in case result of
+           Anf.Let _ (Anf.RCon tag [Anf.ALit (Anf.LInt 1), Anf.ALit (Anf.LInt 2)]) (Anf.Ret (Anf.AVar _)) ->
+             tag @?= T.pack "Tuple2"
+           _ -> assertFailure ("unexpected shape: " <> show result)
+
+  , testCase "list [1] -> Let nil (RCon Nil []) (Let _ (RCon Cons [ALit 1, AVar nil]) (Ret ...))" $
+      let expr   = Abs.EList [Abs.ELitI (Abs.WokInt ((0,0), T.pack "1"))]
+          result = elaborateExprForTest TE.emptyEnv expr
+      in case result of
+           Anf.Let _ (Anf.RCon nilTag []) (Anf.Let _ (Anf.RCon consTag [Anf.ALit (Anf.LInt 1), Anf.AVar _]) (Anf.Ret (Anf.AVar _))) -> do
+             nilTag  @?= T.pack "Nil"
+             consTag @?= T.pack "Cons"
+           _ -> assertFailure ("unexpected shape: " <> show result)
+
+  , testCase "empty list [] -> Let _ (RCon Nil []) (Ret (AVar _))" $
+      let expr   = Abs.EList []
+          result = elaborateExprForTest TE.emptyEnv expr
+      in case result of
+           Anf.Let _ (Anf.RCon nilTag []) (Anf.Ret (Anf.AVar _)) ->
+             nilTag @?= T.pack "Nil"
+           -- nullary con passes through as RAtom-free path -> Let binding
+           _ -> assertFailure ("unexpected shape: " <> show result)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- ElaborateControl tests
+
+-- | Helpers for building dummy-position tokens.
+dummyPos :: (Int, Int)
+dummyPos = (0, 0)
+
+varId :: T.Text -> Abs.VarId
+varId t = Abs.VarId (dummyPos, t)
+
+conId :: T.Text -> Abs.ConId
+conId t = Abs.ConId (dummyPos, t)
+
+-- | Check whether an Expr has a Case with two AltCon arms, the first being
+-- conName1 with at least one field binder and the second being conName2 with
+-- no field binders.
+isTwoConCaseShape :: T.Text -> T.Text -> Anf.Expr -> Bool
+isTwoConCaseShape con1 con2 e = case e of
+  Anf.Case _ [Anf.AltCon c1 (_:_) _, Anf.AltCon c2 [] _] ->
+    c1 == con1 && c2 == con2
+  _ -> False
+
+-- | Check that an Expr contains at least one LetJoin node anywhere.
+hasLetJoin :: Anf.Expr -> Bool
+hasLetJoin (Anf.LetJoin _ _ _ _)     = True
+hasLetJoin (Anf.Let _ _ e)            = hasLetJoin e
+hasLetJoin (Anf.LetRec defs e)        = any (\(_, _, b) -> hasLetJoin b) defs || hasLetJoin e
+hasLetJoin (Anf.Case _ alts)          = any altHasLetJoin alts
+hasLetJoin (Anf.Jump _ _)             = False
+hasLetJoin (Anf.Ret _)                = False
+hasLetJoin (Anf.Handle e _)           = hasLetJoin e
+
+altHasLetJoin :: Anf.Alt -> Bool
+altHasLetJoin (Anf.AltCon _ _ e)  = hasLetJoin e
+altHasLetJoin (Anf.AltLit _ e)    = hasLetJoin e
+altHasLetJoin (Anf.AltDefault e)  = hasLetJoin e
+
+-- | Check that a tail-position if elaborates to a bare Case (no LetJoin).
+isBareIfCase :: Anf.Expr -> Bool
+isBareIfCase (Anf.Case _ [Anf.AltCon t1 [] _, Anf.AltCon f1 [] _]) =
+  t1 == T.pack "True" && f1 == T.pack "False"
+isBareIfCase _ = False
+
+-- | Check the shape of a bare let-value binding:
+-- Let _ (RAtom (ALit (LInt 1))) (Ret (AVar _))
+isLetValueRetShape :: Anf.Expr -> Bool
+isLetValueRetShape (Anf.Let _ (Anf.RAtom (Anf.ALit (Anf.LInt 1))) (Anf.Ret (Anf.AVar _))) = True
+isLetValueRetShape _ = False
+
+-- | Check that an Expr contains a LetRec with at least one entry.
+hasLetRec :: Anf.Expr -> Bool
+hasLetRec (Anf.LetRec (_:_) _)       = True
+hasLetRec (Anf.Let _ _ e)             = hasLetRec e
+hasLetRec (Anf.LetRec _ e)            = hasLetRec e
+hasLetRec (Anf.LetJoin _ _ jb e)     = hasLetRec jb || hasLetRec e
+hasLetRec (Anf.Case _ alts)           = any altHasLetRec alts
+hasLetRec _                           = False
+
+altHasLetRec :: Anf.Alt -> Bool
+altHasLetRec (Anf.AltCon _ _ e) = hasLetRec e
+altHasLetRec (Anf.AltLit _ e)   = hasLetRec e
+altHasLetRec (Anf.AltDefault e) = hasLetRec e
+
+elaborateControlTests :: TestTree
+elaborateControlTests = testGroup "ElaborateControl"
+
+  [ -- case on a 2-constructor type: case m of { Just x -> x ; Nothing -> 0 }
+    -- Expect: Case _ [AltCon "Just" [_] _, AltCon "Nothing" [] _]
+    testCase "case: 2-constructor type Just/Nothing shape" $
+      let mExpr   = Abs.EVar (varId (T.pack "m"))
+          justPat = Abs.PApp (Abs.MPName (conId (T.pack "Just")))
+                             (Abs.APVar (varId (T.pack "x")))
+                             []
+          nothPat = Abs.PAtom (Abs.APCon (Abs.MPName (conId (T.pack "Nothing"))))
+          xExpr   = Abs.EVar (varId (T.pack "x"))
+          zeroExpr = Abs.ELitI (Abs.WokInt (dummyPos, T.pack "0"))
+          alt1    = Abs.AltC justPat xExpr Abs.NoWhere
+          alt2    = Abs.AltC nothPat zeroExpr Abs.NoWhere
+          expr    = Abs.ECase mExpr [alt1, alt2]
+          result  = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Case [AltCon Just [_] _, AltCon Nothing [] _], got: " <> show result)
+           (isTwoConCaseShape (T.pack "Just") (T.pack "Nothing") result)
+
+  , -- value-position if introduces a LetJoin:
+    -- normName (EIf c 1 2) k  =>  LetJoin j [r] (k (AVar r)) (Case c [True->Jump j [1]; False->Jump j [2]])
+    testCase "value-position if: normName introduces LetJoin" $
+      let cExpr = Abs.EVar (varId (T.pack "c"))
+          ifExpr = Abs.EIf cExpr
+                     (Abs.ELitI (Abs.WokInt (dummyPos, T.pack "1")))
+                     (Abs.ELitI (Abs.WokInt (dummyPos, T.pack "2")))
+          -- wrap in a let so 'if' is in value position: let y = (if c then 1 else 2) in y
+          letBody = Abs.EVar (varId (T.pack "y"))
+          letDecl = Abs.LDEqn (Abs.LHSPre (Abs.FNBare (varId (T.pack "y"))) [])
+                               ifExpr Abs.NoWhere
+          expr    = Abs.ELet [letDecl] letBody
+          result  = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected LetJoin in result (value-position if), got: " <> show result)
+           (hasLetJoin result)
+
+  , -- tail-position if is a bare Case over True/False (no LetJoin)
+    testCase "tail-position if: bare Case over True/False" $
+      let cExpr = Abs.EVar (varId (T.pack "c"))
+          expr  = Abs.EIf cExpr
+                    (Abs.ELitI (Abs.WokInt (dummyPos, T.pack "1")))
+                    (Abs.ELitI (Abs.WokInt (dummyPos, T.pack "2")))
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected bare Case over True/False, got: " <> show result)
+           (isBareIfCase result)
+
+  , -- let value binding: let x = 1 in x
+    -- Expect: Let _ (RAtom (ALit (LInt 1))) (Ret (AVar _))
+    testCase "let value binding: let x = 1 in x -> Let _ (RAtom (LInt 1)) (Ret (AVar _))" $
+      let litExpr = Abs.ELitI (Abs.WokInt (dummyPos, T.pack "1"))
+          letDecl = Abs.LDEqn (Abs.LHSPre (Abs.FNBare (varId (T.pack "x"))) [])
+                               litExpr Abs.NoWhere
+          body    = Abs.EVar (varId (T.pack "x"))
+          expr    = Abs.ELet [letDecl] body
+          result  = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Let _ (RAtom (LInt 1)) (Ret (AVar _)), got: " <> show result)
+           (isLetValueRetShape result)
+
+  , -- let function binding: let f y = y in f
+    -- Expect: LetRec with one entry whose body is Ret (AVar _)
+    testCase "let function binding: let f y = y in f -> contains LetRec" $
+      let paramPat = Abs.APVar (varId (T.pack "y"))
+          bodyY    = Abs.EVar (varId (T.pack "y"))
+          letDecl  = Abs.LDEqn (Abs.LHSPre (Abs.FNBare (varId (T.pack "f"))) [paramPat])
+                                bodyY Abs.NoWhere
+          contF    = Abs.EVar (varId (T.pack "f"))
+          expr     = Abs.ELet [letDecl] contF
+          result   = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected LetRec in result, got: " <> show result)
+           (hasLetRec result)
+
+  , -- PCons with a non-trivial (literal) head: case xs of { 0 : rest -> rest ; _ -> [] }
+    -- The head 0 is an APLitI, which is refutable; elabPat must emit a nested
+    -- Case on the head binder with an AltLit 0 arm (not silently wildcard it).
+    testCase "cons pattern with literal head: nested Case on head binder is produced" $
+      let expr = Abs.ECase (Abs.EVar (Abs.VarId ((0,0), T.pack "xs")))
+                   [ Abs.AltC
+                       (Abs.PCons (Abs.APLitI (Abs.WokInt ((0,0), T.pack "0")))
+                                  (Abs.PAtom (Abs.APVar (Abs.VarId ((0,0), T.pack "rest")))))
+                       (Abs.EVar (Abs.VarId ((0,0), T.pack "rest")))
+                       Abs.NoWhere
+                   , Abs.AltC (Abs.PAtom Abs.APWild) (Abs.EList []) Abs.NoWhere
+                   ]
+          result = elaborateExprForTest TE.emptyEnv expr
+          -- The first alt of the outer Case must be AltCon "Cons" [_, _] whose
+          -- body is a Case _ [AltLit (LInt 0) _], proving the literal head test
+          -- was compiled to a nested case rather than silently wildcarded.
+          hasNestedLitHead e = case e of
+            Anf.Case _ (Anf.AltCon c (_:_:_) innerBody : _)
+              | c == T.pack "Cons" -> case innerBody of
+                  Anf.Case _ (Anf.AltLit (Anf.LInt 0) _ : _) -> True
+                  _                                            -> False
+            _ -> False
+      in assertBool
+           ("expected outer Case with AltCon Cons whose body has nested AltLit 0, got: " <> show result)
+           (hasNestedLitHead result)
+
+  , -- where clause: equation body using where-bound name
+    -- let x = (let-with-where body) where w = 5
+    -- Modeled as:  let x = w where { w = 5 } in x
+    testCase "where clause: body uses where-bound name -> binding in scope" $
+      let wExpr   = Abs.EVar (varId (T.pack "w"))
+          wDecl   = Abs.LDEqn (Abs.LHSPre (Abs.FNBare (varId (T.pack "w"))) [])
+                               (Abs.ELitI (Abs.WokInt (dummyPos, T.pack "5"))) Abs.NoWhere
+          xDecl   = Abs.LDEqn (Abs.LHSPre (Abs.FNBare (varId (T.pack "x"))) [])
+                               wExpr (Abs.WithWh [wDecl])
+          xVar    = Abs.EVar (varId (T.pack "x"))
+          expr    = Abs.ELet [xDecl] xVar
+          result  = elaborateExprForTest TE.emptyEnv expr
+      in -- The result should be some nested Let structure (not error) and
+         -- eventually return via Ret.
+         case result of
+           Anf.Ret _               -> assertFailure ("unexpectedly bare Ret: " <> show result)
+           Anf.Let _ _ _           -> pure ()  -- nested Let structure: where binding in scope
+           Anf.LetJoin _ _ _ _     -> pure ()  -- join wiring: also fine
+           other                   -> assertFailure ("unexpected shape: " <> show other)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- ElaborateRecords tests
+-- ---------------------------------------------------------------------------
+
+-- | Minimal env with a record constructor Point { x : U64, y : U64 } and a
+-- non-nullary data constructor Just (arity 1).
+recordTestEnv :: TE.Env
+recordTestEnv =
+  let dummyScheme = Ty.Scheme [] (Ty.CTCon Ty.TcUnit [])
+      justInfo    = TE.ConInfo dummyScheme 1 (T.pack "Maybe")
+      nilInfo     = TE.ConInfo dummyScheme 0 (T.pack "List")
+      pointRci    = TE.RecordConInfo
+                      (T.pack "Point")
+                      [ (T.pack "x", Ty.CTCon Ty.TcU64 [])
+                      , (T.pack "y", Ty.CTCon Ty.TcU64 [])
+                      ]
+                      []
+  in TE.extendRecordCon (T.pack "Point") pointRci
+       (TE.extendCon (T.pack "Just") justInfo
+         (TE.extendCon (T.pack "Nil") nilInfo TE.emptyEnv))
+
+-- Shape predicates for the record tests --------------------------------
+
+-- For ECon "Just" in tail position, elabTail calls elabRhs then deliverRhs,
+-- so the result should be:
+-- Let t (RLam [a] (Let c (RCon "Just" [AVar a]) (Ret (AVar c)))) (Ret (AVar t))
+isEtaJustShape :: Anf.Expr -> Bool
+isEtaJustShape (Anf.Let _ (Anf.RLam (_:_) lamBody) _) = lamBodyHasRCon (T.pack "Just") lamBody
+isEtaJustShape _ = False
+
+lamBodyHasRCon :: T.Text -> Anf.Expr -> Bool
+lamBodyHasRCon conName (Anf.Let _ (Anf.RCon c _) _) = c == conName
+lamBodyHasRCon _       _                            = False
+
+-- | ECon "Nil" (arity 0, registered) should produce RCon "Nil" [].
+-- In tail position: Ret (AVar _) where the var came from a Let _ (RCon "Nil" []).
+-- Actually for nullary: deliverRhs TRet (RCon "Nil" []) ->
+--   Let t (RCon "Nil" []) (Ret (AVar t))
+isNullaryConShape :: T.Text -> Anf.Expr -> Bool
+isNullaryConShape conName (Anf.Let _ (Anf.RCon c []) (Anf.Ret (Anf.AVar _))) = c == conName
+isNullaryConShape _ _ = False
+
+-- | ERecord "Point" [y=2, x=1] reordered to [x=1, y=2] then RRecord "Point" [("x",..), ("y",..)]
+-- In tail position: Let t (RRecord "Point" [...]) (Ret (AVar t))
+isRecordDeclaredOrder :: Anf.Expr -> Bool
+isRecordDeclaredOrder (Anf.Let _ (Anf.RRecord t fields) _) =
+  t == T.pack "Point" && length fields == 2 &&
+  fst (fields !! 0) == T.pack "x" &&
+  fst (fields !! 1) == T.pack "y"
+isRecordDeclaredOrder _ = False
+
+-- | EProj (EVar p) "x" -> Let t (RProj "x" (AVar _)) (Ret (AVar t))
+isProjShape :: T.Text -> Anf.Expr -> Bool
+isProjShape lbl (Anf.Let _ (Anf.RProj l (Anf.AVar _)) _) = l == lbl
+isProjShape _   _                                         = False
+
+-- | Record pattern: case pt of { Point { x = px } -> px }
+-- Expect: Case _ [AltCon "Point" [] (Let _ (RProj "x" _) (Ret (AVar _)))]
+isRecordPatShape :: Anf.Expr -> Bool
+isRecordPatShape (Anf.Case _ [Anf.AltCon t [] body]) =
+  t == T.pack "Point" && bodyHasProjLet body
+isRecordPatShape _ = False
+
+bodyHasProjLet :: Anf.Expr -> Bool
+bodyHasProjLet (Anf.Let _ (Anf.RProj l (Anf.AVar _)) (Anf.Ret (Anf.AVar _))) =
+  l == T.pack "x"
+bodyHasProjLet _ = False
+
+elaborateRecordsTests :: TestTree
+elaborateRecordsTests = testGroup "ElaborateRecords"
+  [ -- Constructor saturation: bare ECon "Just" (arity 1) -> eta-expanded RLam
+    testCase "saturation: ECon Just (arity 1) produces an RLam wrapper" $
+      let expr   = Abs.ECon (conId (T.pack "Just"))
+          result = elaborateExprForTest recordTestEnv expr
+      in assertBool
+           ("expected Let _ (RLam [_] ...) _, got: " <> show result)
+           (isEtaJustShape result)
+
+  , -- Nullary constructor stays RCon
+    testCase "nullary: ECon Nil (arity 0) produces RCon Nil []" $
+      let expr   = Abs.ECon (conId (T.pack "Nil"))
+          result = elaborateExprForTest recordTestEnv expr
+      in assertBool
+           ("expected Let _ (RCon \"Nil\" []) (Ret _), got: " <> show result)
+           (isNullaryConShape (T.pack "Nil") result)
+
+  , -- Unregistered constructor stays nullary
+    testCase "nullary: unregistered ECon stays RCon []" $
+      let expr   = Abs.ECon (conId (T.pack "Nothing"))
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected RCon \"Nothing\" [], got: " <> show result)
+           (isNullaryConShape (T.pack "Nothing") result)
+
+  , -- Record construction with fields given out of order -> reordered to declared order
+    testCase "record construction: ERecord Point [y=2, x=1] reordered to [x,y]" $
+      let litI n = Abs.ELitI (Abs.WokInt (dummyPos, T.pack (show (n :: Int))))
+          fe l e = Abs.RFExpr (varId (T.pack l)) e
+          -- fields in source order: y first, then x
+          expr   = Abs.ERecord (conId (T.pack "Point"))
+                     [ fe "y" (litI 2)
+                     , fe "x" (litI 1)
+                     ]
+          result = elaborateExprForTest recordTestEnv expr
+      in assertBool
+           ("expected RRecord Point [(x,_),(y,_)] in declared order, got: " <> show result)
+           (isRecordDeclaredOrder result)
+
+  , -- Record projection
+    testCase "projection: EProj (EVar p) x -> RProj \"x\" _" $
+      let expr   = Abs.EProj (Abs.EVar (varId (T.pack "p"))) (varId (T.pack "x"))
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Let _ (RProj \"x\" (AVar _)) _, got: " <> show result)
+           (isProjShape (T.pack "x") result)
+
+  , -- Record pattern: case pt of { Point { x = px } -> px }
+    testCase "record pattern PRecord: fields bound by RProj" $
+      let ptExpr  = Abs.EVar (varId (T.pack "pt"))
+          pxPat   = Abs.PAtom (Abs.APVar (varId (T.pack "px")))
+          rfp     = Abs.RFPat (varId (T.pack "x")) pxPat
+          pat     = Abs.PAtom (Abs.PRecord (conId (T.pack "Point")) [rfp])
+          bodyExpr = Abs.EVar (varId (T.pack "px"))
+          alt     = Abs.AltC pat bodyExpr Abs.NoWhere
+          expr    = Abs.ECase ptExpr [alt]
+          result  = elaborateExprForTest recordTestEnv expr
+      in assertBool
+           ("expected Case _ [AltCon Point [] (Let _ (RProj x _) (Ret _))], got: " <> show result)
+           (isRecordPatShape result)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- ElaborateEffects tests
+-- ---------------------------------------------------------------------------
+
+-- | Minimal env with effect IO declaring operations write (1 arg) and read (1 arg).
+effectTestEnv :: TE.Env
+effectTestEnv =
+  let dummyScheme = Ty.Scheme [] (Ty.CTCon Ty.TcUnit [])
+      ioInfo = TE.EffectInfo
+                 []
+                 (Map.fromList
+                   [ (T.pack "write", dummyScheme)
+                   , (T.pack "read",  dummyScheme)
+                   ])
+  in TE.extendEffect (T.pack "IO") ioInfo TE.emptyEnv
+
+-- | Check whether the top-level Rhs of an expression is an ROp with the given label and op.
+-- Searches through the outermost Let if present.
+hasROp :: T.Text -> T.Text -> Anf.Expr -> Bool
+hasROp lbl op e = case e of
+  Anf.Let _ (Anf.ROp l o _) _ -> l == lbl && o == op
+  Anf.Ret (Anf.AVar _)          -> False  -- bare atom, no ROp
+  _                              -> False
+
+-- | Check that an ROp (not an RApp/RProj) appears in the outermost binding.
+topLevelIsROp :: T.Text -> T.Text -> Anf.Expr -> Bool
+topLevelIsROp lbl op expr = case expr of
+  Anf.Let _ (Anf.ROp l o _) _ -> l == lbl && o == op
+  _                             -> False
+
+-- | Check that the outermost expression is a Handle with at least one OpArm
+-- whose label and op match.
+isHandleWithOpArm :: T.Text -> T.Text -> Anf.Expr -> Bool
+isHandleWithOpArm lbl op expr = case expr of
+  Anf.Handle _ (Anf.Handler _ opArms) ->
+    any (\arm -> Anf.oaLabel arm == lbl && Anf.oaOp arm == op) opArms
+  _ -> False
+
+-- | Check that an OpArm body contains an RApp of the resume binder (auto-resume).
+opArmBodyHasResume :: Anf.OpArm -> Bool
+opArmBodyHasResume arm =
+  let resumeName = Anf.bndName (Anf.oaResume arm)
+  in exprHasRAppOf resumeName (Anf.oaBody arm)
+
+exprHasRAppOf :: Name -> Anf.Expr -> Bool
+exprHasRAppOf n (Anf.Let _ (Anf.RApp (Anf.AVar f) _) _) = f == n
+exprHasRAppOf n (Anf.Let _ _ rest)                        = exprHasRAppOf n rest
+exprHasRAppOf n (Anf.LetJoin _ _ jb e)                   = exprHasRAppOf n jb || exprHasRAppOf n e
+exprHasRAppOf _ _                                         = False
+
+elaborateEffectsTests :: TestTree
+elaborateEffectsTests = testGroup "ElaborateEffects"
+
+  [ -- Effect operation call: IO.write x -> ROp "IO" "write" [_]
+    testCase "operation call: EApp (EProj (ECon IO) write) x -> ROp IO write [_]" $
+      let xExpr = Abs.EVar (varId (T.pack "x"))
+          hdExpr = Abs.EProj (Abs.ECon (conId (T.pack "IO"))) (varId (T.pack "write"))
+          expr   = Abs.EApp hdExpr xExpr
+          result = elaborateExprForTest effectTestEnv expr
+      in assertBool
+           ("expected Let _ (ROp \"IO\" \"write\" [_]) _, got: " <> show result)
+           (topLevelIsROp (T.pack "IO") (T.pack "write") result)
+
+  , -- Non-effect projection should still produce RProj, not ROp.
+    testCase "non-effect EProj (EVar r) x -> RProj x _ (not ROp)" $
+      let rExpr  = Abs.EVar (varId (T.pack "r"))
+          expr   = Abs.EProj rExpr (varId (T.pack "x"))
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Let _ (RProj \"x\" _) _, got: " <> show result)
+           (case result of
+             Anf.Let _ (Anf.RProj l (Anf.AVar _)) _ -> l == T.pack "x"
+             _                                        -> False)
+
+  , -- Operator chain: a + b -> RApp <+> [a, b]
+    testCase "EExpr: a + b -> RApp (AVar +) [AVar a, AVar b]" $
+      let aE = Abs.EVar (varId (T.pack "a"))
+          bE = Abs.EVar (varId (T.pack "b"))
+          op = Abs.IOSym (Abs.VarSym (dummyPos, T.pack "+"))
+          expr = Abs.EExpr aE [Abs.ITail op bE]
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Let _ (RApp (AVar +) [AVar a, AVar b]) (Ret (AVar _)), got: " <> show result)
+           (case result of
+             Anf.Let _ (Anf.RApp (Anf.AVar _) [Anf.AVar _, Anf.AVar _]) (Anf.Ret (Anf.AVar _)) -> True
+             _                                                                                    -> False)
+
+  , -- Operator section: (+) -> RAtom (AVar _)
+    testCase "EParenOp (+) -> RAtom (AVar _)" $
+      let expr   = Abs.EParenOp (Abs.VarSym (dummyPos, T.pack "+"))
+          result = elaborateExprForTest TE.emptyEnv expr
+      in assertBool
+           ("expected Ret (AVar _), got: " <> show result)
+           (case result of
+             Anf.Ret (Anf.AVar _) -> True
+             _                    -> False)
+
+  , -- Handler in tail position:
+    -- handle (comp ()) of { IO.write m -> () ; return v -> v }
+    testCase "EHandle tail position: produces Handle + OpArm with auto-resume" $
+      let unitE   = Abs.EUnit
+          compApp = Abs.EApp (Abs.EVar (varId (T.pack "comp"))) unitE
+          mPat    = Abs.APVar (varId (T.pack "m"))
+          writeArm = Abs.HArm (conId (T.pack "IO")) (varId (T.pack "write")) [mPat] Abs.EUnit
+          retArm  = Abs.HReturn (varId (T.pack "v")) (Abs.EVar (varId (T.pack "v")))
+          expr    = Abs.EHandle compApp [writeArm, retArm]
+          result  = elaborateExprForTest effectTestEnv expr
+      in do
+        assertBool
+          ("expected Handle with IO.write OpArm, got: " <> show result)
+          (isHandleWithOpArm (T.pack "IO") (T.pack "write") result)
+        -- check auto-resume: the op arm body contains RApp of the resume binder
+        case result of
+          Anf.Handle _ (Anf.Handler _ (arm:_)) ->
+            assertBool
+              ("expected op arm body to contain RApp of resume binder, got body: "
+               <> show (Anf.oaBody arm))
+              (opArmBodyHasResume arm)
+          _ -> assertFailure ("expected Handle node, got: " <> show result)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- ElaborateModule tests
+
+-- Build a small module with two top-level equations:
+--   idf x = x
+--   k = idf
+-- and an Env whose envVars contains "idf" and "k".
+-- Tests:
+--   1. Two TopBinds named "idf" and "k".
+--   2. idf has one param; body is Ret (AVar p) where p == the param binder.
+--   3. k's body references the SAME canonical Name as idf's tbName.
+
+elaborateModuleTests :: TestTree
+elaborateModuleTests = testGroup "ElaborateModule"
+  [ testCase "produces two TopBinds named idf and k" $ do
+      let (idfBind, kBind) = buildElabModule
+      nameHint (Anf.tbName idfBind) @?= T.pack "idf"
+      nameHint (Anf.tbName kBind)   @?= T.pack "k"
+
+  , testCase "idf has one param binder" $ do
+      let (idfBind, _) = buildElabModule
+      length (Anf.tbParams idfBind) @?= 1
+
+  , testCase "idf body is Ret (AVar param): identity preserved" $ do
+      let (idfBind, _) = buildElabModule
+      case Anf.tbParams idfBind of
+        [b] -> case Anf.tbBody idfBind of
+          Anf.Ret (Anf.AVar n) -> n @?= Anf.bndName b
+          other -> assertFailure ("expected Ret (AVar param), got: " <> show other)
+        _ -> assertFailure "expected exactly one param binder"
+
+  , testCase "k's body references the same canonical Name as idf's tbName" $ do
+      let (idfBind, kBind) = buildElabModule
+          idfName = Anf.tbName idfBind
+      -- k = idf; body should be Ret (AVar idfName)
+      case Anf.tbBody kBind of
+        Anf.Ret (Anf.AVar n) -> n @?= idfName
+        other -> assertFailure ("expected Ret (AVar idfName), got: " <> show other)
+  ]
+
+-- | Build the test module and return (idfBind, kBind).
+buildElabModule :: (Anf.TopBind, Anf.TopBind)
+buildElabModule =
+  let dummyScheme = Ty.Scheme [] (Ty.CTCon Ty.TcUnit [])
+      env = TE.extendVar (T.pack "k")
+              dummyScheme
+              (TE.extendVar (T.pack "idf") dummyScheme TE.emptyEnv)
+      -- idf x = x
+      idfParam = Abs.APVar (varId (T.pack "x"))
+      idfLhs   = Abs.LHSPre (Abs.FNBare (varId (T.pack "idf"))) [idfParam]
+      idfBody  = Abs.EVar (varId (T.pack "x"))
+      idfDecl  = Abs.DEqn idfLhs idfBody Abs.NoWhere
+      -- k = idf
+      kLhs  = Abs.LHSPre (Abs.FNBare (varId (T.pack "k"))) []
+      kBody = Abs.EVar (varId (T.pack "idf"))
+      kDecl = Abs.DEqn kLhs kBody Abs.NoWhere
+      cm = elaborateModule env (Abs.Module [idfDecl, kDecl])
+      binds = Anf.cmBinds cm
+      idfBind = case filter (\b -> nameHint (Anf.tbName b) == T.pack "idf") binds of
+                  (b:_) -> b
+                  []    -> error "buildElabModule: idf bind not found"
+      kBind   = case filter (\b -> nameHint (Anf.tbName b) == T.pack "k") binds of
+                  (b:_) -> b
+                  []    -> error "buildElabModule: k bind not found"
+  in (idfBind, kBind)

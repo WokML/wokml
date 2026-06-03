@@ -1,0 +1,12 @@
+unit =
+  ()
+
+unitWs =
+  ()
+
+discard _ =
+  0
+
+pairUU =
+  let t = Tuple2((), ())
+  t

@@ -1,0 +1,22 @@
+sumCoords p =
+  case p of
+    Point ->
+      let x.1 = p.x
+      case x.1 of
+        0 ->
+          let y.1 = p.y
+          case y.1 of
+            0 -> 0
+    Point ->
+      let x.2 = p.x
+      let y.2 = p.y
+      let t = +(x.2, y.2)
+      t
+
+sumCoordsOpen p =
+  case p of
+    Point ->
+      let x = p.x
+      let y = p.y
+      let t = +(x, y)
+      t

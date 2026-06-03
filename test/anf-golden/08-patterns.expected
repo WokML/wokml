@@ -1,0 +1,17 @@
+first p =
+  case p of
+    Tuple2 x _ -> x
+
+isNone m =
+  case m of
+    None ->
+      let t.1 = True
+      t.1
+    Some _ ->
+      let t.2 = False
+      t.2
+
+headOr d xs =
+  case xs of
+    Nil -> d
+    Cons x _ -> x

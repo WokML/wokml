@@ -10,6 +10,7 @@
 -- can be carved out later if any caller wants to discriminate.
 module Wok.Pipeline
   ( typecheckProgram
+  , elaborateProgram
   ) where
 
 import Control.Monad (foldM)
@@ -17,6 +18,9 @@ import Data.Bifunctor (first)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Tx
 
+import qualified GeneratedParser.Wok.Abs as Abs
+import Wok.IR.Anf (CoreModule)
+import Wok.IR.Elaborate (elaborateModule)
 import Wok.Loader (LoadedModule (..), ModuleName)
 import Wok.Reordering
   ( emptyFixityTable
@@ -27,30 +31,29 @@ import qualified Wok.TypeChecking as TC
 import qualified Wok.TypeChecking.Builtins as B
 import Wok.TypeChecking.Env (emptyEnv, overlayEnvs)
 
-typecheckProgram
-  :: ModuleName     -- entry module name (from Loader)
-  -> [LoadedModule] -- modules in topo order
-  -> Either String ([TC.TypedDecl], [TC.Warning])
-typecheckProgram entryName = go Map.empty Map.empty Map.empty []
+-- | Per-module result of the typecheck fold, carrying only what is needed
+-- for both typecheckProgram and elaborateProgram.
+data ModResult = ModResult
+  { mrDecls  :: [TC.TypedDecl]
+  , mrEnvOut :: TC.Env
+  , mrAst    :: Abs.Module
+  }
+
+-- | Run the shared typecheck fold over all modules in topo order.
+-- Returns a map from module name to its ModResult, plus all warnings.
+runPipelineFold
+  :: ModuleName
+  -> [LoadedModule]
+  -> Either String (Map.Map ModuleName ModResult, [TC.Warning])
+runPipelineFold _entryName = go Map.empty Map.empty Map.empty []
   where
-    go tdMap _envs _fix warns [] =
-      Right (Map.findWithDefault [] entryName tdMap, reverse warns)
-    go tdMap envsByMod fixByMod warns (m : rest) = do
-      -- Loader topo-sort contract: every import has already been
-      -- processed. Map.! on a missing key is a contract-violation panic
-      -- by design — better a clear crash than silent wrong output.
+    go resultMap _envsByMod _fixByMod warns [] =
+      Right (resultMap, reverse warns)
+    go resultMap envsByMod fixByMod warns (m : rest) = do
       let importedFixs = [ fixByMod  Map.! n | n <- lmImports m ]
           importedEnvs = [ envsByMod Map.! n | n <- lmImports m ]
-          -- Seed env-merge with B.initialEnv only for root modules (no
-          -- imports — in practice just Std.Base). Modules WITH imports
-          -- inherit B.initialEnv transitively through the chain, so
-          -- re-seeding would re-collide on U64 / tuples / [].
           envSeed = if null importedEnvs then B.initialEnv else emptyEnv
           ctx s   = s ++ " in " ++ Tx.unpack (lmName m) ++ ": "
-      -- importsFix only (NOT overlaid with the module's own fixities),
-      -- because reorderModuleWith re-derives and overlays the module's
-      -- own table internally. Self-overlay would flag every own fixity
-      -- as RedeclaredOp.
       importsFix <- first ((ctx "fixity merge" ++) . show)
                       (foldM overlayFixities emptyFixityTable importedFixs)
       mergedEnv  <- first ((ctx "env merge" ++) . show)
@@ -59,8 +62,31 @@ typecheckProgram entryName = go Map.empty Map.empty Map.empty []
                       (reorderModuleWith importsFix (lmAst m))
       (envOut, decls, ws) <- first ((ctx "typecheck" ++) . show)
                       (TC.inferProgramWith mergedEnv (lmOrigin m) ast)
-      go (Map.insert (lmName m) decls   tdMap)
-         (Map.insert (lmName m) envOut  envsByMod)
+      let mr = ModResult decls envOut ast
+      go (Map.insert (lmName m) mr         resultMap)
+         (Map.insert (lmName m) envOut     envsByMod)
          (Map.insert (lmName m) (lmFixities m) fixByMod)
          (reverse ws ++ warns)
          rest
+
+typecheckProgram
+  :: ModuleName     -- entry module name (from Loader)
+  -> [LoadedModule] -- modules in topo order
+  -> Either String ([TC.TypedDecl], [TC.Warning])
+typecheckProgram entryName ms = do
+  (resultMap, warns) <- runPipelineFold entryName ms
+  let decls = maybe [] mrDecls (Map.lookup entryName resultMap)
+  Right (decls, warns)
+
+-- | Run the full typecheck pipeline and elaborate the entry module into ANF.
+-- The entry module is identified by `entryName == lmName m`.
+elaborateProgram
+  :: ModuleName
+  -> [LoadedModule]
+  -> Either String CoreModule
+elaborateProgram entryName ms = do
+  (resultMap, _warns) <- runPipelineFold entryName ms
+  case Map.lookup entryName resultMap of
+    Nothing -> Left ("elaborateProgram: entry module not found: " ++ Tx.unpack entryName)
+    Just mr ->
+      Right (elaborateModule (mrEnvOut mr) (mrAst mr))
