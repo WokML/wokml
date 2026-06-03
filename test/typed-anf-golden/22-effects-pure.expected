@@ -1,0 +1,9 @@
+add x : U64 y : U64 =
+  let t : U64 = +(x, y)
+  t
+
+compose2 =
+  let t.3 : a0 -> a1 -> a2 -> a0 -> a2 -> a1 = \f : a0 -> a1 g : a2 -> a0 x : a2 -> let t.1 : a0 = g(x)
+  let t.2 : a1 = f(t.1)
+  t.2
+  t.3

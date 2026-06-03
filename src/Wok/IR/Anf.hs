@@ -11,6 +11,7 @@ module Wok.IR.Anf
   , TopBind (..)
   , CoreModule (..)
   , prettyModule
+  , prettyModuleTyped
   , prettyExpr
   ) where
 
@@ -21,12 +22,13 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Name (Name, JoinId (..), Unique (..), nameHint, nameUniq)
+import Wok.TypeChecking.Types (CType (..), TyCon (..))
 
 -- | Multiplicity. v1 always Unrestricted; Affine is the future no-dup hook.
 data Mult = Unrestricted | Affine
   deriving (Eq, Show)
 
-data Binder = Binder { bndName :: Name, bndMult :: Mult }
+data Binder = Binder { bndName :: Name, bndMult :: Mult, bndType :: CType }
   deriving (Eq, Show)
 
 data Lit = LInt Integer | LStr Text | LChar Char | LUnit
@@ -176,11 +178,21 @@ renderAtom :: HintTable -> Atom -> Text
 renderAtom tbl (AVar n) = rn tbl n
 renderAtom _   (ALit l) = renderLit l
 
-renderBinder :: HintTable -> Binder -> Text
-renderBinder tbl b = rn tbl (bndName b)
+-- | Format a binder using a caller-supplied binder-renderer.
+-- The erased renderer ignores the type; the typed renderer appends \" : type\".
+type BndFmt = HintTable -> Binder -> Text
 
-renderBinders :: HintTable -> [Binder] -> Text
-renderBinders tbl bs = Tx.intercalate (Tx.pack " ") (map (renderBinder tbl) bs)
+erasedBndFmt :: BndFmt
+erasedBndFmt tbl b = rn tbl (bndName b)
+
+typedBndFmt :: BndFmt
+typedBndFmt tbl b = rn tbl (bndName b) <> Tx.pack " : " <> prettyCTypeLocal (bndType b)
+
+renderBinder :: BndFmt -> HintTable -> Binder -> Text
+renderBinder fmt = fmt
+
+renderBinders :: BndFmt -> HintTable -> [Binder] -> Text
+renderBinders fmt tbl bs = Tx.intercalate (Tx.pack " ") (map (renderBinder fmt tbl) bs)
 
 -- Indent every line of a block by n spaces
 indent :: Int -> Text -> Text
@@ -192,82 +204,82 @@ indent n t =
 -- ---------------------------------------------------------------------------
 -- Rendering Rhs
 
-renderRhs :: HintTable -> Rhs -> Text
-renderRhs tbl (RAtom a) =
+renderRhs :: BndFmt -> HintTable -> Rhs -> Text
+renderRhs _   tbl (RAtom a) =
   renderAtom tbl a
-renderRhs tbl (RApp f xs) =
+renderRhs _   tbl (RApp f xs) =
   renderAtom tbl f
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
-renderRhs _   (RCon c []) = c
-renderRhs tbl (RCon c xs) =
+renderRhs _   _   (RCon c []) = c
+renderRhs _   tbl (RCon c xs) =
   c
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
-renderRhs tbl (RLam ps e) =
+renderRhs fmt tbl (RLam ps e) =
   Tx.pack "\\"
-    <> (if null ps then Tx.pack "" else renderBinders tbl ps <> Tx.pack " ")
+    <> (if null ps then Tx.pack "" else renderBinders fmt tbl ps <> Tx.pack " ")
     <> Tx.pack "-> "
-    <> renderExpr tbl e
-renderRhs tbl (ROp lbl op xs) =
+    <> renderExpr fmt tbl e
+renderRhs _   tbl (ROp lbl op xs) =
   lbl <> Tx.pack "." <> op
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
-renderRhs tbl (RRecord tyName flds) =
+renderRhs _   tbl (RRecord tyName flds) =
   tyName
     <> Tx.pack " { "
     <> Tx.intercalate (Tx.pack ", ")
          (map (\(l, a) -> l <> Tx.pack " = " <> renderAtom tbl a) flds)
     <> Tx.pack " }"
-renderRhs tbl (RProj lbl a) =
+renderRhs _   tbl (RProj lbl a) =
   renderAtom tbl a <> Tx.pack "." <> lbl
 
 -- ---------------------------------------------------------------------------
 -- Rendering Expr (flat layout, no extra depth per let)
 
-renderExpr :: HintTable -> Expr -> Text
-renderExpr tbl (Ret a) =
+renderExpr :: BndFmt -> HintTable -> Expr -> Text
+renderExpr _   tbl (Ret a) =
   renderAtom tbl a
-renderExpr tbl (Let b r e) =
-  Tx.pack "let " <> renderBinder tbl b <> Tx.pack " = " <> renderRhs tbl r
+renderExpr fmt tbl (Let b r e) =
+  Tx.pack "let " <> renderBinder fmt tbl b <> Tx.pack " = " <> renderRhs fmt tbl r
     <> Tx.pack "\n"
-    <> renderExpr tbl e
-renderExpr tbl (LetRec defs e) =
+    <> renderExpr fmt tbl e
+renderExpr fmt tbl (LetRec defs e) =
   Tx.pack "letrec\n"
     <> Tx.intercalate (Tx.pack "\n")
          (map (\(b, ps, body) ->
                 indent 2 (
-                  renderBinder tbl b
-                    <> (if null ps then Tx.pack "" else Tx.pack " " <> renderBinders tbl ps)
+                  renderBinder fmt tbl b
+                    <> (if null ps then Tx.pack "" else Tx.pack " " <> renderBinders fmt tbl ps)
                     <> Tx.pack " =\n"
-                    <> indent 2 (renderExpr tbl body)
+                    <> indent 2 (renderExpr fmt tbl body)
                 )) defs)
     <> Tx.pack "\n"
-    <> renderExpr tbl e
-renderExpr tbl (Case a alts) =
+    <> renderExpr fmt tbl e
+renderExpr fmt tbl (Case a alts) =
   Tx.pack "case " <> renderAtom tbl a <> Tx.pack " of\n"
     <> Tx.intercalate (Tx.pack "\n")
-         (map (indent 2 . renderAlt tbl) alts)
-renderExpr tbl (LetJoin jid ps jbody e) =
+         (map (indent 2 . renderAlt fmt tbl) alts)
+renderExpr fmt tbl (LetJoin jid ps jbody e) =
   Tx.pack "join " <> renderJoinId jid
     <> Tx.pack "("
-    <> Tx.intercalate (Tx.pack ", ") (map (renderBinder tbl) ps)
+    <> Tx.intercalate (Tx.pack ", ") (map (renderBinder fmt tbl) ps)
     <> Tx.pack ") =\n"
-    <> indent 2 (renderExpr tbl jbody)
+    <> indent 2 (renderExpr fmt tbl jbody)
     <> Tx.pack "\n"
-    <> renderExpr tbl e
-renderExpr tbl (Jump jid xs) =
+    <> renderExpr fmt tbl e
+renderExpr _   tbl (Jump jid xs) =
   Tx.pack "jump " <> renderJoinId jid
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
-renderExpr tbl (Handle e h) =
-  renderExpr tbl e
+renderExpr fmt tbl (Handle e h) =
+  renderExpr fmt tbl e
     <> Tx.pack "\n"
-    <> renderHandler tbl h
+    <> renderHandler fmt tbl h
 
 -- ---------------------------------------------------------------------------
 -- Rendering Alt
@@ -280,51 +292,77 @@ arrowBody header body =
     [_] -> header <> Tx.pack " " <> body
     _   -> header <> Tx.pack "\n" <> indent 2 body
 
-renderAlt :: HintTable -> Alt -> Text
-renderAlt tbl (AltCon c bs e) =
+renderAlt :: BndFmt -> HintTable -> Alt -> Text
+renderAlt fmt tbl (AltCon c bs e) =
   arrowBody
-    (c <> (if null bs then Tx.pack "" else Tx.pack " " <> renderBinders tbl bs)
+    (c <> (if null bs then Tx.pack "" else Tx.pack " " <> renderBinders fmt tbl bs)
        <> Tx.pack " ->")
-    (renderExpr tbl e)
-renderAlt tbl (AltLit l e) =
-  arrowBody (renderLit l <> Tx.pack " ->") (renderExpr tbl e)
-renderAlt tbl (AltDefault e) =
-  arrowBody (Tx.pack "_ ->") (renderExpr tbl e)
+    (renderExpr fmt tbl e)
+renderAlt fmt tbl (AltLit l e) =
+  arrowBody (renderLit l <> Tx.pack " ->") (renderExpr fmt tbl e)
+renderAlt fmt tbl (AltDefault e) =
+  arrowBody (Tx.pack "_ ->") (renderExpr fmt tbl e)
 
 -- ---------------------------------------------------------------------------
 -- Rendering Handler
 
-renderHandler :: HintTable -> Handler -> Text
-renderHandler tbl (Handler (rb, re) ops) =
+renderHandler :: BndFmt -> HintTable -> Handler -> Text
+renderHandler fmt tbl (Handler (rb, re) ops) =
   Tx.pack "with {"
     <> Tx.pack "\n"
     <> indent 2
-         (arrowBody (Tx.pack "return " <> renderBinder tbl rb <> Tx.pack " ->")
-                    (renderExpr tbl re))
+         (arrowBody (Tx.pack "return " <> renderBinder fmt tbl rb <> Tx.pack " ->")
+                    (renderExpr fmt tbl re))
     <> (if null ops
           then Tx.pack ""
-          else Tx.pack "\n" <> Tx.intercalate (Tx.pack "\n") (map (indent 2 . renderOpArm tbl) ops))
+          else Tx.pack "\n" <> Tx.intercalate (Tx.pack "\n") (map (indent 2 . renderOpArm fmt tbl) ops))
     <> Tx.pack "\n}"
 
-renderOpArm :: HintTable -> OpArm -> Text
-renderOpArm tbl (OpArm lbl op args resume body) =
+renderOpArm :: BndFmt -> HintTable -> OpArm -> Text
+renderOpArm fmt tbl (OpArm lbl op args resume body) =
   arrowBody
     (lbl <> Tx.pack "." <> op
        <> Tx.pack "("
        <> Tx.intercalate (Tx.pack ", ")
-            (map (renderBinder tbl) args ++ [renderBinder tbl resume])
+            (map (renderBinder fmt tbl) args ++ [renderBinder fmt tbl resume])
        <> Tx.pack ") ->")
-    (renderExpr tbl body)
+    (renderExpr fmt tbl body)
 
 -- ---------------------------------------------------------------------------
 -- Top-level rendering
 
-renderTop :: HintTable -> TopBind -> Text
-renderTop tbl (TopBind n ps e) =
+renderTop :: BndFmt -> HintTable -> TopBind -> Text
+renderTop fmt tbl (TopBind n ps e) =
   rn tbl n
-    <> (if null ps then Tx.pack "" else Tx.pack " " <> renderBinders tbl ps)
+    <> (if null ps then Tx.pack "" else Tx.pack " " <> renderBinders fmt tbl ps)
     <> Tx.pack " =\n"
-    <> indent 2 (renderExpr tbl e)
+    <> indent 2 (renderExpr fmt tbl e)
+
+-- ---------------------------------------------------------------------------
+-- Local CType renderer (avoids import cycle if Infer ever imports Anf)
+
+prettyCTypeLocal :: CType -> Text
+prettyCTypeLocal (CTGen i)            = Tx.pack "a" <> Tx.pack (show i)
+prettyCTypeLocal (CTCon TcU64    [])  = Tx.pack "U64"
+prettyCTypeLocal (CTCon TcChar   [])  = Tx.pack "Char"
+prettyCTypeLocal (CTCon TcString [])  = Tx.pack "String"
+prettyCTypeLocal (CTCon TcBool   [])  = Tx.pack "Bool"
+prettyCTypeLocal (CTCon TcUnit   [])  = Tx.pack "()"
+prettyCTypeLocal (CTCon TcList [x])   =
+  Tx.pack "[" <> prettyCTypeLocal x <> Tx.pack "]"
+prettyCTypeLocal (CTCon (TcTuple _) xs) =
+  Tx.pack "("
+    <> Tx.intercalate (Tx.pack ", ") (map prettyCTypeLocal xs)
+    <> Tx.pack ")"
+prettyCTypeLocal (CTCon (TcUser n) []) = n
+prettyCTypeLocal (CTCon (TcUser n) xs) =
+  n <> Tx.pack " " <> Tx.intercalate (Tx.pack " ") (map prettyCTypeLocal xs)
+prettyCTypeLocal (CTCon tc xs) =
+  Tx.pack (show tc)
+    <> (if null xs then Tx.pack "" else Tx.pack " " <> Tx.intercalate (Tx.pack " ") (map prettyCTypeLocal xs))
+prettyCTypeLocal (CTArr a _ b) =
+  prettyCTypeLocal a <> Tx.pack " -> " <> prettyCTypeLocal b
+prettyCTypeLocal (CTRecord t _) = t
 
 -- ---------------------------------------------------------------------------
 -- Public API
@@ -332,10 +370,16 @@ renderTop tbl (TopBind n ps e) =
 prettyModule :: CoreModule -> Text
 prettyModule (CoreModule binds) =
   Tx.intercalate (Tx.pack "\n\n")
-    (map (\b -> renderTop (collectTopBind b Map.empty) b) binds)
+    (map (\b -> renderTop erasedBndFmt (collectTopBind b Map.empty) b) binds)
+
+-- | Like 'prettyModule' but renders each binder as @name : type@.
+prettyModuleTyped :: CoreModule -> Text
+prettyModuleTyped (CoreModule binds) =
+  Tx.intercalate (Tx.pack "\n\n")
+    (map (\b -> renderTop typedBndFmt (collectTopBind b Map.empty) b) binds)
 
 prettyExpr :: Expr -> Text
 prettyExpr e =
   let tbl = buildHintTableExpr e
-  in renderExpr tbl e
+  in renderExpr erasedBndFmt tbl e
 

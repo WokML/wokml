@@ -1,0 +1,12 @@
+add x : U64 y : U64 =
+  let t : U64 = +(x, y)
+  t
+
+double n : U64 =
+  let t : U64 = *(n, 2)
+  t
+
+quad n : U64 =
+  let t.1 : U64 = double(n)
+  let t.2 : U64 = double(t.1)
+  t.2

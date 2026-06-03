@@ -1,0 +1,17 @@
+first p : (a0, a1) =
+  case p of
+    Tuple2 x : a0 _ : a1 -> x
+
+isNone m : Option a0 =
+  case m of
+    None ->
+      let t.1 : Bool = True
+      t.1
+    Some _ : a0 ->
+      let t.2 : Bool = False
+      t.2
+
+headOr d : a0 xs : [a0] =
+  case xs of
+    Nil -> d
+    Cons x : a0 _ : [a0] -> x

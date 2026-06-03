@@ -1,0 +1,14 @@
+fromOption d : a0 m : Option a0 =
+  case m of
+    None -> d
+    Some x : a0 -> x
+
+mapOption f : a0 -> a1 m : Option a0 =
+  case m of
+    None ->
+      let t.1 : Option a1 = None
+      t.1
+    Some x : a0 ->
+      let t.2 : a1 = f(x)
+      let t.3 : Option a1 = Some(t.2)
+      t.3

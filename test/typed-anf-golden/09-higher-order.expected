@@ -1,0 +1,13 @@
+twice f : a0 -> a0 x : a0 =
+  let t.1 : a0 = f(x)
+  let t.2 : a0 = f(t.1)
+  t.2
+
+compose f : a0 -> a1 g : a2 -> a0 x : a2 =
+  let t.1 : a0 = g(x)
+  let t.2 : a1 = f(t.1)
+  t.2
+
+apply f : a0 -> a1 x : a0 =
+  let t : a1 = f(x)
+  t

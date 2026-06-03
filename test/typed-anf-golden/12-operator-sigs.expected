@@ -1,0 +1,3 @@
+add x : U64 y : U64 =
+  let t : U64 = +(x, y)
+  t

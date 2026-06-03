@@ -86,6 +86,7 @@ library
         Wok.TypeChecking.Unify
         Wok.TypeChecking.Infer
         Wok.TypeChecking.Builtins
+        Wok.TypeChecking.Typed
         Wok.IR.Name
         Wok.IR.Anf
         Wok.IR.Elaborate

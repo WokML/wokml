@@ -1,0 +1,22 @@
+sumCoords p : Point =
+  case p of
+    Point ->
+      let x.1 : U64 = p.x
+      case x.1 of
+        0 ->
+          let y.1 : U64 = p.y
+          case y.1 of
+            0 -> 0
+    Point ->
+      let x.2 : U64 = p.x
+      let y.2 : U64 = p.y
+      let t : U64 = +(x.2, y.2)
+      t
+
+sumCoordsOpen p : Point =
+  case p of
+    Point ->
+      let x : U64 = p.x
+      let y : U64 = p.y
+      let t : U64 = +(x, y)
+      t

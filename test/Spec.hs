@@ -22,6 +22,7 @@ import qualified Wok.TypeChecking.Monad as TM
 import qualified Wok.TypeChecking.Unify as U
 import qualified Wok.TypeChecking.Infer as I
 import qualified Wok.TypeChecking.Builtins as B
+import qualified Wok.TypeChecking.Typed as Typed
 import qualified Wok.TypeChecking as TC
 import qualified Wok.SourceOrigin as SO
 import qualified Wok.Prelude as Prelude
@@ -29,7 +30,8 @@ import qualified Wok.Loader as Loader
 import qualified Wok.Pipeline as Pipeline
 import Wok.IR.Name (Unique (..), Name (..), runFresh, freshUnique, freshName, freshJoin)
 import qualified Wok.IR.Anf as Anf
-import Wok.IR.Elaborate (elaborateExprForTest, elaborateModule)
+import Wok.IR.Elaborate (elaborateModule)
+import qualified Wok.IR.Elaborate as Elab
 import qualified Wok.Interp.Value as IV
 import qualified Wok.Interp.Prim as IP
 import qualified Wok.Interp.Machine as IM
@@ -42,6 +44,7 @@ import Control.Monad.Except (throwError)
 import Data.Unique (newUnique, hashUnique)
 import Data.Bifunctor (first)
 import qualified Data.List
+import qualified Data.Maybe
 import Data.List (sortBy)
 import Data.Ord (comparing)
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
@@ -53,6 +56,7 @@ main = do
   typecheckFiles     <- findByExtension [".wok"] "test/typecheck-examples"
   typecheckBadFiles  <- findByExtension [".wok"] "test/typecheck-fail-examples"
   anfFiles           <- findByExtension [".wok"] "test/typecheck-examples"
+  typedAnfFiles      <- findByExtension [".wok"] "test/typecheck-examples"
   runFiles           <- findByExtension [".wok"] "test/run-examples"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
@@ -71,6 +75,7 @@ main = do
     , unifyWalksTests
     , unifyTests
     , generalizeTests
+    , zonkTests
     , builtinsTests
     , translateTests
     , dataTests
@@ -85,6 +90,8 @@ main = do
     , patternTests
     , exprBasicTests
     , exprLetTests
+    , inferTypedTests
+    , typedDeclBodyTests
     , programTests
     , bodylessSigTests
     , loaderTests
@@ -113,6 +120,7 @@ main = do
     , elaborateRecordsTests
     , elaborateEffectsTests
     , elaborateModuleTests
+    , typedAstTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -128,6 +136,10 @@ main = do
     , testGroup "anf golden"
         [ goldenVsString (takeBaseName f) (anfGoldenFor f) (anfElaborateHarness f)
         | f <- anfFiles
+        ]
+    , testGroup "typed-anf golden"
+        [ goldenVsString (takeBaseName f) (typedAnfGoldenFor f) (typedAnfElaborateHarness f)
+        | f <- typedAnfFiles
         ]
     , testGroup "run golden"
         [ goldenVsString (takeBaseName f) (runGoldenFor f) (runProgramHarness f)
@@ -154,6 +166,10 @@ typecheckFailGoldenFor f =
 anfGoldenFor :: FilePath -> FilePath
 anfGoldenFor f =
   replaceDirectory (replaceExtension f ".expected") "test/anf-golden"
+
+typedAnfGoldenFor :: FilePath -> FilePath
+typedAnfGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/typed-anf-golden"
 
 runGoldenFor :: FilePath -> FilePath
 runGoldenFor f =
@@ -205,6 +221,16 @@ anfElaborateHarness path = do
         Left s  -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
         Right cm -> pure (BL.pack (T.unpack (Anf.prettyModule cm) <> "\n"))
 
+typedAnfElaborateHarness :: FilePath -> IO BL.ByteString
+typedAnfElaborateHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgram entryName ms of
+        Left s  -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
+        Right cm -> pure (BL.pack (T.unpack (Anf.prettyModuleTyped cm) <> "\n"))
+
 -- | The "extended" env an ordinary user module sees: B.initialEnv with the
 -- Std.Base prelude's decls layered on top. Used by unit tests that need to
 -- look up names defined by the prelude (Bool, True, +, ++, ...). Loads + parses
@@ -221,6 +247,157 @@ stdBaseExtendedEnv = do
   case TC.inferProgramWith B.initialEnv SO.Embedded reord of
     Left e             -> fail ("stdBaseExtendedEnv: typecheck: " ++ show e)
     Right (env, _, _) -> pure env
+
+-- | Placeholder annotation for the structural test translator below: the
+-- elaboration unit tests assert on the *structure* of the resulting ANF (their
+-- binders are wildcards), so the carried CType is irrelevant. The erased
+-- printer and the runtime ignore binder types regardless.
+testTy :: Ty.CType
+testTy = Ty.CTCon Ty.TcUnit []
+
+ta :: Typed.TexpF Ty.CType -> Typed.TExpr
+ta = Typed.Texp testTy
+
+tpa :: Typed.TpatF Ty.CType -> Typed.TPat
+tpa = Typed.Tpat testTy
+
+-- | Test seam: structurally translate a raw 'Abs.Exp' into a typed 'TExpr',
+-- mirroring the SHAPE the real inferrer produces (spine-collected applications,
+-- effect-op projections, declared-field-order record nodes, where-folding), so
+-- the elaborator -- which now consumes the typed AST -- can be exercised from
+-- unit tests that build raw surface expressions over hand-built envs that are
+-- not amenable to full type inference. Every node carries 'testTy'.
+typedExprForTest :: TE.Env -> Abs.Exp -> Typed.TExpr
+typedExprForTest env = goE
+  where
+    goE :: Abs.Exp -> Typed.TExpr
+    goE (Abs.ELitI (Abs.WokInt (_, t))) = ta (Typed.TLitI (read (T.unpack t)))
+    goE (Abs.ELitS s)                   = ta (Typed.TLitS (T.pack s))
+    goE (Abs.ELitC c)                   = ta (Typed.TLitC c)
+    goE Abs.EUnit                       = ta Typed.TUnit
+    goE (Abs.EParen e)                  = goE e
+    goE (Abs.EVar (Abs.VarId (_, t)))   = ta (Typed.TVar t)
+    goE (Abs.ECon (Abs.ConId (_, c)))   = ta (Typed.TCon c)
+    goE (Abs.EParenOp (Abs.VarSym (_, s))) = ta (Typed.TParenOp s)
+    goE e@(Abs.EApp _ _) =
+      let (hd, args) = collectSpine e
+      in case hd of
+           Abs.EProj (Abs.ECon (Abs.ConId (_, en))) (Abs.VarId (_, op))
+             | isEffOp en op -> ta (Typed.TApp (ta (Typed.TProjCon en op)) (map goE args))
+           _ -> ta (Typed.TApp (goE hd) (map goE args))
+    goE (Abs.ELam pats body) = ta (Typed.TLam (map goAP pats) (goE body))
+    goE (Abs.EIf c a b)      = ta (Typed.TIf (goE c) (goE a) (goE b))
+    goE (Abs.ETuple a rest)  = ta (Typed.TTuple (map goE (a : rest)))
+    goE (Abs.EList xs)       = ta (Typed.TList (map goE xs))
+    goE (Abs.EProj e (Abs.VarId (_, l))) =
+      case e of
+        Abs.ECon (Abs.ConId (_, en)) | isEffOp en l -> ta (Typed.TProjCon en l)
+        _                                            -> ta (Typed.TProj (goE e) l)
+    goE (Abs.ERecord (Abs.ConId (_, t)) fes) =
+      ta (Typed.TRecord t [ (l, goE fe) | Abs.RFExpr (Abs.VarId (_, l)) fe <- fes ])
+    goE (Abs.ERecordExt (Abs.ConId (_, t)) spread mTrailing) =
+      let trailing = case mTrailing of
+            Abs.TFNone     -> []
+            Abs.TFSome fes -> [ (l, goE fe) | Abs.RFExpr (Abs.VarId (_, l)) fe <- fes ]
+      in ta (Typed.TRecordExt t (goE spread) trailing)
+    goE (Abs.ELet decls body) = ta (Typed.TLet (goDecls decls) (goE body))
+    goE (Abs.ECase scrut alts) = ta (Typed.TCase (goE scrut) (map goAlt alts))
+    goE (Abs.EHandle e arms) = ta (Typed.THandle (goE e) (map goArm arms))
+    goE (Abs.EExpr hd []) = goE hd
+    goE (Abs.EExpr hd tails) = goTails (goE hd) tails
+    goE other = error ("typedExprForTest: unsupported form: " <> show other)
+
+    goTails acc [Abs.ITail op rhs] = ta (Typed.TApp (opVar op) [acc, goE rhs])
+    goTails acc (Abs.ITail op rhs : rest) =
+      goTails (ta (Typed.TApp (opVar op) [acc, goE rhs])) rest
+    goTails acc [] = acc
+
+    opVar (Abs.IOSym (Abs.VarSym (_, s))) = ta (Typed.TVar s)
+    opVar (Abs.IOBT  (Abs.VarId  (_, v))) = ta (Typed.TVar v)
+
+    isEffOp en op = case TE.lookupEffect en env of
+      Just ei -> Map.member op (TE.eiOps ei)
+      Nothing -> False
+
+    -- where is folded into the body as a leading TLet (as inference does).
+    goAlt (Abs.AltC pat body wh) =
+      let body' = case wh of
+            Abs.NoWhere    -> goE body
+            Abs.WithWh ds  -> ta (Typed.TLet (goDecls ds) (goE body))
+      in Typed.TAlt (goPat pat) [] body'
+
+    goArm (Abs.HArm (Abs.ConId (_, en)) (Abs.VarId (_, op)) ps body) =
+      Typed.TOpArm en op (map goAP ps) (T.pack "") (goE body)
+    goArm (Abs.HReturn (Abs.VarId (_, v)) body) =
+      Typed.TReturnArm (tpa (Typed.TPVar v)) (goE body)
+
+    goDecls :: [Abs.LocalDecl] -> [Typed.TLocalDecl Ty.CType]
+    goDecls decls =
+      [ Typed.TLocalDecl fn (map goAP params) body'
+      | Abs.LDEqn lhs body wh <- decls
+      , (fn, params) <- lhsParts lhs
+      , let body' = case wh of
+              Abs.NoWhere   -> goE body
+              Abs.WithWh ds -> ta (Typed.TLet (goDecls ds) (goE body))
+      ]
+
+    lhsParts (Abs.LHSPre fn params) = [(funName fn, params)]
+    lhsParts _ = error "typedExprForTest: infix LHS not supported in tests"
+    funName (Abs.FNBare    (Abs.VarId  (_, t))) = t
+    funName (Abs.FNBareSym (Abs.VarSym (_, t))) = t
+    funName (Abs.FNParen   (Abs.VarSym (_, t))) = t
+
+    -- pattern translation -----------------------------------------------------
+    goPat :: Abs.Pat -> Typed.TPat
+    goPat (Abs.PAtom ap)             = goAP ap
+    goPat (Abs.PApp modpath ap aps)  =
+      tpa (Typed.TPCon (modPathFinal modpath) (map goAP (ap : aps)))
+    goPat (Abs.PCons h t)            = tpa (Typed.TPCons (goAP h) (goPat t))
+
+    goAP :: Abs.AtomPat -> Typed.TPat
+    goAP (Abs.APVar (Abs.VarId (_, v))) = tpa (Typed.TPVar v)
+    goAP Abs.APWild                     = tpa Typed.TPWild
+    goAP Abs.PUnit                      = tpa Typed.TPUnit
+    goAP (Abs.APLitI _)                 = tpa (Typed.TPLitI 0)
+    goAP (Abs.APLitS s)                 = tpa (Typed.TPLitS (T.pack s))
+    goAP (Abs.APLitC c)                 = tpa (Typed.TPLitC c)
+    goAP (Abs.APCon modpath)            = tpa (Typed.TPCon (modPathFinal modpath) [])
+    goAP (Abs.APTuple p1 ps)            = tpa (Typed.TPTuple (map goPat (p1 : ps)))
+    goAP (Abs.APList ps)                = tpa (Typed.TPList (map goPat ps))
+    goAP (Abs.APParen p)                = goPat p
+    -- record patterns become TPCon over ALL declared fields in declared order,
+    -- with TPWild for absent / wild fields (exactly as inference produces).
+    goAP (Abs.PRecord (Abs.ConId (_, t)) fps)          = recPat t fps
+    goAP (Abs.PRecordOpen (Abs.ConId (_, t)) fps _)    = recPat t fps
+    goAP (Abs.PRecordWild (Abs.ConId (_, t)) _)        = recPat t []
+
+    recPat t fps =
+      let provided = [ (l, goPat sp) | Abs.RFPat (Abs.VarId (_, l)) sp <- fps ]
+          declared = case TE.lookupRecordCon t env of
+            Just rci -> map fst (TE.rcFields rci)
+            Nothing  -> map fst provided
+          sub l = Data.Maybe.fromMaybe (tpa Typed.TPWild) (lookup l provided)
+      in tpa (Typed.TPCon t (map sub declared))
+
+    modPathFinal (Abs.MPName (Abs.ConId (_, t)))  = t
+    modPathFinal (Abs.MPDot _ (Abs.ConId (_, t))) = t
+
+    collectSpine :: Abs.Exp -> (Abs.Exp, [Abs.Exp])
+    collectSpine e0 = go e0 []
+      where go (Abs.EApp f x) acc = go f (x : acc)
+            go hd             acc = (hd, acc)
+
+-- | Back-compat wrapper matching the old test signature: structurally translate
+-- the raw expression to the typed AST, then elaborate it.
+elaborateExprForTest :: TE.Env -> Abs.Exp -> Anf.Expr
+elaborateExprForTest env e = Elab.elaborateExprForTest env (typedExprForTest env e)
+
+-- | Infer a raw module into the typed decls + env the elaborator consumes.
+typedModuleForTest :: TE.Env -> Abs.Module -> (TE.Env, [I.TypedDecl])
+typedModuleForTest env m =
+  case TC.inferProgramWith env (SO.UserFile "<test>") m of
+    Left err               -> error (show err)
+    Right (envOut, tds, _) -> (envOut, tds)
 
 -- End-to-end resolver pipeline for golden tests: parse, resolve, print.
 -- Errors are rendered as `RESOLVE ERROR: ...` lines so they remain in golden
@@ -922,6 +1099,144 @@ generalizeTests = testGroup "Wok.TypeChecking.Infer (generalize/instantiate)"
            Left e -> assertFailure (show e)
   ]
 
+zonkTests :: TestTree
+zonkTests = testGroup "Zonk"
+  [ testCase "polymorphic body node shares the scheme's CTGen domain" $
+      -- Mirror real use: the binding's RHS var lives one level deeper than
+      -- the level at which we generalize, so 'a' is generalizable.
+      let r = TM.runTC_ B.initialEnv $ do
+                a <- TM.enterLevel (TM.freshTVar Ty.KStar)          -- the 'a' of id
+                let fnTy = Ty.TArr a Ty.RowEmpty a
+                    tree = Typed.Texp a (Typed.TVar (T.pack "x"))   -- body: x : a
+                (sch, tree') <- I.generalizeTyped fnTy tree
+                let Typed.Texp ann _ = tree'
+                pure (Ty.schemeBody sch, ann)
+      in case r of
+           Right (Ty.CTArr d _ _, ann) -> ann @?= d   -- node type == domain
+           other -> assertFailure (show other)
+  , testCase "monomorphic node freezes to concrete CType" $
+      let r = TM.runTC_ B.initialEnv $ do
+                let tree = Typed.Texp (Ty.TCon Ty.TcU64 []) (Typed.TLitI 1)
+                (_, Typed.Texp ann _) <- I.generalizeTyped (Ty.TCon Ty.TcU64 []) tree
+                pure ann
+      in case r of
+           Right ann -> ann @?= Ty.CTCon Ty.TcU64 []
+           Left e    -> assertFailure (show e)
+  ]
+
+-- | Assert that inferExprW builds typed nodes with the right constructor
+-- shape. We inspect the TexpF structure (annotations carry mutable Type s and
+-- are awkward to compare, so we match on node shape and concrete literals).
+inferTypedTests :: TestTree
+inferTypedTests = testGroup "InferTyped"
+  [ testCase "literal 1 yields Texp _ (TLitI 1)" $
+      let r = TM.runTC_ B.initialEnv $ do
+                (_, Typed.Texp _ node) <-
+                  I.inferExprW Map.empty (Abs.ELitI (Abs.WokInt ((0,0), T.pack "1")))
+                pure $ case node of
+                  Typed.TLitI 1 -> True
+                  _             -> False
+      in case r of
+           Right True -> pure ()
+           other      -> assertFailure ("unexpected node: " ++ show other)
+  , testCase "unit yields Texp _ TUnit" $
+      let r = TM.runTC_ B.initialEnv $ do
+                (_, Typed.Texp _ node) <- I.inferExprW Map.empty Abs.EUnit
+                pure $ case node of
+                  Typed.TUnit -> True
+                  _           -> False
+      in case r of
+           Right True -> pure ()
+           other      -> assertFailure ("unexpected node: " ++ show other)
+  , testCase "f x yields Texp _ (TApp (Texp _ (TVar f)) [Texp _ (TVar x)])" $
+      let r = TM.runTC_ B.initialEnv $ do
+                xa <- TM.freshTVar Ty.KStar
+                -- f : x -> r so the application is well typed.
+                rv <- TM.freshTVar Ty.KStar
+                let mono = Map.fromList
+                      [ (T.pack "f", Ty.TArr xa Ty.RowEmpty rv)
+                      , (T.pack "x", xa) ]
+                    app = Abs.EApp
+                            (Abs.EVar (Abs.VarId ((0,0), T.pack "f")))
+                            (Abs.EVar (Abs.VarId ((0,0), T.pack "x")))
+                (_, Typed.Texp _ node) <- I.inferExprW mono app
+                pure $ case node of
+                  Typed.TApp (Typed.Texp _ (Typed.TVar fn))
+                             [Typed.Texp _ (Typed.TVar xn)] ->
+                    fn == T.pack "f" && xn == T.pack "x"
+                  _ -> False
+      in case r of
+           Right True -> pure ()
+           other      -> assertFailure ("unexpected node: " ++ show other)
+  , testCase "lambda yields Texp _ (TLam [TPVar x] (TVar x))" $
+      let lam = Abs.ELam [Abs.APVar (Abs.VarId ((0,0), T.pack "x"))]
+                  (Abs.EVar (Abs.VarId ((0,0), T.pack "x")))
+          r = TM.runTC_ B.initialEnv $ do
+                (_, Typed.Texp _ node) <- I.inferExprW Map.empty lam
+                pure $ case node of
+                  Typed.TLam [Typed.Tpat _ (Typed.TPVar p)]
+                             (Typed.Texp _ (Typed.TVar b)) ->
+                    p == T.pack "x" && b == T.pack "x"
+                  _ -> False
+      in case r of
+           Right True -> pure ()
+           other      -> assertFailure ("unexpected node: " ++ show other)
+  ]
+
+typedDeclBodyTests :: TestTree
+typedDeclBodyTests = testGroup "TypedDeclBody"
+  [ testCase "id x = x: scheme forall a. a -> a, body+params share CTGen" $
+      case parse (T.pack "id x = x\n") of
+        Left err -> assertFailure ("parse: " ++ err)
+        Right ast -> case reorderModule ast of
+          Left es -> assertFailure ("reorder: " ++ show es)
+          Right rm ->
+            case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+              Left e -> assertFailure ("typecheck: " ++ show e)
+              Right (_env, decls, _ws) ->
+                case [ d | d <- decls, TC.tdName d == T.pack "id" ] of
+                  [] -> assertFailure "no TypedDecl for id"
+                  (d : _) ->
+                    case TC.tdScheme d of
+                      Ty.Scheme [_] (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j))
+                        | i == j ->
+                          let bodyAnn = case TC.tdBody d of Typed.Texp a _ -> a
+                          in case TC.tdParams d of
+                               [Typed.Tpat (Ty.CTGen pIdx) (Typed.TPVar nm)] -> do
+                                 -- one quantifier, arrow a -> a
+                                 -- body's root annotation is the domain CTGen i
+                                 bodyAnn @?= Ty.CTGen i
+                                 pIdx @?= i
+                                 nm @?= T.pack "x"
+                               other ->
+                                 assertFailure ("unexpected tdParams: " ++ show other)
+                      other ->
+                        assertFailure ("unexpected scheme: " ++ show other)
+  , testCase "f x = let g y = y in x: node-only poly var does not leak into scheme" $
+      -- 'g' is a let-bound polymorphic helper whose type does not escape into
+      -- f's type. f's scheme must be exactly forall a. a -> a (one quantifier).
+      -- Under the old code, freezing g's body node 'y : b' recorded a spurious
+      -- second quantifier, yielding forall a b. a -> a.
+      case parse (T.pack "f x = let g y = y in x\n") of
+        Left err -> assertFailure ("parse: " ++ err)
+        Right ast -> case reorderModule ast of
+          Left es -> assertFailure ("reorder: " ++ show es)
+          Right rm ->
+            case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+              Left e -> assertFailure ("typecheck: " ++ show e)
+              Right (_env, decls, _ws) ->
+                case [ d | d <- decls, TC.tdName d == T.pack "f" ] of
+                  [] -> assertFailure "no TypedDecl for f"
+                  (d : _) ->
+                    case TC.tdScheme d of
+                      sch@(Ty.Scheme _ (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j)))
+                        | i == j -> do
+                          -- exactly one quantifier; the node-only 'b' did not leak
+                          length (Ty.schemeVars sch) @?= 1
+                      other ->
+                        assertFailure ("unexpected scheme: " ++ show other)
+  ]
+
 -- | Parse, reorder, and typecheck a whole module; assert it succeeds.
 assertModuleTypechecks :: Text -> Assertion
 assertModuleTypechecks src =
@@ -1609,7 +1924,7 @@ patternTests :: TestTree
 patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
   [ testCase "var pattern returns fresh type and one binding" $
       let result = TM.runTC_ B.initialEnv $ do
-            (t, bs) <- I.inferPat
+            (t, bs, _) <- I.inferPat
               (Abs.PAtom (Abs.APVar (Abs.VarId ((0,0), T.pack "x"))))
             pure (length bs, case t of Ty.TVar _ -> True; _ -> False)
       in case result of
@@ -1617,7 +1932,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
            other -> assertFailure ("unexpected: " ++ show other)
   , testCase "literal Int pattern" $
       let result = TM.runTC_ B.initialEnv $ do
-            (t, _) <- I.inferPat
+            (t, _, _) <- I.inferPat
               (Abs.PAtom (Abs.APLitI
                 (Abs.WokInt ((0,0), T.pack "5"))))
             U.freeze t
@@ -1626,7 +1941,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
            Left e -> assertFailure (show e)
   , testCase "wildcard pattern returns fresh type, no bindings" $
       let result = TM.runTC_ B.initialEnv $ do
-            (_, bs) <- I.inferPat (Abs.PAtom Abs.APWild)
+            (_, bs, _) <- I.inferPat (Abs.PAtom Abs.APWild)
             pure (length bs)
       in case result of
            Right 0 -> pure ()
@@ -1634,7 +1949,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
   , testCase "True nullary constructor pattern" $ do
       env <- stdBaseExtendedEnv
       let result = TM.runTC_ env $ do
-            (t, _) <- I.inferPat (Abs.PAtom
+            (t, _, _) <- I.inferPat (Abs.PAtom
               (Abs.APCon (Abs.MPName (Abs.ConId ((0,0), T.pack "True")))))
             U.freeze t
       case result of
@@ -1644,7 +1959,7 @@ patternTests = testGroup "Wok.TypeChecking.Infer (patterns)"
       let pos = (0,0)
           vp s = Abs.PAtom (Abs.APVar (Abs.VarId (pos, T.pack s)))
           result = TM.runTC_ B.initialEnv $ do
-            (t, bs) <- I.inferPat
+            (t, bs, _) <- I.inferPat
               (Abs.PAtom (Abs.APTuple (vp "x") [vp "y"]))
             ct <- U.freeze t
             pure (ct, length bs)
@@ -3007,8 +3322,8 @@ anfTests = testGroup "Anf"
             nf <- freshName (T.pack "f")
             nx <- freshName (T.pack "x")
             nr <- freshName (T.pack "r")
-            let xBndr = Anf.Binder nx Anf.Unrestricted
-                rBndr = Anf.Binder nr Anf.Unrestricted
+            let xBndr = Anf.Binder nx Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
+                rBndr = Anf.Binder nr Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
                 body  = Anf.Let rBndr
                           (Anf.RAtom (Anf.AVar nx))
                           (Anf.Case (Anf.AVar nr)
@@ -3030,7 +3345,7 @@ anfTests = testGroup "Anf"
       let (rendered0, rendered1) = runFresh $ do
             nx0 <- freshName (T.pack "x")
             nx1 <- freshName (T.pack "x")
-            let b0 = Anf.Binder nx0 Anf.Unrestricted
+            let b0 = Anf.Binder nx0 Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
                 -- let x.N0 = x.N1 in x.N0
                 e  = Anf.Let b0 (Anf.RAtom (Anf.AVar nx1)) (Anf.Ret (Anf.AVar nx0))
                 txt = Anf.prettyExpr e
@@ -3046,6 +3361,18 @@ anfTests = testGroup "Anf"
         assertBool "both start with x" $
           T.pack "x" `T.isPrefixOf` rendered0 && T.pack "x" `T.isPrefixOf` rendered1
         assertBool "rendered names differ" (rendered0 /= rendered1)
+
+  , testCase "prettyModuleTyped: binder renders as name : type" $
+      let cm = runFresh $ do
+            nf <- freshName (T.pack "f")
+            nx <- freshName (T.pack "x")
+            let xBndr = Anf.Binder nx Anf.Unrestricted (Ty.CTCon Ty.TcU64 [])
+                body  = Anf.Ret (Anf.AVar nx)
+            pure $ Anf.CoreModule
+              [ Anf.TopBind nf [xBndr] body ]
+          rendered = Anf.prettyModuleTyped cm
+      in assertBool ("expected 'x : U64' in: " ++ T.unpack rendered)
+                    (T.isInfixOf (T.pack "x : U64") rendered)
   ]
 
 interpValueTests :: TestTree
@@ -3158,7 +3485,7 @@ interpMachineTests = testGroup "InterpMachine"
   , testCase "let then ret" $
       let (e, _) = runFresh $ do
             x <- freshName (T.pack "x")
-            let b = Anf.Binder x Anf.Unrestricted
+            let b = Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
             pure (Anf.Let b (Anf.RAtom (Anf.ALit (Anf.LInt 3))) (Anf.Ret (Anf.AVar x)), x)
       in assertEval Map.empty e (T.pack "3")
 
@@ -3167,7 +3494,7 @@ interpMachineTests = testGroup "InterpMachine"
           (e, _) = runFresh $ do
             t <- freshName (T.pack "t")
             np <- freshName (T.pack "+")
-            let b = Anf.Binder t Anf.Unrestricted
+            let b = Anf.Binder t Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
             pure ( Anf.Let b (Anf.RApp (Anf.AVar np) [Anf.ALit (Anf.LInt 2), Anf.ALit (Anf.LInt 3)])
                             (Anf.Ret (Anf.AVar t))
                  , nplus )
@@ -3179,9 +3506,9 @@ interpMachineTests = testGroup "InterpMachine"
             x  <- freshName (T.pack "x")
             i  <- freshName (T.pack "id")
             r  <- freshName (T.pack "r")
-            let lam = Anf.RLam [Anf.Binder x Anf.Unrestricted] (Anf.Ret (Anf.AVar x))
-            pure $ Anf.Let (Anf.Binder i Anf.Unrestricted) lam
-                     (Anf.Let (Anf.Binder r Anf.Unrestricted)
+            let lam = Anf.RLam [Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Ret (Anf.AVar x))
+            pure $ Anf.Let (Anf.Binder i Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) lam
+                     (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                               (Anf.RApp (Anf.AVar i) [Anf.ALit (Anf.LInt 9)])
                               (Anf.Ret (Anf.AVar r)))
       in assertEval Map.empty e (T.pack "9")
@@ -3191,11 +3518,11 @@ interpMachineTests = testGroup "InterpMachine"
       let e = runFresh $ do
             x <- freshName (T.pack "x"); y <- freshName (T.pack "y")
             k <- freshName (T.pack "k"); k1 <- freshName (T.pack "k1"); r <- freshName (T.pack "r")
-            let lam = Anf.RLam [Anf.Binder x Anf.Unrestricted, Anf.Binder y Anf.Unrestricted]
+            let lam = Anf.RLam [Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Binder y Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
                                (Anf.Ret (Anf.AVar x))
-            pure $ Anf.Let (Anf.Binder k Anf.Unrestricted) lam
-                     (Anf.Let (Anf.Binder k1 Anf.Unrestricted) (Anf.RApp (Anf.AVar k) [Anf.ALit (Anf.LInt 1)])
-                       (Anf.Let (Anf.Binder r Anf.Unrestricted) (Anf.RApp (Anf.AVar k1) [Anf.ALit (Anf.LInt 2)])
+            pure $ Anf.Let (Anf.Binder k Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) lam
+                     (Anf.Let (Anf.Binder k1 Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar k) [Anf.ALit (Anf.LInt 1)])
+                       (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar k1) [Anf.ALit (Anf.LInt 2)])
                          (Anf.Ret (Anf.AVar r))))
       in assertEval Map.empty e (T.pack "1")
 
@@ -3206,11 +3533,11 @@ interpMachineTests = testGroup "InterpMachine"
       let e = runFresh $ do
             x <- freshName (T.pack "x"); y <- freshName (T.pack "y")
             g <- freshName (T.pack "g"); f <- freshName (T.pack "f"); r <- freshName (T.pack "r")
-            let inner = Anf.RLam [Anf.Binder y Anf.Unrestricted] (Anf.Ret (Anf.AVar x))
-                outerBody = Anf.Let (Anf.Binder g Anf.Unrestricted) inner (Anf.Ret (Anf.AVar g))
-                outer = Anf.RLam [Anf.Binder x Anf.Unrestricted] outerBody
-            pure $ Anf.Let (Anf.Binder f Anf.Unrestricted) outer
-                     (Anf.Let (Anf.Binder r Anf.Unrestricted)
+            let inner = Anf.RLam [Anf.Binder y Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Ret (Anf.AVar x))
+                outerBody = Anf.Let (Anf.Binder g Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) inner (Anf.Ret (Anf.AVar g))
+                outer = Anf.RLam [Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] outerBody
+            pure $ Anf.Let (Anf.Binder f Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) outer
+                     (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                               (Anf.RApp (Anf.AVar f) [Anf.ALit (Anf.LInt 1), Anf.ALit (Anf.LInt 2)])
                               (Anf.Ret (Anf.AVar r)))
       in assertEval Map.empty e (T.pack "1")
@@ -3225,11 +3552,11 @@ interpMachineTests = testGroup "InterpMachine"
       -- case (Pair 1 2) of Pair a b -> b
       let e = runFresh $ do
             a <- freshName (T.pack "a"); b <- freshName (T.pack "b"); p <- freshName (T.pack "p")
-            pure $ Anf.Let (Anf.Binder p Anf.Unrestricted)
+            pure $ Anf.Let (Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                      (Anf.RCon (T.pack "Pair") [Anf.ALit (Anf.LInt 1), Anf.ALit (Anf.LInt 2)])
                      (Anf.Case (Anf.AVar p)
                        [ Anf.AltCon (T.pack "Pair")
-                           [Anf.Binder a Anf.Unrestricted, Anf.Binder b Anf.Unrestricted]
+                           [Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Binder b Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
                            (Anf.Ret (Anf.AVar b)) ])
       in assertEval Map.empty e (T.pack "2")
 
@@ -3241,12 +3568,12 @@ interpMachineTests = testGroup "InterpMachine"
       -- caught. Missing label must be a clean BadProjection, not a crash.
       let proj label = runFresh $ do
             r <- freshName (T.pack "r"); p <- freshName (T.pack "p")
-            pure $ Anf.Let (Anf.Binder r Anf.Unrestricted)
+            pure $ Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                      (Anf.RRecord (T.pack "T")
                         [ (T.pack "c", Anf.ALit (Anf.LInt 30))
                         , (T.pack "a", Anf.ALit (Anf.LInt 10))
                         , (T.pack "b", Anf.ALit (Anf.LInt 20)) ])
-                     (Anf.Let (Anf.Binder p Anf.Unrestricted)
+                     (Anf.Let (Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.RProj label (Anf.AVar r))
                         (Anf.Ret (Anf.AVar p)))
           check label expected =
@@ -3270,14 +3597,14 @@ interpMachineTests = testGroup "InterpMachine"
             let body = Anf.Case (Anf.AVar n)
                   [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 0)))
                   , Anf.AltDefault
-                      (Anf.Let (Anf.Binder t Anf.Unrestricted)
+                      (Anf.Let (Anf.Binder t Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.RApp (Anf.AVar nm) [Anf.AVar n, Anf.ALit (Anf.LInt 1)])
-                        (Anf.Let (Anf.Binder r Anf.Unrestricted)
+                        (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar loop) [Anf.AVar t])
                           (Anf.Ret (Anf.AVar r)))) ]
             top <- freshName (T.pack "out")
-            pure $ Anf.LetRec [(Anf.Binder loop Anf.Unrestricted, [Anf.Binder n Anf.Unrestricted], body)]
-                     (Anf.Let (Anf.Binder top Anf.Unrestricted)
+            pure $ Anf.LetRec [(Anf.Binder loop Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), [Anf.Binder n Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])], body)]
+                     (Anf.Let (Anf.Binder top Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                        (Anf.RApp (Anf.AVar loop) [Anf.ALit (Anf.LInt 3)])
                        (Anf.Ret (Anf.AVar top)))
       in assertEval Map.empty e (T.pack "0")
@@ -3286,7 +3613,7 @@ interpMachineTests = testGroup "InterpMachine"
       -- join j(r) = ret r ; case 1 of { 0 -> jump j 10 ; _ -> jump j 20 }
       let e = runFresh $ do
             j <- freshJoin; r <- freshName (T.pack "r")
-            pure $ Anf.LetJoin j [Anf.Binder r Anf.Unrestricted] (Anf.Ret (Anf.AVar r))
+            pure $ Anf.LetJoin j [Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Ret (Anf.AVar r))
                      (Anf.Case (Anf.ALit (Anf.LInt 1))
                        [ Anf.AltLit (Anf.LInt 0) (Anf.Jump j [Anf.ALit (Anf.LInt 10)])
                        , Anf.AltDefault (Anf.Jump j [Anf.ALit (Anf.LInt 20)]) ])
@@ -3317,16 +3644,16 @@ interpEffectTests = testGroup "InterpEffect"
             a <- freshName (T.pack "a")
             p <- freshName (T.pack "p"); resume <- freshName (T.pack "resume")
             res <- freshName (T.pack "res"); v <- freshName (T.pack "v")
-            let comp = Anf.Let (Anf.Binder a Anf.Unrestricted)
+            let comp = Anf.Let (Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                          (Anf.ROp (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
                          (Anf.Ret (Anf.AVar a))
                 arm = Anf.OpArm (T.pack "Ask") (T.pack "ask")
-                        [Anf.Binder p Anf.Unrestricted]
-                        (Anf.Binder resume Anf.Unrestricted)
-                        (Anf.Let (Anf.Binder res Anf.Unrestricted)
+                        [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
+                        (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
+                        (Anf.Let (Anf.Binder res Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 41)])
                           (Anf.Ret (Anf.AVar res)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "41")
 
@@ -3334,10 +3661,10 @@ interpEffectTests = testGroup "InterpEffect"
       -- handle (ret 5) of return v -> let r = v + 100 ; ret r   (no ops)
       let e = runFresh $ do
             v <- freshName (T.pack "v"); r <- freshName (T.pack "r"); np <- freshName (T.pack "+")
-            let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted)
+            let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                            (Anf.RApp (Anf.AVar np) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
                            (Anf.Ret (Anf.AVar r))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, retArm) []
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) []
             pure (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 5))) hdlr)
       in assertEval Map.empty e (T.pack "105")
 
@@ -3348,14 +3675,14 @@ interpEffectTests = testGroup "InterpEffect"
       let e = runFresh $ do
             a <- freshName (T.pack "a"); p <- freshName (T.pack "p")
             resume <- freshName (T.pack "resume"); v <- freshName (T.pack "v")
-            let comp = Anf.Let (Anf.Binder a Anf.Unrestricted)
+            let comp = Anf.Let (Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                          (Anf.ROp (T.pack "Abort") (T.pack "abort") [Anf.ALit Anf.LUnit])
                          (Anf.Ret (Anf.AVar a))
                 arm = Anf.OpArm (T.pack "Abort") (T.pack "abort")
-                        [Anf.Binder p Anf.Unrestricted]
-                        (Anf.Binder resume Anf.Unrestricted)
+                        [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
+                        (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.Ret (Anf.ALit (Anf.LInt 7)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "7")
 
@@ -3370,19 +3697,19 @@ interpEffectTests = testGroup "InterpEffect"
             resume <- freshName (T.pack "resume")
             r0 <- freshName (T.pack "r0"); r1 <- freshName (T.pack "r1")
             s <- freshName (T.pack "s"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
-            let comp = Anf.Let (Anf.Binder b Anf.Unrestricted)
+            let comp = Anf.Let (Anf.Binder b Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                          (Anf.ROp (T.pack "Flip") (T.pack "flip") [Anf.ALit Anf.LUnit])
                          (Anf.Case (Anf.AVar b)
                            [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 10)))
                            , Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 20))) ])
                 armBody =
-                  Anf.Let (Anf.Binder r0 Anf.Unrestricted) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 0)])
-                    (Anf.Let (Anf.Binder r1 Anf.Unrestricted) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
-                      (Anf.Let (Anf.Binder s Anf.Unrestricted) (Anf.RApp (Anf.AVar np) [Anf.AVar r0, Anf.AVar r1])
+                  Anf.Let (Anf.Binder r0 Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 0)])
+                    (Anf.Let (Anf.Binder r1 Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
+                      (Anf.Let (Anf.Binder s Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar np) [Anf.AVar r0, Anf.AVar r1])
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "Flip") (T.pack "flip")
-                        [Anf.Binder p Anf.Unrestricted] (Anf.Binder resume Anf.Unrestricted) armBody
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+                        [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) armBody
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "30")
 
@@ -3400,26 +3727,26 @@ interpEffectTests = testGroup "InterpEffect"
             p <- freshName (T.pack "p"); resume <- freshName (T.pack "resume")
             r <- freshName (T.pack "r"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
             let comp =
-                  Anf.Let (Anf.Binder x Anf.Unrestricted)
+                  Anf.Let (Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                     (Anf.ROp (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
-                    (Anf.Let (Anf.Binder y Anf.Unrestricted)
+                    (Anf.Let (Anf.Binder y Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                       (Anf.ROp (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
-                      (Anf.Let (Anf.Binder s Anf.Unrestricted)
+                      (Anf.Let (Anf.Binder s Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.RApp (Anf.AVar np) [Anf.AVar x, Anf.AVar y])
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "E") (T.pack "op")
-                        [Anf.Binder p Anf.Unrestricted] (Anf.Binder resume Anf.Unrestricted)
-                        (Anf.Let (Anf.Binder r Anf.Unrestricted)
+                        [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
+                        (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
                           (Anf.Ret (Anf.AVar r)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "2")
 
   , testCase "unhandled operation errors" $
       let e = runFresh $ do
             a <- freshName (T.pack "a")
-            pure $ Anf.Let (Anf.Binder a Anf.Unrestricted)
+            pure $ Anf.Let (Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                      (Anf.ROp (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
                      (Anf.Ret (Anf.AVar a))
       in case IM.evalExprWith Map.empty e of
@@ -3460,6 +3787,20 @@ runSourceWith elaborate src = do
 runSourceToValue :: Text -> IO (Either String Text)
 runSourceToValue = runSourceWith Pipeline.elaborateProgram
 
+-- Like 'runSourceToValue' but additionally forces the result and converts any
+-- pure 'error' thrown during elaboration (e.g. unsupported pattern) into a
+-- 'Left'. Elaboration errors are raised lazily, so a plain run would otherwise
+-- surface them only as an uncaught exception.
+runSourceToValueForced :: Text -> IO (Either String Text)
+runSourceToValueForced src = do
+  caught <- Control.Exception.try (runSourceToValue src >>= \r -> Control.Exception.evaluate (forceEither r))
+  pure $ case caught of
+    Left (Control.Exception.ErrorCall msg) -> Left msg
+    Right ok                               -> ok
+  where
+    forceEither e@(Left s)  = s `seq` e
+    forceEither e@(Right t) = T.length t `seq` e
+
 removeFileIfExists :: FilePath -> IO ()
 removeFileIfExists p = Dir.doesFileExist p >>= \yes -> Control.Monad.when yes (Dir.removeFile p)
 
@@ -3498,6 +3839,33 @@ interpEntryTests = testGroup "InterpEntry"
       case r of
         Left msg -> assertBool ("expected UnsupportedCaf, got: " <> msg)
                       (Data.List.isInfixOf "UnsupportedCaf" msg)
+        Right v  -> assertFailure ("expected rejection, got " <> T.unpack v)
+  , testCase "non-zero integer pattern matches its literal (C1 regression)" $ do
+      -- Before the fix, integer-literal patterns were compiled to a literal 0,
+      -- so `case 5 of 5 -> 100; _ -> 0` returned 0 instead of 100.
+      r <- runSourceToValue (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "classify n = case n of"
+             , T.pack "  5 -> 100"
+             , T.pack "  _ -> 0"
+             , T.pack "main = classify 5" ])
+      r @?= Right (T.pack "100")
+  , testCase "non-empty list literal pattern is rejected (I3 guard)" $ do
+      -- Exact-length list matching needs a backtracking match compiler the flat
+      -- one-Alt-per-clause model lacks; rather than silently match ANY non-empty
+      -- list, a non-empty list literal pattern is rejected (as it was on main).
+      r <- runSourceToValueForced (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "solo xs = case xs of"
+             , T.pack "  [a] -> a"
+             , T.pack "  _   -> 0"
+             , T.pack "main = solo [1, 2]" ])
+      case r of
+        Left msg -> assertBool
+                      ("expected non-empty list literal pattern rejection, got: " <> msg)
+                      (Data.List.isInfixOf "non-empty list literal pattern" msg)
         Right v  -> assertFailure ("expected rejection, got " <> T.unpack v)
   ]
 
@@ -4069,11 +4437,7 @@ elaborateModuleTests = testGroup "ElaborateModule"
 -- | Build the test module and return (idfBind, kBind).
 buildElabModule :: (Anf.TopBind, Anf.TopBind)
 buildElabModule =
-  let dummyScheme = Ty.Scheme [] (Ty.CTCon Ty.TcUnit [])
-      env = TE.extendVar (T.pack "k")
-              dummyScheme
-              (TE.extendVar (T.pack "idf") dummyScheme TE.emptyEnv)
-      -- idf x = x
+  let -- idf x = x
       idfParam = Abs.APVar (varId (T.pack "x"))
       idfLhs   = Abs.LHSPre (Abs.FNBare (varId (T.pack "idf"))) [idfParam]
       idfBody  = Abs.EVar (varId (T.pack "x"))
@@ -4082,7 +4446,8 @@ buildElabModule =
       kLhs  = Abs.LHSPre (Abs.FNBare (varId (T.pack "k"))) []
       kBody = Abs.EVar (varId (T.pack "idf"))
       kDecl = Abs.DEqn kLhs kBody Abs.NoWhere
-      cm = elaborateModule env (Abs.Module [idfDecl, kDecl])
+      (envOut, tds) = typedModuleForTest B.initialEnv (Abs.Module [idfDecl, kDecl])
+      cm = elaborateModule envOut tds
       binds = Anf.cmBinds cm
       idfBind = case filter (\b -> nameHint (Anf.tbName b) == T.pack "idf") binds of
                   (b:_) -> b
@@ -4091,3 +4456,12 @@ buildElabModule =
                   (b:_) -> b
                   []    -> error "buildElabModule: k bind not found"
   in (idfBind, kBind)
+
+typedAstTests :: TestTree
+typedAstTests = testGroup "TypedAst"
+  [ testCase "fmap/Foldable reach every annotation" $
+      let e = Typed.Texp (1 :: Int) (Typed.TApp (Typed.Texp 2 (Typed.TVar (T.pack "f")))
+                                                 [Typed.Texp 3 (Typed.TLitI 0)])
+          e' = fmap (* 10) e
+      in sum e' @?= (60 :: Int)   -- 10 + 20 + 30 over the three annotations
+  ]

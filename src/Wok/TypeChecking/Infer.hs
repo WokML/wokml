@@ -3,12 +3,14 @@
 -- Later tasks build out the full inferrer on top of these.
 module Wok.TypeChecking.Infer
   ( generalize
+  , generalizeTyped
   , instantiate
   , translateSig
   , processDataDecls
   , processEffectDecls
   , inferPat
   , inferExpr
+  , inferExprW
   , inferProgram
   , inferProgramWith
   , modPathText
@@ -43,6 +45,8 @@ import Wok.TypeChecking.Unify (force, forceRow, freeze, rewriteRow, unify, rewri
 import Wok.TypeChecking.Types
   ( CRow (..), CType (..), Kind (..), Level (..), RVar (..), Row (..)
   , Scheme (..), TyCon (..), TVar (..), Type (..) )
+import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
+import qualified Wok.TypeChecking.Typed as Ty
 
 -- | Freeze a type and quantify any unbound variable whose level is
 -- strictly greater than the current generalisation level. The same
@@ -58,9 +62,41 @@ generalize t = do
     pairs <- readSTRef kindsRef
     pure (Scheme (reverse pairs) body)
 
+-- | Like 'generalize', but additionally freezes a whole typed-AST tree
+-- with the SAME quantification mapping that produces the scheme. Using one
+-- shared ref-set means a polymorphic binding's per-node annotations reuse
+-- the scheme's 'CTGen' numbering. Quantifiers found only inside node
+-- annotations still register in the scheme because 'kindsRef' is read LAST.
+generalizeTyped :: Type s -> TExprS s -> TC s (Scheme, TExpr)
+generalizeTyped t tree = do
+  Level outer <- currentLevel
+  liftST $ do
+    nextRef  <- newSTRef 0
+    seenRef  <- newSTRef (Map.empty :: Map.Map Int Int)
+    kindsRef <- newSTRef ([] :: [(Int, Kind)])
+    -- The principal type is frozen STRICTLY: a skolem in the scheme body is a
+    -- real bug. Node annotations are frozen TOLERANTLY: a typed body may carry
+    -- skolems from inner signed (where-)bindings, which are valid node-level
+    -- slots but must not become quantifiers of THIS binding's scheme.
+    -- The scheme is determined SOLELY by the principal type: goBody records
+    -- quantifiers, goNode does NOT (it only interns vars to shared CTGen indices
+    -- so node annotations stay consistent with the scheme's numbering for shared
+    -- vars and get fresh, non-recorded CTGens for node-only vars).
+    let goBody = freezeQuantify              outer nextRef seenRef kindsRef
+        goNode = freezeQuantifyG  True False outer nextRef seenRef kindsRef
+    body  <- goBody t                    -- principal type first (strict, records)
+    tree' <- traverse goNode tree        -- then every node annotation (no record)
+    pairs <- readSTRef kindsRef          -- read quantifiers (from goBody only)
+    pure (Scheme (reverse pairs) body, tree')
+
 -- Internal: walk a Type s, replacing unbound vars at level > outer with
 -- CTGens, sharing slots by uniq via 'seen'. Pure-ST so we don't pay
 -- TC monad overhead per node.
+--
+-- This is the STRICT walker used to build a stored scheme: a 'Rigid' skolem is
+-- a hard error (skolems must never leak into a scheme). Freezing typed-AST
+-- trees -- which may legitimately carry skolems from inner signed bindings --
+-- goes through a tolerant, non-recording 'freezeQuantifyG' instead.
 freezeQuantify
   :: Int                              -- ^ outer level
   -> STRef s Int                      -- ^ next CTGen index
@@ -68,8 +104,46 @@ freezeQuantify
   -> STRef s [(Int, Kind)]            -- ^ accumulator (reversed)
   -> Type s
   -> Control.Monad.ST.ST s CType
-freezeQuantify outer nextRef seenRef kindsRef = goT
+freezeQuantify = freezeQuantifyG False True
+
+-- Like 'freezeQuantify' but parameterised on whether 'Rigid' skolems are
+-- tolerated and whether generalizable unbound vars are RECORDED as scheme
+-- quantifiers. With @tolerateRigid = True@ a skolem is interned to a fresh CTGen
+-- (shared by uniq via 'seen') WITHOUT being recorded in the kind accumulator,
+-- so it never becomes a scheme quantifier -- it is just a node-annotation slot
+-- standing for some inner binding's polymorphic variable. With
+-- @recordQuant = False@ a generalizable unbound var (level > outer) is likewise
+-- interned to a shared CTGen but NOT recorded, so node-only polymorphic vars do
+-- not leak into the scheme; vars already seen in the principal type still reuse
+-- their recorded index. The strict scheme path ('freezeQuantify') passes
+-- @False@/@True@ and keeps erroring on skolems while recording quantifiers.
+freezeQuantifyG
+  :: Bool                             -- ^ tolerate Rigid skolems?
+  -> Bool                             -- ^ record generalizable vars as quantifiers?
+  -> Int                              -- ^ outer level
+  -> STRef s Int                      -- ^ next CTGen index
+  -> STRef s (Map.Map Int Int)        -- ^ uniq -> CTGen index
+  -> STRef s [(Int, Kind)]            -- ^ accumulator (reversed)
+  -> Type s
+  -> Control.Monad.ST.ST s CType
+freezeQuantifyG tolerateRigid recordQuant outer nextRef seenRef kindsRef = goT
   where
+    -- Intern a uniq to a shared CTGen index; record its kind only when asked
+    -- (scheme quantifiers are recorded, tolerated skolems are not).
+    intern u mKind = do
+      seen <- readSTRef seenRef
+      case Map.lookup u seen of
+        Just idx -> pure (CTGen idx)
+        Nothing -> do
+          idx <- readSTRef nextRef
+          writeSTRef nextRef (idx + 1)
+          writeSTRef seenRef (Map.insert u idx seen)
+          case mKind of
+            Just k -> do
+              prior <- readSTRef kindsRef
+              writeSTRef kindsRef ((idx, k) : prior)
+            Nothing -> pure ()
+          pure (CTGen idx)
     goT ty = do
       ty' <- forceST ty
       case ty' of
@@ -80,21 +154,13 @@ freezeQuantify outer nextRef seenRef kindsRef = goT
           tv <- readSTRef ref
           case tv of
             Link _ -> error "freezeQuantify: TVar was Link after forceST (caller invariant violation)"
-            Rigid u _ -> error
-              ("freezeQuantify: unexpected Rigid (uniq " ++ show u
-              ++ "); skolems should never leak into stored schemes")
+            Rigid u _
+              | tolerateRigid -> intern u Nothing
+              | otherwise -> error
+                  ("freezeQuantify: unexpected Rigid (uniq " ++ show u
+                  ++ "); skolems should never leak into stored schemes")
             Unbound u (Level l) k
-              | l > outer -> do
-                  seen <- readSTRef seenRef
-                  case Map.lookup u seen of
-                    Just idx -> pure (CTGen idx)
-                    Nothing -> do
-                      idx <- readSTRef nextRef
-                      writeSTRef nextRef (idx + 1)
-                      writeSTRef seenRef (Map.insert u idx seen)
-                      prior <- readSTRef kindsRef
-                      writeSTRef kindsRef ((idx, k) : prior)
-                      pure (CTGen idx)
+              | l > outer -> intern u (if recordQuant then Just k else Nothing)
               | otherwise -> error
                   ("freezeQuantify: unexpected level-" ++ show l
                   ++ " var (uniq " ++ show u
@@ -132,6 +198,24 @@ freezeQuantify outer nextRef seenRef kindsRef = goT
             pure r''
           _ -> pure rr
       _ -> pure rr
+
+-- | Freeze a typed-AST tree for a SIGNED binding. Unlike 'generalizeTyped',
+-- this produces no scheme (the binding's scheme is its DECLARED signature) and
+-- it tolerates 'Rigid' skolems: a signed body is checked against a skolemised
+-- instantiation of its sig ('freezeSig'), so its node annotations reference the
+-- skolems standing for the sig's quantified variables. Each distinct skolem
+-- uniq -- and any genuinely-polymorphic unbound var at level > outer -- maps to
+-- a fresh 'CTGen', shared across the whole tree so params and body agree. The
+-- resulting numbering is self-consistent within the tree; it need not match the
+-- declared scheme's quantifier indices (callers keep the declared scheme).
+freezeTypedTreeSig :: TExprS s -> TC s TExpr
+freezeTypedTreeSig tree = do
+  Level outer <- currentLevel
+  liftST $ do
+    nextRef  <- newSTRef 0
+    seenRef  <- newSTRef (Map.empty :: Map.Map Int Int)
+    kindsRef <- newSTRef ([] :: [(Int, Kind)])   -- discarded: no scheme built
+    traverse (freezeQuantifyG True False outer nextRef seenRef kindsRef) tree
 
 -- | Instantiate a scheme: each quantifier becomes a fresh TVar (KStar) or
 -- fresh RowVar (KEffect) at the current level; the body is rebuilt with
@@ -779,7 +863,7 @@ processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
 
 -- | Infer a pattern's type and the bindings it introduces.
 -- Returns (the type the pattern matches, variable bindings introduced).
-inferPat :: Abs.Pat -> TC s (Type s, [(Text, Type s)])
+inferPat :: Abs.Pat -> TC s (Type s, [(Text, Type s)], TPatS s)
 inferPat (Abs.PAtom ap) = inferAtomPat ap
 inferPat (Abs.PApp modPath ap aps) = do
   let name  = modPathText modPath
@@ -794,27 +878,32 @@ inferPat (Abs.PApp modPath ap aps) = do
       conTy <- instantiate (conScheme info)
       (argTys, resultTy) <- splitConType conTy (length atoms)
       subResults <- mapM inferAtomPat atoms
-      let subTys = map fst subResults
-          subBinds = concatMap snd subResults
+      let subTys = map (\(t, _, _) -> t) subResults
+          subBinds = concatMap (\(_, b, _) -> b) subResults
+          subNodes = map (\(_, _, n) -> n) subResults
       mapM_ (\(a, b) -> unify (Just pos) a b) (zip argTys subTys)
-      pure (resultTy, subBinds)
+      pure (resultTy, subBinds, Ty.Tpat resultTy (Ty.TPCon name subNodes))
 inferPat (Abs.PCons headPat tailPat) = do
-  (hT, hBinds) <- inferAtomPat headPat
-  (tT, tBinds) <- inferPat tailPat
+  (hT, hBinds, hNode) <- inferAtomPat headPat
+  (tT, tBinds, tNode) <- inferPat tailPat
   unify Nothing tT (TCon TcList [hT])
-  pure (TCon TcList [hT], hBinds ++ tBinds)
+  let ty = TCon TcList [hT]
+  pure (ty, hBinds ++ tBinds, Ty.Tpat ty (Ty.TPCons hNode tNode))
 
-inferAtomPat :: Abs.AtomPat -> TC s (Type s, [(Text, Type s)])
+inferAtomPat :: Abs.AtomPat -> TC s (Type s, [(Text, Type s)], TPatS s)
 inferAtomPat (Abs.APVar (Abs.VarId (_, name))) = do
   t <- freshTVar KStar
-  pure (t, [(name, t)])
+  pure (t, [(name, t)], Ty.Tpat t (Ty.TPVar name))
 inferAtomPat Abs.APWild = do
   t <- freshTVar KStar
-  pure (t, [])
-inferAtomPat Abs.PUnit = pure (TCon TcUnit [], [])
-inferAtomPat (Abs.APLitI _) = pure (TCon TcU64 [], [])
-inferAtomPat (Abs.APLitS _) = pure (TCon TcString [], [])
-inferAtomPat (Abs.APLitC _) = pure (TCon TcChar [], [])
+  pure (t, [], Ty.Tpat t Ty.TPWild)
+inferAtomPat Abs.PUnit = let ty = TCon TcUnit [] in pure (ty, [], Ty.Tpat ty Ty.TPUnit)
+inferAtomPat (Abs.APLitI (Abs.WokInt (_, t))) =
+  let ty = TCon TcU64 [] in pure (ty, [], Ty.Tpat ty (Ty.TPLitI (readInt t)))
+inferAtomPat (Abs.APLitS s) =
+  let ty = TCon TcString [] in pure (ty, [], Ty.Tpat ty (Ty.TPLitS (Tx.pack s)))
+inferAtomPat (Abs.APLitC c) =
+  let ty = TCon TcChar [] in pure (ty, [], Ty.Tpat ty (Ty.TPLitC c))
 inferAtomPat (Abs.APCon modPath) = do
   let name = modPathText modPath
       pos  = modPathPos modPath
@@ -825,22 +914,27 @@ inferAtomPat (Abs.APCon modPath) = do
       when (conArity info /= 0) $
         throwError (ArityMismatch (Just pos) name (conArity info) 0)
       ty <- instantiate (conScheme info)
-      pure (ty, [])
+      pure (ty, [], Ty.Tpat ty (Ty.TPCon name []))
 inferAtomPat (Abs.APTuple p1 ps) = do
   results <- mapM inferPat (p1 : ps)
-  let ts = map fst results
-      bs = concatMap snd results
-  pure (TCon (TcTuple (length results)) ts, bs)
+  let ts = map (\(t, _, _) -> t) results
+      bs = concatMap (\(_, b, _) -> b) results
+      ns = map (\(_, _, n) -> n) results
+      ty = TCon (TcTuple (length results)) ts
+  pure (ty, bs, Ty.Tpat ty (Ty.TPTuple ns))
 inferAtomPat (Abs.APList []) = do
   e <- freshTVar KStar
-  pure (TCon TcList [e], [])
+  let ty = TCon TcList [e]
+  pure (ty, [], Ty.Tpat ty (Ty.TPList []))
 inferAtomPat (Abs.APList (p : ps)) = do
-  (firstT, firstBinds) <- inferPat p
+  (firstT, firstBinds, firstNode) <- inferPat p
   restResults <- mapM inferPat ps
-  let restTs = map fst restResults
-      restBinds = concatMap snd restResults
+  let restTs = map (\(t, _, _) -> t) restResults
+      restBinds = concatMap (\(_, b, _) -> b) restResults
+      restNodes = map (\(_, _, n) -> n) restResults
   mapM_ (unify Nothing firstT) restTs
-  pure (TCon TcList [firstT], firstBinds ++ restBinds)
+  let ty = TCon TcList [firstT]
+  pure (ty, firstBinds ++ restBinds, Ty.Tpat ty (Ty.TPList (firstNode : restNodes)))
 inferAtomPat (Abs.APParen p) = inferPat p
 
 -- Strict record pattern: PRecord T { f1 = p1, ..., fn = pn }
@@ -868,14 +962,15 @@ inferAtomPat (Abs.PRecord (Abs.ConId (pos, conName)) fieldPats) = do
     let declaredFieldT = substCTypeWith paramSubst fcty
     case lookup fname providedFields of
       Just p -> do
-        (patT, patBinds) <- inferPat p
+        (patT, patBinds, patNode) <- inferPat p
         unify (Just pos) patT declaredFieldT
-        pure (fname, declaredFieldT, patBinds)
+        pure (fname, declaredFieldT, patBinds, patNode)
       Nothing -> error "PRecord: missing field not caught above (impossible)"
-  let row   = foldr (\(n, t, _) acc -> RowExtend n t acc) RowEmpty rowEntries
+  let row   = foldr (\(n, t, _, _) acc -> RowExtend n t acc) RowEmpty rowEntries
       patT  = TRecord conName row
-      binds = concatMap (\(_, _, b) -> b) rowEntries
-  pure (patT, binds)
+      binds = concatMap (\(_, _, b, _) -> b) rowEntries
+      nodes = map (\(_, _, _, n) -> n) rowEntries
+  pure (patT, binds, Ty.Tpat patT (Ty.TPCon conName nodes))
 
 -- Open record pattern with anonymous row tail: PRecordOpen T { fs, .. }
 -- Provided fields must be a subset of declared; produces an open row (fresh RowVar tail).
@@ -898,15 +993,16 @@ inferAtomPat (Abs.PRecordOpen (Abs.ConId (pos, conName)) fieldPats Abs.PRTAnon) 
     let declaredFieldT = substCTypeWith paramSubst fcty
     case lookup fname providedFields of
       Just p -> do
-        (patT, patBinds) <- inferPat p
+        (patT, patBinds, patNode) <- inferPat p
         unify (Just pos) patT declaredFieldT
-        pure (fname, declaredFieldT, patBinds)
-      Nothing -> pure (fname, declaredFieldT, [])
+        pure (fname, declaredFieldT, patBinds, patNode)
+      Nothing -> pure (fname, declaredFieldT, [], Ty.Tpat declaredFieldT Ty.TPWild)
   rowVarTail <- freshRVar
-  let row   = foldr (\(n, t, _) acc -> RowExtend n t acc) rowVarTail rowEntries
+  let row   = foldr (\(n, t, _, _) acc -> RowExtend n t acc) rowVarTail rowEntries
       patT  = TRecord conName row
-      binds = concatMap (\(_, _, b) -> b) rowEntries
-  pure (patT, binds)
+      binds = concatMap (\(_, _, b, _) -> b) rowEntries
+      nodes = map (\(_, _, _, n) -> n) rowEntries
+  pure (patT, binds, Ty.Tpat patT (Ty.TPCon conName nodes))
 
 -- Open record pattern with named row tail: deferred to v2.
 inferAtomPat (Abs.PRecordOpen (Abs.ConId (pos, _)) _ (Abs.PRTNamed (Abs.VarId (_, binder)))) =
@@ -928,7 +1024,8 @@ inferAtomPat (Abs.PRecordWild (Abs.ConId (pos, conName)) Abs.PRTAnon) = do
   rowVarTail <- freshRVar
   let row  = foldr (\(n, t) acc -> RowExtend n t acc) rowVarTail declaredEntries
       patT = TRecord conName row
-  pure (patT, [])
+      nodes = map (\(_, t) -> Ty.Tpat t Ty.TPWild) declaredEntries
+  pure (patT, [], Ty.Tpat patT (Ty.TPCon conName nodes))
 
 -- Wild record pattern with named row tail: deferred to v2.
 inferAtomPat (Abs.PRecordWild (Abs.ConId (pos, _)) (Abs.PRTNamed (Abs.VarId (_, binder)))) =
@@ -950,16 +1047,20 @@ splitConType ty n = do
 -- Expression inference
 -- ---------------------------------------------------------------------------
 
--- | Infer the type of an expression. Returns the inferred Type s.
--- v1 does not yet thread a typed AST result; that comes later.
+-- | Parse an integer literal's textual form into its 'Integer' value.
+readInt :: Text -> Integer
+readInt t = read (Tx.unpack t)
+
+-- | Infer the type of an expression. Returns the inferred Type s, discarding
+-- the typed node (callers that need the typed AST use 'inferExprW' directly).
 inferExpr :: Abs.Exp -> TC s (Type s)
-inferExpr e = inferExprW Map.empty e
+inferExpr e = fst <$> inferExprW Map.empty e
 
 -- | Type-infer an expression with an optional expected type. The expected
 -- type informs bidirectional record construction: ERecord and ERecordExt
 -- consult it to allow extra fields that match the expected row extension.
 -- All other AST shapes fall back to pure inferExprW and ignore the hint.
-inferExprWChecked :: Map.Map Text (Type s) -> Maybe (Type s) -> Abs.Exp -> TC s (Type s)
+inferExprWChecked :: Map.Map Text (Type s) -> Maybe (Type s) -> Abs.Exp -> TC s (Type s, TExprS s)
 inferExprWChecked mono Nothing e = inferExprW mono e
 
 -- ERecord with expected type: allow extra fields matching the expected
@@ -1009,9 +1110,9 @@ inferExprWChecked mono (Just expected) (Abs.ERecord (Abs.ConId (pos, conName)) f
         let mExpr = lookup fname providedPairs
         case mExpr of
           Just e -> do
-            actualT <- inferExprW mono e
+            (actualT, actualNode) <- inferExprW mono e
             unify (Just pos') actualT fieldT
-            pure (fname, fieldT)
+            pure (fname, fieldT, actualNode)
           Nothing -> error "inferERecordWithExt: missing declared field not caught above"
       -- Infer + unify extension fields against the expected row.
       extRowEntries <- forM (filter (\(n, _) -> Set.member n extSet) providedPairs) $ \(fname, fexp) -> do
@@ -1024,13 +1125,15 @@ inferExprWChecked mono (Just expected) (Abs.ERecord (Abs.ConId (pos, conName)) f
               Just ft -> pure ft
               Nothing -> freshTVar KStar
           Nothing -> freshTVar KStar
-        actualT <- inferExprW mono fexp
+        (actualT, actualNode) <- inferExprW mono fexp
         unify (Just pos') actualT extFieldT
-        pure (fname, extFieldT)
+        pure (fname, extFieldT, actualNode)
       -- Build the result row: declared fields + extension fields.
       let allEntries = declaredRowEntries ++ extRowEntries
-          row = foldr (\(l, t) acc -> RowExtend l t acc) RowEmpty allEntries
-      pure (TRecord conName' row)
+          row = foldr (\(l, t, _) acc -> RowExtend l t acc) RowEmpty allEntries
+          fieldNodes = map (\(l, _, n) -> (l, n)) allEntries
+          ty = TRecord conName' row
+      pure (ty, Ty.Texp ty (Ty.TRecord conName' fieldNodes))
 
 -- ERecordExt with expected type: allow trailing fields matching the expected
 -- extension (beyond the spread source's declared row).
@@ -1044,7 +1147,7 @@ inferExprWChecked mono (Just expected) (Abs.ERecordExt (Abs.ConId (pos, conName)
   case expected' of
     TRecord expTag expRow | expTag == conName -> do
       -- Infer the spread type.
-      spreadT <- inferExprW mono spreadExpr
+      (spreadT, spreadNode) <- inferExprW mono spreadExpr
       -- Constrain the spread to be TRecord conName with a fresh open row.
       -- This handles the case where the spread is still a TVar (e.g., a
       -- function parameter whose type is being inferred from the sig).
@@ -1080,10 +1183,11 @@ inferExprWChecked mono (Just expected) (Abs.ERecordExt (Abs.ConId (pos, conName)
       -- Partition trailing into overrides (in spread/declared) and additions (in ext).
       (overrides, additions) <- partitionTrailing declaredNames extSet pos conName trailingPairs
       -- Verify overrides match the spread's row type.
-      forM_ overrides $ \(fname, fexp) -> do
+      overrideNodes <- forM overrides $ \(fname, fexp) -> do
         (declaredT, _rest) <- rewriteRowStrict (Just pos) fname spreadRow
-        actualT <- inferExprW mono fexp
+        (actualT, actualNode) <- inferExprW mono fexp
         unify (Just pos) actualT declaredT
+        pure (fname, actualNode)
       -- Infer + unify additions against the expected extension row.
       extEntries <- forM additions $ \(fname, fexp) -> do
         extFieldT <- do
@@ -1091,12 +1195,14 @@ inferExprWChecked mono (Just expected) (Abs.ERecordExt (Abs.ConId (pos, conName)
           case mft of
             Just ft -> pure ft
             Nothing -> freshTVar KStar
-        actualT <- inferExprW mono fexp
+        (actualT, actualNode) <- inferExprW mono fexp
         unify (Just pos) actualT extFieldT
-        pure (fname, extFieldT)
+        pure (fname, extFieldT, actualNode)
       -- Build result: spread row + extension fields appended.
-      let resultRow = foldr (\(l, t) acc -> RowExtend l t acc) spreadRow extEntries
-      pure (TRecord conName resultRow)
+      let resultRow = foldr (\(l, t, _) acc -> RowExtend l t acc) spreadRow extEntries
+          extNodes = map (\(l, _, n) -> (l, n)) extEntries
+          ty = TRecord conName resultRow
+      pure (ty, Ty.Texp ty (Ty.TRecordExt conName spreadNode (overrideNodes ++ extNodes)))
     _ ->
       -- Not a compatible expected type: fall back to strict spread.
       inferExprW mono (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing)
@@ -1147,34 +1253,44 @@ partitionTrailing spreadSet extSet pos conName pairs =
 -- Worker that carries a map of monomorphic (lambda/pattern) bindings.
 -- These are looked up directly without instantiation, preserving the
 -- identity of the mutable TVar across all uses in the expression.
-inferExprW :: Map.Map Text (Type s) -> Abs.Exp -> TC s (Type s)
-inferExprW _ (Abs.ELitI _) = pure (TCon TcU64 [])
-inferExprW _ (Abs.ELitS _) = pure (TCon TcString [])
-inferExprW _ (Abs.ELitC _) = pure (TCon TcChar [])
-inferExprW _ Abs.EUnit = pure (TCon TcUnit [])
+inferExprW :: Map.Map Text (Type s) -> Abs.Exp -> TC s (Type s, TExprS s)
+inferExprW _ (Abs.ELitI (Abs.WokInt (_, t))) =
+  let ty = TCon TcU64 [] in pure (ty, Ty.Texp ty (Ty.TLitI (readInt t)))
+inferExprW _ (Abs.ELitS s) =
+  let ty = TCon TcString [] in pure (ty, Ty.Texp ty (Ty.TLitS (Tx.pack s)))
+inferExprW _ (Abs.ELitC c) =
+  let ty = TCon TcChar [] in pure (ty, Ty.Texp ty (Ty.TLitC c))
+inferExprW _ Abs.EUnit =
+  let ty = TCon TcUnit [] in pure (ty, Ty.Texp ty Ty.TUnit)
 inferExprW mono (Abs.EVar (Abs.VarId (pos, name))) =
   case Map.lookup name mono of
-    Just t -> pure t
+    Just t -> pure (t, Ty.Texp t (Ty.TVar name))
     Nothing -> do
       env <- currentEnv
       case lookupVar name env of
-        Just s -> instantiate s
+        Just s -> do
+          t <- instantiate s
+          pure (t, Ty.Texp t (Ty.TVar name))
         Nothing -> throwError (UnknownVar (Just pos) name)
 inferExprW _ (Abs.ECon (Abs.ConId (pos, name))) = do
   env <- currentEnv
   case lookupCon name env of
-    Just info -> instantiate (conScheme info)
+    Just info -> do
+      t <- instantiate (conScheme info)
+      pure (t, Ty.Texp t (Ty.TCon name))
     Nothing -> case lookupRecordCon name env of
       Just _  -> throwError (RecordConstructorNotAValue (Just pos) name)
       Nothing -> throwError (UnknownCon (Just pos) name)
 inferExprW mono (Abs.EParen e) = inferExprW mono e
 inferExprW mono (Abs.EParenOp (Abs.VarSym (pos, name))) =
   case Map.lookup name mono of
-    Just t -> pure t
+    Just t -> pure (t, Ty.Texp t (Ty.TParenOp name))
     Nothing -> do
       env <- currentEnv
       case lookupVar name env of
-        Just s -> instantiate s
+        Just s -> do
+          t <- instantiate s
+          pure (t, Ty.Texp t (Ty.TParenOp name))
         Nothing -> throwError (UnknownVar (Just pos) name)
 inferExprW mono (Abs.EApp f x) = do
   -- Detect record constructor used in positional application and reject it.
@@ -1185,8 +1301,8 @@ inferExprW mono (Abs.EApp f x) = do
         Just _  -> throwError (RecordConstructorNeedsBraces (Just pos) name)
         Nothing -> pure ()
     _ -> pure ()
-  fT <- inferExprW mono f
-  xT <- inferExprW mono x
+  (fT, fNode) <- inferExprW mono f
+  (xT, xNode) <- inferExprW mono x
   rT <- freshTVar KStar
   effRow <- freshRVar
   -- The applied arrow may carry an effect row; unify with a fresh row var so we
@@ -1199,28 +1315,40 @@ inferExprW mono (Abs.EApp f x) = do
   unify Nothing fT (TArr xT effRow rT)
   emitRow Nothing effRow
   closeRow effRow
-  pure rT
+  -- Flatten the curried application spine: nested EApp on the left becomes a
+  -- single TApp head [args]. The head node's annotation is the type at that
+  -- point in the spine (which matches what inferExprW computed for it).
+  let node = case fNode of
+        Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
+        _                          -> Ty.TApp fNode [xNode]
+  pure (rT, Ty.Texp rT node)
 inferExprW mono (Abs.EIf c a b) = do
-  cT <- inferExprW mono c
-  aT <- inferExprW mono a
-  bT <- inferExprW mono b
+  (cT, cNode) <- inferExprW mono c
+  (aT, aNode) <- inferExprW mono a
+  (bT, bNode) <- inferExprW mono b
   unify Nothing cT (TCon TcBool [])
   unify Nothing aT bT
-  pure aT
+  pure (aT, Ty.Texp aT (Ty.TIf cNode aNode bNode))
 inferExprW mono (Abs.ETuple a others) = do
-  ts <- mapM (inferExprW mono) (a : others)
-  pure (TCon (TcTuple (length ts)) ts)
+  results <- mapM (inferExprW mono) (a : others)
+  let ts = map fst results
+      ns = map snd results
+      ty = TCon (TcTuple (length ts)) ts
+  pure (ty, Ty.Texp ty (Ty.TTuple ns))
 inferExprW _ (Abs.EList []) = do
   e <- freshTVar KStar
-  pure (TCon TcList [e])
+  let ty = TCon TcList [e]
+  pure (ty, Ty.Texp ty (Ty.TList []))
 inferExprW mono (Abs.EList (x : xs)) = do
-  firstT <- inferExprW mono x
-  mapM_ (\e -> do { t <- inferExprW mono e; unify Nothing firstT t }) xs
-  pure (TCon TcList [firstT])
+  (firstT, firstNode) <- inferExprW mono x
+  restNodes <- mapM (\e -> do { (t, n) <- inferExprW mono e; unify Nothing firstT t; pure n }) xs
+  let ty = TCon TcList [firstT]
+  pure (ty, Ty.Texp ty (Ty.TList (firstNode : restNodes)))
 inferExprW mono (Abs.ELam atomPats body) = do
   patResults <- mapM inferAtomPat atomPats
-  let paramTys = map fst patResults
-      binds = concatMap snd patResults
+  let paramTys = map (\(t, _, _) -> t) patResults
+      patNodes = map (\(_, _, n) -> n) patResults
+      binds = concatMap (\(_, b, _) -> b) patResults
       mono' = foldl' (\m (n, t) -> Map.insert n t m) mono binds
   -- A lambda is a function: the effects its body performs happen when the
   -- lambda is APPLIED, so they belong to the lambda's own (innermost) arrow,
@@ -1231,21 +1359,26 @@ inferExprW mono (Abs.ELam atomPats body) = do
   -- lambda value would be typed as a pure arrow.
   ambient0 <- freshRVar
   effRef <- liftST (newSTRef ambient0)
-  bodyT <- withEffRow effRef (inferExprW mono' body)
+  (bodyT, bodyNode) <- withEffRow effRef (inferExprW mono' body)
   ambient <- liftST (readSTRef effRef)
   closeRow ambient
-  pure (arrowsWithEffect paramTys bodyT ambient)
+  let ty = arrowsWithEffect paramTys bodyT ambient
+  pure (ty, Ty.Texp ty (Ty.TLam patNodes bodyNode))
 inferExprW mono (Abs.EExpr head_ tails) = do
-  hT <- inferExprW mono head_
-  applyTails hT tails
+  (hT, hNode) <- inferExprW mono head_
+  applyTails hT hNode tails
   where
-    applyTails t [] = pure t
-    applyTails fT (Abs.ITail op rhs : rest) = do
-      opTy <- inferInfixOpW mono op
-      rhsT <- inferExprW mono rhs
+    applyTails t node [] = pure (t, node)
+    applyTails fT lhsNode (Abs.ITail op rhs : rest) = do
+      (opTy, opName) <- inferInfixOpW mono op
+      (rhsT, rhsNode) <- inferExprW mono rhs
       r1 <- freshTVar KStar
       unify Nothing opTy (TArr fT RowEmpty (TArr rhsT RowEmpty r1))
-      applyTails r1 rest
+      -- Mirror the resolved application `op lhs rhs` as a nested TApp whose
+      -- head is the operator used as a value. r1 is the result type at this
+      -- step; the running lhs node carries the accumulated chain.
+      let appNode = Ty.Texp r1 (Ty.TApp (Ty.Texp opTy (Ty.TVar opName)) [lhsNode, rhsNode])
+      applyTails r1 appNode rest
 -- Operation invocation `E.op`: when the head is a constructor naming a
 -- declared effect and @op@ is one of its operations, this is an operation
 -- reference, not record-field access. Its type is the operation's scheme; it
@@ -1268,7 +1401,7 @@ inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (p
                              [ Map.findWithDefault (TCon TcUnit []) i paramSubst
                              | (i, _) <- ps ]
           emitEffect (Just pos) ename labelTy
-          pure opTy
+          pure (opTy, Ty.Texp opTy (Ty.TProjCon ename label))
       | otherwise -> throwError (UnknownOperation (Just pos) ename label)
     Nothing -> inferProjection mono headE pos label
 inferExprW mono (Abs.EProj e (Abs.VarId (pos, label))) =
@@ -1309,12 +1442,14 @@ inferExprW mono (Abs.ERecord (Abs.ConId (pos, conName)) fieldExprs) = do
     let mExpr = lookup fname providedPairs
     case mExpr of
       Just e -> do
-        actualT <- inferExprW mono e
+        (actualT, actualNode) <- inferExprW mono e
         unify (Just pos) actualT fieldT
-        pure (fname, fieldT)
+        pure (fname, fieldT, actualNode)
       Nothing -> error "ERecord: missing field not caught above (invariant violation)"
-  let row = foldr (\(l, t) acc -> RowExtend l t acc) RowEmpty rowEntries
-  pure (TRecord conName row)
+  let row = foldr (\(l, t, _) acc -> RowExtend l t acc) RowEmpty rowEntries
+      fieldNodes = map (\(l, _, n) -> (l, n)) rowEntries
+      ty = TRecord conName row
+  pure (ty, Ty.Texp ty (Ty.TRecord conName fieldNodes))
 
 -- | Record spread construction: Point { ..p } or Point { ..p, x = 99 }
 -- The spread expression must be a TRecord with the same nominal tag.
@@ -1328,7 +1463,7 @@ inferExprW mono (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing)
     Nothing -> throwError (UnknownCon (Just pos) conName)
     Just _  -> pure ()
   -- Infer the spread expression type.
-  spreadT <- inferExprW mono spreadExpr
+  (spreadT, spreadNode) <- inferExprW mono spreadExpr
   spreadT' <- force spreadT
   -- The spread must be a TRecord with the same nominal tag.
   case spreadT' of
@@ -1353,26 +1488,29 @@ inferExprW mono (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing)
   let spreadRow = case spreadT' of
         TRecord _ row -> row
         _             -> error "ERecordExt: spreadT' shape changed (impossible)"
-  forM_ trailingPairs $ \(fname, fexp) -> do
+  fieldNodes <- forM trailingPairs $ \(fname, fexp) -> do
     (declaredT, _rest) <- rewriteRowStrict (Just pos) fname spreadRow
-    actualT <- inferExprW mono fexp
+    (actualT, actualNode) <- inferExprW mono fexp
     unify (Just pos) actualT declaredT
+    pure (fname, actualNode)
   -- The result type is the spread's type: overrides don't change the
   -- nominal row for concrete-row spreads (all overriding fields must match
   -- the declared types, which we have just verified via unify above).
-  pure spreadT'
+  pure (spreadT', Ty.Texp spreadT' (Ty.TRecordExt conName spreadNode fieldNodes))
 
 inferExprW mono (Abs.ELet localDecls body) =
-  inferLetGroup mono localDecls (\m -> inferExprW m body)
+  inferLetGroup mono localDecls $ \m declNodes -> do
+    (bodyT, bodyNode) <- inferExprW m body
+    pure (bodyT, Ty.Texp bodyT (Ty.TLet declNodes bodyNode))
 inferExprW mono (Abs.ECase scrutinee alts) = do
-  sT <- inferExprW mono scrutinee
+  (sT, sNode) <- inferExprW mono scrutinee
   rT <- freshTVar KStar
   -- Check coverage BEFORE inferring alts: the strict-pattern alts will
   -- unify the scrutinee's row variable to RowEmpty, destroying the open-tail
   -- information we need for the non-exhaustive warning.
   checkRecordPatternCoverage (expPos scrutinee) sT alts
-  mapM_ (inferAlt mono sT rT) alts
-  pure rT
+  altNodes <- mapM (inferAlt mono sT rT) alts
+  pure (rT, Ty.Texp rT (Ty.TCase sNode altNodes))
 -- Handler: `handle EXPR of { E.op args -> body ... ; return v -> r }`.
 -- v1 (transparent operations, no resume): infer EXPR under a fresh sub-ambient
 -- effect row; the handled effects are those named by the arm heads; every
@@ -1383,7 +1521,7 @@ inferExprW mono (Abs.ECase scrutinee alts) = do
 -- the handled ones, joined into the enclosing ambient.
 inferExprW mono (Abs.EHandle e arms) = inferHandler mono e arms
 
-inferHandler :: Map.Map Text (Type s) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s)
+inferHandler :: Map.Map Text (Type s) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
 inferHandler mono e arms = do
   env <- currentEnv
   -- Split arms into operation arms and an optional return arm.
@@ -1399,7 +1537,7 @@ inferHandler mono e arms = do
   -- exactly which effects it performs.
   subAmbient0 <- freshRVar
   subRef <- liftST (newSTRef subAmbient0)
-  exprT <- withEffRow subRef (inferExprW mono e)
+  (exprT, exprNode) <- withEffRow subRef (inferExprW mono e)
   -- The handled effects are the distinct effect names mentioned by arm heads.
   let handledEffects = Data.List.nub [ en | (en, _, _, _, _) <- opArms ]
   -- Coverage: every operation of each handled effect must have an arm.
@@ -1421,7 +1559,7 @@ inferHandler mono e arms = do
   -- types and check its body against the op's RESULT type. Arm bodies run under
   -- the OUTER ambient (the current one), so effects performed inside an arm
   -- (effect translation) flow to the enclosing computation.
-  forM_ opArms $ \(en, op, ps, body, pos) ->
+  opArmNodes <- forM opArms $ \(en, op, ps, body, pos) ->
     case lookupEffect en env of
       Nothing -> throwError (MissingEffectDecl (Just pos) en)
       Just eInfo -> case Map.lookup op (eiOps eInfo) of
@@ -1431,15 +1569,19 @@ inferHandler mono e arms = do
           let opTy = substCTypeWith paramSubst (schemeBody opScheme)
           -- Peel the op's argument types onto the arm's argument patterns.
           patResults <- mapM inferAtomPat ps
-          let pTys  = map fst patResults
-              binds = concatMap snd patResults
+          let pTys  = map (\(t, _, _) -> t) patResults
+              binds = concatMap (\(_, b, _) -> b) patResults
+              argPatNodes = map (\(_, _, n) -> n) patResults
               mono' = foldr (\(n, t) m -> Map.insert n t m) mono binds
           mResult <- peelArrowsWithArgUnify opTy pTys
           resultTy <- case mResult of
             Just r  -> pure r
             Nothing -> throwError (UnknownOperation (Just pos) en op)
-          bodyT <- inferExprW mono' body
+          (bodyT, bodyNode) <- inferExprW mono' body
           unify (Just pos) bodyT resultTy
+          -- v1 has no resume binding in the surface syntax, so the resume name
+          -- is empty; transparent operations do not capture a continuation.
+          pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
   -- Discharge the handled effects from the handled expression's row, leaving
   -- the residual effects to flow outward.
   subRow <- liftST (readSTRef subRef)
@@ -1447,10 +1589,15 @@ inferHandler mono e arms = do
   emitRow Nothing residual
   -- Apply the optional return arm to compute the handle's result type.
   case retArms of
-    []               -> pure exprT
+    []               ->
+      pure (exprT, Ty.Texp exprT (Ty.THandle exprNode opArmNodes))
     ((_, v, rb) : _) -> do
       let mono' = Map.insert v exprT mono
-      inferExprW mono' rb
+      (rT, rNode) <- inferExprW mono' rb
+      -- The return arm binds the handled value @v@ (type exprT) and transforms
+      -- it; represent the binder as a variable pattern annotated with exprT.
+      let retArm = Ty.TReturnArm (Ty.Tpat exprT (Ty.TPVar v)) rNode
+      pure (rT, Ty.Texp rT (Ty.THandle exprNode (opArmNodes ++ [retArm])))
 
 -- | Remove the given effect labels from a row (each label dropped once per
 -- occurrence is unnecessary in v1 -- effects are not duplicated by inference --
@@ -1471,14 +1618,14 @@ dischargeEffects row handled = do
 -- | Ordinary record field projection `e.label`: the original (pre-effects)
 -- 'EProj' behaviour, factored out so the operation-call case can fall back to
 -- it when the head constructor is not a declared effect.
-inferProjection :: Map.Map Text (Type s) -> Abs.Exp -> (Int, Int) -> Text -> TC s (Type s)
+inferProjection :: Map.Map Text (Type s) -> Abs.Exp -> (Int, Int) -> Text -> TC s (Type s, TExprS s)
 inferProjection mono e pos label = do
-  eT <- inferExprW mono e
+  (eT, eNode) <- inferExprW mono e
   eT' <- force eT
   case eT' of
     TRecord _ row -> do
       (fieldT, _rest) <- rewriteRowStrict (Just pos) label row
-      pure fieldT
+      pure (fieldT, Ty.Texp fieldT (Ty.TProj eNode label))
     _ -> do
       cT <- freeze eT'
       throwError (NotARecord (Just pos) cT)
@@ -1548,20 +1695,23 @@ emitRow sp row = do
       emitRow sp rest
 
 -- | Look up an infix operator; monomorphic bindings are checked first.
-inferInfixOpW :: Map.Map Text (Type s) -> Abs.InfixOp -> TC s (Type s)
+-- Returns the operator's type and its name (for building the typed node).
+inferInfixOpW :: Map.Map Text (Type s) -> Abs.InfixOp -> TC s (Type s, Text)
 inferInfixOpW mono (Abs.IOSym (Abs.VarSym (pos, name))) =
   lookupOpNameW mono pos name
 inferInfixOpW mono (Abs.IOBT (Abs.VarId (pos, name))) =
   lookupOpNameW mono pos name
 
-lookupOpNameW :: Map.Map Text (Type s) -> (Int, Int) -> Text -> TC s (Type s)
+lookupOpNameW :: Map.Map Text (Type s) -> (Int, Int) -> Text -> TC s (Type s, Text)
 lookupOpNameW mono pos name =
   case Map.lookup name mono of
-    Just t -> pure t
+    Just t -> pure (t, name)
     Nothing -> do
       env <- currentEnv
       case lookupVar name env of
-        Just s -> instantiate s
+        Just s -> do
+          t <- instantiate s
+          pure (t, name)
         Nothing -> throwError (UnknownVar (Just pos) name)
 
 -- ---------------------------------------------------------------------------
@@ -1624,17 +1774,20 @@ expPos _                                 = Nothing
 -- Let/where inference helpers
 -- ---------------------------------------------------------------------------
 
--- | Infer a single case alternative.
-inferAlt :: Map.Map Text (Type s) -> Type s -> Type s -> Abs.Alt -> TC s ()
+-- | Infer a single case alternative, returning its typed form.
+inferAlt :: Map.Map Text (Type s) -> Type s -> Type s -> Abs.Alt -> TC s (Ty.TAlt (Type s))
 inferAlt mono sT rT (Abs.AltC pat body mw) = do
-  (pT, binds) <- inferPat pat
+  (pT, binds, patNode) <- inferPat pat
   unify Nothing sT pT
   let mono' = foldr (\(n, t) m -> Map.insert n t m) mono binds
   let withWhere k = case mw of
-        Abs.NoWhere -> k mono'
+        Abs.NoWhere -> k mono' []
         Abs.WithWh ds -> inferLetGroup mono' ds k
-  bodyT <- withWhere (\m -> inferExprW m body)
+  (bodyT, bodyNode, whereNodes) <- withWhere $ \m declNodes -> do
+    (t, n) <- inferExprW m body
+    pure (t, n, declNodes)
   unify Nothing rT bodyT
+  pure (Ty.TAlt patNode whereNodes bodyNode)
 
 -- | Process a local-decl group as a single mutually-recursive let.
 -- Each binding's placeholder TVar lives in the mono-map during RHS typing
@@ -1644,7 +1797,7 @@ inferAlt mono sT rT (Abs.AltC pat body mw) = do
 inferLetGroup
   :: Map.Map Text (Type s)
   -> [Abs.LocalDecl]
-  -> (Map.Map Text (Type s) -> TC s a)
+  -> (Map.Map Text (Type s) -> [Ty.TLocalDecl (Type s)] -> TC s a)
   -> TC s a
 inferLetGroup mono decls k = do
   let (sigs, eqns) = partitionLocalDecls decls
@@ -1666,8 +1819,11 @@ inferLetGroup mono decls k = do
                                             else Map.insert n tv m)
                         mono placeholders
     mapM (unifyGroupWith monoRec sigMap) placeholders
+  -- The typed local decls for every equation across all groups, in source
+  -- order, available to the continuation for building TLet/where nodes.
+  let declNodes = concatMap (\(_, _, ds) -> ds) unified
   -- Phase 2: back at outer level, generalize or check sig.
-  results <- withEnv extendSig $ mapM (finalizeGroup sigMap) unified
+  results <- withEnv extendSig $ mapM (\(n, tv, _) -> finalizeGroup sigMap (n, tv)) unified
   -- Bodyless sigs in this let block become visible bindings with the
   -- declared scheme verbatim (NO freezeSig). Warnings are NOT emitted
   -- here in v1 -- let-block bodyless diagnostics are deferred to a
@@ -1682,7 +1838,7 @@ inferLetGroup mono decls k = do
       mono'   = foldr (\(n, tv) m -> Map.insert n tv m) mono monoBindings
       extend2 = foldr (.) id [ extendVarTC n s
                              | (n, s) <- polyBindings ++ sigOnlyBindings ]
-  extend2 (k mono')
+  extend2 (k mono' declNodes)
 
 partitionLocalDecls :: [Abs.LocalDecl] -> ([Abs.LocalDecl], [Abs.LocalDecl])
 partitionLocalDecls = foldr step ([], [])
@@ -1747,16 +1903,18 @@ unifyGroupWith
   :: Map.Map Text (Type s)
   -> Map.Map Text Scheme
   -> (Text, Type s, [Abs.LocalDecl])
-  -> TC s (Text, Type s)
+  -> TC s (Text, Type s, [Ty.TLocalDecl (Type s)])
 unifyGroupWith monoRec sigMap (name, tv, eqns) = do
   let mSig = Map.lookup name sigMap
-  eqTypes <- mapM (typeEquationWith monoRec mSig) eqns
+  eqResults <- mapM (typeEquationWith monoRec mSig) eqns
+  let eqTypes = map fst eqResults
+      eqDecls = map snd eqResults
   case eqTypes of
     [] -> error ("unifyGroupWith: no equations for " ++ show name)
     (t : ts) -> do
       mapM_ (unify Nothing t) ts
       unify Nothing tv t
-      pure (name, tv)
+      pure (name, tv, eqDecls)
 
 -- | Walk a forced type and report whether any unbound TVar has level <= outer.
 -- When this is true the binding is monomorphic (its type is pinned by an
@@ -1819,17 +1977,85 @@ finalizeGroup sigMap (name, tv) =
           gen <- generalize tv
           pure (Right (name, gen))
 
+-- | Top-level variant of 'finalizeGroup': in addition to producing the
+-- binding's scheme, it FREEZES the binding's typed parameter patterns and
+-- body into a 'TypedDecl'. Freezing happens here, at the top level, in a
+-- single 'generalizeTyped' call so that the params and body share one
+-- quantification mapping (consistent 'CTGen' numbering) and so that no var at
+-- level <= outer can reach the freeze -- the top level has no enclosing
+-- scope, so every quantifiable var sits above it. Inner let-groups keep using
+-- the plain 'finalizeGroup' (schemes only); their unfrozen sub-trees are
+-- folded into the enclosing body and frozen as part of THIS top-level tree.
+--
+-- The typed equations come from 'unifyGroupWith'. A binding may have several
+-- equations (one 'TLocalDecl' each); v1 surfaces the FIRST clause's params and
+-- body on the 'TypedDecl'. The scheme covers all clauses (their types were
+-- unified), so 'tdScheme' is unaffected by which clause is surfaced.
+--
+-- The top level never reports escape (no outer scope), so unlike
+-- 'finalizeGroup' this returns a 'TypedDecl' directly.
+finalizeGroupTyped
+  :: Map.Map Text Scheme
+  -> (Text, Type s, [Ty.TLocalDecl (Type s)])
+  -> TC s TypedDecl
+finalizeGroupTyped sigMap (name, tv, eqDecls) = do
+  (paramsS, bodyS) <- case eqDecls of
+    -- Only the first clause is surfaced; multi-clause top-level functions are
+    -- not supported (they were already non-functional on main). Carrying all
+    -- clauses requires a clause list on TypedDecl -- deferred.
+    (Ty.TLocalDecl _ ps b : _) -> pure (ps, b)
+    [] -> error ("finalizeGroupTyped: no typed equations for " ++ Tx.unpack name)
+  -- Freeze params + body together under one mapping by wrapping them in a
+  -- synthetic TLam whose own annotation is the binding's principal type.
+  let synthetic = Ty.Texp tv (Ty.TLam paramsS bodyS)
+  case Map.lookup name sigMap of
+    Just declared -> do
+      -- A user signature pins the scheme. Verify it (as 'finalizeGroup'
+      -- does), then freeze the inferred tree for its node types while keeping
+      -- the DECLARED scheme as 'tdScheme'. The body was checked against a
+      -- skolemised instantiation of the sig, so its annotations carry Rigid
+      -- skolems; 'freezeTypedTreeSig' folds those into CTGens (it does not
+      -- error on Rigids the way 'generalizeTyped'/'freezeQuantify' do).
+      declT <- freezeSig declared
+      unify Nothing declT tv
+      frozen <- freezeTypedTreeSig synthetic
+      let (ps, b) = unTLam name frozen
+      pure TypedDecl { tdName = name, tdScheme = declared, tdParams = ps, tdBody = b }
+    Nothing -> do
+      Level outer <- currentLevel
+      hasEscape <- hasOuterScopeVar outer tv
+      when hasEscape $ error
+        ("finalizeGroupTyped: unexpected escape for top-level binding "
+        ++ Tx.unpack name)
+      (gen, frozen) <- generalizeTyped tv synthetic
+      let (ps, b) = unTLam name frozen
+      pure TypedDecl { tdName = name, tdScheme = gen, tdParams = ps, tdBody = b }
+
+-- | Recover the params + body from the synthetic 'TLam' that 'generalizeTyped'
+-- froze. The wrapper shape is preserved by freezing (it is a structural
+-- traversal), so this never fails unless the wrapper was built wrong.
+unTLam :: Text -> TExpr -> ([TPat], TExpr)
+unTLam _ (Ty.Texp _ (Ty.TLam ps b)) = (ps, b)
+unTLam name _ = error
+  ("finalizeGroupTyped: synthetic TLam lost its shape for " ++ Tx.unpack name)
+
 -- | Type one equation, using the given recursive mono-map as the base
 -- (so mutually-recursive names are visible). Pattern bindings extend it.
 -- The optional sig scheme is used for bidirectional checking: when the
 -- equation has no parameters, the sig is instantiated and threaded as a
 -- hint to the body so that ERecord/ERecordExt can accept extension fields.
-typeEquationWith :: Map.Map Text (Type s) -> Maybe Scheme -> Abs.LocalDecl -> TC s (Type s)
+typeEquationWith
+  :: Map.Map Text (Type s)
+  -> Maybe Scheme
+  -> Abs.LocalDecl
+  -> TC s (Type s, Ty.TLocalDecl (Type s))
 typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
   let atoms = lhsAtomPats lhs
+      name  = funLHSName lhs
   patResults <- mapM inferAtomPat atoms
-  let pTys  = map fst patResults
-      binds = concatMap snd patResults
+  let pTys  = map (\(t, _, _) -> t) patResults
+      patNodes = map (\(_, _, n) -> n) patResults
+      binds = concatMap (\(_, b, _) -> b) patResults
       mono  = foldr (\(n, t) m -> Map.insert n t m) monoRec binds
   -- Instantiate the sig once (shared by the body hint and the effect-row seed).
   -- Derive the expected body type by peeling off one arrow per pattern
@@ -1846,8 +2072,18 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
       mResult <- peelArrowsWithArgUnify sigT pTys
       pure (mResult, effRow)
   let withWhere k = case mw of
-        Abs.NoWhere -> k mono
+        Abs.NoWhere -> k mono []
         Abs.WithWh ds -> inferLetGroup mono ds k
+      -- Run the body under the where-bindings, returning the body type and a
+      -- node. A non-empty `where` becomes a `TLet` wrapping the body so the
+      -- typed binding's single body field carries the where group.
+      runBody = withWhere $ \m declNodes -> do
+        (t, n) <- inferExprWChecked m mBodyHint body
+        let n' = case declNodes of
+                   [] -> n
+                   _  -> Ty.Texp t (Ty.TLet declNodes n)
+        pure (t, n')
+      mkDecl = Ty.TLocalDecl name patNodes
   -- Effect-row discipline depends on whether this equation has parameters:
   --
   --   * WITH parameters: it is a function. Its effects happen when it is
@@ -1866,18 +2102,18 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
       menc <- currentEffRow
       case menc of
         Just _  -> do
-          bodyT <- withWhere (\m -> inferExprWChecked m mBodyHint body)
-          pure bodyT
+          (bodyT, bodyNode) <- runBody
+          pure (bodyT, mkDecl bodyNode)
         Nothing -> do
           -- Top-level zero-arg binding: no enclosing ambient. Use a local one
           -- and close it; a top-level value performing effects has nowhere to
           -- discharge them, so closing to its concrete effects is correct.
           ambient0 <- freshRVar
           effRef <- liftST (newSTRef ambient0)
-          bodyT <- withEffRow effRef (withWhere (\m -> inferExprWChecked m mBodyHint body))
+          (bodyT, bodyNode) <- withEffRow effRef runBody
           ambient <- liftST (readSTRef effRef)
           closeRow ambient
-          pure bodyT
+          pure (bodyT, mkDecl bodyNode)
     _ -> do
       -- Seed the ambient from the declared sig's effect row when there is one,
       -- so the body is checked AGAINST the declared effects: a closed sig row
@@ -1895,10 +2131,10 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
         Just r  -> pure r
         Nothing -> freshRVar
       effRef <- liftST (newSTRef ambient0)
-      bodyT <- withEffRow effRef (withWhere (\m -> inferExprWChecked m mBodyHint body))
+      (bodyT, bodyNode) <- withEffRow effRef runBody
       ambient <- liftST (readSTRef effRef)
       closeRow ambient
-      pure (arrowsWithEffect pTys bodyT ambient)
+      pure (arrowsWithEffect pTys bodyT ambient, mkDecl bodyNode)
 typeEquationWith _ _ Abs.LDSig{} = error "typeEquationWith: signature in equation list"
 
 -- | The effect row on the @n@-th arrow (1-indexed) of an instantiated sig type.
@@ -1965,15 +2201,22 @@ lhsAtomPats (Abs.LHSInfBT a _ b) = [a, b]
 -- Top-level program inference
 -- ---------------------------------------------------------------------------
 
--- | The v1 typed-AST output: one entry per top-level binding, carrying
--- its generalised scheme. The expression-level typed AST is omitted
--- from v1; future coverage / eval passes will get it when those
--- features land.
+-- | The typed-AST output: one entry per top-level binding, carrying its
+-- generalised scheme together with the binding's typed parameter patterns
+-- and body. The params and body are frozen ('CType' annotations) under the
+-- SAME quantification mapping as the scheme, so their per-node 'CTGen'
+-- numbering agrees with the scheme's quantifiers. The body already folds in
+-- any @where@ clause as a leading 'Ty.TLet' (see 'typeEquationWith'), so a
+-- single body field carries the whole RHS.
+--
+-- No 'Eq' instance: 'TExpr'/'Tpat' are not 'Eq'.
 data TypedDecl = TypedDecl
   { tdName :: Text
   , tdScheme :: Scheme
+  , tdParams :: [TPat]
+  , tdBody :: TExpr
   }
-  deriving (Eq, Show)
+  deriving (Show)
 
 -- | Pipeline entry parameterised by the seed env and module origin.
 -- The seed env is the irreducible pre-env (from Builtins) overlaid with
@@ -2011,10 +2254,10 @@ inferProgramTC seedEnv origin decls = do
   -- Warnings (BodylessBinding, RowShadow, …) are emitted into the TC
   -- monad's warning channel via addWarning; they are collected by runTC.
   withEnv (const env1e) $ do
-    schemes <- inferTopLetGroup origin localDecls
+    tds <- inferTopLetGroup origin localDecls
     env2 <- currentEnv
-    let finalEnv = foldr (\(n, s) e -> extendVar n s e) env2 schemes
-    pure (finalEnv, [ TypedDecl n s | (n, s) <- schemes ])
+    let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
+    pure (finalEnv, tds)
 
 -- | Convert a top-level Decl to zero or more LocalDecls so we can reuse
 -- the existing inferLetGroup machinery.
@@ -2024,12 +2267,14 @@ toLocalDecl (Abs.DSig sn extras ty) = [Abs.LDSig sn extras ty]
 toLocalDecl _ = []
 
 -- | Type the top-level declarations as one big mutually-recursive let,
--- returning the list of (name, scheme) pairs in binding order. Non-fatal
--- warnings (e.g. bodyless top-level sigs in UserFile origin) are emitted
--- into the TC monad's warning channel via 'addWarning' and collected by
--- 'runTC'.
+-- returning one 'TypedDecl' per binding in binding order. Each binding with a
+-- body carries its frozen typed params + body (see 'finalizeGroupTyped');
+-- bodyless sigs carry their declared scheme with empty params and a sentinel
+-- body (the bound name at its declared type), since they have no RHS. Non-fatal
+-- warnings (e.g. bodyless top-level sigs in UserFile origin) are emitted into
+-- the TC monad's warning channel via 'addWarning' and collected by 'runTC'.
 inferTopLetGroup
-  :: Origin -> [Abs.LocalDecl] -> TC s [(Text, Scheme)]
+  :: Origin -> [Abs.LocalDecl] -> TC s [TypedDecl]
 inferTopLetGroup origin localDecls = do
   let (sigs, eqns) = partitionLocalDecls localDecls
   sigMap <- buildSigMap sigs
@@ -2040,7 +2285,14 @@ inferTopLetGroup origin localDecls = do
       sigOnlyNames    = [ n | n <- sigNamesInOrder sigs
                             , Map.member n sigMap
                             , not (Set.member n coveredEqn) ]
-      sigOnlyBindings = [ (n, sigMap Map.! n) | n <- sigOnlyNames ]
+      -- Bodyless sigs have no RHS, so they carry the declared scheme with no
+      -- params and a sentinel body: the bound name at its scheme body type.
+      sigOnlyBindings =
+        [ let s = sigMap Map.! n
+          in TypedDecl { tdName = n, tdScheme = s
+                       , tdParams = []
+                       , tdBody = Ty.Texp (schemeBody s) (Ty.TVar n) }
+        | n <- sigOnlyNames ]
   -- Every binding that has a declared signature -- bodyless OR with a body --
   -- is in scope as its declared scheme while peer equations are typechecked, so
   -- references instantiate it polymorphically. Two reasons: (1) a bodyless sig
@@ -2057,17 +2309,12 @@ inferTopLetGroup origin localDecls = do
                                             else Map.insert n tv m)
                         Map.empty placeholders
     mapM (unifyGroupWith monoRec sigMap) placeholders
-  results <- withEnv extendSig $ mapM (finalizeGroup sigMap) unified
-  -- Top level has no outer scope, so finalizeGroup should never report
-  -- escape for a top-level binding. If it does, the inferrer's invariants
-  -- are violated -- fail loudly rather than silently emitting a Scheme []
-  -- whose body references unquantified CTGen slots (the exact dangling
-  -- pattern the escape fix was meant to eliminate).
-  topResults <- forM results $ \case
-    Right (n, s) -> pure (n, s)
-    Left (n, _) -> error
-      ("inferTopLetGroup: unexpected escape for top-level binding "
-      ++ Tx.unpack n)
+  -- Finalize each binding at the top level: generalize (or verify its sig) AND
+  -- freeze its typed params + body into a TypedDecl under one quantification
+  -- mapping (so node CTGens agree with the scheme). The top level has no outer
+  -- scope, so freezing the whole tree here is safe and 'finalizeGroupTyped'
+  -- never reports escape.
+  topResults <- withEnv extendSig $ mapM (finalizeGroupTyped sigMap) unified
   -- Emit a warning only for UserFile origin so Std.Base (Embedded) primitive
   -- schemes stay silent.
   case origin of

@@ -1,0 +1,3 @@
+double n : U64 =
+  let t : U64 = +(n, n)
+  t

@@ -1,0 +1,9 @@
+myId x : a0 =
+  x
+
+myConst x : a0 y : a1 =
+  x
+
+myFlip f : a0 -> a1 -> a2 x : a1 y : a0 =
+  let t : a2 = f(y, x)
+  t

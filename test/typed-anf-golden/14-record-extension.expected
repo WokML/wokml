@@ -1,0 +1,19 @@
+getX p : Point =
+  let t : U64 = p.x
+  t
+
+getXOpen p : Point =
+  let t : U64 = p.x
+  t
+
+preserveExtras p.1 : Point =
+  let p.2 : Point = p.1.x
+  let p.3 : Point = p.1.y
+  let t : Point = Point { x = p.2, y = p.3 }
+  t
+
+flipXY p : Point =
+  let t.1 : U64 = p.y
+  let t.2 : U64 = p.x
+  let t.3 : Point = Point { x = t.1, y = t.2 }
+  t.3

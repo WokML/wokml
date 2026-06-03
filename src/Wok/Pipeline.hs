@@ -19,7 +19,6 @@ import Data.Bifunctor (first)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Tx
 
-import qualified GeneratedParser.Wok.Abs as Abs
 import Wok.IR.Anf (CoreModule)
 import Wok.IR.Elaborate (elaborateModule, elaborateModulesShared)
 import Wok.Loader (LoadedModule (..), ModuleName)
@@ -37,7 +36,6 @@ import Wok.TypeChecking.Env (emptyEnv, overlayEnvs)
 data ModResult = ModResult
   { mrDecls  :: [TC.TypedDecl]
   , mrEnvOut :: TC.Env
-  , mrAst    :: Abs.Module
   }
 
 -- | Run the shared typecheck fold over all modules in topo order.
@@ -63,7 +61,7 @@ runPipelineFold _entryName = go Map.empty Map.empty Map.empty []
                       (reorderModuleWith importsFix (lmAst m))
       (envOut, decls, ws) <- first ((ctx "typecheck" ++) . show)
                       (TC.inferProgramWith mergedEnv (lmOrigin m) ast)
-      let mr = ModResult decls envOut ast
+      let mr = ModResult decls envOut
       go (Map.insert (lmName m) mr         resultMap)
          (Map.insert (lmName m) envOut     envsByMod)
          (Map.insert (lmName m) (lmFixities m) fixByMod)
@@ -90,7 +88,7 @@ elaborateProgram entryName ms = do
   case Map.lookup entryName resultMap of
     Nothing -> Left ("elaborateProgram: entry module not found: " ++ Tx.unpack entryName)
     Just mr ->
-      Right (elaborateModule (mrEnvOut mr) (mrAst mr))
+      Right (elaborateModule (mrEnvOut mr) (mrDecls mr))
 
 -- | Elaborate ALL loaded modules into one whole-program CoreModule, sharing a
 -- single global-name map so cross-module references resolve consistently.
@@ -100,5 +98,5 @@ elaborateProgramFull
   -> Either String CoreModule
 elaborateProgramFull entryName ms = do
   (resultMap, _warns) <- runPipelineFold entryName ms
-  let mods = [ (mrEnvOut mr, mrAst mr) | mr <- Map.elems resultMap ]
+  let mods = [ (mrEnvOut mr, mrDecls mr) | mr <- Map.elems resultMap ]
   Right (elaborateModulesShared mods)

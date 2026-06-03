@@ -1,0 +1,17 @@
+zero =
+  0
+
+one =
+  1
+
+two =
+  2
+
+allZeros =
+  case zero of
+    0 ->
+      let t.1 : Bool = True
+      t.1
+    _ ->
+      let t.2 : Bool = False
+      t.2

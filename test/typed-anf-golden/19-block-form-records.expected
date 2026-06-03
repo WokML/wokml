@@ -1,0 +1,41 @@
+somePoint =
+  let t : Rect = Rect { width = 4, height = 3 }
+  t
+
+unitCircle =
+  let t : Circle = Circle { radius = 1 }
+  t
+
+unitSquare =
+  let t : Square = Square { side = 1 }
+  t
+
+getWidth =
+  let t : U64 = somePoint.width
+  t
+
+getRadius =
+  let t : U64 = unitCircle.radius
+  t
+
+getSide =
+  let t : U64 = unitSquare.side
+  t
+
+mkRect w : U64 h : U64 =
+  let t : Rect = Rect { width = w, height = h }
+  t
+
+mixed =
+  let t : Rect = Rect { width = 7, height = 8 }
+  t
+
+trailingCommas =
+  let t : Rect = Rect { width = 5, height = 6 }
+  t
+
+flipWH r : Rect =
+  let t.1 : U64 = r.height
+  let t.2 : U64 = r.width
+  let t.3 : Rect = Rect { width = t.1, height = t.2 }
+  t.3

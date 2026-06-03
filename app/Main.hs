@@ -8,7 +8,7 @@ import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
-import Wok.IR.Anf (prettyModule)
+import Wok.IR.Anf (prettyModuleTyped)
 import qualified Wok.Interp as Interp
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
@@ -55,7 +55,7 @@ runApp entry extras mode = do
     Right (entryName, ms) -> case mode of
       ModeDumpAnf -> case Pipeline.elaborateProgram entryName ms of
         Left msg  -> hPutStrLn stderr msg >> exitFailure
-        Right cm  -> TIO.putStrLn (prettyModule cm)
+        Right cm  -> TIO.putStrLn (prettyModuleTyped cm)
       ModeRun -> case Pipeline.elaborateProgramFull entryName ms of
         Left msg -> hPutStrLn stderr msg >> exitFailure
         Right cm -> case Interp.runModule cm of
@@ -67,8 +67,8 @@ runApp entry extras mode = do
           mapM_ (hPutStrLn stderr . prettyWarning) warnings
           mapM_ printDecl (sortBy (comparing TC.tdName) decls)
   where
-    printDecl (TC.TypedDecl n s) =
-      TIO.putStrLn (n <> Tx.pack " : " <> TC.prettyScheme s)
+    printDecl td =
+      TIO.putStrLn (TC.tdName td <> Tx.pack " : " <> TC.prettyScheme (TC.tdScheme td))
 
 -- ----------------------------------------------------------------
 -- Pretty-printers

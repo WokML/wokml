@@ -1,0 +1,25 @@
+runIO comp : () -> a0 =
+  let t : a0 = comp(())
+  t
+  with {
+    return v : a0 -> v
+    IO.read(p : String, resume.1 : String) ->
+      let res.1 : String = resume.1(p)
+      res.1
+    IO.write(m : String, resume.2 : ()) ->
+      let res.2 : () = resume.2(())
+      res.2
+  }
+
+runIO2 comp : () -> a0 =
+  let t : a0 = comp(())
+  t
+  with {
+    return v : a0 -> v
+    IO.read(p : String, resume.1 : String) ->
+      let res.1 : String = resume.1(p)
+      res.1
+    IO.write(m : String, resume.2 : ()) ->
+      let res.2 : () = resume.2(())
+      res.2
+  }

@@ -1,0 +1,8 @@
+mapResult f : a0 -> a1 g : a2 -> a1 e : Result a0 a2 =
+  case e of
+    Ok a : a0 ->
+      let t.1 : a1 = f(a)
+      t.1
+    Err b : a2 ->
+      let t.2 : a1 = g(b)
+      t.2

@@ -1,0 +1,7 @@
+userValue u : UserId =
+  let t : U64 = u.value
+  t
+
+orderValue o : OrderId =
+  let t : U64 = o.value
+  t

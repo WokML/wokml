@@ -1,0 +1,20 @@
+myLength xs : [a0] =
+  case xs of
+    Nil -> 0
+    Cons _ : a0 ys : [a0] ->
+      let t.1 : U64 = myLength(ys)
+      let t.2 : U64 = +(1, t.1)
+      t.2
+
+myMap f : a0 -> a1 xs : [a0] =
+  case xs of
+    Nil ->
+      let t.1 : [a1] = Nil
+      t.1
+    Cons y : a0 ys : [a0] ->
+      let t.2 : a1 = f(y)
+      let t.3 : [a1] = Nil
+      let t.4 : [a1] = Cons(t.2, t.3)
+      let t.5 : [a1] = myMap(f, ys)
+      let t.6 : [a1] = ++(t.4, t.5)
+      t.6

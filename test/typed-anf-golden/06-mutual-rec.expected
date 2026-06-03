@@ -1,0 +1,19 @@
+even n : U64 =
+  case n of
+    0 ->
+      let t.1 : Bool = True
+      t.1
+    _ ->
+      let t.2 : U64 = -(n, 1)
+      let t.3 : Bool = odd(t.2)
+      t.3
+
+odd n : U64 =
+  case n of
+    0 ->
+      let t.1 : Bool = False
+      t.1
+    _ ->
+      let t.2 : U64 = -(n, 1)
+      let t.3 : Bool = even(t.2)
+      t.3
