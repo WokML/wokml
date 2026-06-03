@@ -11,6 +11,7 @@
 module Wok.Pipeline
   ( typecheckProgram
   , elaborateProgram
+  , elaborateProgramFull
   ) where
 
 import Control.Monad (foldM)
@@ -20,7 +21,7 @@ import qualified Data.Text as Tx
 
 import qualified GeneratedParser.Wok.Abs as Abs
 import Wok.IR.Anf (CoreModule)
-import Wok.IR.Elaborate (elaborateModule)
+import Wok.IR.Elaborate (elaborateModule, elaborateModulesShared)
 import Wok.Loader (LoadedModule (..), ModuleName)
 import Wok.Reordering
   ( emptyFixityTable
@@ -90,3 +91,14 @@ elaborateProgram entryName ms = do
     Nothing -> Left ("elaborateProgram: entry module not found: " ++ Tx.unpack entryName)
     Just mr ->
       Right (elaborateModule (mrEnvOut mr) (mrAst mr))
+
+-- | Elaborate ALL loaded modules into one whole-program CoreModule, sharing a
+-- single global-name map so cross-module references resolve consistently.
+elaborateProgramFull
+  :: ModuleName
+  -> [LoadedModule]
+  -> Either String CoreModule
+elaborateProgramFull entryName ms = do
+  (resultMap, _warns) <- runPipelineFold entryName ms
+  let mods = [ (mrEnvOut mr, mrAst mr) | mr <- Map.elems resultMap ]
+  Right (elaborateModulesShared mods)

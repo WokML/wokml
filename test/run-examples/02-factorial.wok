@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+fact : U64 -> U64
+fact n = case n of
+  0 -> 1
+  _ -> n * fact (n - 1)
+
+main = fact 5

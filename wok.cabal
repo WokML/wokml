@@ -89,6 +89,10 @@ library
         Wok.IR.Name
         Wok.IR.Anf
         Wok.IR.Elaborate
+        Wok.Interp
+        Wok.Interp.Value
+        Wok.Interp.Prim
+        Wok.Interp.Machine
     autogen-modules:
         Paths_wok
     other-modules:

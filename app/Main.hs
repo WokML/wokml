@@ -9,6 +9,7 @@ import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
 import Wok.IR.Anf (prettyModule)
+import qualified Wok.Interp as Interp
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
 import qualified Wok.TypeChecking as TC
@@ -18,9 +19,9 @@ import qualified Wok.TypeChecking as TC
 -- ----------------------------------------------------------------
 
 usage :: String
-usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf]"
+usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --run]"
 
-data CliMode = ModePrintSchemes | ModeDumpAnf
+data CliMode = ModePrintSchemes | ModeDumpAnf | ModeRun
 
 main :: IO ()
 main = do
@@ -37,6 +38,7 @@ parseCli = go Nothing [] ModePrintSchemes
     go _        _  _  ["-I"]               = Left ("-I requires an argument\n" ++ usage)
     go e        xs md ("-I" : f : rest)    = go e (f : xs) md rest
     go e        xs _  ("--dump-anf" : rest) = go e xs ModeDumpAnf rest
+    go e        xs _  ("--run" : rest)      = go e xs ModeRun rest
     go Nothing  xs md (a : rest)           = go (Just a) xs md rest
     go (Just _) _  _  (a : _)             =
       Left ("unexpected extra positional: " ++ a ++ "\n" ++ usage)
@@ -54,6 +56,11 @@ runApp entry extras mode = do
       ModeDumpAnf -> case Pipeline.elaborateProgram entryName ms of
         Left msg  -> hPutStrLn stderr msg >> exitFailure
         Right cm  -> TIO.putStrLn (prettyModule cm)
+      ModeRun -> case Pipeline.elaborateProgramFull entryName ms of
+        Left msg -> hPutStrLn stderr msg >> exitFailure
+        Right cm -> case Interp.runModule cm of
+          Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure
+          Right v   -> TIO.putStrLn (Interp.renderValue v)
       ModePrintSchemes -> case Pipeline.typecheckProgram entryName ms of
         Left msg -> hPutStrLn stderr msg >> exitFailure
         Right (decls, warnings) -> do

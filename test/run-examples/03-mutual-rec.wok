@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+even : U64 -> Bool
+even n = case n of
+  0 -> True
+  _ -> odd (n - 1)
+
+odd : U64 -> Bool
+odd n = case n of
+  0 -> False
+  _ -> even (n - 1)
+
+main = even 10

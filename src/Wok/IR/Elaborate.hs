@@ -1,6 +1,7 @@
 module Wok.IR.Elaborate
-  ( elaborateExprForTest   -- test seam: Env -> Abs.Exp -> Expr
-  , elaborateModule        -- full module elaboration: Env -> Abs.Module -> CoreModule
+  ( elaborateExprForTest      -- test seam: Env -> Abs.Exp -> Expr
+  , elaborateModule           -- full module elaboration: Env -> Abs.Module -> CoreModule
+  , elaborateModulesShared    -- whole-program: [(Env, Module)] -> CoreModule
   ) where
 
 import Control.Monad.Reader
@@ -770,6 +771,24 @@ elabTopBind (Abs.LHSInfSym{}) _ _ =
   error "elaborateModule: top-level infix operator definitions not supported"
 elabTopBind (Abs.LHSInfBT{}) _ _ =
   error "elaborateModule: top-level infix operator definitions not supported"
+
+-- | Elaborate several modules into one CoreModule, minting global names ONCE
+-- from the union of all modules' value-level vars so cross-module references
+-- share identity. Each module elaborates with its OWN env (for constructor
+-- arities, record fields, effect ops) but the SHARED globals map.
+elaborateModulesShared :: [(Env, Abs.Module)] -> CoreModule
+elaborateModulesShared mods =
+  runFresh $ do
+    let allVarNames = Map.keys (Map.unions [ envVars env | (env, _) <- mods ])
+    gpairs <- mapM (\t -> (,) t <$> freshName t) allVarNames
+    let globals = Map.fromList gpairs
+    binds <- concat <$> mapM (elabOne globals) mods
+    pure (CoreModule binds)
+  where
+    elabOne globals (env, Abs.Module decls) =
+      let eqns = [ (lhs, body, mw) | Abs.DEqn lhs body mw <- decls ]
+      in mapM (\(lhs, body, mw) ->
+                 runReaderT (elabTopBind lhs body mw) (ElabCtx env Map.empty globals)) eqns
 
 -- ---------------------------------------------------------------------------
 -- Public test seam

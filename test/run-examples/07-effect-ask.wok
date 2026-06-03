@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+effect Ask = { ask : () -> U64 }
+
+useAsk : () -> U64 with Ask
+useAsk u = Ask.ask () + 1
+
+main : U64
+main = handle (useAsk ()) of
+  Ask.ask p -> 41
+  return v -> v

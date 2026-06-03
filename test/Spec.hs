@@ -27,10 +27,19 @@ import qualified Wok.SourceOrigin as SO
 import qualified Wok.Prelude as Prelude
 import qualified Wok.Loader as Loader
 import qualified Wok.Pipeline as Pipeline
-import Wok.IR.Name (Unique (..), Name (..), runFresh, freshUnique, freshName)
+import Wok.IR.Name (Unique (..), Name (..), runFresh, freshUnique, freshName, freshJoin)
 import qualified Wok.IR.Anf as Anf
 import Wok.IR.Elaborate (elaborateExprForTest, elaborateModule)
+import qualified Wok.Interp.Value as IV
+import qualified Wok.Interp.Prim as IP
+import qualified Wok.Interp.Machine as IM
+import qualified Wok.IR.Name as Name
+import qualified Wok.Interp as Interp
+import qualified System.Directory as Dir
+import qualified Control.Monad
+import qualified Control.Exception
 import Control.Monad.Except (throwError)
+import Data.Unique (newUnique, hashUnique)
 import Data.Bifunctor (first)
 import qualified Data.List
 import Data.List (sortBy)
@@ -44,6 +53,7 @@ main = do
   typecheckFiles     <- findByExtension [".wok"] "test/typecheck-examples"
   typecheckBadFiles  <- findByExtension [".wok"] "test/typecheck-fail-examples"
   anfFiles           <- findByExtension [".wok"] "test/typecheck-examples"
+  runFiles           <- findByExtension [".wok"] "test/run-examples"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -92,6 +102,12 @@ main = do
     , blockLayoutTests
     , irNameTests
     , anfTests
+    , interpValueTests
+    , interpPrimTests
+    , interpMachineTests
+    , interpEffectTests
+    , interpEntryTests
+    , interpWholeProgramTests
     , elaborateBasicTests
     , elaborateControlTests
     , elaborateRecordsTests
@@ -112,6 +128,10 @@ main = do
     , testGroup "anf golden"
         [ goldenVsString (takeBaseName f) (anfGoldenFor f) (anfElaborateHarness f)
         | f <- anfFiles
+        ]
+    , testGroup "run golden"
+        [ goldenVsString (takeBaseName f) (runGoldenFor f) (runProgramHarness f)
+        | f <- runFiles
         ]
     ]
 
@@ -134,6 +154,22 @@ typecheckFailGoldenFor f =
 anfGoldenFor :: FilePath -> FilePath
 anfGoldenFor f =
   replaceDirectory (replaceExtension f ".expected") "test/anf-golden"
+
+runGoldenFor :: FilePath -> FilePath
+runGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/run-golden"
+
+runProgramHarness :: FilePath -> IO BL.ByteString
+runProgramHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s  -> pure (BL.pack ("elaborate: " <> s <> "\n"))
+        Right cm -> case Interp.runModule cm of
+          Left rerr -> pure (BL.pack ("runtime error: " <> show rerr <> "\n"))
+          Right v   -> pure (BL.pack (T.unpack (Interp.renderValue v) <> "\n"))
 
 typecheckSuccessHarness :: FilePath -> IO BL.ByteString
 typecheckSuccessHarness path = do
@@ -3010,6 +3046,475 @@ anfTests = testGroup "Anf"
         assertBool "both start with x" $
           T.pack "x" `T.isPrefixOf` rendered0 && T.pack "x" `T.isPrefixOf` rendered1
         assertBool "rendered names differ" (rendered0 /= rendered1)
+  ]
+
+interpValueTests :: TestTree
+interpValueTests = testGroup "InterpValue"
+  [ testCase "render int" $
+      IV.renderValue (IV.VLit (Anf.LInt 42)) @?= T.pack "42"
+  , testCase "render unit" $
+      IV.renderValue (IV.VLit Anf.LUnit) @?= T.pack "()"
+  , testCase "render True" $
+      IV.renderValue (IV.VCon (T.pack "True") []) @?= T.pack "True"
+  , testCase "render empty list" $
+      IV.renderValue (IV.VCon (T.pack "Nil") []) @?= T.pack "[]"
+  , testCase "render cons list [1, 2]" $
+      let lst = IV.VCon (T.pack "Cons")
+                  [ IV.VLit (Anf.LInt 1)
+                  , IV.VCon (T.pack "Cons") [IV.VLit (Anf.LInt 2), IV.VCon (T.pack "Nil") []] ]
+      in IV.renderValue lst @?= T.pack "[1, 2]"
+  , testCase "render tuple (1, 2)" $
+      IV.renderValue (IV.VCon (T.pack "Tuple2") [IV.VLit (Anf.LInt 1), IV.VLit (Anf.LInt 2)])
+        @?= T.pack "(1, 2)"
+  , testCase "render saturated constructor" $
+      IV.renderValue (IV.VCon (T.pack "Some") [IV.VLit (Anf.LInt 7)])
+        @?= T.pack "Some(7)"
+  , testCase "resolveAtom: local binding wins by Unique" $
+      let n  = runFresh (freshName (T.pack "x"))
+          sc = IV.Scope (Map.fromList [(Name.nameUniq n, IV.VLit (Anf.LInt 9))]) Map.empty
+      in case IV.resolveAtom Map.empty sc (Anf.AVar n) of
+           Right v -> IV.renderValue v @?= T.pack "9"
+           Left e  -> assertFailure (show e)
+  , testCase "resolveAtom: falls back to prim table by hint" $
+      let n  = runFresh (freshName (T.pack "+"))
+          p  = IV.Prim (T.pack "+") 2 [] (\_ -> Left (IV.PrimError (T.pack "unused")))
+          pt = Map.fromList [(T.pack "+", p)]
+      in case IV.resolveAtom pt IV.emptyScope (Anf.AVar n) of
+           Right (IV.VPrim q) -> IV.primName q @?= T.pack "+"
+           Right _            -> assertFailure "expected VPrim"
+           Left e             -> assertFailure (show e)
+  , testCase "resolveAtom: unbound errors" $
+      let n = runFresh (freshName (T.pack "ghost"))
+      in IV.resolveAtom Map.empty IV.emptyScope (Anf.AVar n)
+           @?= Left (IV.UnboundVar (T.pack "ghost"))
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Interp prim tests
+
+-- Invoke a prim from the table by name with fully-applied args (test helper).
+runPrim :: Text -> [IV.Value] -> Either IV.RuntimeError IV.PrimResult
+runPrim name args =
+  case Map.lookup name IP.primTable of
+    Nothing -> Left (IV.UnboundVar name)
+    Just p  -> IV.primFn p args
+
+li :: Integer -> IV.Value
+li = IV.VLit . Anf.LInt
+
+interpPrimTests :: TestTree
+interpPrimTests = testGroup "InterpPrim"
+  [ testCase "table has exactly the bodyless operators" $
+      Data.List.sort (Map.keys IP.primTable)
+        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","==","/=","&&","||","++","$"])
+  , testCase "addition" $
+      case runPrim (T.pack "+") [li 2, li 3] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
+        other -> assertFailure (show2 other)
+  , testCase "equality true" $
+      case runPrim (T.pack "==") [li 4, li 4] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
+        other -> assertFailure (show2 other)
+  , testCase "equality false" $
+      case runPrim (T.pack "==") [li 4, li 5] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
+        other -> assertFailure (show2 other)
+  , testCase "boolean and" $
+      case runPrim (T.pack "&&") [IV.VCon (T.pack "True") [], IV.VCon (T.pack "False") []] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
+        other -> assertFailure (show2 other)
+  , testCase "division (non-negative)" $
+      case runPrim (T.pack "/") [li 7, li 2] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "3"
+        other -> assertFailure (show2 other)
+  , testCase "division by zero is a PrimError" $
+      case runPrim (T.pack "div") [li 1, li 0] of
+        Left (IV.PrimError _) -> pure ()
+        other -> assertFailure (show2 other)
+  , testCase "list append" $
+      let mkList = foldr (\x acc -> IV.VCon (T.pack "Cons") [li x, acc]) (IV.VCon (T.pack "Nil") [])
+      in case runPrim (T.pack "++") [mkList [1,2], mkList [3]] of
+           Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "[1, 2, 3]"
+           other -> assertFailure (show2 other)
+  , testCase "dollar requests an application" $
+      case runPrim (T.pack "$") [IV.VCon (T.pack "K") [], li 1] of
+        Right (IV.PRApply (IV.VCon t []) [arg]) -> do
+          t @?= T.pack "K"
+          IV.renderValue arg @?= T.pack "1"
+        other -> assertFailure (show2 other)
+  ]
+  where
+    show2 (Left e)  = "Left " <> show e
+    show2 (Right _) = "Right <prim-result>"
+
+-- ---------------------------------------------------------------------------
+-- CEK machine tests
+
+interpMachineTests :: TestTree
+interpMachineTests = testGroup "InterpMachine"
+  [ testCase "Ret literal" $
+      assertEval Map.empty (Anf.Ret (Anf.ALit (Anf.LInt 7))) (T.pack "7")
+
+  , testCase "let then ret" $
+      let (e, _) = runFresh $ do
+            x <- freshName (T.pack "x")
+            let b = Anf.Binder x Anf.Unrestricted
+            pure (Anf.Let b (Anf.RAtom (Anf.ALit (Anf.LInt 3))) (Anf.Ret (Anf.AVar x)), x)
+      in assertEval Map.empty e (T.pack "3")
+
+  , testCase "primitive application 2 + 3" $
+      let nplus = runFresh (freshName (T.pack "+"))
+          (e, _) = runFresh $ do
+            t <- freshName (T.pack "t")
+            np <- freshName (T.pack "+")
+            let b = Anf.Binder t Anf.Unrestricted
+            pure ( Anf.Let b (Anf.RApp (Anf.AVar np) [Anf.ALit (Anf.LInt 2), Anf.ALit (Anf.LInt 3)])
+                            (Anf.Ret (Anf.AVar t))
+                 , nplus )
+      in assertEval Map.empty e (T.pack "5")
+
+  , testCase "closure: identity applied to 9" $
+      -- let id = \x -> x ; let r = id 9 ; ret r
+      let e = runFresh $ do
+            x  <- freshName (T.pack "x")
+            i  <- freshName (T.pack "id")
+            r  <- freshName (T.pack "r")
+            let lam = Anf.RLam [Anf.Binder x Anf.Unrestricted] (Anf.Ret (Anf.AVar x))
+            pure $ Anf.Let (Anf.Binder i Anf.Unrestricted) lam
+                     (Anf.Let (Anf.Binder r Anf.Unrestricted)
+                              (Anf.RApp (Anf.AVar i) [Anf.ALit (Anf.LInt 9)])
+                              (Anf.Ret (Anf.AVar r)))
+      in assertEval Map.empty e (T.pack "9")
+
+  , testCase "currying: (\\x y -> x) applied to one arg is a value, then applied again" $
+      -- let k = \x y -> x ; let k1 = k 1 ; let r = k1 2 ; ret r
+      let e = runFresh $ do
+            x <- freshName (T.pack "x"); y <- freshName (T.pack "y")
+            k <- freshName (T.pack "k"); k1 <- freshName (T.pack "k1"); r <- freshName (T.pack "r")
+            let lam = Anf.RLam [Anf.Binder x Anf.Unrestricted, Anf.Binder y Anf.Unrestricted]
+                               (Anf.Ret (Anf.AVar x))
+            pure $ Anf.Let (Anf.Binder k Anf.Unrestricted) lam
+                     (Anf.Let (Anf.Binder k1 Anf.Unrestricted) (Anf.RApp (Anf.AVar k) [Anf.ALit (Anf.LInt 1)])
+                       (Anf.Let (Anf.Binder r Anf.Unrestricted) (Anf.RApp (Anf.AVar k1) [Anf.ALit (Anf.LInt 2)])
+                         (Anf.Ret (Anf.AVar r))))
+      in assertEval Map.empty e (T.pack "1")
+
+  , testCase "over-application: a closure returning a closure, applied to extra args" $
+      -- let f = \x -> (let g = \y -> x in ret g)   -- f : a -> (b -> a)
+      -- let r = f 1 2                                -- 2 args, f takes 1 -> over-application
+      -- ret r                                        -- inner closure applied to 2, returns x = 1
+      let e = runFresh $ do
+            x <- freshName (T.pack "x"); y <- freshName (T.pack "y")
+            g <- freshName (T.pack "g"); f <- freshName (T.pack "f"); r <- freshName (T.pack "r")
+            let inner = Anf.RLam [Anf.Binder y Anf.Unrestricted] (Anf.Ret (Anf.AVar x))
+                outerBody = Anf.Let (Anf.Binder g Anf.Unrestricted) inner (Anf.Ret (Anf.AVar g))
+                outer = Anf.RLam [Anf.Binder x Anf.Unrestricted] outerBody
+            pure $ Anf.Let (Anf.Binder f Anf.Unrestricted) outer
+                     (Anf.Let (Anf.Binder r Anf.Unrestricted)
+                              (Anf.RApp (Anf.AVar f) [Anf.ALit (Anf.LInt 1), Anf.ALit (Anf.LInt 2)])
+                              (Anf.Ret (Anf.AVar r)))
+      in assertEval Map.empty e (T.pack "1")
+
+  , testCase "case on literal selects the matching arm" $
+      let e = Anf.Case (Anf.ALit (Anf.LInt 0))
+                [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 100)))
+                , Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 200))) ]
+      in assertEval Map.empty e (T.pack "100")
+
+  , testCase "case on constructor binds fields" $
+      -- case (Pair 1 2) of Pair a b -> b
+      let e = runFresh $ do
+            a <- freshName (T.pack "a"); b <- freshName (T.pack "b"); p <- freshName (T.pack "p")
+            pure $ Anf.Let (Anf.Binder p Anf.Unrestricted)
+                     (Anf.RCon (T.pack "Pair") [Anf.ALit (Anf.LInt 1), Anf.ALit (Anf.LInt 2)])
+                     (Anf.Case (Anf.AVar p)
+                       [ Anf.AltCon (T.pack "Pair")
+                           [Anf.Binder a Anf.Unrestricted, Anf.Binder b Anf.Unrestricted]
+                           (Anf.Ret (Anf.AVar b)) ])
+      in assertEval Map.empty e (T.pack "2")
+
+  , testCase "record projection returns each field by label (order-independent invariant)" $
+      -- Invariant: projecting label L on a record returns exactly the atom bound
+      -- to L, for EVERY label, regardless of field insertion order. Fields are
+      -- declared in non-sorted order with distinct values, so a position-based
+      -- (rather than label-based) projection bug returns the wrong number and is
+      -- caught. Missing label must be a clean BadProjection, not a crash.
+      let proj label = runFresh $ do
+            r <- freshName (T.pack "r"); p <- freshName (T.pack "p")
+            pure $ Anf.Let (Anf.Binder r Anf.Unrestricted)
+                     (Anf.RRecord (T.pack "T")
+                        [ (T.pack "c", Anf.ALit (Anf.LInt 30))
+                        , (T.pack "a", Anf.ALit (Anf.LInt 10))
+                        , (T.pack "b", Anf.ALit (Anf.LInt 20)) ])
+                     (Anf.Let (Anf.Binder p Anf.Unrestricted)
+                        (Anf.RProj label (Anf.AVar r))
+                        (Anf.Ret (Anf.AVar p)))
+          check label expected =
+            case IM.evalExprWith Map.empty (proj label) of
+              Right v -> IV.renderValue v @?= expected
+              Left e  -> assertFailure ("projection " <> T.unpack label <> " failed: " <> show e)
+      in do
+        check (T.pack "a") (T.pack "10")
+        check (T.pack "b") (T.pack "20")
+        check (T.pack "c") (T.pack "30")
+        case IM.evalExprWith Map.empty (proj (T.pack "zzz")) of
+          Left (IV.BadProjection l) -> l @?= T.pack "zzz"
+          other -> assertFailure ("expected BadProjection, got " <> show other)
+
+  , testCase "letrec: countdown sums to 0 via recursion (even/odd style)" $
+      -- letrec loop n = case n of { 0 -> 0 ; _ -> loop (n-1) } ; ret (loop 3)
+      let e = runFresh $ do
+            loop <- freshName (T.pack "loop"); n <- freshName (T.pack "n")
+            nm   <- freshName (T.pack "-");    t <- freshName (T.pack "t")
+            r    <- freshName (T.pack "r")
+            let body = Anf.Case (Anf.AVar n)
+                  [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+                  , Anf.AltDefault
+                      (Anf.Let (Anf.Binder t Anf.Unrestricted)
+                        (Anf.RApp (Anf.AVar nm) [Anf.AVar n, Anf.ALit (Anf.LInt 1)])
+                        (Anf.Let (Anf.Binder r Anf.Unrestricted)
+                          (Anf.RApp (Anf.AVar loop) [Anf.AVar t])
+                          (Anf.Ret (Anf.AVar r)))) ]
+            top <- freshName (T.pack "out")
+            pure $ Anf.LetRec [(Anf.Binder loop Anf.Unrestricted, [Anf.Binder n Anf.Unrestricted], body)]
+                     (Anf.Let (Anf.Binder top Anf.Unrestricted)
+                       (Anf.RApp (Anf.AVar loop) [Anf.ALit (Anf.LInt 3)])
+                       (Anf.Ret (Anf.AVar top)))
+      in assertEval Map.empty e (T.pack "0")
+
+  , testCase "letjoin/jump merges branches" $
+      -- join j(r) = ret r ; case 1 of { 0 -> jump j 10 ; _ -> jump j 20 }
+      let e = runFresh $ do
+            j <- freshJoin; r <- freshName (T.pack "r")
+            pure $ Anf.LetJoin j [Anf.Binder r Anf.Unrestricted] (Anf.Ret (Anf.AVar r))
+                     (Anf.Case (Anf.ALit (Anf.LInt 1))
+                       [ Anf.AltLit (Anf.LInt 0) (Anf.Jump j [Anf.ALit (Anf.LInt 10)])
+                       , Anf.AltDefault (Anf.Jump j [Anf.ALit (Anf.LInt 20)]) ])
+      in assertEval Map.empty e (T.pack "20")
+
+  , testCase "non-exhaustive case errors" $
+      let e = Anf.Case (Anf.ALit (Anf.LInt 5)) [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 1))) ]
+      in case IM.evalExprWith Map.empty e of
+           Left (IV.NonExhaustiveCase _) -> pure ()
+           other -> assertFailure ("expected NonExhaustiveCase, got " <> show other)
+  ]
+  where
+    assertEval env e expected =
+      case IM.evalExprWith env e of
+        Right v -> IV.renderValue v @?= expected
+        Left err -> assertFailure ("eval failed: " <> show err)
+
+-- ---------------------------------------------------------------------------
+-- interpEffectTests
+
+interpEffectTests :: TestTree
+interpEffectTests = testGroup "InterpEffect"
+  [ testCase "auto-resume: handler returns the resumed downstream value" $
+      -- handle ( let a = Ask.ask () in ret a ) of
+      --   Ask.ask(p, resume) -> let res = resume 41 in ret res
+      --   return v -> v
+      let e = runFresh $ do
+            a <- freshName (T.pack "a")
+            p <- freshName (T.pack "p"); resume <- freshName (T.pack "resume")
+            res <- freshName (T.pack "res"); v <- freshName (T.pack "v")
+            let comp = Anf.Let (Anf.Binder a Anf.Unrestricted)
+                         (Anf.ROp (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
+                         (Anf.Ret (Anf.AVar a))
+                arm = Anf.OpArm (T.pack "Ask") (T.pack "ask")
+                        [Anf.Binder p Anf.Unrestricted]
+                        (Anf.Binder resume Anf.Unrestricted)
+                        (Anf.Let (Anf.Binder res Anf.Unrestricted)
+                          (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 41)])
+                          (Anf.Ret (Anf.AVar res)))
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+            pure (Anf.Handle comp hdlr)
+      in assertEval Map.empty e (T.pack "41")
+
+  , testCase "return arm transforms a normally-completing computation" $
+      -- handle (ret 5) of return v -> let r = v + 100 ; ret r   (no ops)
+      let e = runFresh $ do
+            v <- freshName (T.pack "v"); r <- freshName (T.pack "r"); np <- freshName (T.pack "+")
+            let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted)
+                           (Anf.RApp (Anf.AVar np) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
+                           (Anf.Ret (Anf.AVar r))
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, retArm) []
+            pure (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 5))) hdlr)
+      in assertEval Map.empty e (T.pack "105")
+
+  , testCase "abort: arm ignores resume and returns its own value" $
+      -- handle ( let a = Abort.abort () in ret a ) of
+      --   Abort.abort(p, resume) -> ret 7      (resume unused)
+      --   return v -> v
+      let e = runFresh $ do
+            a <- freshName (T.pack "a"); p <- freshName (T.pack "p")
+            resume <- freshName (T.pack "resume"); v <- freshName (T.pack "v")
+            let comp = Anf.Let (Anf.Binder a Anf.Unrestricted)
+                         (Anf.ROp (T.pack "Abort") (T.pack "abort") [Anf.ALit Anf.LUnit])
+                         (Anf.Ret (Anf.AVar a))
+                arm = Anf.OpArm (T.pack "Abort") (T.pack "abort")
+                        [Anf.Binder p Anf.Unrestricted]
+                        (Anf.Binder resume Anf.Unrestricted)
+                        (Anf.Ret (Anf.ALit (Anf.LInt 7)))
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+            pure (Anf.Handle comp hdlr)
+      in assertEval Map.empty e (T.pack "7")
+
+  , testCase "multi-shot: resume invoked twice, results summed" $
+      -- handle ( let b = Flip.flip () in case b of { 0 -> ret 10 ; _ -> ret 20 } ) of
+      --   Flip.flip(p, resume) ->
+      --       let r0 = resume 0 in let r1 = resume 1 in let s = r0 + r1 in ret s
+      --   return v -> v
+      -- resume 0 -> downstream picks 10 ; resume 1 -> downstream picks 20 ; sum 30.
+      let e = runFresh $ do
+            b <- freshName (T.pack "b"); p <- freshName (T.pack "p")
+            resume <- freshName (T.pack "resume")
+            r0 <- freshName (T.pack "r0"); r1 <- freshName (T.pack "r1")
+            s <- freshName (T.pack "s"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
+            let comp = Anf.Let (Anf.Binder b Anf.Unrestricted)
+                         (Anf.ROp (T.pack "Flip") (T.pack "flip") [Anf.ALit Anf.LUnit])
+                         (Anf.Case (Anf.AVar b)
+                           [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 10)))
+                           , Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 20))) ])
+                armBody =
+                  Anf.Let (Anf.Binder r0 Anf.Unrestricted) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 0)])
+                    (Anf.Let (Anf.Binder r1 Anf.Unrestricted) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
+                      (Anf.Let (Anf.Binder s Anf.Unrestricted) (Anf.RApp (Anf.AVar np) [Anf.AVar r0, Anf.AVar r1])
+                        (Anf.Ret (Anf.AVar s))))
+                arm = Anf.OpArm (T.pack "Flip") (T.pack "flip")
+                        [Anf.Binder p Anf.Unrestricted] (Anf.Binder resume Anf.Unrestricted) armBody
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+            pure (Anf.Handle comp hdlr)
+      in assertEval Map.empty e (T.pack "30")
+
+  , testCase "deep handler: handler is re-installed so a SECOND op is still handled" $
+      -- handle ( let x = E.op () in let y = E.op () in let s = x + y in ret s ) of
+      --   E.op(p, resume) -> let r = resume 1 in ret r       (single auto-resume)
+      --   return v -> v
+      -- The computation performs E.op TWICE in sequence. The second op only
+      -- finds a handler because resume re-installs the KHandle frame (deep
+      -- semantics). A broken re-install surfaces NoMatchingHandler on the
+      -- second op, so the expected value 2 (= 1 + 1) is the discriminator.
+      -- Low-effort: reuses the auto-resume arm shape; no multi-shot machinery.
+      let e = runFresh $ do
+            x <- freshName (T.pack "x"); y <- freshName (T.pack "y"); s <- freshName (T.pack "s")
+            p <- freshName (T.pack "p"); resume <- freshName (T.pack "resume")
+            r <- freshName (T.pack "r"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
+            let comp =
+                  Anf.Let (Anf.Binder x Anf.Unrestricted)
+                    (Anf.ROp (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
+                    (Anf.Let (Anf.Binder y Anf.Unrestricted)
+                      (Anf.ROp (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
+                      (Anf.Let (Anf.Binder s Anf.Unrestricted)
+                        (Anf.RApp (Anf.AVar np) [Anf.AVar x, Anf.AVar y])
+                        (Anf.Ret (Anf.AVar s))))
+                arm = Anf.OpArm (T.pack "E") (T.pack "op")
+                        [Anf.Binder p Anf.Unrestricted] (Anf.Binder resume Anf.Unrestricted)
+                        (Anf.Let (Anf.Binder r Anf.Unrestricted)
+                          (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
+                          (Anf.Ret (Anf.AVar r)))
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted, Anf.Ret (Anf.AVar v)) [arm]
+            pure (Anf.Handle comp hdlr)
+      in assertEval Map.empty e (T.pack "2")
+
+  , testCase "unhandled operation errors" $
+      let e = runFresh $ do
+            a <- freshName (T.pack "a")
+            pure $ Anf.Let (Anf.Binder a Anf.Unrestricted)
+                     (Anf.ROp (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
+                     (Anf.Ret (Anf.AVar a))
+      in case IM.evalExprWith Map.empty e of
+           Left (IV.NoMatchingHandler l o) -> (l, o) @?= (T.pack "Ask", T.pack "ask")
+           other -> assertFailure ("expected NoMatchingHandler, got " <> show other)
+  ]
+  where
+    assertEval env e expected =
+      case IM.evalExprWith env e of
+        Right v -> IV.renderValue v @?= expected
+        Left err -> assertFailure ("eval failed: " <> show err)
+
+-- ---------------------------------------------------------------------------
+-- interpEntryTests
+
+-- Load + elaborate (via the given elaborator) + run a single-file program.
+-- Unique temp path per call (parallel-safe); guaranteed cleanup.
+runSourceWith
+  :: (Loader.ModuleName -> [Loader.LoadedModule] -> Either String Anf.CoreModule)
+  -> Text -> IO (Either String Text)
+runSourceWith elaborate src = do
+  u <- newUnique
+  let path = "test/.interp-tmp-" <> show (hashUnique u) <> ".wok"
+  go path `Control.Exception.finally` removeFileIfExists path
+  where
+    go path = do
+      TIO.writeFile path src
+      result <- Loader.loadProgram path []
+      case result of
+        Left lerr -> pure (Left ("loader: " <> show lerr))
+        Right (entryName, ms) ->
+          case elaborate entryName ms of
+            Left s  -> pure (Left ("elaborate: " <> s))
+            Right cm -> case Interp.runModule cm of
+              Left rerr -> pure (Left ("runtime: " <> show rerr))
+              Right v   -> pure (Right (Interp.renderValue v))
+
+runSourceToValue :: Text -> IO (Either String Text)
+runSourceToValue = runSourceWith Pipeline.elaborateProgram
+
+removeFileIfExists :: FilePath -> IO ()
+removeFileIfExists p = Dir.doesFileExist p >>= \yes -> Control.Monad.when yes (Dir.removeFile p)
+
+interpEntryTests :: TestTree
+interpEntryTests = testGroup "InterpEntry"
+  [ testCase "arithmetic main" $ do
+      r <- runSourceToValue (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "main = 2 + 3 * 4" ])
+      r @?= Right (T.pack "14")
+  , testCase "recursive factorial" $ do
+      r <- runSourceToValue (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "fact n = case n of"
+             , T.pack "  0 -> 1"
+             , T.pack "  _ -> n * fact (n - 1)"
+             , T.pack "main = fact 5" ])
+      r @?= Right (T.pack "120")
+  , testCase "missing main errors" $ do
+      r <- runSourceToValue (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "helper x = x" ])
+      case r of
+        Left msg -> assertBool ("expected missing-main (UnboundVar) error, got: " <> msg)
+                      (Data.List.isInfixOf "UnboundVar" msg && Data.List.isInfixOf "main" msg)
+        Right v  -> assertFailure ("expected failure, got " <> T.unpack v)
+  , testCase "top-level constant (CAF) is rejected with a clear error" $ do
+      r <- runSourceToValue (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "answer = 42"
+             , T.pack "main = answer" ])
+      case r of
+        Left msg -> assertBool ("expected UnsupportedCaf, got: " <> msg)
+                      (Data.List.isInfixOf "UnsupportedCaf" msg)
+        Right v  -> assertFailure ("expected rejection, got " <> T.unpack v)
+  ]
+
+interpWholeProgramTests :: TestTree
+interpWholeProgramTests = testGroup "InterpWholeProgram"
+  [ testCase "main calls prelude id" $ do
+      r <- runSourceWith Pipeline.elaborateProgramFull (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "main = id 99" ])
+      r @?= Right (T.pack "99")
+  , testCase "main calls prelude const" $ do
+      r <- runSourceWith Pipeline.elaborateProgramFull (T.unlines
+             [ T.pack "module Main"
+             , T.pack "import Std.Base"
+             , T.pack "main = const 7 99" ])
+      r @?= Right (T.pack "7")
   ]
 
 -- ---------------------------------------------------------------------------

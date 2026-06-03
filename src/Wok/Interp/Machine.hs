@@ -1,0 +1,199 @@
+module Wok.Interp.Machine
+  ( step
+  , run
+  , enter
+  , evalExprWith
+  , runModule
+  ) where
+
+import qualified Data.Map.Strict as Map
+import Data.Text (Text)
+import qualified Data.Text as Tx
+import Wok.IR.Anf
+  ( Alt (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
+  , OpArm (..), Rhs (..), TopBind (..) )
+import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
+import Wok.Interp.Prim (primTable)
+import Wok.Interp.Value
+
+-- | Single small-step. Halts on Return into KDone.
+step :: PrimTable -> Config -> Either RuntimeError Step
+step _     (Return v KDone) = Right (Done v)
+step prims cfg              = More <$> transition prims cfg
+
+-- | The non-halting transition: always yields the next Config.
+transition :: PrimTable -> Config -> Either RuntimeError Config
+transition prims (Return v k)      = returnTo prims v k
+transition prims (Eval expr sc k)  = evalExpr prims expr sc k
+
+-- | Deliver a value to a continuation frame.
+returnTo :: PrimTable -> Value -> Kont -> Either RuntimeError Config
+returnTo _     _ KDone               = Left (PrimError (Tx.pack "internal: returnTo KDone"))
+returnTo _     v (KLet b body sc k)  =
+  Right (Eval body sc { scEnv = bindBinder b v (scEnv sc) } k)
+returnTo prims v (KApp args k)       = enter prims v args k
+returnTo _     v (KHandle h hsc k)   =
+  -- Normal completion of a handled computation: run the return arm.
+  let (rb, rbody) = hReturn h
+  in Right (Eval rbody hsc { scEnv = bindBinder rb v (scEnv hsc) } k)
+
+evalExpr :: PrimTable -> Expr -> Scope -> Kont -> Either RuntimeError Config
+evalExpr prims expr sc k = case expr of
+  Ret a -> do
+    v <- resolveAtom prims sc a
+    Right (Return v k)
+
+  Let b rhs body -> evalRhs prims b rhs body sc k
+
+  Case a alts -> do
+    v <- resolveAtom prims sc a
+    matchAlts v alts sc k
+
+  LetRec defs body ->
+    -- Tie the recursive knot: each closure captures the post-binding env'.
+    -- env' is self-referential; VClosure's lazy env field keeps this productive.
+    let env' = foldr addDef (scEnv sc) defs
+        addDef (b, ps, bdy) e = Map.insert (nameUniq (bndName b)) (VClosure env' ps bdy) e
+    in Right (Eval body sc { scEnv = env' } k)
+
+  LetJoin j ps jb body ->
+    let jp = JoinPoint sc ps jb k
+    in Right (Eval body sc { scJoins = Map.insert j jp (scJoins sc) } k)
+
+  Jump j args -> do
+    vs <- mapM (resolveAtom prims sc) args
+    case Map.lookup j (scJoins sc) of
+      Nothing -> Left (UnboundVar (renderJoin j))
+      Just (JoinPoint jsc ps jbody jk) ->
+        Right (Eval jbody jsc { scEnv = bindBinders ps vs (scEnv jsc) } jk)
+
+  Handle e h -> Right (Eval e sc (KHandle h sc k))   -- dispatch lands in Task 4
+
+evalRhs :: PrimTable -> Binder -> Rhs -> Expr -> Scope -> Kont -> Either RuntimeError Config
+evalRhs prims b rhs body sc k = case rhs of
+  RAtom a -> resolveAtom prims sc a >>= cont
+  RCon c as -> do vs <- mapM (resolveAtom prims sc) as; cont (VCon c vs)
+  RLam ps e -> cont (VClosure (scEnv sc) ps e)
+  RRecord t flds -> do
+    vs <- mapM (\(l, a) -> (,) l <$> resolveAtom prims sc a) flds
+    cont (VRecord t (Map.fromList vs))
+  RProj l a -> do
+    v <- resolveAtom prims sc a
+    case v of
+      VRecord _ m -> maybe (Left (BadProjection l)) cont (Map.lookup l m)
+      _           -> Left (BadProjection l)
+  RApp f as -> do
+    fv <- resolveAtom prims sc f
+    vs <- mapM (resolveAtom prims sc) as
+    enter prims fv vs (KLet b body sc k)
+  ROp lbl op as -> do
+    vs <- mapM (resolveAtom prims sc) as
+    dispatchOp lbl op vs (KLet b body sc k)   -- defined in Task 4
+  where
+    cont v = Right (Eval body sc { scEnv = bindBinder b v (scEnv sc) } k)
+
+-- | Apply a value to args, continuing with k. Handles currying for closures
+-- and accumulation for prims; over-application chains via KApp.
+enter :: PrimTable -> Value -> [Value] -> Kont -> Either RuntimeError Config
+enter prims fv args k = case fv of
+  VClosure cenv ps body ->
+    let np = length ps; na = length args in
+    case compare na np of
+      EQ -> Right (Eval body (Scope (bindBinders ps args cenv) Map.empty) k)
+      LT -> Right (Return (VClosure (bindBinders (take na ps) args cenv) (drop na ps) body) k)
+      GT -> let (use, over) = splitAt np args
+            in Right (Eval body (Scope (bindBinders ps use cenv) Map.empty) (KApp over k))
+  VPrim p ->
+    let combined = primArgs p ++ args in
+    if length combined < primArity p
+      then Right (Return (VPrim p { primArgs = combined }) k)
+      else let (use, over) = splitAt (primArity p) combined in do
+        r <- primFn p use
+        case r of
+          PRDone v        -> if null over then Right (Return v k) else enter prims v over k
+          PRApply g gargs -> enter prims g (gargs ++ over) k
+  VCont kb -> case args of
+    [v] -> Right (Return v (kb k))
+    _   -> Left (ArityError (Tx.pack "continuation expects exactly one argument"))
+  _ -> Left (NotAFunction (renderValue fv))
+
+matchAlts :: Value -> [Alt] -> Scope -> Kont -> Either RuntimeError Config
+matchAlts v alts sc k = go alts
+  where
+    go [] = Left (NonExhaustiveCase (renderValue v))
+    go (AltCon c bs e : rest) = case v of
+      VCon c' vs | c' == c && length bs == length vs ->
+        Right (Eval e sc { scEnv = bindBinders bs vs (scEnv sc) } k)
+      _ -> go rest
+    go (AltLit l e : rest) = case v of
+      VLit l' | l' == l -> Right (Eval e sc k)
+      _ -> go rest
+    go (AltDefault e : _) = Right (Eval e sc k)
+
+-- | An operation: find the nearest matching handler, capture the delimited
+-- continuation above it as a builder, bind the op args and a (deep, multi-shot)
+-- resume, and run the arm under the handler's below-continuation.
+dispatchOp :: Text -> Text -> [Value] -> Kont -> Either RuntimeError Config
+dispatchOp lbl op argVals kCur =
+  case findHandler lbl op kCur of
+    Nothing -> Left (NoMatchingHandler lbl op)
+    Just (above, h, hsc, kBelow) ->
+      case lookupOpArm lbl op h of
+        Nothing -> Left (NoMatchingHandler lbl op)
+        Just oa ->
+          -- resume v (called at continuation `after`) re-runs the delimited
+          -- frames with the handler RE-INSTALLED over `after` (deep handler).
+          let resumeVal = VCont (\after -> above (KHandle h hsc after))
+              env1 = bindBinders (oaArgs oa) argVals (scEnv hsc)
+              env2 = bindBinder (oaResume oa) resumeVal env1
+          in Right (Eval (oaBody oa) (Scope env2 (scJoins hsc)) kBelow)
+
+-- | Walk outward from the operation's continuation to the nearest KHandle that
+-- covers (label, op). Returns: a builder that re-prepends the frames above the
+-- handler, the matched handler, its captured scope, and the continuation below.
+findHandler :: Text -> Text -> Kont -> Maybe (Kont -> Kont, Handler, Scope, Kont)
+findHandler lbl op = go id
+  where
+    go _   KDone               = Nothing
+    go acc (KLet b e sc k)     = go (acc . KLet b e sc) k
+    go acc (KApp vs k)         = go (acc . KApp vs) k
+    go acc (KHandle h sc k)
+      | covers h               = Just (acc, h, sc, k)
+      | otherwise              = go (acc . KHandle h sc) k
+      where covers hh = any (\a -> oaLabel a == lbl && oaOp a == op) (hOps hh)
+
+lookupOpArm :: Text -> Text -> Handler -> Maybe OpArm
+lookupOpArm lbl op h =
+  case [ a | a <- hOps h, oaLabel a == lbl, oaOp a == op ] of
+    (a : _) -> Just a
+    []      -> Nothing
+
+renderJoin :: JoinId -> Text
+renderJoin (JoinId (Unique i)) = Tx.pack "j" <> Tx.pack (show i)
+
+-- | Run a configuration to a final value.
+run :: PrimTable -> Config -> Either RuntimeError Value
+run prims = loop
+  where
+    loop cfg = do
+      s <- step prims cfg
+      case s of
+        Done v -> Right v
+        More c -> loop c
+
+-- | Pure test seam: evaluate an Expr in a given environment.
+evalExprWith :: Env -> Expr -> Either RuntimeError Value
+evalExprWith env e = run primTable (Eval e (Scope env Map.empty) KDone)
+
+-- | Whole-module entry -- implemented in Task 5.
+runModule :: CoreModule -> Either RuntimeError Value
+runModule (CoreModule binds) =
+  case [ nameHint n | TopBind n [] _ <- binds, nameHint n /= Tx.pack "main" ] of
+    (cafHint : _) -> Left (UnsupportedCaf cafHint)
+    [] ->
+      let gEnv = foldr addBind Map.empty binds
+          addBind (TopBind n ps body) e = Map.insert (nameUniq n) (VClosure gEnv ps body) e
+      in case [ tb | tb@(TopBind n _ _) <- binds, nameHint n == Tx.pack "main" ] of
+           (TopBind _ [] body : _) -> run primTable (Eval body (Scope gEnv Map.empty) KDone)
+           (TopBind{}        : _)  -> Left (ArityError (Tx.pack "main must take no arguments"))
+           []                      -> Left (UnboundVar (Tx.pack "main"))

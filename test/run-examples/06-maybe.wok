@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+unwrapOr : Option a -> a -> a
+unwrapOr o d = case o of
+  Some x -> x
+  None   -> d
+
+main = unwrapOr (Some 7) 0

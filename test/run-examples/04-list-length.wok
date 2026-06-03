@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+len : [a] -> U64
+len xs = case xs of
+  []      -> 0
+  _ :: ys -> 1 + len ys
+
+main = len [10, 20, 30]
