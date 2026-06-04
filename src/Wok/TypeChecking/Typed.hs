@@ -28,6 +28,7 @@ data TexpF a
   | TTuple [Texp a]
   | TList [Texp a]
   | TParenOp Text                   -- (==) used as a value
+  | TQVar Text [(Text, a)]          -- constrained-identifier use: name + [(class, classArgType)]
   | TProj (Texp a) Text             -- record field projection
   | TProjCon Text Text              -- E.op effect projection (label, op)
   | TRecord Text [(Text, Texp a)]

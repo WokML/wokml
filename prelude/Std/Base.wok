@@ -21,8 +21,6 @@ data Result t e = Ok t | Err e
 (/)  : U64 -> U64 -> U64
 div  : U64 -> U64 -> U64
 mod  : U64 -> U64 -> U64
-(==) : U64 -> U64 -> Bool
-(/=) : U64 -> U64 -> Bool
 (&&) : Bool -> Bool -> Bool
 (||) : Bool -> Bool -> Bool
 (++) : [a] -> [a] -> [a]
@@ -33,3 +31,33 @@ id x = x
 
 const : a -> b -> a
 const x y = x
+
+eqU64 : U64 -> U64 -> Bool
+eqU32 : U32 -> U32 -> Bool
+u32   : U64 -> U32 -- we hardcoded all number literal to U64 sorry
+
+not : Bool -> Bool
+not x = case x of
+  True  -> False
+  False -> True
+
+class Eq a where
+  (==) : a -> a -> Bool
+  (/=) : a -> a -> Bool
+  (/=) x y = not (x == y)
+
+instance Eq U64 where
+  (==) = eqU64
+
+instance Eq U32 where
+  (==) = eqU32
+
+instance (Eq a) => Eq (Option a) where
+  (==) x y =
+    case x of
+      None   -> case y of
+        None   -> True
+        Some _ -> False
+      Some a -> case y of
+        None   -> False
+        Some b -> a == b

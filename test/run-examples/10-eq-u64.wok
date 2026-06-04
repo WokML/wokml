@@ -1,0 +1,3 @@
+module Run.EqU64
+import Std.Base
+main = if 3 == 3 then 1 else 0

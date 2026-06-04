@@ -83,6 +83,34 @@ data TypeError
     -- ^ A handler omits operations of the handled effect (effect, missing ops).
   | DuplicateReturnArm SourceSpan
     -- ^ A handler has more than one @return@ arm; only one is allowed.
+  | UnknownClass Text
+    -- ^ An instance references a class that has not been declared.
+  | DuplicateClass Text
+    -- ^ A class name is registered more than once. Arg: class name.
+  | MalformedClassDecl Text
+    -- ^ A class declaration is malformed (e.g. not exactly one class
+    -- parameter). Arg: human-readable detail.
+  | MalformedInstance Text
+    -- ^ An instance declaration is malformed (e.g. not exactly one head
+    -- argument, a head that is not a type-constructor application, an
+    -- unbound type variable, a type-level extension, or a multi-argument
+    -- context constraint). Arg: human-readable detail.
+  | OverlappingInstance Text Text
+    -- ^ A second instance for the same (class, head tycon) pair.
+    -- Args: class name, head tycon rendering.
+  | InstanceNotSmaller Text Text
+    -- ^ An instance context constraint's argument is not structurally
+    -- smaller than the instance head (termination check).
+    -- Args: class name, head rendering.
+  | MissingMethod Text Text
+    -- ^ An instance does not provide a class method and the class has no
+    -- default for it. Args: instance head rendering, method name.
+  | AmbiguousConstraint Text
+    -- ^ A constraint's variable does not appear in the type being
+    -- constrained, so no instance can ever be selected. Arg: class name.
+  | NoInstance Text Text
+    -- ^ No instance exists to discharge a constraint.
+    -- Args: class name, type rendering.
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint

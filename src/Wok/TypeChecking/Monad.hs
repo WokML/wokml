@@ -6,6 +6,7 @@
 module Wok.TypeChecking.Monad
   ( TC
   , TCCtx (..)
+  , ConstraintS (..)
   , runTC
   , runTC_
   , liftST
@@ -18,6 +19,8 @@ module Wok.TypeChecking.Monad
   , withEnv
   , extendVarTC
   , addWarning
+  , addConstraint
+  , takeConstraints
   , currentEffRow
   , withEffRow
   ) where
@@ -34,18 +37,28 @@ import Wok.TypeChecking.Error (TypeError, Warning)
 import Wok.TypeChecking.Types
   ( Kind, Level (..), RVar (..), Row (..), Scheme, TVar (..), Type (..) )
 
+-- | A constraint collected during inference; its argument is still a mutable
+-- 'Type s' and is frozen to 'CType' at the binding's generalization.
+data ConstraintS s = ConstraintS
+  { csClass :: Text
+  , csArg   :: Type s
+  }
+
 data TCCtx s = TCCtx
-  { ctxFresh    :: STRef s Int
-  , ctxLevel    :: Level
-  , ctxEnv      :: Env
-  , ctxWarnings :: STRef s [Warning]
+  { ctxFresh       :: STRef s Int
+  , ctxLevel       :: Level
+  , ctxEnv         :: Env
+  , ctxWarnings    :: STRef s [Warning]
     -- ^ Accumulated non-fatal warnings. Prepended in emission order;
     -- 'runTC' reverses to restore source order.
-  , ctxEffRow   :: Maybe (STRef s (Row s))
+  , ctxEffRow      :: Maybe (STRef s (Row s))
     -- ^ The ambient effect row of the function equation currently being
     -- checked: an open-tailed 'Row' that operation calls and effectful
     -- applications extend. 'Nothing' outside any equation body (e.g. while
     -- translating signatures or at the top level), where effects are ignored.
+  , ctxConstraints :: STRef s [ConstraintS s]
+    -- ^ Constraints accumulated during inference. Prepended in emission order;
+    -- 'takeConstraints' reverses to restore insertion order.
   }
 
 newtype TC s a = TC { unTC :: ReaderT (TCCtx s) (ExceptT TypeError (ST s)) a }
@@ -65,7 +78,8 @@ runTC :: Env -> (forall s. TC s a) -> Either TypeError (a, [Warning])
 runTC env action = runST $ do
   freshRef <- newSTRef 0
   warnsRef <- newSTRef []
-  let ctx = TCCtx freshRef (Level 0) env warnsRef Nothing
+  consRef  <- newSTRef []
+  let ctx = TCCtx freshRef (Level 0) env warnsRef Nothing consRef
   result <- runExceptT (runReaderT (unTC action) ctx)
   case result of
     Left err -> pure (Left err)
@@ -135,3 +149,18 @@ addWarning :: Warning -> TC s ()
 addWarning w = do
   ref <- asks ctxWarnings
   liftST $ modifySTRef' ref (w :)
+
+-- | Record an inference-time constraint (class name, type argument).
+addConstraint :: Text -> Type s -> TC s ()
+addConstraint cls arg = do
+  ref <- asks ctxConstraints
+  liftST $ modifySTRef' ref (ConstraintS cls arg :)
+
+-- | Read and clear all currently-accumulated constraints (in insertion order).
+takeConstraints :: TC s [ConstraintS s]
+takeConstraints = do
+  ref <- asks ctxConstraints
+  liftST $ do
+    cs <- readSTRef ref
+    writeSTRef ref []
+    pure (reverse cs)

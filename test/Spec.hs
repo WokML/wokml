@@ -21,7 +21,10 @@ import qualified Wok.TypeChecking.Error as TErr
 import qualified Wok.TypeChecking.Monad as TM
 import qualified Wok.TypeChecking.Unify as U
 import qualified Wok.TypeChecking.Infer as I
+import qualified Wok.TypeChecking.Class as Class
 import qualified Wok.TypeChecking.Builtins as B
+import qualified Wok.TypeChecking.Solve as Solve
+import qualified Data.Set as Set
 import qualified Wok.TypeChecking.Typed as Typed
 import qualified Wok.TypeChecking as TC
 import qualified Wok.SourceOrigin as SO
@@ -66,6 +69,7 @@ main = do
     , fixityTests
     , resolveTests
     , typesSmokeTests
+    , constraintTypesTests
     , envSmokeTests
     , envOverlayTests
     , sourceOriginTests
@@ -111,6 +115,7 @@ main = do
     , anfTests
     , interpValueTests
     , interpPrimTests
+    , interpCafTests
     , interpMachineTests
     , interpEffectTests
     , interpEntryTests
@@ -121,6 +126,14 @@ main = do
     , elaborateEffectsTests
     , elaborateModuleTests
     , typedAstTests
+    , classParseTests
+    , classEnvTests
+    , classRegisterTests
+    , constraintAccumTests
+    , solveTests
+    , eqInferTests
+    , eqDesugarTests
+    , eqElaborateTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -732,10 +745,23 @@ typesSmokeTests = testGroup "Wok.TypeChecking.Types"
            Ty.CTArr (Ty.CTGen i) Ty.CREmpty (Ty.CTGen j) -> (i, j) @?= (0, 0)
            _ -> assertFailure "shape mismatch"
   , testCase "Scheme stores quantifiers and body" $
-      let s = Ty.Scheme [(0, Ty.KStar)] (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0))
+      let s = Ty.mkScheme [(0, Ty.KStar)] (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0))
       in Ty.schemeVars s @?= [(0, Ty.KStar)]
   , testCase "Level is comparable" $
       compare (Ty.Level 1) (Ty.Level 2) @?= LT
+  ]
+
+constraintTypesTests :: TestTree
+constraintTypesTests = testGroup "ConstraintTypes"
+  [ testCase "scheme carries constraints" $
+      let s = Ty.Scheme [(0, Ty.KStar)]
+                        [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+                        (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty
+                          (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTCon Ty.TcBool [])))
+      in Ty.schemeConstraints s @?= [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+  , testCase "evidence equality" $
+      Ty.EvApp (T.pack "dict$Eq$Option") [Ty.EvGlobal (T.pack "dict$Eq$U64")]
+        @?= Ty.EvApp (T.pack "dict$Eq$Option") [Ty.EvGlobal (T.pack "dict$Eq$U64")]
   ]
 
 envSmokeTests :: TestTree
@@ -745,7 +771,7 @@ envSmokeTests = testGroup "Wok.TypeChecking.Env"
       TE.lookupCon (T.pack "Just") TE.emptyEnv @?= Nothing
       TE.lookupTyCon (T.pack "Maybe") TE.emptyEnv @?= Nothing
   , testCase "extendVar then lookupVar finds it" $
-      let s = Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])
+      let s = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           e = TE.extendVar (T.pack "x") s TE.emptyEnv
       in TE.lookupVar (T.pack "x") e @?= Just s
   , testCase "TypeError has Show" $
@@ -756,8 +782,8 @@ envSmokeTests = testGroup "Wok.TypeChecking.Env"
 envOverlayTests :: TestTree
 envOverlayTests = testGroup "envOverlay"
   [ testCase "disjoint vars union cleanly" $
-      let a = TE.extendVar (T.pack "x") (Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])) TE.emptyEnv
-          b = TE.extendVar (T.pack "y") (Ty.Scheme [] (Ty.CTCon Ty.TcBool [])) TE.emptyEnv
+      let a = TE.extendVar (T.pack "x") (Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])) TE.emptyEnv
+          b = TE.extendVar (T.pack "y") (Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])) TE.emptyEnv
       in case TE.overlayEnvs a b of
            Right e -> do
              TE.lookupVar (T.pack "x") e @?= TE.lookupVar (T.pack "x") a
@@ -765,8 +791,8 @@ envOverlayTests = testGroup "envOverlay"
            Left _ -> assertFailure "expected Right"
 
   , testCase "var collision returns Left with NsVar" $
-      let s1 = Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])
-          s2 = Ty.Scheme [] (Ty.CTCon Ty.TcBool [])
+      let s1 = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
+          s2 = Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])
           a = TE.extendVar (T.pack "dup") s1 TE.emptyEnv
           b = TE.extendVar (T.pack "dup") s2 TE.emptyEnv
       in case TE.overlayEnvs a b of
@@ -782,7 +808,7 @@ envOverlayTests = testGroup "envOverlay"
            Right _ -> assertFailure "expected Left"
 
   , testCase "con collision returns Left with NsCon" $
-      let ci = TE.ConInfo (Ty.Scheme [] (Ty.CTCon Ty.TcBool [])) 0 (T.pack "Bool")
+      let ci = TE.ConInfo (Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])) 0 (T.pack "Bool")
           a = TE.extendCon (T.pack "True") ci TE.emptyEnv
           b = TE.extendCon (T.pack "True") ci TE.emptyEnv
       in case TE.overlayEnvs a b of
@@ -791,7 +817,7 @@ envOverlayTests = testGroup "envOverlay"
 
   , testCase "extendEffect then lookupEffect round-trips" $
       let ei  = TE.EffectInfo []
-                  (Map.fromList [(T.pack "read", Ty.Scheme [] (Ty.CTCon Ty.TcString []))])
+                  (Map.fromList [(T.pack "read", Ty.mkScheme [] (Ty.CTCon Ty.TcString []))])
           env = TE.extendEffect (T.pack "IO") ei TE.emptyEnv
       in TE.lookupEffect (T.pack "IO") env @?= Just ei
 
@@ -804,7 +830,7 @@ envOverlayTests = testGroup "envOverlay"
            Right _ -> assertFailure "expected Left"
 
   , testCase "collisions across multiple namespaces are all reported" $
-      let s = Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])
+      let s = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           tci = TE.TyConInfo Ty.KStar 0 []
           a = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
@@ -1011,7 +1037,7 @@ builtinsTests = testGroup "Wok.TypeChecking.Builtins + Std.Base"
   , testCase "Std.Base: + has scheme U64 -> U64 -> U64" $ do
       env <- stdBaseExtendedEnv
       case TE.lookupVar (T.pack "+") env of
-        Just (Ty.Scheme [] body) -> case body of
+        Just (Ty.Scheme [] _ body) -> case body of
           Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty
             (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty (Ty.CTCon Ty.TcU64 [])) ->
               pure ()
@@ -1020,7 +1046,7 @@ builtinsTests = testGroup "Wok.TypeChecking.Builtins + Std.Base"
   , testCase "Std.Base: ++ has one type quantifier" $ do
       env <- stdBaseExtendedEnv
       case TE.lookupVar (T.pack "++") env of
-        Just (Ty.Scheme [(_, Ty.KStar)] _) -> pure ()
+        Just (Ty.Scheme [(_, Ty.KStar)] _ _) -> pure ()
         _ -> assertFailure "++ has wrong quantifier count"
   , testCase "tuple constructors up to arity 16" $ do
       case TE.lookupTyCon (T.pack "(,)") B.initialEnv of
@@ -1038,7 +1064,7 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
           ty  = Abs.TFun int int
           result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv ty)
       in case result of
-           Right s -> s @?= Ty.Scheme []
+           Right s -> s @?= Ty.mkScheme []
                             (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty
                                       (Ty.CTCon Ty.TcU64 []))
            Left e -> assertFailure (show e)
@@ -1047,7 +1073,7 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
           ty  = Abs.TFun var var
           result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv ty)
       in case result of
-           Right (Ty.Scheme [(0, Ty.KStar)]
+           Right (Ty.Scheme [(0, Ty.KStar)] _
                     (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0))) ->
              pure ()
            other -> assertFailure ("unexpected: " ++ show other)
@@ -1055,7 +1081,7 @@ translateTests = testGroup "Wok.TypeChecking.Infer (translateSig)"
       let var = Abs.TVar (Abs.VarId ((0,0), T.pack "a"))
           result = TM.runTC_ B.initialEnv (I.translateSig B.initialEnv (Abs.TList var))
       in case result of
-           Right (Ty.Scheme [(0, Ty.KStar)] (Ty.CTCon Ty.TcList [Ty.CTGen 0])) ->
+           Right (Ty.Scheme [(0, Ty.KStar)] _ (Ty.CTCon Ty.TcList [Ty.CTGen 0])) ->
              pure ()
            other -> assertFailure ("unexpected: " ++ show other)
   , testCase "unknown tycon errors" $
@@ -1073,19 +1099,19 @@ generalizeTests = testGroup "Wok.TypeChecking.Infer (generalize/instantiate)"
       let result = TM.runTC_ TE.emptyEnv $
             I.generalize (Ty.TCon Ty.TcU64 [])
       in case result of
-           Right s -> s @?= Ty.Scheme [] (Ty.CTCon Ty.TcU64 [])
+           Right s -> s @?= Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
            Left e -> assertFailure (show e)
   , testCase "generalize fresh a -> a yields forall a. a -> a" $
       let result = TM.runTC_ TE.emptyEnv $ do
             a <- TM.enterLevel (TM.freshTVar Ty.KStar)
             I.generalize (Ty.TArr a Ty.RowEmpty a)
       in case result of
-           Right (Ty.Scheme [(i, Ty.KStar)]
+           Right (Ty.Scheme [(i, Ty.KStar)] _
                     (Ty.CTArr (Ty.CTGen j) Ty.CREmpty (Ty.CTGen k)))
              | i == j && j == k -> pure ()
            other -> assertFailure ("unexpected scheme: " ++ show other)
   , testCase "instantiate forall a. a -> a yields shared TVar" $
-      let s = Ty.Scheme [(0, Ty.KStar)]
+      let s = Ty.mkScheme [(0, Ty.KStar)]
                 (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0))
           result = TM.runTC_ TE.emptyEnv $ do
             t <- I.instantiate s
@@ -1108,7 +1134,7 @@ zonkTests = testGroup "Zonk"
                 a <- TM.enterLevel (TM.freshTVar Ty.KStar)          -- the 'a' of id
                 let fnTy = Ty.TArr a Ty.RowEmpty a
                     tree = Typed.Texp a (Typed.TVar (T.pack "x"))   -- body: x : a
-                (sch, tree') <- I.generalizeTyped fnTy tree
+                (sch, tree', _cs) <- I.generalizeTyped fnTy tree []
                 let Typed.Texp ann _ = tree'
                 pure (Ty.schemeBody sch, ann)
       in case r of
@@ -1117,7 +1143,7 @@ zonkTests = testGroup "Zonk"
   , testCase "monomorphic node freezes to concrete CType" $
       let r = TM.runTC_ B.initialEnv $ do
                 let tree = Typed.Texp (Ty.TCon Ty.TcU64 []) (Typed.TLitI 1)
-                (_, Typed.Texp ann _) <- I.generalizeTyped (Ty.TCon Ty.TcU64 []) tree
+                (_, Typed.Texp ann _, _cs) <- I.generalizeTyped (Ty.TCon Ty.TcU64 []) tree []
                 pure ann
       in case r of
            Right ann -> ann @?= Ty.CTCon Ty.TcU64 []
@@ -1198,7 +1224,7 @@ typedDeclBodyTests = testGroup "TypedDeclBody"
                   [] -> assertFailure "no TypedDecl for id"
                   (d : _) ->
                     case TC.tdScheme d of
-                      Ty.Scheme [_] (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j))
+                      Ty.Scheme [_] _ (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j))
                         | i == j ->
                           let bodyAnn = case TC.tdBody d of Typed.Texp a _ -> a
                           in case TC.tdParams d of
@@ -1229,7 +1255,7 @@ typedDeclBodyTests = testGroup "TypedDeclBody"
                   [] -> assertFailure "no TypedDecl for f"
                   (d : _) ->
                     case TC.tdScheme d of
-                      sch@(Ty.Scheme _ (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j)))
+                      sch@(Ty.Scheme _ _ (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j)))
                         | i == j -> do
                           -- exactly one quantifier; the node-only 'b' did not leak
                           length (Ty.schemeVars sch) @?= 1
@@ -1898,7 +1924,7 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
                  TE.conArity info @?= 1
                  TE.conTyCon info @?= T.pack "Maybe"
                  case TE.conScheme info of
-                   Ty.Scheme [(0, Ty.KStar)] body ->
+                   Ty.Scheme [(0, Ty.KStar)] _ body ->
                      case body of
                        Ty.CTArr (Ty.CTGen 0) Ty.CREmpty
                          (Ty.CTCon (Ty.TcUser tn) [Ty.CTGen 0])
@@ -2066,7 +2092,7 @@ exprLetTests = testGroup "ExprLet"
       in case result of
            Right (_, [td]) ->
              case TC.tdScheme td of
-               Ty.Scheme [(0, Ty.KStar)]
+               Ty.Scheme [(0, Ty.KStar)] _
                  (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0)) -> pure ()
                other -> assertFailure ("expected forall a. a -> a, got " ++ show other)
            Right (_, decls) ->
@@ -2086,7 +2112,7 @@ programTests = testGroup "Wok.TypeChecking (program)"
       in case result of
            Right (_, [td]) ->
              case TC.tdScheme td of
-               Ty.Scheme [(0, Ty.KStar)]
+               Ty.Scheme [(0, Ty.KStar)] _
                  (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTGen 0)) -> pure ()
                other -> assertFailure ("got: " ++ show other)
            Right (_, decls) ->
@@ -2109,7 +2135,7 @@ bodylessSigTests = testGroup "bodyless"
              case TE.lookupVar (T.pack "myConst") env of
                Just s ->
                  case s of
-                   Ty.Scheme [(_, Ty.KStar)]
+                   Ty.Scheme [(_, Ty.KStar)] _
                      (Ty.CTArr (Ty.CTGen i) Ty.CREmpty (Ty.CTGen j))
                      | i == j -> pure ()
                    other -> assertFailure ("unexpected scheme: " ++ show other)
@@ -2680,7 +2706,7 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
                  (mkRCAnon [("score", mkU64)])
       case translateSigInPointEnv ty of
         Left e -> assertFailure ("unexpected error: " ++ show e)
-        Right (Ty.Scheme _ (Ty.CTRecord tag row)) -> do
+        Right (Ty.Scheme _ _ (Ty.CTRecord tag row)) -> do
           tag @?= T.pack "Point"
           let labels = cRowLabels row
           -- score is prepended (outermost), x and y come from Point's fields
@@ -2697,7 +2723,7 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
       let ty = Abs.TExtend mkPointTy (mkVarSym "+") (mkRCVar "r")
       case translateSigInPointEnv ty of
         Left e -> assertFailure ("unexpected error: " ++ show e)
-        Right (Ty.Scheme qs (Ty.CTRecord tag row)) -> do
+        Right (Ty.Scheme qs _ (Ty.CTRecord tag row)) -> do
           tag @?= T.pack "Point"
           -- The row should end with a CRGen for the row variable
           let hasRowVar (Ty.CRGen _) = True
@@ -2715,7 +2741,7 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
           ty    = Abs.TFun extTy extTy
       case translateSigInPointEnv ty of
         Left e -> assertFailure ("unexpected error: " ++ show e)
-        Right (Ty.Scheme qs _) -> do
+        Right (Ty.Scheme qs _ _) -> do
           -- Exactly one KEffect slot (one row var `r`)
           let rowQs = [ i | (i, Ty.KEffect) <- qs ]
           length rowQs @?= 1
@@ -2733,7 +2759,7 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
       -- Just referencing `Point` in a sig should produce CTRecord "Point" {...}
       case translateSigInPointEnv mkPointTy of
         Left e -> assertFailure ("unexpected error: " ++ show e)
-        Right (Ty.Scheme _ (Ty.CTRecord tag row)) -> do
+        Right (Ty.Scheme _ _ (Ty.CTRecord tag row)) -> do
           tag @?= T.pack "Point"
           let labels = cRowLabels row
           length labels @?= 2
@@ -2749,7 +2775,7 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
                     (mkRCAnon [("color", mkU64)])
       case translateSigInPointEnv ty of
         Left e -> assertFailure ("unexpected error: " ++ show e)
-        Right (Ty.Scheme _ (Ty.CTRecord tag row)) -> do
+        Right (Ty.Scheme _ _ (Ty.CTRecord tag row)) -> do
           tag @?= T.pack "Point"
           let labels = cRowLabels row
           length labels @?= 4
@@ -2837,7 +2863,7 @@ recordConstructionTests = testGroup "RecordConstruction"
         Right decls ->
           case lookup (T.pack "p") decls of
             Nothing -> assertFailure "p not in decls"
-            Just (Ty.Scheme [] (Ty.CTRecord tag row)) -> do
+            Just (Ty.Scheme [] _ (Ty.CTRecord tag row)) -> do
               tag @?= T.pack "Point"
               let labels = cRowLabels row
               Data.List.sort labels @?= Data.List.sort [T.pack "x", T.pack "y"]
@@ -3433,18 +3459,26 @@ interpPrimTests :: TestTree
 interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
-        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","==","/=","&&","||","++","$"])
+        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$"])
   , testCase "addition" $
       case runPrim (T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
         other -> assertFailure (show2 other)
   , testCase "equality true" $
-      case runPrim (T.pack "==") [li 4, li 4] of
+      case runPrim (T.pack "eqU64") [li 4, li 4] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
         other -> assertFailure (show2 other)
   , testCase "equality false" $
-      case runPrim (T.pack "==") [li 4, li 5] of
+      case runPrim (T.pack "eqU64") [li 4, li 5] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
+        other -> assertFailure (show2 other)
+  , testCase "u32 equality" $
+      case runPrim (T.pack "eqU32") [li 4, li 4] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
+        other -> assertFailure (show2 other)
+  , testCase "u32 conversion is identity on the value" $
+      case runPrim (T.pack "u32") [li 7] of
+        Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "7"
         other -> assertFailure (show2 other)
   , testCase "boolean and" $
       case runPrim (T.pack "&&") [IV.VCon (T.pack "True") [], IV.VCon (T.pack "False") []] of
@@ -3473,6 +3507,23 @@ interpPrimTests = testGroup "InterpPrim"
   where
     show2 (Left e)  = "Left " <> show e
     show2 (Right _) = "Right <prim-result>"
+
+-- ---------------------------------------------------------------------------
+-- CAF (0-arity top-level bind) evaluation
+
+interpCafTests :: TestTree
+interpCafTests = testGroup "InterpCaf"
+  [ testCase "0-arity top-level constant is forced and shared" $
+      -- module: answer = 42 ; main = answer
+      let answer = Anf.TopBind (mkCafName "answer" 0) []
+                     (Anf.Ret (Anf.ALit (Anf.LInt 42)))
+          mainB  = Anf.TopBind (mkCafName "main" 1) []
+                     (Anf.Ret (Anf.AVar (mkCafName "answer" 0)))
+          cm = Anf.CoreModule [answer, mainB]
+      in Interp.runModule cm @?= Right (IV.VLit (Anf.LInt 42))
+  ]
+  where
+    mkCafName hint u = Name (T.pack hint) (Unique u)
 
 -- ---------------------------------------------------------------------------
 -- CEK machine tests
@@ -3830,16 +3881,16 @@ interpEntryTests = testGroup "InterpEntry"
         Left msg -> assertBool ("expected missing-main (UnboundVar) error, got: " <> msg)
                       (Data.List.isInfixOf "UnboundVar" msg && Data.List.isInfixOf "main" msg)
         Right v  -> assertFailure ("expected failure, got " <> T.unpack v)
-  , testCase "top-level constant (CAF) is rejected with a clear error" $ do
+  , testCase "top-level constant (CAF) is forced and usable from main" $ do
+      -- A 0-arity non-main bind is now evaluated once to a value and shared
+      -- (previously rejected as UnsupportedCaf). This underpins ground
+      -- instance dictionaries, which lower to 0-arity record values.
       r <- runSourceToValue (T.unlines
              [ T.pack "module Main"
              , T.pack "import Std.Base"
              , T.pack "answer = 42"
              , T.pack "main = answer" ])
-      case r of
-        Left msg -> assertBool ("expected UnsupportedCaf, got: " <> msg)
-                      (Data.List.isInfixOf "UnsupportedCaf" msg)
-        Right v  -> assertFailure ("expected rejection, got " <> T.unpack v)
+      r @?= Right (T.pack "42")
   , testCase "non-zero integer pattern matches its literal (C1 regression)" $ do
       -- Before the fix, integer-literal patterns were compiled to a literal 0,
       -- so `case 5 of 5 -> 100; _ -> 0` returned 0 instead of 100.
@@ -4150,7 +4201,7 @@ elaborateControlTests = testGroup "ElaborateControl"
 -- non-nullary data constructor Just (arity 1).
 recordTestEnv :: TE.Env
 recordTestEnv =
-  let dummyScheme = Ty.Scheme [] (Ty.CTCon Ty.TcUnit [])
+  let dummyScheme = Ty.mkScheme [] (Ty.CTCon Ty.TcUnit [])
       justInfo    = TE.ConInfo dummyScheme 1 (T.pack "Maybe")
       nilInfo     = TE.ConInfo dummyScheme 0 (T.pack "List")
       pointRci    = TE.RecordConInfo
@@ -4280,7 +4331,7 @@ elaborateRecordsTests = testGroup "ElaborateRecords"
 -- | Minimal env with effect IO declaring operations write (1 arg) and read (1 arg).
 effectTestEnv :: TE.Env
 effectTestEnv =
-  let dummyScheme = Ty.Scheme [] (Ty.CTCon Ty.TcUnit [])
+  let dummyScheme = Ty.mkScheme [] (Ty.CTCon Ty.TcUnit [])
       ioInfo = TE.EffectInfo
                  []
                  (Map.fromList
@@ -4464,4 +4515,438 @@ typedAstTests = testGroup "TypedAst"
                                                  [Typed.Texp 3 (Typed.TLitI 0)])
           e' = fmap (* 10) e
       in sum e' @?= (60 :: Int)   -- 10 + 20 + 30 over the three annotations
+  , testCase "TQVar folds over its class-arg annotations" $
+      let e = Typed.Texp (10 :: Int)
+                (Typed.TQVar (T.pack "==") [(T.pack "Eq", 5)])
+      in sum e @?= 15   -- node ann 10 + class-arg ann 5
   ]
+
+-- | Parse-only coverage for the Eq type-class slice (Task 0): `class`/`instance`
+-- declarations and `(C a) => T` qualified types parse into the new Abs nodes.
+-- These are semantically ignored for now (no typechecking yet).
+classParseTests :: TestTree
+classParseTests = testGroup "ClassParse"
+  [ testCase "class decl parses to DClass" $
+      case parse (T.pack "module M\nclass Eq a where\n  (==) : a -> a -> Bool\n") of
+        Right (Abs.Module ds) -> assertBool "expected a DClass" (any isDClass ds)
+        Left e -> assertFailure ("parse: " ++ e)
+  , testCase "instance decl parses to DInstance" $
+      case parse (T.pack "module M\ninstance Eq U64 where\n  (==) = eqU64\n") of
+        Right (Abs.Module ds) -> assertBool "expected a DInstance" (any isDInstance ds)
+        Left e -> assertFailure ("parse: " ++ e)
+  , testCase "instance with context parses to IHCtx" $
+      case parse (T.pack "module M\ninstance (Eq a) => Eq (Option a) where\n  (==) x y = True\n") of
+        Right (Abs.Module ds) -> assertBool "expected an IHCtx instance head" (any isCtxInstance ds)
+        Left e -> assertFailure ("parse: " ++ e)
+  , testCase "qualified sig parses to TQual" $
+      case parse (T.pack "module M\nisEq : (Eq a) => a -> a -> Bool\n") of
+        Right (Abs.Module ds) -> assertBool "expected a TQual in a DSig" (any sigHasQual ds)
+        Left e -> assertFailure ("parse: " ++ e)
+  ]
+  where
+    isDClass Abs.DClass{}    = True
+    isDClass _               = False
+    isDInstance Abs.DInstance{} = True
+    isDInstance _               = False
+    isCtxInstance (Abs.DInstance (Abs.IHCtx{}) _) = True
+    isCtxInstance _                               = False
+    sigHasQual (Abs.DSig _ _ (Abs.TQual _ _)) = True
+    sigHasQual _                              = False
+
+classEnvTests :: TestTree
+classEnvTests = testGroup "ClassEnv"
+  [ testCase "register + lookup a class and its method" $
+      let ci = TE.ClassInfo (0, Ty.KStar)
+                 (Map.singleton (T.pack "==") eqScheme)
+                 Map.empty [T.pack "=="] (T.pack "Eq$Dict")
+          e  = TE.extendClass (T.pack "Eq") ci TE.emptyEnv
+      in do TE.lookupClass (T.pack "Eq") e @?= Just ci
+            TE.classOfMethod (T.pack "==") e @?= Just (T.pack "Eq")
+  , testCase "register + lookup an instance" $
+      let ii = TE.InstanceInfo (T.pack "Eq") (Ty.CTCon Ty.TcU64 []) []
+                 (T.pack "dict$Eq$U64") Map.empty
+          e  = TE.extendInstance ii TE.emptyEnv
+      in TE.lookupInstances (T.pack "Eq") e @?= [ii]
+  ]
+  where
+    eqScheme = Ty.Scheme [(0, Ty.KStar)] [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+                 (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty
+                   (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (Ty.CTCon Ty.TcBool [])))
+
+-- | Parse a module body (prefixed with @module M@), then fold the class
+-- registrar over all class decls and the instance registrar over all
+-- instance decls, starting from 'B.initialEnv'. Class decls are processed
+-- before instance decls so that an instance can see its class.
+registerDecls :: Text -> Either TErr.TypeError TE.Env
+registerDecls body =
+  case parse (T.pack "module M\n" <> body) of
+    Left e -> error ("registerDecls: parse: " ++ e)
+    Right (Abs.Module ds) -> do
+      e1 <- Control.Monad.foldM Class.processClassDecl B.initialEnv ds
+      Control.Monad.foldM Class.processInstanceDecl e1 ds
+
+-- | Register a module body and hand the resulting 'Env' to a callback,
+-- failing the test if registration returns 'Left'.
+withDecls :: Text -> (TE.Env -> Assertion) -> Assertion
+withDecls body k = case registerDecls body of
+  Left err  -> assertFailure ("expected successful registration, got: " ++ show err)
+  Right env -> k env
+
+-- | Assert that registering a module body fails (returns 'Left').
+assertRejected :: Text -> Assertion
+assertRejected body = case registerDecls body of
+  Left _    -> pure ()
+  Right _   -> assertFailure "expected registration to be rejected, but it succeeded"
+
+classRegisterTests :: TestTree
+classRegisterTests = testGroup "ClassRegister"
+  [ testCase "class Eq registers method scheme with Eq constraint" $
+      withDecls (T.pack "class Eq a where\n  (==) : a -> a -> Bool\n") $ \env ->
+        case TE.lookupVar (T.pack "==") env of
+          Just s  -> Ty.schemeConstraints s
+                       @?= [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+          Nothing -> assertFailure "no == in env"
+  , testCase "ground instance registers, ground dict name" $
+      withDecls (T.pack "class Eq a where\n  (==) : a -> a -> Bool\ninstance Eq U64 where\n  (==) = eqU64\n") $ \env ->
+        case TE.lookupInstances (T.pack "Eq") env of
+          [i] -> TE.iiDictName i @?= T.pack "dict$Eq$U64"
+          _   -> assertFailure "expected exactly one Eq instance"
+  , testCase "non-smaller instance context rejected" $
+      assertRejected (T.pack "class Eq a where\n  (==) : a -> a -> Bool\ninstance (Eq [a]) => Eq a where\n  (==) x y = True\n")
+  , testCase "overlapping instance rejected" $
+      assertRejected (T.pack "class Eq a where\n  (==) : a -> a -> Bool\ninstance Eq U64 where\n  (==) = eqU64\ninstance Eq U64 where\n  (==) = eqU64\n")
+  ]
+
+constraintAccumTests :: TestTree
+constraintAccumTests = testGroup "ConstraintAccum"
+  [ testCase "add then take returns in order, then empties" $
+      let r = TM.runTC_ B.initialEnv $ do
+                a <- TM.freshTVar Ty.KStar
+                TM.addConstraint (T.pack "Eq") a
+                cs1 <- TM.takeConstraints
+                cs2 <- TM.takeConstraints
+                pure (map TM.csClass cs1, length cs1, length cs2)
+      in case r of
+           Right t -> t @?= ([T.pack "Eq"], 1, 0)
+           Left e  -> assertFailure (show e)
+  ]
+
+solveTests :: TestTree
+solveTests = testGroup "Solve"
+  [ testCase "ground instance -> EvGlobal" $
+      Solve.resolve env Set.empty (T.pack "Eq") (Ty.CTCon Ty.TcU64 [])
+        @?= Right (Ty.EvGlobal (T.pack "dict$Eq$U64"))
+  , testCase "constrained instance over concrete -> EvApp of EvGlobal" $
+      Solve.resolve env Set.empty (T.pack "Eq")
+        (Ty.CTCon (Ty.TcUser (T.pack "Option")) [Ty.CTCon Ty.TcU64 []])
+        @?= Right (Ty.EvApp (T.pack "dict$Eq$Option")
+                            [Ty.EvGlobal (T.pack "dict$Eq$U64")])
+  , testCase "quantified var in scope -> EvParam" $
+      Solve.resolve env (Set.singleton 0) (T.pack "Eq") (Ty.CTGen 0)
+        @?= Right (Ty.EvParam (T.pack "d$Eq$0"))
+  , testCase "quantified var out of scope -> Ambiguous" $
+      Solve.resolve env Set.empty (T.pack "Eq") (Ty.CTGen 0)
+        @?= Left (Solve.Ambiguous (T.pack "Eq"))
+  , testCase "no instance -> NoInst" $
+      Solve.resolve env Set.empty (T.pack "Eq") (Ty.CTCon Ty.TcString [])
+        @?= Left (Solve.NoInst (T.pack "Eq") (Ty.CTCon Ty.TcString []))
+  ]
+  where
+    env = TE.extendInstance optInst (TE.extendInstance u64Inst TE.emptyEnv)
+    u64Inst = TE.InstanceInfo
+                (T.pack "Eq")
+                (Ty.CTCon Ty.TcU64 [])
+                []
+                (T.pack "dict$Eq$U64")
+                Map.empty
+    optInst = TE.InstanceInfo
+                (T.pack "Eq")
+                (Ty.CTCon (Ty.TcUser (T.pack "Option")) [Ty.CTGen 0])
+                [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+                (T.pack "dict$Eq$Option")
+                Map.empty
+
+-- | End-to-end inference of the Eq type-class slice: qualified signatures,
+-- constraint emission at use-sites, and top-level discharge. Each snippet is
+-- prefixed with a minimal Eq class + an `Eq U64` instance (and an `eqU64`
+-- bodyless sig so the instance impl typechecks), then run through the full
+-- parse -> reorder -> inferProgramWith pipeline so registration, inference, and
+-- discharge all execute together.
+eqInferTests :: TestTree
+eqInferTests = testGroup "EqInfer"
+  [ testCase "1 == 2 : Bool" $
+      case eqInferDecl (T.pack "main") (T.pack "main = 1 == 2") of
+        Left e  -> assertFailure ("typecheck: " ++ show e)
+        Right d -> do
+          -- The constraint Eq U64 resolves to an instance, so main's scheme is
+          -- monomorphic Bool with no residual constraints or evidence.
+          Ty.schemeBody (I.tdScheme d) @?= Ty.CTCon Ty.TcBool []
+          Ty.schemeConstraints (I.tdScheme d) @?= []
+          I.tdEvidence d @?= []
+  , testCase "isEq : forall a.(Eq a)=> a->a->Bool with evidence param" $
+      case eqInferDecl (T.pack "isEq") (T.pack "isEq x y = x == y") of
+        Left e  -> assertFailure ("typecheck: " ++ show e)
+        Right d -> do
+          Ty.schemeConstraints (I.tdScheme d)
+            @?= [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+          map fst (I.tdEvidence d) @?= [T.pack "d$Eq$0"]
+  , testCase "no instance for Eq String errors" $
+      case eqInferModule (T.pack "bad = \"a\" == \"b\"") of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected NoInstance error for Eq String"
+  , testCase "ambiguous constraint errors" $
+      case eqInferModule (T.pack "amb : (Eq a) => Bool\namb = True") of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected AmbiguousConstraint error"
+  , -- Regression guard (signed-path entailment must check the ARGUMENT, not
+    -- merely the class name): the body needs Eq b but the declared context only
+    -- promises Eq a, so this is under-entailed and must be REJECTED.
+    testCase "under-entailed signed binding rejected (Eq a sig, body needs Eq b)" $
+      case eqInferModule
+             (T.pack "f : (Eq a) => a -> b -> Bool\nf x y = y == y") of
+        Left _  -> pure ()
+        Right _ -> assertFailure
+          "expected rejection: body uses (==) on b but sig only provides Eq a"
+  , -- A ground signed binding whose only Eq use is on U64 discharges to a
+    -- concrete instance: no residual constraint, no evidence parameter.
+    testCase "ground signed binding using == on U64 succeeds, no evidence" $
+      case eqInferDecl (T.pack "g") (T.pack "g : U64 -> Bool\ng x = x == 0") of
+        Left e  -> assertFailure ("typecheck: " ++ show e)
+        Right d -> do
+          Ty.schemeConstraints (I.tdScheme d) @?= []
+          I.tdEvidence d @?= []
+  ]
+  where
+    -- Minimal Eq prelude: fixity decls so the reorderer accepts (==)/(/=),
+    -- a Bool datatype, a bodyless eqU64 (so the instance impl checks), and a
+    -- single-parameter Eq class with an Eq U64 instance implementing both
+    -- methods (the completeness check requires every method to be implemented).
+    preludeEq =
+      T.concat
+        [ T.pack "fixity == left\n"
+        , T.pack "fixity /= left\n"
+        , T.pack "data Bool = True | False\n"
+        , T.pack "eqU64 : U64 -> U64 -> Bool\n"
+        , T.pack "class Eq a where\n"
+        , T.pack "  (==) : a -> a -> Bool\n"
+        , T.pack "  (/=) : a -> a -> Bool\n"
+        , T.pack "instance Eq U64 where\n"
+        , T.pack "  (==) = eqU64\n"
+        , T.pack "  (/=) = eqU64\n"
+        ]
+
+    -- Parse + reorder + infer a module built from the Eq prelude plus the
+    -- given body. Returns all TypedDecls or the type error.
+    eqInferModule :: Text -> Either TErr.TypeError [I.TypedDecl]
+    eqInferModule body =
+      let src = T.concat [T.pack "module M\n", preludeEq, body, T.pack "\n"]
+      in case parse src of
+           Left e -> error ("EqInfer parse: " ++ e)
+           Right ast -> case reorderModule ast of
+             Left es -> error ("EqInfer reorder: " ++ show es)
+             Right rm ->
+               case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+                 Left e             -> Left e
+                 Right (_, ds, _ws) -> Right ds
+
+    -- Run 'eqInferModule' and pick out the named TypedDecl.
+    eqInferDecl :: Text -> Text -> Either TErr.TypeError I.TypedDecl
+    eqInferDecl name body = do
+      ds <- eqInferModule body
+      case [ d | d <- ds, I.tdName d == name ] of
+        (d : _) -> Right d
+        []      -> error ("EqInfer: no TypedDecl named " ++ T.unpack name)
+
+-- | Synthetic instance desugaring (Task 9): each instance produces real
+-- typed dict bindings via the existing inference pipeline. We infer a module
+-- with an `Eq U64` (ground) and an `Eq (Option a)` (constrained) instance and
+-- assert the resulting dict TypedDecls have the right schemes and evidence.
+eqDesugarTests :: TestTree
+eqDesugarTests = testGroup "EqDesugar"
+  [ testCase "dict$Eq$U64 has scheme `Eq U64`, no constraints, no evidence" $
+      case desugarModule of
+        Left e   -> assertFailure ("typecheck: " ++ show e)
+        Right ds -> case findDecl (T.pack "dict$Eq$U64") ds of
+          Nothing -> assertFailure "no dict$Eq$U64 TypedDecl"
+          Just d  -> do
+            Ty.schemeBody (I.tdScheme d)
+              @?= Ty.CTCon (Ty.TcUser (T.pack "Eq")) [Ty.CTCon Ty.TcU64 []]
+            Ty.schemeConstraints (I.tdScheme d) @?= []
+            I.tdEvidence d @?= []
+  , testCase "dict$Eq$Option has (Eq a) constraint + an Eq evidence param" $
+      case desugarModule of
+        Left e   -> assertFailure ("typecheck: " ++ show e)
+        Right ds -> case findDecl (T.pack "dict$Eq$Option") ds of
+          Nothing -> assertFailure "no dict$Eq$Option TypedDecl"
+          Just d  -> do
+            Ty.schemeConstraints (I.tdScheme d)
+              @?= [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+            map fst (I.tdEvidence d) @?= [T.pack "d$Eq$0"]
+  , testCase "method-synth bindings dict$Eq$U64$m0 / $m1 exist" $
+      case desugarModule of
+        Left e   -> assertFailure ("typecheck: " ++ show e)
+        Right ds -> do
+          assertBool "missing dict$Eq$U64$m0"
+            (any ((== T.pack "dict$Eq$U64$m0") . I.tdName) ds)
+          assertBool "missing dict$Eq$U64$m1"
+            (any ((== T.pack "dict$Eq$U64$m1") . I.tdName) ds)
+  , -- C1 regression: a signed binding whose body yields a constraint with a
+    -- declared skolem NESTED UNDER a type constructor (`Eq (Option a)` from
+    -- `(Some x) == (Some x)`). This previously CRASHED in `freeze` on the
+    -- embedded Rigid; the declared `(Eq a) =>` promises `Eq a`, and the
+    -- `instance (Eq a) => Eq (Option a)` makes `Eq (Option a)` entailed, so it
+    -- must TYPECHECK with `schemeConstraints = [Eq (CTGen 0)]` and a `d$Eq$0`.
+    testCase "signed `Eq (Option a)` constraint entailed (skolem under tycon)" $
+      case desugarModuleWith
+             (T.pack "f : (Eq a) => a -> Bool\nf x = (Some x) == (Some x)\n") of
+        Left e   -> assertFailure ("typecheck: " ++ show e)
+        Right ds -> case findDecl (T.pack "f") ds of
+          Nothing -> assertFailure "no f TypedDecl"
+          Just d  -> do
+            Ty.schemeConstraints (I.tdScheme d)
+              @?= [Ty.Constraint (T.pack "Eq") (Ty.CTGen 0)]
+            map fst (I.tdEvidence d) @?= [T.pack "d$Eq$0"]
+  ]
+  where
+    findDecl n ds = case [ d | d <- ds, I.tdName d == n ] of
+      (d : _) -> Just d
+      []      -> Nothing
+
+    -- Fixities, Bool, Option, a bodyless eqU64, not, the Eq class with a (/=)
+    -- default, a ground Eq U64 instance, and a constrained Eq (Option a).
+    desugarSrc =
+      T.concat
+        [ T.pack "module M\n"
+        , T.pack "fixity == left\n"
+        , T.pack "fixity /= left\n"
+        , T.pack "data Bool = True | False\n"
+        , T.pack "data Option a = None | Some a\n"
+        , T.pack "eqU64 : U64 -> U64 -> Bool\n"
+        , T.pack "not : Bool -> Bool\n"
+        , T.pack "class Eq a where\n"
+        , T.pack "  (==) : a -> a -> Bool\n"
+        , T.pack "  (/=) : a -> a -> Bool\n"
+        , T.pack "  (/=) x y = not (x == y)\n"
+        , T.pack "instance Eq U64 where\n"
+        , T.pack "  (==) = eqU64\n"
+        , T.pack "instance (Eq a) => Eq (Option a) where\n"
+        , T.pack "  (==) x y = case (x, y) of\n"
+        , T.pack "    (None, None) -> True\n"
+        , T.pack "    (Some a, Some b) -> a == b\n"
+        , T.pack "    _ -> False\n"
+        ]
+
+    desugarModule :: Either TErr.TypeError [I.TypedDecl]
+    desugarModule = desugarModuleWith (T.pack "")
+
+    -- Like 'desugarModule', but appends an extra declaration body to the
+    -- shared Eq+Option prelude before inferring.
+    desugarModuleWith :: Text -> Either TErr.TypeError [I.TypedDecl]
+    desugarModuleWith extra =
+      case parse (T.append desugarSrc extra) of
+        Left e -> error ("EqDesugar parse: " ++ e)
+        Right ast -> case reorderModule ast of
+          Left es -> error ("EqDesugar reorder: " ++ show es)
+          Right rm ->
+            case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+              Left e             -> Left e
+              Right (_, ds, _ws) -> Right ds
+
+-- | End-to-end elaboration of a minimal Eq program (Task 10): parse -> reorder
+-- -> infer -> elaborate, then assert the ANF shape of the desugared dictionary
+-- bind and the case-projecting method dispatch in `main = 1 == 2`.
+eqElaborateTests :: TestTree
+eqElaborateTests = testGroup "ElaborateClass"
+  [ testCase "dict$Eq$U64 is a 0-arity TopBind constructing Eq$Dict" $
+      withElab $ \cm ->
+        case findBind (T.pack "dict$Eq$U64") cm of
+          Nothing -> assertFailure "no dict$Eq$U64 TopBind"
+          Just tb -> do
+            Anf.tbParams tb @?= []
+            assertBool "dict$Eq$U64 body does not construct Eq$Dict"
+              (buildsCon (T.pack "Eq$Dict") (Anf.tbBody tb))
+  , testCase "main = 1 == 2 lowers `==` to a Case-project + apply" $
+      withElab $ \cm ->
+        case findBind (T.pack "main") cm of
+          Nothing -> assertFailure "no main TopBind"
+          Just tb ->
+            case findMethodDispatch (Anf.tbBody tb) of
+              Nothing -> assertFailure
+                ("main body has no Eq$Dict Case-project+apply; body:\n"
+                  ++ show (Anf.tbBody tb))
+              Just () -> pure ()
+  ]
+  where
+    src =
+      T.concat
+        [ T.pack "module M\n"
+        , T.pack "fixity == left\n"
+        , T.pack "data Bool = True | False\n"
+        , T.pack "eqU64 : U64 -> U64 -> Bool\n"
+        , T.pack "class Eq a where\n"
+        , T.pack "  (==) : a -> a -> Bool\n"
+        , T.pack "instance Eq U64 where\n"
+        , T.pack "  (==) = eqU64\n"
+        , T.pack "main = 1 == 2\n"
+        ]
+
+    withElab :: (Anf.CoreModule -> Assertion) -> Assertion
+    withElab k =
+      case parse src of
+        Left e -> assertFailure ("ElaborateClass parse: " ++ e)
+        Right ast -> case reorderModule ast of
+          Left es -> assertFailure ("ElaborateClass reorder: " ++ show es)
+          Right rm ->
+            case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+              Left e            -> assertFailure ("ElaborateClass typecheck: " ++ show e)
+              Right (env, ds, _) -> k (elaborateModule env ds)
+
+    findBind :: Text -> Anf.CoreModule -> Maybe Anf.TopBind
+    findBind n (Anf.CoreModule binds) =
+      case [ tb | tb <- binds, Name.nameHint (Anf.tbName tb) == n ] of
+        (tb : _) -> Just tb
+        []       -> Nothing
+
+    -- Does this Expr (anywhere down the let-chain / tail) emit an RCon for `c`?
+    buildsCon :: Text -> Anf.Expr -> Bool
+    buildsCon c expr = case expr of
+      Anf.Let _ (Anf.RCon c' _) _ | c' == c -> True
+      Anf.Let _ _ body                       -> buildsCon c body
+      Anf.LetRec _ body                      -> buildsCon c body
+      Anf.LetJoin _ _ j body                 -> buildsCon c j || buildsCon c body
+      Anf.Case _ alts                        -> any (buildsCon c . altBody) alts
+      _                                      -> False
+
+    altBody :: Anf.Alt -> Anf.Expr
+    altBody (Anf.AltCon _ _ e)  = e
+    altBody (Anf.AltLit _ e)    = e
+    altBody (Anf.AltDefault e)  = e
+
+    -- Find a Case over a dict scrutinee that matches the Eq$Dict constructor,
+    -- binds the method fields, and applies field 0 (the `==` method) to args.
+    findMethodDispatch :: Anf.Expr -> Maybe ()
+    findMethodDispatch expr = case expr of
+      Anf.Case _ [Anf.AltCon con fbs body]
+        | con == T.pack "Eq$Dict"
+        , (f0 : _) <- map Anf.bndName fbs
+        , appliesField f0 body -> Just ()
+      Anf.Case _ alts   -> firstJust (map (findMethodDispatch . altBody) alts)
+      Anf.Let _ _ body  -> findMethodDispatch body
+      Anf.LetRec _ body -> findMethodDispatch body
+      Anf.LetJoin _ _ j body ->
+        firstJust [findMethodDispatch j, findMethodDispatch body]
+      _ -> Nothing
+
+    -- The field-0 method var is applied to two literal args somewhere in body.
+    appliesField :: Name.Name -> Anf.Expr -> Bool
+    appliesField f expr = case expr of
+      Anf.Let _ (Anf.RApp (Anf.AVar g) _) _ | g == f -> True
+      Anf.Ret _              -> False
+      Anf.Let _ _ body       -> appliesField f body
+      Anf.LetRec _ body      -> appliesField f body
+      Anf.LetJoin _ _ j body -> appliesField f j || appliesField f body
+      Anf.Case _ alts        -> any (appliesField f . altBody) alts
+      _                      -> False
+
+    firstJust :: [Maybe a] -> Maybe a
+    firstJust = Data.Maybe.listToMaybe . Data.Maybe.catMaybes

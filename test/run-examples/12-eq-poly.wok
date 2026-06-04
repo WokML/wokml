@@ -1,0 +1,5 @@
+module Run.EqPoly
+import Std.Base
+allEq : (Eq a) => a -> a -> a -> Bool
+allEq x y z = (x == y) && (y == z)
+main = if allEq 7 7 7 then 1 else 0

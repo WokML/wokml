@@ -20,13 +20,23 @@ prims =
   , divLike (Tx.pack "/")
   , divLike (Tx.pack "div")
   , modLike (Tx.pack "mod")
-  , cmp (Tx.pack "==") (==)
-  , cmp (Tx.pack "/=") (/=)
+  , cmp (Tx.pack "eqU64") (==)
+  , cmp (Tx.pack "eqU32") (==)
+  , u32Conv
   , boolOp (Tx.pack "&&") (&&)
   , boolOp (Tx.pack "||") (||)
   , appendP
   , dollarP
   ]
+
+-- | (u32) : narrow a U64 to U32. v1 models integers as unbounded 'Integer' and
+-- does NOT model modular wrapping (consistent with the U64 arithmetic prims), so
+-- this is the identity on the underlying value; it exists so U32 values can be
+-- constructed. Bounded/wrapping semantics is deferred along with U64's.
+u32Conv :: Prim
+u32Conv = mkPrim (Tx.pack "u32") 1 $ \args -> case args of
+  [a] -> do _ <- asInt a; Right (PRDone a)
+  _   -> Left (ArityError (Tx.pack "u32"))
 
 mkPrim :: Text -> Int -> ([Value] -> Either RuntimeError PrimResult) -> Prim
 mkPrim name arity fn = Prim name arity [] fn

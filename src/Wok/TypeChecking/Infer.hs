@@ -23,7 +23,7 @@ module Wok.TypeChecking.Infer
 import qualified Control.Monad.ST
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Except (throwError)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.List (foldl')
 import qualified Data.List
 import qualified Data.Map.Strict as Map
@@ -40,13 +40,15 @@ import Wok.TypeChecking.Env
   , extendCon, extendEffect, extendRecordCon, extendTyCon, extendVar
   , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
 import Wok.TypeChecking.Error (TypeError (..), Warning (..))
-import Wok.TypeChecking.Monad (TC, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, withEffRow, withEnv)
-import Wok.TypeChecking.Unify (force, forceRow, freeze, rewriteRow, unify, rewriteRowStrict)
+import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
+import Wok.TypeChecking.Unify (force, forceRow, freeze, freezeTolerant, rewriteRow, unify, rewriteRowStrict)
 import Wok.TypeChecking.Types
-  ( CRow (..), CType (..), Kind (..), Level (..), RVar (..), Row (..)
-  , Scheme (..), TyCon (..), TVar (..), Type (..) )
+  ( CRow (..), CType (..), Constraint (..), Kind (..), Level (..), RVar (..), Row (..)
+  , Scheme (..), mkScheme, TyCon (..), TVar (..), Type (..) )
 import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
 import qualified Wok.TypeChecking.Typed as Ty
+import qualified Wok.TypeChecking.Class as Class
+import qualified Wok.TypeChecking.Solve as Solve
 
 -- | Freeze a type and quantify any unbound variable whose level is
 -- strictly greater than the current generalisation level. The same
@@ -60,15 +62,15 @@ generalize t = do
     kindsRef <- newSTRef ([] :: [(Int, Kind)])
     body <- freezeQuantify outer nextRef seenRef kindsRef t
     pairs <- readSTRef kindsRef
-    pure (Scheme (reverse pairs) body)
+    pure (mkScheme (reverse pairs) body)
 
 -- | Like 'generalize', but additionally freezes a whole typed-AST tree
 -- with the SAME quantification mapping that produces the scheme. Using one
 -- shared ref-set means a polymorphic binding's per-node annotations reuse
 -- the scheme's 'CTGen' numbering. Quantifiers found only inside node
 -- annotations still register in the scheme because 'kindsRef' is read LAST.
-generalizeTyped :: Type s -> TExprS s -> TC s (Scheme, TExpr)
-generalizeTyped t tree = do
+generalizeTyped :: Type s -> TExprS s -> [ConstraintS s] -> TC s (Scheme, TExpr, [Constraint])
+generalizeTyped t tree cs = do
   Level outer <- currentLevel
   liftST $ do
     nextRef  <- newSTRef 0
@@ -86,8 +88,18 @@ generalizeTyped t tree = do
         goNode = freezeQuantifyG  True False outer nextRef seenRef kindsRef
     body  <- goBody t                    -- principal type first (strict, records)
     tree' <- traverse goNode tree        -- then every node annotation (no record)
+    -- Freeze each accumulated constraint's argument with the NON-RECORDING
+    -- walker (goNode), sharing the same refs. A residual constraint whose arg is
+    -- a quantified var already recorded by goBody reuses that same CTGen (so it
+    -- lands in the scheme's quantifier set). A constraint whose arg is a var that
+    -- does NOT appear in the principal type gets a fresh CTGen that is NOT
+    -- recorded -- so it is absent from schemeVars and the discharge step flags it
+    -- as ambiguous. A concrete arg freezes to its CType. Using goNode (not
+    -- goBody) is essential: goBody would RECORD a constraint-only var as a
+    -- spurious quantifier, masking the ambiguity.
+    fcs <- mapM (\(ConstraintS cls arg) -> Constraint cls <$> goNode arg) cs
     pairs <- readSTRef kindsRef          -- read quantifiers (from goBody only)
-    pure (Scheme (reverse pairs) body, tree')
+    pure (mkScheme (reverse pairs) body, tree', fcs)
 
 -- Internal: walk a Type s, replacing unbound vars at level > outer with
 -- CTGens, sharing slots by uniq via 'seen'. Pure-ST so we don't pay
@@ -208,27 +220,45 @@ freezeQuantifyG tolerateRigid recordQuant outer nextRef seenRef kindsRef = goT
 -- a fresh 'CTGen', shared across the whole tree so params and body agree. The
 -- resulting numbering is self-consistent within the tree; it need not match the
 -- declared scheme's quantifier indices (callers keep the declared scheme).
-freezeTypedTreeSig :: TExprS s -> TC s TExpr
-freezeTypedTreeSig tree = do
+-- It also freezes any accumulated constraints under the SAME tolerant refs so
+-- their CTGen numbering agrees with the node annotations (used only to VALIDATE
+-- dischargeability against the declared context, not to build the scheme).
+freezeTypedTreeSig :: TExprS s -> [ConstraintS s] -> TC s (TExpr, [Constraint])
+freezeTypedTreeSig tree cs = do
   Level outer <- currentLevel
   liftST $ do
     nextRef  <- newSTRef 0
     seenRef  <- newSTRef (Map.empty :: Map.Map Int Int)
     kindsRef <- newSTRef ([] :: [(Int, Kind)])   -- discarded: no scheme built
-    traverse (freezeQuantifyG True False outer nextRef seenRef kindsRef) tree
+    let goNode = freezeQuantifyG True False outer nextRef seenRef kindsRef
+    tree' <- traverse goNode tree
+    fcs   <- mapM (\(ConstraintS cls arg) -> Constraint cls <$> goNode arg) cs
+    pure (tree', fcs)
 
 -- | Instantiate a scheme: each quantifier becomes a fresh TVar (KStar) or
 -- fresh RowVar (KEffect) at the current level; the body is rebuilt with
--- those fresh refs substituted.
+-- those fresh refs substituted. Defined in terms of 'instantiateQ' so that
+-- every existing caller is unchanged (it just drops the constraints).
 instantiate :: Scheme -> TC s (Type s)
-instantiate (Scheme vars body) = do
+instantiate s = fst <$> instantiateQ s
+
+-- | Like 'instantiate', but also returns the scheme's constraint arguments
+-- instantiated through the SAME fresh substitution: each @Constraint cls arg@
+-- becomes @(cls, arg')@ where @arg'@ is @arg@ with the scheme's CTGen slots
+-- replaced by the same fresh vars used for the body. Use-sites feed these back
+-- into the constraint accumulator and into the 'TQVar' typed node.
+instantiateQ :: Scheme -> TC s (Type s, [(Text, Type s)])
+instantiateQ (Scheme vars constraints body) = do
   tySubst  <- Map.fromList <$>
     mapM (\(i, k) -> do { t <- freshTVar k; pure (i, t) })
          [ (i, k) | (i, k) <- vars, k /= KEffect ]
   rowSubst <- Map.fromList <$>
     mapM (\(i, _) -> do { r <- freshRVar; pure (i, r) })
          [ (i, k) | (i, k) <- vars, k == KEffect ]
-  pure (substInCType tySubst rowSubst body)
+  let body' = substInCType tySubst rowSubst body
+      cs'   = [ (conClass c, substInCType tySubst rowSubst (conArg c))
+              | c <- constraints ]
+  pure (body', cs')
   where
     substInCType :: Map.Map Int (Type s) -> Map.Map Int (Row s) -> CType -> Type s
     substInCType m rm = goT
@@ -289,19 +319,30 @@ substCTypeWith m = goT
 -- being dropped as RowEmpty. This ensures two uses of the same row variable
 -- in a sig (e.g. `Point + row r -> Point + row r`) share the same RowVar.
 freezeSig :: Scheme -> TC s (Type s)
-freezeSig (Scheme vars body) = do
+freezeSig s = fst <$> freezeSigSkolems s
+
+-- | Like 'freezeSig', but also returns the mapping from each declared scheme
+-- variable index to the @uniq@ of the 'Rigid' skolem minted for it. The signed
+-- path needs this to entail a body's accumulated class constraints BY ARGUMENT
+-- (not merely by class name): a declared @Eq a@ promises a dictionary for the
+-- skolem standing for @a@, so a body constraint on a DIFFERENT skolem (or an
+-- unbound metavar) is under-entailed and must be rejected. Type (KStar) vars
+-- only; row (KEffect) vars do not carry class constraints.
+freezeSigSkolems :: Scheme -> TC s (Type s, Map.Map Int Int)
+freezeSigSkolems (Scheme vars _ body) = do
   skolems <- mapM (\(i, k) -> do
                      u <- freshUniq
                      ref <- liftST $ newSTRef (Rigid u k)
-                     pure (i, TVar ref)
+                     pure (i, (u, TVar ref))
                   ) [ (i, k) | (i, k) <- vars, k /= KEffect ]
   rowVars <- mapM (\(i, _) -> do
                      r <- freshRVar
                      pure (i, r)
                   ) [ (i, k) | (i, k) <- vars, k == KEffect ]
-  let tySubst  = Map.fromList skolems
-      rowSubst = Map.fromList rowVars
-  pure (substInCType tySubst rowSubst body)
+  let tySubst   = Map.fromList [ (i, t) | (i, (_, t)) <- skolems ]
+      rowSubst  = Map.fromList rowVars
+      uniqOfVar = Map.fromList [ (i, u) | (i, (u, _)) <- skolems ]
+  pure (substInCType tySubst rowSubst body, uniqOfVar)
   where
     substInCType :: Map.Map Int (Type s) -> Map.Map Int (Row s) -> CType -> Type s
     substInCType m rm = goT
@@ -343,6 +384,10 @@ checkAnonTailPolarity sp = goT True
     -- @pos@ True = covariant (.. allowed); False = contravariant (.. rejected).
     goT :: Bool -> Abs.Type -> TC s ()
     goT pos t = case t of
+      -- Qualified type `(C a) => T` (Eq slice, Task 0): parse-only. The
+      -- constraint context carries no anonymous-row tails, so just descend
+      -- into the qualified body. Real constraint handling lands in a later task.
+      Abs.TQual _ body      -> goT pos body
       Abs.TFun a b         -> goT (not pos) a >> goT pos b
       Abs.TWith a b eff     -> goT (not pos) a >> goT pos b >> goRow pos eff
       Abs.TExtend lhs _ rc  -> goT pos lhs >> goRC pos rc
@@ -370,12 +415,59 @@ checkAnonTailPolarity sp = goT True
       Abs.RCVar _       -> pure ()                       -- named row var: threads
       Abs.RCWild        -> unless pos $ throwError (AnonRowTailInParam sp)
 
+-- | Reinterpret the LHS of a qualified type `(...) => T` -- which the grammar
+-- encodes AS a 'Abs.Type' -- into a list of (class name, argument type) pairs.
+-- A single constraint parses as `TParen (TApp (TCon C) arg)`; several parse as
+-- `TTuple c1 [c2, ...]` of such applications (no enclosing paren). Each element
+-- must be a saturated single-argument class application `TApp (TCon C) arg`;
+-- any other shape is malformed and rejected. The argument type is returned raw
+-- so the caller can translate it through the shared slot map.
+-- | Split a constraint context (the LHS of @=>@) into its individual class
+-- applications. A well-formed element is @Right (class, arg)@; a malformed one
+-- (not of the shape @C arg@) is @Left t@, which 'translateSig' surfaces as an
+-- error rather than silently dropping (dropping would let an ill-formed context
+-- typecheck as if unconstrained).
+constraintsOfType :: Abs.Type -> [Either Abs.Type (Text, Abs.Type)]
+constraintsOfType = goCtx
+  where
+    goCtx (Abs.TParen t)        = goCtx t
+    goCtx (Abs.TTuple a others) = concatMap one (a : others)
+    goCtx t                     = one t
+
+    one t = case classApp t of
+      Just pair -> [Right pair]
+      Nothing   -> [Left t]
+
+    -- A single-parameter class application `C arg`.
+    classApp (Abs.TParen t)             = classApp t
+    classApp (Abs.TApp (Abs.TCon mp) a) = Just (modPathText mp, a)
+    classApp _                          = Nothing
+
 translateSig :: Env -> Abs.Type -> TC s Scheme
 translateSig env ty = do
   seenRef    <- liftST $ newSTRef (Map.empty :: Map.Map Text Int)
   nextRef    <- liftST $ newSTRef (0 :: Int)
   rowSeenRef <- liftST $ newSTRef (Map.empty :: Map.Map Text Int)
-  body <- walk env seenRef nextRef rowSeenRef ty
+  -- A qualified type `(C a, ...) => T` is split into its constraint context
+  -- (the LHS, encoded by the grammar AS a type: `TParen`/`TTuple` of
+  -- `TApp (TCon Class) arg`) and the body T. The body is translated FIRST so
+  -- that each type variable's CTGen slot is allocated by first occurrence in
+  -- the body; each constraint argument is then translated through the SAME
+  -- `walk` (sharing `seenRef`/`nextRef`) so e.g. `a` in `(Eq a)` reuses the
+  -- body's slot. A non-qualified sig carries no constraints (empty context).
+  let (ctxElems, bodyTy) = case ty of
+        Abs.TQual lhs b -> (constraintsOfType lhs, b)
+        _               -> ([], ty)
+  -- A malformed context element (not of the shape `C arg`) is rejected here
+  -- rather than dropped, so an ill-formed context cannot masquerade as the
+  -- empty (unconstrained) one.
+  ctxTys <- forM ctxElems $ \case
+    Right pair -> pure pair
+    Left _     -> throwError (UnknownClass (Tx.pack "<malformed constraint context>"))
+  body <- walk env seenRef nextRef rowSeenRef bodyTy
+  constraints <- forM ctxTys $ \(cls, argTy) -> do
+    argCT <- walk env seenRef nextRef rowSeenRef argTy
+    pure (Constraint cls argCT)
   slots    <- liftST $ readSTRef seenRef
   rowSlots <- liftST $ readSTRef rowSeenRef
   -- Type vars use KStar, row vars use KEffect.
@@ -383,7 +475,7 @@ translateSig env ty = do
       rowPairs = Data.List.sortBy (\a b -> compare (snd a) (snd b)) (Map.toList rowSlots)
       qs = map (\(_, i) -> (i, KStar)) tyPairs
         ++ map (\(_, i) -> (i, KEffect)) rowPairs
-  pure (Scheme qs body)
+  pure (Scheme qs constraints body)
   where
     walk :: Env
          -> STRef s (Map.Map Text Int)
@@ -401,6 +493,12 @@ translateSig env ty = do
           modifySTRef' ref (Map.insert name n)
           pure n
 
+        -- Top-level qualified types `(C a) => T` are peeled by 'translateSig'
+        -- before 'walk' runs; reaching this arm means a constraint context
+        -- appeared in a nested (non-prenex) position, which is unsupported.
+        goT (Abs.TQual _ _) =
+          throwError (UnsupportedFeature Nothing
+            (Tx.pack "nested qualified type (constraint context) not supported"))
         goT (Abs.TFun a b) = CTArr <$> goT a <*> pure CREmpty <*> goT b
         goT (Abs.TVar (Abs.VarId (_, name))) = do
           seen <- liftST (readSTRef seenRef)
@@ -627,6 +725,7 @@ sigNamePos (Abs.SNParen (Abs.VarSym (p, _))) = p
 resolveTyCon :: Text -> TyCon
 resolveTyCon name
   | name == Tx.pack "U64"    = TcU64
+  | name == Tx.pack "U32"    = TcU32
   | name == Tx.pack "Char"   = TcChar
   | name == Tx.pack "String" = TcString
   | name == Tx.pack "Bool"   = TcBool
@@ -739,7 +838,7 @@ processDataDecls env0 decls = do
                            [ CTGen i | i <- [0 .. paramCount - 1] ]
               body = foldr (\arg acc -> CTArr arg CREmpty acc) resultTy argCTypes
               quantifiers = [ (i, KStar) | i <- [0 .. paramCount - 1] ]
-              scheme = Scheme quantifiers body
+              scheme = mkScheme quantifiers body
               info = ConInfo scheme arity tcName
           pure (extendCon cname info env)
 
@@ -855,7 +954,7 @@ processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
         Just _  -> throwError (DuplicateOperation pos ename opName)
         Nothing -> do
           ct <- translateConArg env paramMap ty
-          pure (Map.insert opName (Scheme quantifiers ct) acc)
+          pure (Map.insert opName (mkScheme quantifiers ct) acc)
 
 -- ---------------------------------------------------------------------------
 -- Pattern inference
@@ -1250,6 +1349,26 @@ partitionTrailing spreadSet extSet pos conName pairs =
       | Set.member fname extSet    = pure (ovs, (fname, fexp) : adds)
       | otherwise = throwError (UnknownField (Just pos) conName fname)
 
+-- | Emit accumulator constraints for an instantiated identifier and choose the
+-- typed node form. With no constraints, the node is the PLAIN form (@TVar@ /
+-- @TParenOp@) -- byte-identical to non-class code. With constraints, every one
+-- is recorded in the accumulator (for top-level discharge) and the node becomes
+-- a 'TQVar' carrying the per-constraint class-argument types, which elaboration
+-- lowers to dictionary passing.
+emitQVar :: Text -> Ty.TexpF (Type s) -> [(Text, Type s)] -> TC s (Ty.TexpF (Type s))
+emitQVar _    plain [] = pure plain
+emitQVar name _     cs = do
+  mapM_ (uncurry addConstraint) cs
+  pure (Ty.TQVar name cs)
+
+-- | 'emitQVar' specialised to the @TVar@ plain form (ordinary identifier).
+emitQVarNode :: Text -> [(Text, Type s)] -> TC s (Ty.TexpF (Type s))
+emitQVarNode name = emitQVar name (Ty.TVar name)
+
+-- | 'emitQVar' specialised to the @TParenOp@ plain form (operator as value).
+emitQParenOpNode :: Text -> [(Text, Type s)] -> TC s (Ty.TexpF (Type s))
+emitQParenOpNode name = emitQVar name (Ty.TParenOp name)
+
 -- Worker that carries a map of monomorphic (lambda/pattern) bindings.
 -- These are looked up directly without instantiation, preserving the
 -- identity of the mutable TVar across all uses in the expression.
@@ -1269,8 +1388,9 @@ inferExprW mono (Abs.EVar (Abs.VarId (pos, name))) =
       env <- currentEnv
       case lookupVar name env of
         Just s -> do
-          t <- instantiate s
-          pure (t, Ty.Texp t (Ty.TVar name))
+          (t, cs) <- instantiateQ s
+          node <- emitQVarNode name cs
+          pure (t, Ty.Texp t node)
         Nothing -> throwError (UnknownVar (Just pos) name)
 inferExprW _ (Abs.ECon (Abs.ConId (pos, name))) = do
   env <- currentEnv
@@ -1289,8 +1409,9 @@ inferExprW mono (Abs.EParenOp (Abs.VarSym (pos, name))) =
       env <- currentEnv
       case lookupVar name env of
         Just s -> do
-          t <- instantiate s
-          pure (t, Ty.Texp t (Ty.TParenOp name))
+          (t, cs) <- instantiateQ s
+          node <- emitQParenOpNode name cs
+          pure (t, Ty.Texp t node)
         Nothing -> throwError (UnknownVar (Just pos) name)
 inferExprW mono (Abs.EApp f x) = do
   -- Detect record constructor used in positional application and reject it.
@@ -1370,14 +1491,17 @@ inferExprW mono (Abs.EExpr head_ tails) = do
   where
     applyTails t node [] = pure (t, node)
     applyTails fT lhsNode (Abs.ITail op rhs : rest) = do
-      (opTy, opName) <- inferInfixOpW mono op
+      (opTy, opName, opCs) <- inferInfixOpW mono op
       (rhsT, rhsNode) <- inferExprW mono rhs
       r1 <- freshTVar KStar
       unify Nothing opTy (TArr fT RowEmpty (TArr rhsT RowEmpty r1))
       -- Mirror the resolved application `op lhs rhs` as a nested TApp whose
       -- head is the operator used as a value. r1 is the result type at this
-      -- step; the running lhs node carries the accumulated chain.
-      let appNode = Ty.Texp r1 (Ty.TApp (Ty.Texp opTy (Ty.TVar opName)) [lhsNode, rhsNode])
+      -- step; the running lhs node carries the accumulated chain. A constrained
+      -- operator (e.g. `==`) emits its constraints and uses a 'TQVar' head; an
+      -- unconstrained one keeps the byte-identical 'TVar' head.
+      opNode <- emitQVar opName (Ty.TVar opName) opCs
+      let appNode = Ty.Texp r1 (Ty.TApp (Ty.Texp opTy opNode) [lhsNode, rhsNode])
       applyTails r1 appNode rest
 -- Operation invocation `E.op`: when the head is a constructor naming a
 -- declared effect and @op@ is one of its operations, this is an operation
@@ -1696,22 +1820,27 @@ emitRow sp row = do
 
 -- | Look up an infix operator; monomorphic bindings are checked first.
 -- Returns the operator's type and its name (for building the typed node).
-inferInfixOpW :: Map.Map Text (Type s) -> Abs.InfixOp -> TC s (Type s, Text)
+-- Returns the operator's instantiated type, its name, AND the per-constraint
+-- class-argument types it carries (empty for non-constrained operators, e.g.
+-- the builtin @(+)@). The constraints are NOT emitted here: 'applyTails' decides
+-- the head node form (plain @TVar@ vs 'TQVar') and emits via 'emitQVar', so the
+-- accumulator gets exactly one entry per constrained use.
+inferInfixOpW :: Map.Map Text (Type s) -> Abs.InfixOp -> TC s (Type s, Text, [(Text, Type s)])
 inferInfixOpW mono (Abs.IOSym (Abs.VarSym (pos, name))) =
   lookupOpNameW mono pos name
 inferInfixOpW mono (Abs.IOBT (Abs.VarId (pos, name))) =
   lookupOpNameW mono pos name
 
-lookupOpNameW :: Map.Map Text (Type s) -> (Int, Int) -> Text -> TC s (Type s, Text)
+lookupOpNameW :: Map.Map Text (Type s) -> (Int, Int) -> Text -> TC s (Type s, Text, [(Text, Type s)])
 lookupOpNameW mono pos name =
   case Map.lookup name mono of
-    Just t -> pure (t, name)
+    Just t -> pure (t, name, [])
     Nothing -> do
       env <- currentEnv
       case lookupVar name env of
         Just s -> do
-          t <- instantiate s
-          pure (t, name)
+          (t, cs) <- instantiateQ s
+          pure (t, name, cs)
         Nothing -> throwError (UnknownVar (Just pos) name)
 
 -- ---------------------------------------------------------------------------
@@ -1996,9 +2125,9 @@ finalizeGroup sigMap (name, tv) =
 -- 'finalizeGroup' this returns a 'TypedDecl' directly.
 finalizeGroupTyped
   :: Map.Map Text Scheme
-  -> (Text, Type s, [Ty.TLocalDecl (Type s)])
+  -> (Text, Type s, [Ty.TLocalDecl (Type s)], [ConstraintS s])
   -> TC s TypedDecl
-finalizeGroupTyped sigMap (name, tv, eqDecls) = do
+finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
   (paramsS, bodyS) <- case eqDecls of
     -- Only the first clause is surfaced; multi-clause top-level functions are
     -- not supported (they were already non-functional on main). Carrying all
@@ -2016,20 +2145,108 @@ finalizeGroupTyped sigMap (name, tv, eqDecls) = do
       -- skolemised instantiation of the sig, so its annotations carry Rigid
       -- skolems; 'freezeTypedTreeSig' folds those into CTGens (it does not
       -- error on Rigids the way 'generalizeTyped'/'freezeQuantify' do).
-      declT <- freezeSig declared
+      -- Skolemise the declared scheme and capture each declared var index's
+      -- skolem identity (uniq). Unifying the skolemised sig with 'tv' links the
+      -- body's metavars to these skolems, so an accumulated constraint's
+      -- argument -- once forced -- resolves to the very skolem standing for the
+      -- declared var it constrains (or to a different skolem / metavar, which is
+      -- exactly the under-entailed case we must reject).
+      (declT, varUniq) <- freezeSigSkolems declared
       unify Nothing declT tv
-      frozen <- freezeTypedTreeSig synthetic
+      -- Freeze the inferred tree for its node types. The accumulated constraints
+      -- are validated below against the still-mutable 'accCs' (whose arguments
+      -- are the skolems/metavars above), NOT against any re-folded CTGen copy:
+      -- entailment must be checked by ARGUMENT, and the tree's independent CTGen
+      -- numbering would lose that identity. The scheme stays the declared one.
+      (frozen, _) <- freezeTypedTreeSig synthetic accCs
       let (ps, b) = unTLam name frozen
-      pure TypedDecl { tdName = name, tdScheme = declared, tdParams = ps, tdBody = b }
+      let declared' = nubConstraints (schemeConstraints declared)
+          -- The skolem uniqs the declared context PROMISES a dictionary for: a
+          -- declared `Eq a` provides a dictionary for the skolem standing for
+          -- `a`. Used as the in-scope param set for 'Solve.resolve': a residual
+          -- @CTGen u@ with @u@ in this set resolves to 'EvParam' (entailed);
+          -- otherwise it is 'Ambiguous' (under-entailed). 'freezeTolerant' maps
+          -- @Rigid u@ to @CTGen u@ identically, so these uniqs line up with the
+          -- frozen constraint arguments -- including skolems nested under a type
+          -- constructor (e.g. `Eq (Option a)`), which 'Solve.resolve' reaches by
+          -- recursing through the matching instance head.
+          promisedSet = Set.fromList
+            [ u
+            | c <- declared', CTGen i <- [conArg c]
+            , Just u <- [Map.lookup i varUniq] ]
+          -- Ambiguity: a declared constraint over a variable that does not occur
+          -- in the declared body type can never be resolved at a call site
+          -- (e.g. `amb : (Eq a) => Bool`). Concrete-arg constraints (none in the
+          -- Eq slice) are validated by resolve below, not here.
+          bodyVars = ctGenVars (schemeBody declared)
+      forM_ declared' $ \c -> case conArg c of
+        CTGen i | not (i `Set.member` bodyVars) ->
+                    throwError (AmbiguousConstraint (conClass c))
+        _       -> pure ()
+      env <- currentEnv
+      -- Validate every accumulated constraint by its ARGUMENT against the
+      -- declared context. Freeze the argument with a Rigid-TOLERANT walker that
+      -- maps each skolem @Rigid u@ to the sentinel @CTGen u@ (and any unbound
+      -- metavar likewise), then resolve against the PROMISED skolem uniqs:
+      --   * bare promised skolem  (@CTGen u@, u in promisedSet) -> 'EvParam';
+      --   * skolem UNDER a tycon  (@Eq (Option (CTGen u))@) -> recurses through
+      --     the @instance (Eq a)=>Eq (Option a)@ head to @Eq (CTGen u)@, then
+      --     'EvParam' since u is promised -- this is the case a bare-skolem-only
+      --     check missed (and that previously CRASHED in 'freeze' on the Rigid);
+      --   * concrete head -> must resolve to an instance, else 'NoInstance';
+      --   * unpromised skolem / unbound metavar -> 'Ambiguous' (under-entailed).
+      forM_ accCs $ \(ConstraintS cls argS) -> do
+        argC <- freezeTolerant argS
+        case Solve.resolve env promisedSet cls argC of
+          Right _                    -> pure ()
+          Left (Solve.NoInst cl a)   -> throwError (NoInstance cl (prettyCType a))
+          Left (Solve.Ambiguous cl)  -> throwError (AmbiguousConstraint cl)
+      -- Evidence parameters come from the DECLARED context, ordered by the
+      -- CTGen index of each constraint's var (so `isEq`'s `(Eq a)=>` yields
+      -- `[("d$Eq$0", Eq (CTGen 0))]`). Concrete declared constraints (none in
+      -- the slice) carry no parameter.
+      let evParams = [ (Solve.paramName (conClass c) i, c)
+                     | c <- declared', CTGen i <- [conArg c] ]
+      pure TypedDecl { tdName = name, tdScheme = declared, tdParams = ps
+                     , tdBody = b, tdEvidence = evParams }
     Nothing -> do
       Level outer <- currentLevel
       hasEscape <- hasOuterScopeVar outer tv
       when hasEscape $ error
         ("finalizeGroupTyped: unexpected escape for top-level binding "
         ++ Tx.unpack name)
-      (gen, frozen) <- generalizeTyped tv synthetic
+      (gen, frozen, fcs) <- generalizeTyped tv synthetic accCs
       let (ps, b) = unTLam name frozen
-      pure TypedDecl { tdName = name, tdScheme = gen, tdParams = ps, tdBody = b }
+      -- Discharge the frozen constraints against the generalized scheme:
+      --   * arg = CTGen i quantified by the scheme -> residual (kept on the
+      --     scheme + minted as an evidence parameter);
+      --   * arg = CTGen i NOT quantified -> ambiguous (constraint var absent
+      --     from the inferred type);
+      --   * concrete arg -> must resolve to an instance, else NoInstance.
+      let qs = Set.fromList (map fst (schemeVars gen))
+      env <- currentEnv
+      residual <- fmap concat $ forM (nubConstraints fcs) $ \c -> case conArg c of
+        CTGen i
+          | i `Set.member` qs -> pure [c]
+          | otherwise         -> throwError (AmbiguousConstraint (conClass c))
+        arg -> case Solve.resolve env Set.empty (conClass c) arg of
+          Right _                    -> pure []
+          Left (Solve.NoInst cls a)  -> throwError (NoInstance cls (prettyCType a))
+          Left (Solve.Ambiguous cls) -> throwError (AmbiguousConstraint cls)
+      let evParams = [ (Solve.paramName (conClass c) i, c)
+                     | c <- residual, CTGen i <- [conArg c] ]
+          gen' = gen { schemeConstraints = residual }
+      pure TypedDecl { tdName = name, tdScheme = gen', tdParams = ps
+                     , tdBody = b, tdEvidence = evParams }
+  where
+    sameConstraint a b = conClass a == conClass b && conArg a == conArg b
+    nubConstraints = Data.List.nubBy sameConstraint
+    -- The set of CTGen indices occurring anywhere in a (frozen) CType.
+    ctGenVars :: CType -> Set.Set Int
+    ctGenVars (CTGen i)       = Set.singleton i
+    ctGenVars (CTCon _ ts)    = Set.unions (map ctGenVars ts)
+    ctGenVars (CTArr a _ b)   = ctGenVars a `Set.union` ctGenVars b
+    ctGenVars (CTRecord _ _)  = Set.empty
 
 -- | Recover the params + body from the synthetic 'TLam' that 'generalizeTyped'
 -- froze. The wrapper shape is preserved by freezing (it is a structural
@@ -2211,10 +2428,11 @@ lhsAtomPats (Abs.LHSInfBT a _ b) = [a, b]
 --
 -- No 'Eq' instance: 'TExpr'/'Tpat' are not 'Eq'.
 data TypedDecl = TypedDecl
-  { tdName :: Text
-  , tdScheme :: Scheme
-  , tdParams :: [TPat]
-  , tdBody :: TExpr
+  { tdName     :: Text
+  , tdScheme   :: Scheme
+  , tdParams   :: [TPat]
+  , tdBody     :: TExpr
+  , tdEvidence :: [(Text, Constraint)]   -- evidence params (name, constraint)
   }
   deriving (Show)
 
@@ -2243,17 +2461,39 @@ inferProgram m =
 inferProgramTC
   :: Env -> Origin -> [Abs.Decl] -> TC s (Env, [TypedDecl])
 inferProgramTC seedEnv origin decls = do
+  -- Synthetic dict data types: each class registers a one-constructor dict
+  -- data type (data Eq a = Eq$Dict (a->a->Bool) (a->a->Bool)). These cons
+  -- must register BEFORE the synthetic instance bindings infer (the dict
+  -- assembly applies the dict con). Non-class modules yield no dictData, so
+  -- this is a no-op for all existing programs.
+  let dictData = mapMaybe Class.dictDataDecl decls
   -- Pass 1: register data declarations against the seed env (which is
   -- the irreducible pre-env overlaid with imports for the loader path,
   -- or just Builtins.initialEnv for the back-compat path).
-  env1  <- processDataDecls seedEnv decls
+  env1  <- processDataDecls seedEnv (decls ++ dictData)
   env1e <- processEffectDecls env1 decls
+  -- Register class then instance declarations (pure registrars from the Class
+  -- module). Classes inject each method's constrained scheme into envVars, so
+  -- equation bodies that use `==` resolve it; instances populate the solver's
+  -- registry consulted at top-level discharge. Order matters: an instance head
+  -- references its class. class/instance decls are NOT value bindings
+  -- (toLocalDecl drops them), so they never enter localDecls.
+  env1c <- either throwError pure
+             (foldM Class.processClassDecl env1e [ d | d@Abs.DClass{} <- decls ])
+  env1i <- either throwError pure
+             (foldM Class.processInstanceDecl env1c [ d | d@Abs.DInstance{} <- decls ])
+  -- Desugar each instance into synthetic typed top-level bindings (its method
+  -- impls/defaults + the dict assembly) that flow through the existing
+  -- inference pipeline. Non-class modules have no DInstance, so instB is [].
+  instB <- either throwError (pure . concat)
+             (mapM (Class.instanceBindings [ d | d@Abs.DClass{} <- decls ])
+                   [ d | d@Abs.DInstance{} <- decls ])
   -- Convert top-level decls to LocalDecl form for reuse of inferLetGroup
-  let localDecls = concatMap toLocalDecl decls
+  let localDecls = concatMap toLocalDecl (decls ++ instB)
   -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup.
   -- Warnings (BodylessBinding, RowShadow, …) are emitted into the TC
   -- monad's warning channel via addWarning; they are collected by runTC.
-  withEnv (const env1e) $ do
+  withEnv (const env1i) $ do
     tds <- inferTopLetGroup origin localDecls
     env2 <- currentEnv
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
@@ -2291,7 +2531,8 @@ inferTopLetGroup origin localDecls = do
         [ let s = sigMap Map.! n
           in TypedDecl { tdName = n, tdScheme = s
                        , tdParams = []
-                       , tdBody = Ty.Texp (schemeBody s) (Ty.TVar n) }
+                       , tdBody = Ty.Texp (schemeBody s) (Ty.TVar n)
+                       , tdEvidence = [] }
         | n <- sigOnlyNames ]
   -- Every binding that has a declared signature -- bodyless OR with a body --
   -- is in scope as its declared scheme while peer equations are typechecked, so
@@ -2308,12 +2549,22 @@ inferTopLetGroup origin localDecls = do
                                             then m
                                             else Map.insert n tv m)
                         Map.empty placeholders
-    mapM (unifyGroupWith monoRec sigMap) placeholders
+    -- Infer each binding's equations, then DRAIN the constraint accumulator
+    -- immediately so each binding owns exactly the constraints raised by its own
+    -- body (including any inner let/where bodies, which do not drain). The
+    -- drained args are mutable Type s refs that keep being resolved by later
+    -- group-mates' unification; they are frozen at outer level in
+    -- 'finalizeGroupTyped'. (Bindings with no constrained use drain [], so the
+    -- non-class path is byte-identical.)
+    forM placeholders $ \ph -> do
+      (n, tv, ds) <- unifyGroupWith monoRec sigMap ph
+      cs <- takeConstraints
+      pure (n, tv, ds, cs)
   -- Finalize each binding at the top level: generalize (or verify its sig) AND
   -- freeze its typed params + body into a TypedDecl under one quantification
   -- mapping (so node CTGens agree with the scheme). The top level has no outer
   -- scope, so freezing the whole tree here is safe and 'finalizeGroupTyped'
-  -- never reports escape.
+  -- never reports escape. Each binding carries its own drained constraints.
   topResults <- withEnv extendSig $ mapM (finalizeGroupTyped sigMap) unified
   -- Emit a warning only for UserFile origin so Std.Base (Embedded) primitive
   -- schemes stay silent.
@@ -2353,8 +2604,8 @@ sigNamesInOrder = concatMap one
 
 -- | Render a Scheme as a single line: "forall a b. (a -> b) -> [a] -> [b]"
 prettyScheme :: Scheme -> Text
-prettyScheme (Scheme [] body) = prettyCType body
-prettyScheme (Scheme vars body) =
+prettyScheme (Scheme [] _ body) = prettyCType body
+prettyScheme (Scheme vars _ body) =
   Tx.concat
     [ Tx.pack "forall "
     , Tx.intercalate (Tx.pack " ") (map (varName . fst) vars)
@@ -2370,6 +2621,7 @@ varName i
 prettyCType :: CType -> Text
 prettyCType (CTGen i) = varName i
 prettyCType (CTCon TcU64    []) = Tx.pack "U64"
+prettyCType (CTCon TcU32    []) = Tx.pack "U32"
 prettyCType (CTCon TcChar   []) = Tx.pack "Char"
 prettyCType (CTCon TcString []) = Tx.pack "String"
 prettyCType (CTCon TcBool   []) = Tx.pack "Bool"

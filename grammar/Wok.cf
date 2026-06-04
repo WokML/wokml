@@ -66,6 +66,31 @@ DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
 DEffect.  Decl ::= "effect" ConId [VarId] "=" "{" [RecordFieldType] "}" ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 
+-- Type classes (Eq slice). These declarations are fully processed: the
+-- typechecker registers each class/instance, checks coherence/termination/
+-- completeness, and elaboration desugars instances into dictionaries with
+-- dictionary-passing. Reordering passes them through (no top-level exprs there).
+-- The `where "{" ... "}"` braces are layout-virtual: `where` is already a layout
+-- keyword (see `layout "let", "where", "of" ;`).
+DClass.    Decl ::= "class" ConId [VarId] "where" "{" [ClassEntry] "}" ;
+DInstance. Decl ::= "instance" InstHead "where" "{" [InstEntry] "}" ;
+
+IHPlain.   InstHead ::= ConId [Type2] ;
+IHCtx.     InstHead ::= "(" [Constraint] ")" "=>" ConId [Type2] ;
+
+MNBare.    MethodName ::= VarId ;
+MNParen.   MethodName ::= "(" VarSym ")" ;
+
+CESig.     ClassEntry ::= MethodName ":" Type ;
+CEDefault. ClassEntry ::= FunLHS "=" Exp ;
+separator  ClassEntry ";" ;
+
+IEImpl.    InstEntry ::= FunLHS "=" Exp ;
+separator  InstEntry ";" ;
+
+Constraint. Constraint ::= ConId [Type2] ;
+separator   Constraint "," ;
+
 separator Decl ";" ;
 
 -- Hierarchical dotted module paths (e.g. Data.List)
@@ -84,9 +109,8 @@ DLocal.   Decl ::= "local" Decl ;
 -- Reserved for future language features. ReservedKw exists only so BNFC adds
 -- these words to the lexer's reserved set, keeping them out of VarId. When a
 -- feature ships, move its word out of here into that feature's real production.
-rules     ReservedKw ::= "contract" | "type" | "class" | "instance"
-                       | "deriving" | "forall" | "do" | "record" | "row"
-                       | "fun" | "ctl" | "resume" ;
+rules     ReservedKw ::= "contract" | "type" | "deriving" | "forall"
+                       | "do" | "record" | "row" | "fun" | "ctl" | "resume" ;
 DReserved. Decl ::= ReservedKw ;
 
 -- Helper: comma-separated additional names for multi-name sigs (`f, (+), h : T`).
@@ -192,6 +216,23 @@ separator Pat "," ;
 -- a `Type1 "->" Type` arrow. Because both TWith and TFun start with the same
 -- `Type1 "->" Type` prefix, the parser defers the `with`-vs-end decision until
 -- after the arrow body, so a trailing `with E` binds to the whole arrow chain.
+-- Qualified type (Eq slice, Task 0): `(C a) => T` is the loosest type form,
+-- recursing on the whole `Type` to its right. Parse-only for now; the
+-- typechecker ignores the constraint context.
+--
+-- DESIGN NOTE (LALR(1) constraint): the context LHS is parsed as an ordinary
+-- `Type1`, NOT as a dedicated `"(" [Constraint] ")"`. A separate
+-- comma-separated `[Constraint]` nonterminal here is unparseable: inside `(`,
+-- a leading `ConId` (e.g. `Int` in the tuple type `(Int, String)`) cannot be
+-- resolved between `Constraint -> ConId ...` and `ModPath -> ConId` until the
+-- post-`)` token (`=>` vs end), which LALR(1) cannot defer. That ambiguity
+-- produces reduce/reduce conflicts and silently breaks tuple/paren types.
+-- Parsing the LHS as a `Type1` shares the inner reduction with TParen/TTuple,
+-- so the only decision left is the post-`)` operator token (`=>` vs `->`/end),
+-- a clean shift/reduce. The surface form `(Eq a)` arrives as a TParen of a
+-- TApp, and `(Eq a, Ord b)` as a TTuple; a later semantic pass reinterprets
+-- the LHS `Type` as the constraint context `[Constraint]`.
+TQual.    Type  ::= Type1 "=>" Type ;
 TWith.    Type  ::= Type1 "->" Type "with" EffectRow ;
 TFun.     Type  ::= Type1 "->" Type ;       -- right-assoc function arrow
 _.        Type  ::= Type1 ;

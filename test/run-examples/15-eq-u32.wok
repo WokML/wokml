@@ -1,0 +1,6 @@
+module Run.EqU32
+import Std.Base
+main =
+  if (u32 5) == (u32 5) then
+    (if (u32 5) == (u32 6) then 0 else 1)
+  else 0

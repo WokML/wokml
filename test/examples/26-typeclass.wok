@@ -1,0 +1,19 @@
+module Test.TypeClass
+
+class Eq a where
+  (==) : a -> a -> Bool
+  (/=) : a -> a -> Bool
+  (/=) x y = not (x == y)
+
+instance Eq U64 where
+  (==) = eqU64
+
+instance (Eq a) => Eq (Option a) where
+  (==) x y =
+    case (x, y) of
+      (None, None)     -> True
+      (Some a, Some b) -> a == b
+      _                -> False
+
+isEq : (Eq a) => a -> a -> Bool
+isEq x y = x == y

@@ -1,0 +1,5 @@
+module Fail.Ambiguous
+import Std.Base
+
+amb : (Eq a) => Bool
+amb = True

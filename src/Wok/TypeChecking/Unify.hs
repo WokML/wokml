@@ -16,6 +16,7 @@ module Wok.TypeChecking.Unify
   , force
   , forceRow
   , freeze
+  , freezeTolerant
   , freezeRow
   , occursAdjust
   , occursAdjustRow
@@ -75,6 +76,30 @@ freeze t = do
         Unbound u _ _ -> pure (CTGen u)
         Link _ -> error "freeze: TVar was Link after force (caller invariant violation)"
         Rigid u _ -> error ("freeze: unexpected Rigid (uniq " ++ show u ++ ")")
+
+-- | Like 'freeze', but TOLERATES 'Rigid' skolems by mapping each @Rigid u@ to
+-- @CTGen u@ (the skolem's uniq used directly as the generic index), instead of
+-- erroring. Used by the signed-path constraint validator to freeze a constraint
+-- argument that may embed signature skolems UNDER type constructors (e.g.
+-- @Eq (Option a)@ where @a@ is a declared skolem). Because the mapping is the
+-- identity on uniqs, a caller that knows the set of PROMISED skolem uniqs can
+-- feed it directly to 'Solve.resolve' as the in-scope param set, so a residual
+-- @CTGen u@ for a promised skolem resolves to 'EvParam' (entailed) rather than
+-- 'Ambiguous'. Unbound metavars still become @CTGen u@ (never promised, so they
+-- resolve to 'Ambiguous' -- the under-entailed case).
+freezeTolerant :: Type s -> TC s CType
+freezeTolerant t = do
+  t' <- force t
+  case t' of
+    TCon c ts -> CTCon c <$> mapM freezeTolerant ts
+    TArr a r b -> CTArr <$> freezeTolerant a <*> freezeRow r <*> freezeTolerant b
+    TRecord tag row -> CTRecord tag <$> freezeRow row
+    TVar ref -> do
+      tv <- liftST $ readSTRef ref
+      case tv of
+        Unbound u _ _ -> pure (CTGen u)
+        Rigid u _ -> pure (CTGen u)
+        Link _ -> error "freezeTolerant: TVar was Link after force (caller invariant violation)"
 
 freezeRow :: Row s -> TC s CRow
 freezeRow r = do

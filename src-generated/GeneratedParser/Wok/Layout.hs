@@ -28,19 +28,19 @@ data LayoutDelimiters
 
 layoutWords :: [(TokSymbol, LayoutDelimiters)]
 layoutWords =
-  [ ( TokSymbol "let" 35
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
+  [ ( TokSymbol "let" 36
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 53)) (Just (TokSymbol "}" 55))
     )
-  , ( TokSymbol "where" 50
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
+  , ( TokSymbol "where" 51
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 53)) (Just (TokSymbol "}" 55))
     )
-  , ( TokSymbol "of" 39
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
+  , ( TokSymbol "of" 40
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 53)) (Just (TokSymbol "}" 55))
     )
   ]
 
 layoutStopWords :: [TokSymbol]
-layoutStopWords = [TokSymbol "in" 32]
+layoutStopWords = [TokSymbol "in" 33]
 
 -- layout separators
 
@@ -52,11 +52,11 @@ layoutSep   = List.nub $ TokSymbol ";" 9 : map (delimSep . snd) layoutWords
 parenOpen, parenClose :: [TokSymbol]
 parenOpen  =
   [ TokSymbol "(" 1
-  , TokSymbol "[" 11
+  , TokSymbol "[" 12
   ]
 parenClose =
   [ TokSymbol ")" 2
-  , TokSymbol "]" 13
+  , TokSymbol "]" 14
   ]
 
 -- | Report an error during layout resolution.
@@ -95,12 +95,14 @@ resolveLayout topLayout =
 
   -- Handling explicit blocks:
   res pt st (t0 : ts)
-    -- PATCH (see grammar/Wok.cf POST-REGEN NOTE): split the combined
-    -- isLayoutOpen || isParenOpen branch. Layout-open braces are the body of the
-    -- preceding layout word (`let {`, `where {`, `of {`) and must NOT get a
-    -- separator. Paren-open can start a top-level decl (e.g. a bodyless operator
-    -- sig `(+) : ...`), so it needs maybeInsertSeparator like a plain id. The
-    -- binder must be `pt`, not `_`.
+    -- We found an open brace in the input,
+    -- put an explicit layout block on the stack.
+    -- This is done even if there was no layout word,
+    -- to keep opening and closing braces.
+    -- PATCH (post-regen): split the combined isLayoutOpen || isParenOpen branch
+    -- so ONLY the paren branch inserts a decl separator before a paren-opening
+    -- top-level decl. The binder must be `pt` (not `_`). See grammar/Wok.cf
+    -- POST-REGEN NOTE for the rationale.
     | isLayoutOpen t0
       = t0 : res (Just t0) (Explicit : st) ts
     | isParenOpen t0

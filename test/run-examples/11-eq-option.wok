@@ -1,0 +1,3 @@
+module Run.EqOption
+import Std.Base
+main = if (Some 4) == (Some 4) then 1 else 0

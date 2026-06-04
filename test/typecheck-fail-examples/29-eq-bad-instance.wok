@@ -1,0 +1,8 @@
+module Fail.BadInstance
+import Std.Base
+
+class C a where
+  f : a -> Bool
+
+instance (C [a]) => C a where
+  f x = True

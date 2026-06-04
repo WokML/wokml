@@ -34,50 +34,51 @@ import qualified Data.Text
   '::'       { PT _ (TS _ 8)     }
   ';'        { PT _ (TS _ 9)     }
   '='        { PT _ (TS _ 10)    }
-  '['        { PT _ (TS _ 11)    }
-  '\\'       { PT _ (TS _ 12)    }
-  ']'        { PT _ (TS _ 13)    }
-  '_'        { PT _ (TS _ 14)    }
-  '`'        { PT _ (TS _ 15)    }
-  'case'     { PT _ (TS _ 16)    }
-  'class'    { PT _ (TS _ 17)    }
-  'contract' { PT _ (TS _ 18)    }
-  'ctl'      { PT _ (TS _ 19)    }
-  'data'     { PT _ (TS _ 20)    }
-  'deriving' { PT _ (TS _ 21)    }
-  'do'       { PT _ (TS _ 22)    }
-  'eff'      { PT _ (TS _ 23)    }
-  'effect'   { PT _ (TS _ 24)    }
-  'else'     { PT _ (TS _ 25)    }
-  'fixity'   { PT _ (TS _ 26)    }
-  'forall'   { PT _ (TS _ 27)    }
-  'fun'      { PT _ (TS _ 28)    }
-  'handle'   { PT _ (TS _ 29)    }
-  'if'       { PT _ (TS _ 30)    }
-  'import'   { PT _ (TS _ 31)    }
-  'in'       { PT _ (TS _ 32)    }
-  'instance' { PT _ (TS _ 33)    }
-  'left'     { PT _ (TS _ 34)    }
-  'let'      { PT _ (TS _ 35)    }
-  'local'    { PT _ (TS _ 36)    }
-  'looser'   { PT _ (TS _ 37)    }
-  'module'   { PT _ (TS _ 38)    }
-  'of'       { PT _ (TS _ 39)    }
-  'record'   { PT _ (TS _ 40)    }
-  'resume'   { PT _ (TS _ 41)    }
-  'return'   { PT _ (TS _ 42)    }
-  'right'    { PT _ (TS _ 43)    }
-  'row'      { PT _ (TS _ 44)    }
-  'than'     { PT _ (TS _ 45)    }
-  'then'     { PT _ (TS _ 46)    }
-  'tighter'  { PT _ (TS _ 47)    }
-  'type'     { PT _ (TS _ 48)    }
-  'use'      { PT _ (TS _ 49)    }
-  'where'    { PT _ (TS _ 50)    }
-  'with'     { PT _ (TS _ 51)    }
-  '{'        { PT _ (TS _ 52)    }
-  '|'        { PT _ (TS _ 53)    }
-  '}'        { PT _ (TS _ 54)    }
+  '=>'       { PT _ (TS _ 11)    }
+  '['        { PT _ (TS _ 12)    }
+  '\\'       { PT _ (TS _ 13)    }
+  ']'        { PT _ (TS _ 14)    }
+  '_'        { PT _ (TS _ 15)    }
+  '`'        { PT _ (TS _ 16)    }
+  'case'     { PT _ (TS _ 17)    }
+  'class'    { PT _ (TS _ 18)    }
+  'contract' { PT _ (TS _ 19)    }
+  'ctl'      { PT _ (TS _ 20)    }
+  'data'     { PT _ (TS _ 21)    }
+  'deriving' { PT _ (TS _ 22)    }
+  'do'       { PT _ (TS _ 23)    }
+  'eff'      { PT _ (TS _ 24)    }
+  'effect'   { PT _ (TS _ 25)    }
+  'else'     { PT _ (TS _ 26)    }
+  'fixity'   { PT _ (TS _ 27)    }
+  'forall'   { PT _ (TS _ 28)    }
+  'fun'      { PT _ (TS _ 29)    }
+  'handle'   { PT _ (TS _ 30)    }
+  'if'       { PT _ (TS _ 31)    }
+  'import'   { PT _ (TS _ 32)    }
+  'in'       { PT _ (TS _ 33)    }
+  'instance' { PT _ (TS _ 34)    }
+  'left'     { PT _ (TS _ 35)    }
+  'let'      { PT _ (TS _ 36)    }
+  'local'    { PT _ (TS _ 37)    }
+  'looser'   { PT _ (TS _ 38)    }
+  'module'   { PT _ (TS _ 39)    }
+  'of'       { PT _ (TS _ 40)    }
+  'record'   { PT _ (TS _ 41)    }
+  'resume'   { PT _ (TS _ 42)    }
+  'return'   { PT _ (TS _ 43)    }
+  'right'    { PT _ (TS _ 44)    }
+  'row'      { PT _ (TS _ 45)    }
+  'than'     { PT _ (TS _ 46)    }
+  'then'     { PT _ (TS _ 47)    }
+  'tighter'  { PT _ (TS _ 48)    }
+  'type'     { PT _ (TS _ 49)    }
+  'use'      { PT _ (TS _ 50)    }
+  'where'    { PT _ (TS _ 51)    }
+  'with'     { PT _ (TS _ 52)    }
+  '{'        { PT _ (TS _ 53)    }
+  '|'        { PT _ (TS _ 54)    }
+  '}'        { PT _ (TS _ 55)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -115,11 +116,53 @@ Decl
   | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
   | 'effect' ConId ListVarId '=' '{' ListRecordFieldType '}' { GeneratedParser.Wok.Abs.DEffect $2 $3 $6 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
+  | 'class' ConId ListVarId 'where' '{' ListClassEntry '}' { GeneratedParser.Wok.Abs.DClass $2 $3 $6 }
+  | 'instance' InstHead 'where' '{' ListInstEntry '}' { GeneratedParser.Wok.Abs.DInstance $2 $5 }
   | 'module' ModPath { GeneratedParser.Wok.Abs.DModule $2 }
   | 'import' ModPath { GeneratedParser.Wok.Abs.DImport $2 }
   | 'use' ModPath { GeneratedParser.Wok.Abs.DUse $2 }
   | 'local' Decl { GeneratedParser.Wok.Abs.DLocal $2 }
   | ReservedKw { GeneratedParser.Wok.Abs.DReserved $1 }
+
+InstHead :: { GeneratedParser.Wok.Abs.InstHead }
+InstHead
+  : ConId ListType2 { GeneratedParser.Wok.Abs.IHPlain $1 $2 }
+  | '(' ListConstraint ')' '=>' ConId ListType2 { GeneratedParser.Wok.Abs.IHCtx $2 $5 $6 }
+
+MethodName :: { GeneratedParser.Wok.Abs.MethodName }
+MethodName
+  : VarId { GeneratedParser.Wok.Abs.MNBare $1 }
+  | '(' VarSym ')' { GeneratedParser.Wok.Abs.MNParen $2 }
+
+ClassEntry :: { GeneratedParser.Wok.Abs.ClassEntry }
+ClassEntry
+  : MethodName ':' Type { GeneratedParser.Wok.Abs.CESig $1 $3 }
+  | FunLHS '=' Exp { GeneratedParser.Wok.Abs.CEDefault $1 $3 }
+
+ListClassEntry :: { [GeneratedParser.Wok.Abs.ClassEntry] }
+ListClassEntry
+  : {- empty -} { [] }
+  | ClassEntry { (:[]) $1 }
+  | ClassEntry ';' ListClassEntry { (:) $1 $3 }
+
+InstEntry :: { GeneratedParser.Wok.Abs.InstEntry }
+InstEntry : FunLHS '=' Exp { GeneratedParser.Wok.Abs.IEImpl $1 $3 }
+
+ListInstEntry :: { [GeneratedParser.Wok.Abs.InstEntry] }
+ListInstEntry
+  : {- empty -} { [] }
+  | InstEntry { (:[]) $1 }
+  | InstEntry ';' ListInstEntry { (:) $1 $3 }
+
+Constraint :: { GeneratedParser.Wok.Abs.Constraint }
+Constraint
+  : ConId ListType2 { GeneratedParser.Wok.Abs.Constraint $1 $2 }
+
+ListConstraint :: { [GeneratedParser.Wok.Abs.Constraint] }
+ListConstraint
+  : {- empty -} { [] }
+  | Constraint { (:[]) $1 }
+  | Constraint ',' ListConstraint { (:) $1 $3 }
 
 ListDecl :: { [GeneratedParser.Wok.Abs.Decl] }
 ListDecl
@@ -136,8 +179,6 @@ ReservedKw :: { GeneratedParser.Wok.Abs.ReservedKw }
 ReservedKw
   : 'contract' { GeneratedParser.Wok.Abs.ReservedKw_contract }
   | 'type' { GeneratedParser.Wok.Abs.ReservedKw_type }
-  | 'class' { GeneratedParser.Wok.Abs.ReservedKw_class }
-  | 'instance' { GeneratedParser.Wok.Abs.ReservedKw_instance }
   | 'deriving' { GeneratedParser.Wok.Abs.ReservedKw_deriving }
   | 'forall' { GeneratedParser.Wok.Abs.ReservedKw_forall }
   | 'do' { GeneratedParser.Wok.Abs.ReservedKw_do }
@@ -209,7 +250,7 @@ ListRecordFieldPat
 
 -- PATCH: left-recursive NEListRecordFieldPat to avoid the shift/reduce conflict
 --        with the trailing comma before `..` in PRecordOpen. The list is built
---        in reversed order and reversed in the PRecordOpen action.
+--        in reversed order and reversed in the PRecord/PRecordOpen actions.
 --        See grammar/Wok.cf POST-REGEN NOTE.
 NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
 NEListRecordFieldPat
@@ -233,7 +274,8 @@ ListPat
 
 Type :: { GeneratedParser.Wok.Abs.Type }
 Type
-  : Type1 '->' Type 'with' EffectRow { GeneratedParser.Wok.Abs.TWith $1 $3 $5 }
+  : Type1 '=>' Type { GeneratedParser.Wok.Abs.TQual $1 $3 }
+  | Type1 '->' Type 'with' EffectRow { GeneratedParser.Wok.Abs.TWith $1 $3 $5 }
   | Type1 '->' Type { GeneratedParser.Wok.Abs.TFun $1 $3 }
   | Type1 { $1 }
 

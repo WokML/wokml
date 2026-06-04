@@ -6,18 +6,25 @@ module Wok.IR.Elaborate
 
 import Control.Monad.Reader
 import Control.Monad.State.Strict (State)
+import Data.List (elemIndex)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
 import Wok.IR.Name
-import Wok.TypeChecking.Env (Env, envVars, lookupCon, conArity, lookupRecordCon, rcFields)
+import Wok.TypeChecking.Env
+  ( Env, envVars, lookupCon, conArity, lookupRecordCon, rcFields
+  , classOfMethod, lookupClass, ClassInfo (..) )
 import Wok.TypeChecking.Infer (TypedDecl (..))
 import Wok.TypeChecking.Typed
   ( Texp (..), TexpF (..), Tpat (..), TpatF (..)
   , TAlt (..), THandlerArm (..), TLocalDecl (..)
   , TExpr, TPat )
-import Wok.TypeChecking.Types (CType)
+import Wok.TypeChecking.Types
+  ( CType (..), TyCon (..), Constraint (..), Evidence (..) )
+import qualified Wok.TypeChecking.Solve as Solve
 
 -- ---------------------------------------------------------------------------
 -- Annotation accessors
@@ -30,9 +37,11 @@ teType (Texp ty _) = ty
 -- Context and monad
 
 data ElabCtx = ElabCtx
-  { ecEnv     :: Env                 -- carried for record and effect elaboration
-  , ecScope   :: Map.Map Text Name   -- local binders in scope
-  , ecGlobals :: Map.Map Text Name   -- top-level/builtin names
+  { ecEnv         :: Env                 -- carried for record and effect elaboration
+  , ecScope       :: Map.Map Text Name   -- local binders in scope
+  , ecGlobals     :: Map.Map Text Name   -- top-level/builtin names
+  , ecEvidence    :: Map.Map Text Name   -- evidence-param name -> its dict binder
+  , ecEvidenceIdx :: Set Int             -- in-scope quantified-constraint indices
   }
 
 -- | Elab is a reader over the elaboration context, built on top of Fresh.
@@ -221,6 +230,102 @@ elabParams (p:ps) = do
 -- ---------------------------------------------------------------------------
 -- Core elaboration
 
+-- ---------------------------------------------------------------------------
+-- Evidence / dictionary lowering (Task 10)
+
+-- | Build the dictionary atom witnessing a single class constraint, then pass
+-- it to the continuation. 'Solve.resolve' is total here by construction: the
+-- type-checker already proved the constraint dischargeable, so a 'Left' is an
+-- internal invariant violation (panic, mirroring elaboration's other panics).
+evidenceAtom :: (Text, CType) -> (Atom -> Elab Expr) -> Elab Expr
+evidenceAtom (cls, argTy) k = do
+  ctx <- ask
+  case Solve.resolve (ecEnv ctx) (ecEvidenceIdx ctx) cls argTy of
+    Left e   -> error ("elaborate: unresolvable constraint "
+                        <> Tx.unpack cls <> " (" <> show argTy <> "): " <> show e)
+    Right ev -> lowerEvidence ev k
+
+-- | Lower an 'Evidence' term into a dictionary 'Atom', emitting let-bindings
+-- for any 'EvApp' dict-builder applications, then continue.
+lowerEvidence :: Evidence -> (Atom -> Elab Expr) -> Elab Expr
+lowerEvidence (EvGlobal d) k = resolveVar d >>= k
+lowerEvidence (EvParam p)  k = do
+  ctx <- ask
+  case Map.lookup p (ecEvidence ctx) of
+    Just n  -> k (AVar n)
+    Nothing -> resolveVar p >>= k   -- defensive: fall back to a global/fresh
+lowerEvidence (EvApp d evs) k =
+  lowerEvidenceAll evs $ \subAtoms -> do
+    dA <- resolveVar d
+    n  <- bindFresh (Tx.pack "dict")
+    -- The dict-builder result type is erased; a nullary user con stands in.
+    let dictTy = CTCon (TcUser d) []
+    Let (Binder n Unrestricted dictTy) (RApp dA subAtoms) <$> k (AVar n)
+
+-- | Lower a list of evidence terms left-to-right, collecting the atoms.
+lowerEvidenceAll :: [Evidence] -> ([Atom] -> Elab Expr) -> Elab Expr
+lowerEvidenceAll []       k = k []
+lowerEvidenceAll (e:es)   k =
+  lowerEvidence e $ \a -> lowerEvidenceAll es $ \as -> k (a : as)
+
+-- | Lower a 'TQVar' use (a constrained-identifier reference), given the already
+-- normalized argument atoms (empty for a bare value use), and a continuation
+-- expecting the resulting 'Rhs'.
+--
+-- Two cases, distinguished by whether the name is a class method:
+--
+-- * Class method: project the method out of its dictionary via a single-alt
+--   'Case' over the dict, then apply it to the args INSIDE the alt (so the
+--   projected field stays in scope). The continuation runs inside the alt.
+--
+-- * Ordinary constrained function: resolve each constraint to a dict atom and
+--   pass the dicts as LEADING arguments to the function.
+lowerTQVar :: CType -> Text -> [(Text, CType)] -> [Atom]
+           -> (Rhs -> Elab Expr) -> Elab Expr
+lowerTQVar ty name cs args k = do
+  ctx <- ask
+  case classOfMethod name (ecEnv ctx) of
+    Just cls ->
+      -- Class method: cs is exactly the single constraint for this method.
+      let argTy = case lookup cls cs of
+            Just t  -> t
+            Nothing -> case cs of
+              ((_, t) : _) -> t
+              []           -> error ("elaborate: TQVar class method "
+                                      <> Tx.unpack name <> " has no constraint")
+      in case lookupClass cls (ecEnv ctx) of
+           Nothing -> error ("elaborate: unknown class " <> Tx.unpack cls)
+           Just ci ->
+             case elemIndex name (ciMethodNames ci) of
+               Nothing -> error ("elaborate: method " <> Tx.unpack name
+                                  <> " not in class " <> Tx.unpack cls)
+               Just idx ->
+                 evidenceAtom (cls, argTy) $ \dAtom -> do
+                   -- One field binder per declared method; project field `idx`.
+                   -- Field binder types are erased; the use-site type stands in.
+                   fns <- mapM (const (bindFresh (Tx.pack "f"))) (ciMethodNames ci)
+                   let dictCon      = ciDictCon ci
+                       fieldBinders = map (\n -> Binder n Unrestricted ty) fns
+                       methodAt     = AVar (fns !! idx)
+                   altBody <-
+                     if null args
+                       then k (RAtom methodAt)
+                       else k (RApp methodAt args)
+                   pure (Case dAtom [AltCon dictCon fieldBinders altBody])
+    Nothing ->
+      -- Ordinary constrained function: dicts become leading arguments.
+      lowerEvidenceAtoms cs $ \evs -> do
+        fA <- resolveVar name
+        k (RApp fA (evs ++ args))
+
+-- | Lower each constraint of a 'TQVar' to a dict atom, left-to-right.
+lowerEvidenceAtoms :: [(Text, CType)] -> ([Atom] -> Elab Expr) -> Elab Expr
+lowerEvidenceAtoms []       k = k []
+lowerEvidenceAtoms (c:cs)   k =
+  evidenceAtom c $ \a -> lowerEvidenceAtoms cs $ \as -> k (a : as)
+
+-- ---------------------------------------------------------------------------
+
 -- | Elaborate to a single Rhs (naming sub-parts first), then continue.
 elabRhs :: TExpr -> (Rhs -> Elab Expr) -> Elab Expr
 elabRhs (Texp ty node) = elabRhsF ty node
@@ -243,6 +348,11 @@ elabRhsF _ (TParenOp s) k = do
   a <- resolveVar s
   k (RAtom a)
 
+-- Constrained-identifier use as a BARE value (no args): lower the evidence
+-- and either project the method out of its dict, or partially apply the
+-- constrained function to its leading dict arguments.
+elabRhsF ty (TQVar n cs) k = lowerTQVar ty n cs [] k
+
 -- Constructor: eta-expand if arity > 0, emit RCon [] if nullary
 elabRhsF ty (TCon c) k = do
   a <- conArityOf c
@@ -261,6 +371,10 @@ elabRhsF ty (TApp hd args) k =
         rhs <- saturateCon ty c atoms a
         k rhs
       Texp _ (TProjCon effect op) -> k (ROp effect op atoms)
+      -- Constrained-identifier as APP head: lower with the arg atoms, so a
+      -- class method is case-projected then applied inside its alt, and an
+      -- ordinary constrained function gets its dicts as leading args.
+      Texp hty (TQVar n cs) -> lowerTQVar hty n cs atoms k
       _ -> normName hd $ \h -> k (RApp h atoms)
 
 -- Lambda
@@ -602,14 +716,35 @@ isBodylessSig td = case (tdParams td, tdBody td) of
   _                     -> False
 
 -- | Elaborate one TypedDecl into a 'TopBind', given the resolved global Name.
+--
+-- For a constrained binding, the declared evidence parameters ('tdEvidence')
+-- are lowered into dictionary binders prepended BEFORE the value parameters,
+-- and an evidence scope (paramName -> binder, plus the in-scope quantified
+-- indices for 'Solve') is threaded through the body. Unconstrained bindings
+-- ('tdEvidence' empty) elaborate byte-identically to before.
 elabTopBind :: Map.Map Text Name -> TypedDecl -> Elab TopBind
 elabTopBind globals td = do
   let fname = tdName td
       name  = Map.findWithDefault (errName fname) fname globals
-  (paramBinders, extender) <- elabParams (tdParams td)
-  bodyExpr <- extender (elabTail (tdBody td))
-  pure (TopBind name paramBinders bodyExpr)
-  where errName t = error ("elaborateModule: top-level name not in env: " <> Tx.unpack t)
+  -- Lower the evidence parameters into dict binders.
+  evBinders <- mapM mintEvidenceBinder (tdEvidence td)
+  let evScope = Map.fromList
+        [ (pName, bndName b) | ((pName, _), b) <- zip (tdEvidence td) evBinders ]
+      evIdx = Set.fromList [ i | (_, Constraint _ (CTGen i)) <- tdEvidence td ]
+  local (\ctx -> ctx { ecEvidence = evScope, ecEvidenceIdx = evIdx }) $ do
+    (paramBinders, extender) <- elabParams (tdParams td)
+    bodyExpr <- extender (elabTail (tdBody td))
+    pure (TopBind name (evBinders ++ paramBinders) bodyExpr)
+  where
+    errName t = error ("elaborateModule: top-level name not in env: " <> Tx.unpack t)
+    -- Mint a dict binder for one evidence parameter. The binder type is the
+    -- dict data type (annotation only; erased at runtime).
+    mintEvidenceBinder (pName, Constraint cls argTy) = do
+      n <- bindFresh pName
+      let dictTy = case argTy of
+            CTGen i -> CTCon (TcUser cls) [CTGen i]
+            _       -> CTCon (TcUser cls) [argTy]
+      pure (Binder n Unrestricted dictTy)
 
 -- | Elaborate every top-level binding in a module into a 'TopBind'.
 -- One canonical 'Name' is minted for every value-level global (from 'envVars'),
@@ -620,7 +755,7 @@ elaborateModule env tds =
     gpairs <- mapM (\t -> (,) t <$> freshName t) (Map.keys (envVars env))
     let globals = Map.fromList gpairs
     binds <- mapM (\td -> runReaderT (elabTopBind globals td)
-                                     (ElabCtx env Map.empty globals))
+                                     (ElabCtx env Map.empty globals Map.empty Set.empty))
                   (filter (not . isBodylessSig) tds)
     pure (CoreModule binds)
 
@@ -638,7 +773,8 @@ elaborateModulesShared mods =
     pure (CoreModule binds)
   where
     elabOne globals (env, tds) =
-      mapM (\td -> runReaderT (elabTopBind globals td) (ElabCtx env Map.empty globals))
+      mapM (\td -> runReaderT (elabTopBind globals td)
+                              (ElabCtx env Map.empty globals Map.empty Set.empty))
            (filter (not . isBodylessSig) tds)
 
 -- ---------------------------------------------------------------------------
@@ -646,4 +782,4 @@ elaborateModulesShared mods =
 
 elaborateExprForTest :: Env -> TExpr -> Expr
 elaborateExprForTest env e =
-  runFresh (runReaderT (elabTail e) (ElabCtx env Map.empty Map.empty))
+  runFresh (runReaderT (elabTail e) (ElabCtx env Map.empty Map.empty Map.empty Set.empty))

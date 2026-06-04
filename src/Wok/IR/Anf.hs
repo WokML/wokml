@@ -344,6 +344,7 @@ renderTop fmt tbl (TopBind n ps e) =
 prettyCTypeLocal :: CType -> Text
 prettyCTypeLocal (CTGen i)            = Tx.pack "a" <> Tx.pack (show i)
 prettyCTypeLocal (CTCon TcU64    [])  = Tx.pack "U64"
+prettyCTypeLocal (CTCon TcU32    [])  = Tx.pack "U32"
 prettyCTypeLocal (CTCon TcChar   [])  = Tx.pack "Char"
 prettyCTypeLocal (CTCon TcString [])  = Tx.pack "String"
 prettyCTypeLocal (CTCon TcBool   [])  = Tx.pack "Bool"

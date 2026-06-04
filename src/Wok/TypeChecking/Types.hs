@@ -18,6 +18,10 @@ module Wok.TypeChecking.Types
   , CRow (..)
     -- * Type schemes (generalised types)
   , Scheme (..)
+  , mkScheme
+    -- * Class constraints and evidence
+  , Constraint (..)
+  , Evidence (..)
     -- * Type-constructor tags
   , TyCon (..)
     -- * Generalisation levels
@@ -38,6 +42,7 @@ newtype Level = Level Int
 
 data TyCon
   = TcU64
+  | TcU32
   | TcChar
   | TcString
   | TcBool
@@ -89,7 +94,26 @@ data CRow
   deriving (Eq, Show)
 
 data Scheme = Scheme
-  { schemeVars :: [(Int, Kind)]
-  , schemeBody :: CType
+  { schemeVars        :: [(Int, Kind)]
+  , schemeConstraints :: [Constraint]   -- ^ qualified prefix, e.g. [Eq (CTGen 0)]
+  , schemeBody        :: CType
   }
+  deriving (Eq, Show)
+
+-- | A scheme with no class constraints (the overwhelmingly common case).
+mkScheme :: [(Int, Kind)] -> CType -> Scheme
+mkScheme vs body = Scheme vs [] body
+
+-- | A single class constraint, e.g. @Eq a@ (single-parameter classes only).
+data Constraint = Constraint
+  { conClass :: Text   -- ^ class name, e.g. "Eq"
+  , conArg   :: CType  -- ^ the (closed) argument type
+  }
+  deriving (Eq, Show)
+
+-- | A dictionary-passing witness for a discharged constraint.
+data Evidence
+  = EvGlobal Text             -- ^ a ground instance dict, e.g. "dict$Eq$U64"
+  | EvParam  Text             -- ^ an in-scope dictionary parameter, e.g. "d$Eq$0"
+  | EvApp    Text [Evidence]  -- ^ a dict-builder applied to sub-evidence
   deriving (Eq, Show)

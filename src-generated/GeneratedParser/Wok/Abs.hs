@@ -23,11 +23,29 @@ data Decl
     | DData ConId [VarId] [ConDef]
     | DEffect ConId [VarId] [RecordFieldType]
     | DFixity FixName FixAssoc [FixRel]
+    | DClass ConId [VarId] [ClassEntry]
+    | DInstance InstHead [InstEntry]
     | DModule ModPath
     | DImport ModPath
     | DUse ModPath
     | DLocal Decl
     | DReserved ReservedKw
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data InstHead
+    = IHPlain ConId [Type] | IHCtx [Constraint] ConId [Type]
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data MethodName = MNBare VarId | MNParen VarSym
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ClassEntry = CESig MethodName Type | CEDefault FunLHS Exp
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data InstEntry = IEImpl FunLHS Exp
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data Constraint = Constraint ConId [Type]
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data ModPath = MPName ConId | MPDot ModPath ConId
@@ -36,8 +54,6 @@ data ModPath = MPName ConId | MPDot ModPath ConId
 data ReservedKw
     = ReservedKw_contract
     | ReservedKw_type
-    | ReservedKw_class
-    | ReservedKw_instance
     | ReservedKw_deriving
     | ReservedKw_forall
     | ReservedKw_do
@@ -92,7 +108,8 @@ data PatRowTail = PRTNamed VarId | PRTAnon
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data Type
-    = TWith Type Type EffectRow
+    = TQual Type Type
+    | TWith Type Type EffectRow
     | TFun Type Type
     | TApp Type Type
     | TVar VarId

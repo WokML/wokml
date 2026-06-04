@@ -7,6 +7,7 @@ module Wok.Interp.Machine
   ) where
 
 import qualified Data.Map.Strict as Map
+import qualified Data.Map.Lazy as MapL
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
@@ -185,15 +186,35 @@ run prims = loop
 evalExprWith :: Env -> Expr -> Either RuntimeError Value
 evalExprWith env e = run primTable (Eval e (Scope env Map.empty) KDone)
 
--- | Whole-module entry -- implemented in Task 5.
+-- | Whole-module entry.
+--
+-- Builds a knot-tied global environment: arity-0 top-level binds (CAFs) are
+-- EVALUATED once to a 'Value' and shared; arity>0 binds stay 'VClosure's.
+-- The env is built with 'Data.Map.Lazy' so each CAF value is a thunk forced on
+-- demand, letting a CAF body refer to other globals (knot-tying) without a
+-- force-time cycle. Ground instance dictionaries lower to 0-arity record values
+-- and rely on this so their fields capture 'gEnv' lazily.
+--
+-- 'main' is itself a 0-arity bind, so it also gets a forced entry in 'gEnv'.
+-- That entry is a lazy thunk that is never demanded (nothing references 'main'),
+-- so main's body does NOT run via 'gEnv'. The final 'case' below re-runs main's
+-- body explicitly and returns that result, preserving exact prior behavior.
 runModule :: CoreModule -> Either RuntimeError Value
 runModule (CoreModule binds) =
-  case [ nameHint n | TopBind n [] _ <- binds, nameHint n /= Tx.pack "main" ] of
-    (cafHint : _) -> Left (UnsupportedCaf cafHint)
-    [] ->
-      let gEnv = foldr addBind Map.empty binds
-          addBind (TopBind n ps body) e = Map.insert (nameUniq n) (VClosure gEnv ps body) e
-      in case [ tb | tb@(TopBind n _ _) <- binds, nameHint n == Tx.pack "main" ] of
-           (TopBind _ [] body : _) -> run primTable (Eval body (Scope gEnv Map.empty) KDone)
-           (TopBind{}        : _)  -> Left (ArityError (Tx.pack "main must take no arguments"))
-           []                      -> Left (UnboundVar (Tx.pack "main"))
+  let gEnv = MapL.fromList (map entry binds)
+      entry (TopBind n ps body)
+        | null ps   = (nameUniq n, forceTop body)
+        | otherwise = (nameUniq n, VClosure gEnv ps body)
+      -- A 0-arity bind evaluates to a Value once. Forcing a dictionary record
+      -- only evaluates its spine to a VRecord (field closures capture gEnv
+      -- lazily), so this does not recurse into other CAFs at force time.
+      -- A Left here means a compiler-generated CAF failed to evaluate, which is
+      -- an internal invariant violation (analogous to elaboration's
+      -- panic-on-impossible) -- dictionaries never fail to evaluate.
+      forceTop body = case run primTable (Eval body (Scope gEnv Map.empty) KDone) of
+        Right v  -> v
+        Left err -> error ("runModule: CAF evaluation failed: " <> show err)
+  in case [ tb | tb@(TopBind n _ _) <- binds, nameHint n == Tx.pack "main" ] of
+       (TopBind _ [] body : _) -> run primTable (Eval body (Scope gEnv Map.empty) KDone)
+       (TopBind{}         : _) -> Left (ArityError (Tx.pack "main must take no arguments"))
+       []                      -> Left (UnboundVar (Tx.pack "main"))

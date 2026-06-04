@@ -1,0 +1,4 @@
+module Fail.NoInstance
+import Std.Base
+
+bad = "a" == "b"
