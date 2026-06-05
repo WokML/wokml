@@ -1,0 +1,14 @@
+zipSum p.1 p.2 =
+  join j30(x, xs, y, ys) =
+    let t.1 = +(x, y)
+    let t.2 = zipSum(xs, ys)
+    let t.3 = +(t.1, t.2)
+    t.3
+  join j38() =
+    0
+  case p.1 of
+    Cons f.1 f.2 ->
+      case p.2 of
+        Cons f.3 f.4 -> jump j30(f.1, f.2, f.3, f.4)
+        _ -> jump j38()
+    _ -> jump j38()

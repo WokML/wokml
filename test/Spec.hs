@@ -39,6 +39,7 @@ import qualified Wok.Interp.Value as IV
 import qualified Wok.Interp.Prim as IP
 import qualified Wok.Interp.Machine as IM
 import qualified Wok.IR.Name as Name
+import qualified Wok.IR.Match as M
 import qualified Wok.Interp as Interp
 import qualified System.Directory as Dir
 import qualified Control.Monad
@@ -96,6 +97,9 @@ main = do
     , exprLetTests
     , inferTypedTests
     , typedDeclBodyTests
+    , clauseArityTests
+    , unsupportedHeadTests
+    , typedDeclClauseTests
     , programTests
     , bodylessSigTests
     , loaderTests
@@ -110,6 +114,7 @@ main = do
     , recordPatternTests
     , rowShadowTests
     , patternCoverageTests
+    , matchWarningTests
     , blockLayoutTests
     , irNameTests
     , anfTests
@@ -134,6 +139,8 @@ main = do
     , eqInferTests
     , eqDesugarTests
     , eqElaborateTests
+    , matchCompilerTests
+    , matchCoverageTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -1226,16 +1233,16 @@ typedDeclBodyTests = testGroup "TypedDeclBody"
                     case TC.tdScheme d of
                       Ty.Scheme [_] _ (Ty.CTArr (Ty.CTGen i) _ (Ty.CTGen j))
                         | i == j ->
-                          let bodyAnn = case TC.tdBody d of Typed.Texp a _ -> a
-                          in case TC.tdParams d of
-                               [Typed.Tpat (Ty.CTGen pIdx) (Typed.TPVar nm)] -> do
-                                 -- one quantifier, arrow a -> a
+                          case TC.tdClauses d of
+                            [([Typed.Tpat (Ty.CTGen pIdx) (Typed.TPVar nm)],
+                              Typed.Texp bodyAnn _)] -> do
+                                 -- one clause, one quantifier, arrow a -> a
                                  -- body's root annotation is the domain CTGen i
                                  bodyAnn @?= Ty.CTGen i
                                  pIdx @?= i
                                  nm @?= T.pack "x"
-                               other ->
-                                 assertFailure ("unexpected tdParams: " ++ show other)
+                            other ->
+                                 assertFailure ("unexpected tdClauses: " ++ show other)
                       other ->
                         assertFailure ("unexpected scheme: " ++ show other)
   , testCase "f x = let g y = y in x: node-only poly var does not leak into scheme" $
@@ -1262,6 +1269,108 @@ typedDeclBodyTests = testGroup "TypedDeclBody"
                       other ->
                         assertFailure ("unexpected scheme: " ++ show other)
   ]
+
+-- | Equations for the same name that disagree on argument count are rejected
+-- with 'ClauseArityMismatch'. The arity check runs before inference, so it
+-- works on a self-contained module using only builtin types.
+clauseArityTests :: TestTree
+clauseArityTests = testGroup "ClauseArity"
+  [ testCase "equations disagreeing on arity are rejected" $
+      assertModuleFailsWith isClauseArity $ T.unlines
+        [ T.pack "f : U64 -> U64 -> U64"
+        , T.pack "f 0 = 0"
+        , T.pack "f x y = y" ]
+  , testCase "equations agreeing on arity are accepted" $
+      assertModuleTypechecks $ T.unlines
+        [ T.pack "f : U64 -> U64 -> U64"
+        , T.pack "f 0 y = y"
+        , T.pack "f x y = y" ]
+  ]
+  where
+    isClauseArity e = case e of
+      TErr.ClauseArityMismatch{} -> True
+      _                          -> False
+
+-- | Head-pattern shapes the match compiler cannot lower (record-constructor
+-- patterns and non-empty list literals in a routed-through-match head) are
+-- rejected at typecheck time with a clean 'UnsupportedHeadPattern', BEFORE any
+-- coverage warning fires. Single-clause record heads take the cheap projection
+-- path and must still type-check.
+unsupportedHeadTests :: TestTree
+unsupportedHeadTests = testGroup "UnsupportedHead"
+  [ testCase "multi-clause record-constructor head is a clean type error" $ do
+      let src = T.unlines
+            [ T.pack "data Box = Box { v : U64 }"
+            , T.pack "f : Box -> U64"
+            , T.pack "f (Box { v = 0 }) = 0"
+            , T.pack "f (Box { v = x }) = x" ]
+      assertNoRedundantBeforeUnsupported src
+
+  , testCase "non-empty list literal head is a clean type error" $ do
+      let src = T.unlines
+            [ T.pack "g : [U64] -> U64"
+            , T.pack "g [1, 2] = 1"
+            , T.pack "g _      = 0" ]
+      assertNoRedundantBeforeUnsupported src
+
+  , testCase "single-clause record head still type-checks (cheap path preserved)" $ do
+      let src = T.unlines
+            [ T.pack "data Box = Box { v : U64 }"
+            , T.pack "getV : Box -> U64"
+            , T.pack "getV (Box { v = x }) = x" ]
+      assertModuleTypechecks src
+  ]
+  where
+    -- Run with UserFile origin (the origin that WOULD emit coverage warnings)
+    -- and assert the result is the clean UnsupportedHeadPattern error -- the
+    -- error short-circuits inference, so no RedundantClause/NonExhaustiveMatch
+    -- warning can ever precede it.
+    assertNoRedundantBeforeUnsupported src =
+      case parse src of
+        Left err  -> assertFailure ("parse: " ++ err)
+        Right ast -> case reorderModule ast of
+          Left es -> assertFailure ("reorder: " ++ show es)
+          Right rm ->
+            case TC.inferProgramWith B.initialEnv (SO.UserFile "<test>")
+                   (reorderedAst rm) of
+              Left TErr.UnsupportedHeadPattern{} -> pure ()
+              Left e  -> assertFailure ("expected UnsupportedHeadPattern, got: " ++ show e)
+              Right _ -> assertFailure "expected UnsupportedHeadPattern, got success"
+
+-- | A multi-clause function keeps EVERY clause on its 'TypedDecl' (the
+-- finalizer no longer drops all-but-first). A single-clause binding round-trips
+-- as a one-element clause list.
+typedDeclClauseTests :: TestTree
+typedDeclClauseTests = testGroup "typedDeclClause"
+  [ testCase "two-clause function carries two clauses" $
+      withDeclsFor (T.unlines
+        [ T.pack "data Nat = Z | S Nat"
+        , T.pack "f : Nat -> U64"
+        , T.pack "f Z = 0"
+        , T.pack "f (S n) = 1" ]) (T.pack "f") $ \d ->
+          length (TC.tdClauses d) @?= 2
+  , testCase "single-clause binding round-trips as one clause" $
+      withDeclsFor (T.pack "id x = x\n") (T.pack "id") $ \d ->
+          length (TC.tdClauses d) @?= 1
+  , testCase "zero-arg value round-trips as one empty-param clause" $
+      withDeclsFor (T.pack "answer = 42\n") (T.pack "answer") $ \d ->
+          case TC.tdClauses d of
+            [([], _)] -> pure ()
+            other     -> assertFailure ("unexpected clauses: " ++ show other)
+  ]
+  where
+    withDeclsFor src nm k =
+      case parse src of
+        Left err -> assertFailure ("parse: " ++ err)
+        Right ast -> case reorderModule ast of
+          Left es -> assertFailure ("reorder: " ++ show es)
+          Right rm ->
+            case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+              Left e -> assertFailure ("typecheck: " ++ show e)
+              Right (_env, decls, _ws) ->
+                case [ d | d <- decls, TC.tdName d == nm ] of
+                  []      -> assertFailure ("no TypedDecl for " ++ T.unpack nm)
+                  (d : _) -> k d
 
 -- | Parse, reorder, and typecheck a whole module; assert it succeeds.
 assertModuleTypechecks :: Text -> Assertion
@@ -3217,6 +3326,39 @@ patternCoverageTests = testGroup "PatternCoverage"
   ]
 
 -- ---------------------------------------------------------------------------
+-- Match warning tests (non-exhaustive heads + redundant clauses)
+-- ---------------------------------------------------------------------------
+
+matchWarningTests :: TestTree
+matchWarningTests = testGroup "MatchWarnings"
+  [ testCase "partial single clause warns non-exhaustive" $ do
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "safeHead : [U64] -> U64"
+            , "safeHead (x :: xs) = x" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.NonExhaustiveMatch _ n <- ws, n == T.pack "safeHead" ] @?= 1
+
+  , testCase "total function: no non-exhaustive warning" $ do
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "isNil : [U64] -> U64"
+            , "isNil []        = 1"
+            , "isNil (x :: xs) = 0" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.NonExhaustiveMatch _ _ <- ws ] @?= 0
+
+  , testCase "shadowed clause warns redundant" $ do
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "f : U64 -> U64"
+            , "f x = x"
+            , "f 0 = 0" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.RedundantClause _ n _ <- ws, n == T.pack "f" ] @?= 1
+  ]
+
+-- ---------------------------------------------------------------------------
 -- BlockLayout tests
 -- ---------------------------------------------------------------------------
 
@@ -4950,3 +5092,159 @@ eqElaborateTests = testGroup "ElaborateClass"
 
     firstJust :: [Maybe a] -> Maybe a
     firstJust = Data.Maybe.listToMaybe . Data.Maybe.catMaybes
+
+matchCompilerTests :: TestTree
+matchCompilerTests = testGroup "MatchCompiler"
+  [ testCase "single constructor column: one Case, complete signature, no default" $ do
+      let oracle = M.ConOracle
+            { M.coArity = \t -> if t == T.pack "Some" then 1 else 0
+            , M.coSiblings = \_ -> Just [T.pack "None", T.pack "Some"] }
+          ty = Ty.CTCon Ty.TcUnit []
+          j0 = Name.JoinId (Name.Unique 100)
+          j1 = Name.JoinId (Name.Unique 101)
+          rows =
+            [ M.Row [M.MPat ty (M.MCon (T.pack "None") [])] [] j0 [] 0
+            , M.Row [M.MPat ty (M.MCon (T.pack "Some")
+                       [M.MPat ty (M.MVar (Just (T.pack "x")))])] [] j1 [T.pack "x"] 1 ]
+          expr = runFresh
+            (M.compileMatch oracle [Anf.AVar (Name.Name (T.pack "m") (Name.Unique 1))] rows)
+      case expr of
+        Anf.Case _ alts -> do
+          length alts @?= 2
+          [ () | Anf.AltDefault _ <- alts ] @?= []
+          -- Assert None alt routes to j0 with no atoms.
+          case [ body | Anf.AltCon c [] body <- alts, c == T.pack "None" ] of
+            [body] -> body @?= Anf.Jump j0 []
+            _      -> assertFailure "expected AltCon \"None\" [] ..."
+          -- Assert Some alt binds the field and routes to j1 with that atom.
+          case [ (fieldBinder, body)
+               | Anf.AltCon c [fieldBinder] body <- alts, c == T.pack "Some" ] of
+            [(fieldBinder, body)] ->
+              body @?= Anf.Jump j1 [Anf.AVar (Anf.bndName fieldBinder)]
+            _ -> assertFailure "expected AltCon \"Some\" [_] ..."
+        other -> assertFailure ("expected Case, got: " ++ show other)
+
+  , testCase "two columns: nested Case with cross-clause fallthrough" $ do
+      let oracle = M.ConOracle
+            { M.coArity = \t -> if t == T.pack "Cons" then 2 else 0
+            , M.coSiblings = \_ -> Just [T.pack "Nil", T.pack "Cons"] }
+          ty = Ty.CTCon Ty.TcUnit []
+          v  s = M.MPat ty (M.MVar (Just (T.pack s)))
+          cons h t = M.MPat ty (M.MCon (T.pack "Cons") [h, t])
+          wild = M.MPat ty (M.MVar Nothing)
+          jA = Name.JoinId (Name.Unique 200)
+          jB = Name.JoinId (Name.Unique 201)
+          rows =
+            [ M.Row [cons (v "x") (v "xs"), cons (v "y") (v "ys")] []
+                    jA [T.pack "x", T.pack "xs", T.pack "y", T.pack "ys"] 0
+            , M.Row [wild, wild] [] jB [] 1 ]
+          a1 = Anf.AVar (Name.Name (T.pack "a") (Name.Unique 1))
+          a2 = Anf.AVar (Name.Name (T.pack "b") (Name.Unique 2))
+          expr = runFresh (M.compileMatch oracle [a1, a2] rows)
+          jumps = collectJumps expr
+      case expr of
+        Anf.Case _ alts -> assertBool "nested Case present" (any isNestedCase alts)
+        other -> assertFailure ("expected Case, got: " ++ show other)
+      assertBool "jA reachable via Cons/Cons clause" (jA `elem` jumps)
+      assertBool "jB reachable via wildcard fallthrough" (jB `elem` jumps)
+
+  , testCase "literal column tests constructor once then switches literal" $ do
+      let oracle = M.ConOracle
+            { M.coArity = \t -> if t == T.pack "Just" then 1 else 0
+            , M.coSiblings = \_ -> Just [T.pack "Just", T.pack "Nothing"] }
+          ty = Ty.CTCon Ty.TcUnit []
+          just p = M.MPat ty (M.MCon (T.pack "Just") [p])
+          lit0 = M.MPat ty (M.MLit (Anf.LInt 0))
+          wild = M.MPat ty (M.MVar Nothing)
+          none = M.MPat ty (M.MCon (T.pack "Nothing") [])
+          j0 = Name.JoinId (Name.Unique 300)
+          j1 = Name.JoinId (Name.Unique 301)
+          j2 = Name.JoinId (Name.Unique 302)
+          rows =
+            [ M.Row [just lit0] [] j0 [] 0
+            , M.Row [just wild] [] j1 [] 1
+            , M.Row [none]      [] j2 [] 2 ]
+          a1 = Anf.AVar (Name.Name (T.pack "m") (Name.Unique 1))
+          expr = runFresh (M.compileMatch oracle [a1] rows)
+      case expr of
+        Anf.Case _ alts -> case [ e | Anf.AltCon c _ e <- alts, c == T.pack "Just" ] of
+          (Anf.Case _ inner : _) ->
+            assertBool "inner switch is on a literal"
+              (any (\x -> case x of Anf.AltLit _ _ -> True; _ -> False) inner)
+          _ -> assertFailure "expected a nested Case under AltCon Just"
+        other -> assertFailure ("expected Case, got: " ++ show other)
+  ]
+  where
+    isNestedCase (Anf.AltCon _ _ (Anf.Case _ _)) = True
+    isNestedCase _                               = False
+
+    -- Recursively collect all Jump targets in an Expr.
+    collectJumps :: Anf.Expr -> [Name.JoinId]
+    collectJumps (Anf.Jump j _)         = [j]
+    collectJumps (Anf.Ret _)            = []
+    collectJumps (Anf.Let _ rhs e)      = collectJumpsRhs rhs ++ collectJumps e
+    collectJumps (Anf.LetRec defs e)    = concatMap (\(_,_,b) -> collectJumps b) defs ++ collectJumps e
+    collectJumps (Anf.LetJoin _ _ jb e) = collectJumps jb ++ collectJumps e
+    collectJumps (Anf.Case _ alts)      = concatMap collectJumpsAlt alts
+    collectJumps (Anf.Handle e h)       =
+      collectJumps e
+        ++ collectJumps (snd (Anf.hReturn h))
+        ++ concatMap (collectJumps . Anf.oaBody) (Anf.hOps h)
+
+    collectJumpsRhs :: Anf.Rhs -> [Name.JoinId]
+    collectJumpsRhs (Anf.RLam _ e) = collectJumps e
+    collectJumpsRhs _              = []
+
+    collectJumpsAlt :: Anf.Alt -> [Name.JoinId]
+    collectJumpsAlt (Anf.AltCon _ _ e)  = collectJumps e
+    collectJumpsAlt (Anf.AltLit _ e)    = collectJumps e
+    collectJumpsAlt (Anf.AltDefault e)  = collectJumps e
+
+matchCoverageTests :: TestTree
+matchCoverageTests = testGroup "MatchCoverage"
+  [ testCase "single partial clause is non-exhaustive" $ do
+      let oracle = M.ConOracle
+            { M.coArity = \t -> if t == T.pack "Cons" then 2 else 0
+            , M.coSiblings = \_ -> Just [T.pack "Nil", T.pack "Cons"] }
+          ty = Ty.CTCon Ty.TcUnit []
+          cons = M.MPat ty (M.MCon (T.pack "Cons")
+                   [M.MPat ty (M.MVar (Just (T.pack "x")))
+                   ,M.MPat ty (M.MVar (Just (T.pack "xs")))])
+          rows = [ M.Row [cons] [] (Name.JoinId (Name.Unique 1)) [T.pack "x", T.pack "xs"] 0 ]
+          cov  = M.matchCoverage oracle 1 rows
+      M.covExhaustive cov @?= False
+      M.covRedundant cov @?= []
+
+  , testCase "full finite signature is exhaustive" $ do
+      let oracle = M.ConOracle
+            { M.coArity = \t -> if t == T.pack "Cons" then 2 else 0
+            , M.coSiblings = \_ -> Just [T.pack "Nil", T.pack "Cons"] }
+          ty = Ty.CTCon Ty.TcUnit []
+          nil  = M.MPat ty (M.MCon (T.pack "Nil") [])
+          cons = M.MPat ty (M.MCon (T.pack "Cons")
+                   [M.MPat ty (M.MVar Nothing), M.MPat ty (M.MVar Nothing)])
+          rows = [ M.Row [nil]  [] (Name.JoinId (Name.Unique 1)) [] 0
+                 , M.Row [cons] [] (Name.JoinId (Name.Unique 2)) [] 1 ]
+          cov  = M.matchCoverage oracle 1 rows
+      M.covExhaustive cov @?= True
+      M.covRedundant cov @?= []
+
+  , testCase "redundant later clause under an all-var clause" $ do
+      let oracle = M.ConOracle { M.coArity = const 0, M.coSiblings = \_ -> Just [T.pack "A"] }
+          ty = Ty.CTCon Ty.TcUnit []
+          wild = M.MPat ty (M.MVar Nothing)
+          a    = M.MPat ty (M.MCon (T.pack "A") [])
+          rows = [ M.Row [wild] [] (Name.JoinId (Name.Unique 1)) [] 0
+                 , M.Row [a]    [] (Name.JoinId (Name.Unique 2)) [] 1 ]
+          cov  = M.matchCoverage oracle 1 rows
+      M.covExhaustive cov @?= True
+      M.covRedundant cov @?= [1]
+
+  , testCase "literal column is non-exhaustive" $ do
+      let oracle = M.ConOracle { M.coArity = const 0, M.coSiblings = \_ -> Nothing }
+          ty = Ty.CTCon Ty.TcUnit []
+          l0 = M.MPat ty (M.MLit (Anf.LInt 0))
+          rows = [ M.Row [l0] [] (Name.JoinId (Name.Unique 1)) [] 0 ]
+          cov  = M.matchCoverage oracle 1 rows
+      M.covExhaustive cov @?= False
+  ]

@@ -21,6 +21,10 @@ data TypeError
   | UnknownTyCon SourceSpan Text
   | ArityMismatch SourceSpan Text Int Int
     -- ^ name, expected, got
+  | ClauseArityMismatch SourceSpan Text Int Int
+    -- ^ Two equations for the same name disagree on argument count.
+    -- Args: offending equation position, function name, first equation's
+    -- arity, this equation's arity.
   | RowMismatch SourceSpan CRow CRow
   | RowOccursCheck SourceSpan Int CRow
     -- ^ A row variable occurs inside the row being assigned to it.
@@ -111,6 +115,10 @@ data TypeError
   | NoInstance Text Text
     -- ^ No instance exists to discharge a constraint.
     -- Args: class name, type rendering.
+  | UnsupportedHeadPattern SourceSpan Text Text
+    -- ^ A function-head clause group routed through the match compiler contains a
+    -- pattern shape the compiler cannot lower. Args: position, function name,
+    -- a human description of the unsupported pattern.
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint
@@ -135,4 +143,8 @@ data Warning
     -- wildcard). The strict arms are still reachable (they match when the row
     -- variable is instantiated to RowEmpty), but the open-extension case is
     -- not covered. Args: position, the record constructor tag.
+  | NonExhaustiveMatch SourceSpan Text
+    -- ^ A function's clause group does not cover all inputs. Args: position, name.
+  | RedundantClause SourceSpan Text Int
+    -- ^ A clause can never match (shadowed). Args: position, name, 0-based clause index.
   deriving (Eq, Show)

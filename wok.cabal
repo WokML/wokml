@@ -92,6 +92,7 @@ library
         Wok.IR.Name
         Wok.IR.Anf
         Wok.IR.Elaborate
+        Wok.IR.Match
         Wok.Interp
         Wok.Interp.Value
         Wok.Interp.Prim

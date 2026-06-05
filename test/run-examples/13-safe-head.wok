@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+
+headOr0 : [U64] -> U64
+headOr0 (x :: _) = x
+headOr0 []       = 0
+
+main = headOr0 [7, 8]

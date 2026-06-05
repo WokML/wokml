@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+
+sumPairs : [U64] -> [U64] -> U64
+sumPairs (x :: xs) (y :: ys) = x + y + sumPairs xs ys
+sumPairs _         _         = 0
+
+main = sumPairs [1, 2, 3] [10, 20, 30]

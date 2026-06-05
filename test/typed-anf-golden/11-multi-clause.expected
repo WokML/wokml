@@ -1,0 +1,14 @@
+zipSum p.1 : [U64] p.2 : [U64] =
+  join j30(x : U64, xs : [U64], y : U64, ys : [U64]) =
+    let t.1 : U64 = +(x, y)
+    let t.2 : U64 = zipSum(xs, ys)
+    let t.3 : U64 = +(t.1, t.2)
+    t.3
+  join j38() =
+    0
+  case p.1 of
+    Cons f.1 : U64 f.2 : [U64] ->
+      case p.2 of
+        Cons f.3 : U64 f.4 : [U64] -> jump j30(f.1, f.2, f.3, f.4)
+        _ -> jump j38()
+    _ -> jump j38()

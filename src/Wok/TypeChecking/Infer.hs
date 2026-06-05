@@ -23,7 +23,7 @@ module Wok.TypeChecking.Infer
 import qualified Control.Monad.ST
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Except (throwError)
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.List (foldl')
 import qualified Data.List
 import qualified Data.Map.Strict as Map
@@ -47,6 +47,12 @@ import Wok.TypeChecking.Types
   , Scheme (..), mkScheme, TyCon (..), TVar (..), Type (..) )
 import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
 import qualified Wok.TypeChecking.Typed as Ty
+import Wok.IR.Match
+  ( ConOracle (..), Coverage (..), MPat (..), MPatF (..)
+  , matchCoverage, tupleTag )
+import qualified Wok.IR.Match as Match
+import Wok.IR.Anf (Lit (..))
+import Wok.IR.Name (JoinId (..), Unique (..))
 import qualified Wok.TypeChecking.Class as Class
 import qualified Wok.TypeChecking.Solve as Solve
 
@@ -2117,9 +2123,11 @@ finalizeGroup sigMap (name, tv) =
 -- folded into the enclosing body and frozen as part of THIS top-level tree.
 --
 -- The typed equations come from 'unifyGroupWith'. A binding may have several
--- equations (one 'TLocalDecl' each); v1 surfaces the FIRST clause's params and
--- body on the 'TypedDecl'. The scheme covers all clauses (their types were
--- unified), so 'tdScheme' is unaffected by which clause is surfaced.
+-- equations (one 'TLocalDecl' each); EVERY clause is carried on the 'TypedDecl'
+-- as @(params, body)@. All clauses are frozen together under ONE quantification
+-- mapping (by wrapping them in a synthetic @TLam (TList ...)@) so that per-node
+-- 'CTGen' numbering stays consistent across clause bodies. The scheme covers all
+-- clauses (their types were unified), so 'tdScheme' is the same regardless.
 --
 -- The top level never reports escape (no outer scope), so unlike
 -- 'finalizeGroup' this returns a 'TypedDecl' directly.
@@ -2128,15 +2136,19 @@ finalizeGroupTyped
   -> (Text, Type s, [Ty.TLocalDecl (Type s)], [ConstraintS s])
   -> TC s TypedDecl
 finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
-  (paramsS, bodyS) <- case eqDecls of
-    -- Only the first clause is surfaced; multi-clause top-level functions are
-    -- not supported (they were already non-functional on main). Carrying all
-    -- clauses requires a clause list on TypedDecl -- deferred.
-    (Ty.TLocalDecl _ ps b : _) -> pure (ps, b)
+  (arity, clauseList) <- case eqDecls of
     [] -> error ("finalizeGroupTyped: no typed equations for " ++ Tx.unpack name)
-  -- Freeze params + body together under one mapping by wrapping them in a
-  -- synthetic TLam whose own annotation is the binding's principal type.
-  let synthetic = Ty.Texp tv (Ty.TLam paramsS bodyS)
+    (Ty.TLocalDecl _ firstParamsS _ : _) ->
+      pure ( length firstParamsS
+           , [ (ps, b) | Ty.TLocalDecl _ ps b <- eqDecls ] )
+  -- Freeze ALL clauses together under one mapping by wrapping every clause's
+  -- params and body in a single synthetic TLam (params concatenated) whose own
+  -- body is a TList of all clause bodies. Freezing is a structural traversal
+  -- ('generalizeTyped'/'freezeTypedTreeSig' use 'traverse'), so this wrapper
+  -- survives intact and 'unClauses' re-splits it using the uniform arity.
+  let allParamsS = concatMap fst clauseList
+      allBodiesS = map snd clauseList
+      synthetic  = Ty.Texp tv (Ty.TLam allParamsS (Ty.Texp tv (Ty.TList allBodiesS)))
   case Map.lookup name sigMap of
     Just declared -> do
       -- A user signature pins the scheme. Verify it (as 'finalizeGroup'
@@ -2159,7 +2171,7 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
       -- entailment must be checked by ARGUMENT, and the tree's independent CTGen
       -- numbering would lose that identity. The scheme stays the declared one.
       (frozen, _) <- freezeTypedTreeSig synthetic accCs
-      let (ps, b) = unTLam name frozen
+      let clauses = unClauses name arity frozen
       let declared' = nubConstraints (schemeConstraints declared)
           -- The skolem uniqs the declared context PROMISES a dictionary for: a
           -- declared `Eq a` provides a dictionary for the skolem standing for
@@ -2207,8 +2219,8 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
       -- the slice) carry no parameter.
       let evParams = [ (Solve.paramName (conClass c) i, c)
                      | c <- declared', CTGen i <- [conArg c] ]
-      pure TypedDecl { tdName = name, tdScheme = declared, tdParams = ps
-                     , tdBody = b, tdEvidence = evParams }
+      pure TypedDecl { tdName = name, tdScheme = declared
+                     , tdClauses = clauses, tdEvidence = evParams }
     Nothing -> do
       Level outer <- currentLevel
       hasEscape <- hasOuterScopeVar outer tv
@@ -2216,7 +2228,7 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
         ("finalizeGroupTyped: unexpected escape for top-level binding "
         ++ Tx.unpack name)
       (gen, frozen, fcs) <- generalizeTyped tv synthetic accCs
-      let (ps, b) = unTLam name frozen
+      let clauses = unClauses name arity frozen
       -- Discharge the frozen constraints against the generalized scheme:
       --   * arg = CTGen i quantified by the scheme -> residual (kept on the
       --     scheme + minted as an evidence parameter);
@@ -2236,8 +2248,8 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
       let evParams = [ (Solve.paramName (conClass c) i, c)
                      | c <- residual, CTGen i <- [conArg c] ]
           gen' = gen { schemeConstraints = residual }
-      pure TypedDecl { tdName = name, tdScheme = gen', tdParams = ps
-                     , tdBody = b, tdEvidence = evParams }
+      pure TypedDecl { tdName = name, tdScheme = gen'
+                     , tdClauses = clauses, tdEvidence = evParams }
   where
     sameConstraint a b = conClass a == conClass b && conArg a == conArg b
     nubConstraints = Data.List.nubBy sameConstraint
@@ -2248,13 +2260,28 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
     ctGenVars (CTArr a _ b)   = ctGenVars a `Set.union` ctGenVars b
     ctGenVars (CTRecord _ _)  = Set.empty
 
--- | Recover the params + body from the synthetic 'TLam' that 'generalizeTyped'
--- froze. The wrapper shape is preserved by freezing (it is a structural
--- traversal), so this never fails unless the wrapper was built wrong.
-unTLam :: Text -> TExpr -> ([TPat], TExpr)
-unTLam _ (Ty.Texp _ (Ty.TLam ps b)) = (ps, b)
-unTLam name _ = error
-  ("finalizeGroupTyped: synthetic TLam lost its shape for " ++ Tx.unpack name)
+-- | Recover the per-clause @(params, body)@ list from the synthetic wrapper that
+-- 'finalizeGroupTyped' froze: a 'TLam' over all clauses' params concatenated,
+-- whose body is a 'TList' of all clauses' bodies. 'arity' (the uniform column
+-- count, guaranteed equal across equations by the arity-agreement check) re-
+-- splits the concatenated params. The wrapper shape is preserved by freezing (a
+-- structural traversal), so this never fails unless the wrapper was built wrong.
+--
+-- The @arity == 0@ case is special: zero-param bindings (top-level values,
+-- @main@) concatenate no params, so 'zip'ping a chunked param list against the
+-- bodies would yield no clauses and LOSE the body. Handle it directly by pairing
+-- each body with an empty param list.
+unClauses :: Text -> Int -> TExpr -> [([TPat], TExpr)]
+unClauses _ 0 (Ty.Texp _ (Ty.TLam [] (Ty.Texp _ (Ty.TList bodies)))) =
+  [ ([], b) | b <- bodies ]
+unClauses _ arity (Ty.Texp _ (Ty.TLam allParams (Ty.Texp _ (Ty.TList bodies)))) =
+  zip (chunk arity allParams) bodies
+  where
+    chunk _ [] = []
+    chunk n xs = take n xs : chunk n (drop n xs)
+unClauses name _ _ = error
+  ("finalizeGroupTyped: synthetic clause wrapper lost its shape for "
+  ++ Tx.unpack name)
 
 -- | Type one equation, using the given recursive mono-map as the base
 -- (so mutually-recursive names are visible). Pattern bindings extend it.
@@ -2414,24 +2441,38 @@ lhsAtomPats (Abs.LHSPre _ aps) = aps
 lhsAtomPats (Abs.LHSInfSym a _ b) = [a, b]
 lhsAtomPats (Abs.LHSInfBT a _ b) = [a, b]
 
+-- | The source position of a function's left-hand side, taken from the bound
+-- name's token (the head 'FunName' for a prefix LHS, the operator token for an
+-- infix LHS). Used to point arity-disagreement errors at the offending equation.
+lhsPos :: Abs.FunLHS -> BNFC'Position
+lhsPos (Abs.LHSPre fn _)                     = Just (funNamePos fn)
+lhsPos (Abs.LHSInfSym _ (Abs.VarSym (p, _)) _) = Just p
+lhsPos (Abs.LHSInfBT  _ (Abs.VarId  (p, _)) _) = Just p
+
+funNamePos :: Abs.FunName -> (Int, Int)
+funNamePos (Abs.FNBare    (Abs.VarId  (p, _))) = p
+funNamePos (Abs.FNBareSym (Abs.VarSym (p, _))) = p
+funNamePos (Abs.FNParen   (Abs.VarSym (p, _))) = p
+
 -- ---------------------------------------------------------------------------
 -- Top-level program inference
 -- ---------------------------------------------------------------------------
 
 -- | The typed-AST output: one entry per top-level binding, carrying its
--- generalised scheme together with the binding's typed parameter patterns
--- and body. The params and body are frozen ('CType' annotations) under the
+-- generalised scheme together with the binding's typed clauses. Each clause is
+-- a @(params, body)@ pair; a single-equation binding has exactly one clause and
+-- a multi-equation function carries one clause per equation (all sharing the
+-- same arity). The params and bodies are frozen ('CType' annotations) under the
 -- SAME quantification mapping as the scheme, so their per-node 'CTGen'
--- numbering agrees with the scheme's quantifiers. The body already folds in
--- any @where@ clause as a leading 'Ty.TLet' (see 'typeEquationWith'), so a
--- single body field carries the whole RHS.
+-- numbering agrees with the scheme's quantifiers across every clause. Each
+-- clause body already folds in any @where@ clause as a leading 'Ty.TLet' (see
+-- 'typeEquationWith'), so a single body field per clause carries the whole RHS.
 --
 -- No 'Eq' instance: 'TExpr'/'Tpat' are not 'Eq'.
 data TypedDecl = TypedDecl
   { tdName     :: Text
   , tdScheme   :: Scheme
-  , tdParams   :: [TPat]
-  , tdBody     :: TExpr
+  , tdClauses  :: [([TPat], TExpr)]
   , tdEvidence :: [(Text, Constraint)]   -- evidence params (name, constraint)
   }
   deriving (Show)
@@ -2520,6 +2561,17 @@ inferTopLetGroup origin localDecls = do
   sigMap <- buildSigMap sigs
   let groups        = groupEquations eqns
       coveredEqn    = Set.fromList (map fst groups)
+  -- Arity-agreement check: every equation for a given name must take the same
+  -- number of arguments. Disagreement (e.g. `f 0 = 0` then `f x y = y`) is a
+  -- malformed function definition and is rejected up front, before inference.
+  forM_ groups $ \(gname, eqs) -> do
+    let arities = [ (length (lhsAtomPats lhs), lhsPos lhs)
+                  | Abs.LDEqn lhs _ _ <- eqs ]
+    case arities of
+      []              -> pure ()
+      ((a0, _) : rest) -> forM_ rest $ \(a, pos) ->
+        when (a /= a0) $ throwError (ClauseArityMismatch pos gname a0 a)
+  let
       -- Walk `sigs` in source order so warnings + bindings appear in the
       -- order names were declared, not Map order (alphabetical).
       sigOnlyNames    = [ n | n <- sigNamesInOrder sigs
@@ -2530,8 +2582,7 @@ inferTopLetGroup origin localDecls = do
       sigOnlyBindings =
         [ let s = sigMap Map.! n
           in TypedDecl { tdName = n, tdScheme = s
-                       , tdParams = []
-                       , tdBody = Ty.Texp (schemeBody s) (Ty.TVar n)
+                       , tdClauses = [([], Ty.Texp (schemeBody s) (Ty.TVar n))]
                        , tdEvidence = [] }
         | n <- sigOnlyNames ]
   -- Every binding that has a declared signature -- bodyless OR with a body --
@@ -2572,7 +2623,164 @@ inferTopLetGroup origin localDecls = do
     Embedded   -> pure ()
     UserFile _ -> forM_ sigOnlyNames $ \n ->
       addWarning (BodylessBinding n (sigPos sigs n))
+  -- Reject head-pattern shapes the match compiler cannot lower BEFORE the
+  -- coverage check runs, so no bogus RedundantClause/NonExhaustiveMatch warning
+  -- precedes the error and elaboration never reaches its raw `error`. This is a
+  -- hard compiler limitation, NOT origin-gated. A group only needs rejecting if
+  -- it ROUTES THROUGH the match compiler; the cheap elabParams projection path
+  -- (mirrored from 'Elaborate.irrefutableHead' / 'elabTopBind') handles
+  -- single-clause irrefutable/record top-level heads fine, so it is exempt.
+  do
+    rejectEnv <- currentEnv
+    let resultMap0 = Map.fromList [ (tdName td, td) | td <- topResults ]
+    forM_ groups $ \(gname, eqs) ->
+      case Map.lookup gname resultMap0 of
+        Nothing -> pure ()
+        Just td
+          | isBodylessSentinel td -> pure ()
+          | otherwise -> do
+              let clauses = tdClauses td
+                  cheapHead (Ty.Tpat _ pnode) = case pnode of
+                    Ty.TPVar _   -> True
+                    Ty.TPWild    -> True
+                    Ty.TPUnit    -> True
+                    Ty.TPCon c _ -> case lookupRecordCon c rejectEnv of
+                      Just _  -> True
+                      Nothing -> False
+                    _            -> False
+                  cheapPath = case clauses of
+                    [(ps, _)] -> all cheapHead ps
+                    _         -> False
+                  routesToMatch = not cheapPath
+                  unsupported =
+                    firstJust [ unsupportedHeadPat rejectEnv p
+                              | (ps, _) <- clauses, p <- ps ]
+                  pos = case eqs of (Abs.LDEqn lhs _ _ : _) -> lhsPos lhs; _ -> Nothing
+              when routesToMatch $
+                case unsupported of
+                  Just desc -> throwError (UnsupportedHeadPattern pos gname desc)
+                  Nothing   -> pure ()
+  -- Exhaustiveness + redundancy check over each group's clause HEADS (not body
+  -- `case` exprs). A group with a single variable head (e.g. `f x = case x of`)
+  -- yields a one-row all-wildcard matrix -> exhaustive, no warning, which limits
+  -- false positives. Warnings flow through the same channel as BodylessBinding.
+  -- Gated on UserFile origin: Embedded (Std.Base) modules are curated and must
+  -- not trigger coverage warnings.
+  case origin of
+    Embedded   -> pure ()
+    UserFile _ -> do
+      cenv <- currentEnv
+      let oracle    = buildMatchOracle cenv
+          resultMap = Map.fromList [ (tdName td, td) | td <- topResults ]
+      forM_ groups $ \(gname, eqs) ->
+        case Map.lookup gname resultMap of
+          Nothing -> pure ()
+          Just td -> case tdClauses td of
+            []      -> pure ()
+            clauses@((firstPats, _) : _)
+              | isBodylessSentinel td -> pure ()
+              | otherwise -> do
+                  let arity = length firstPats
+                      rows  = [ Match.Row { Match.rowPats  = map (typedPatToMPat cenv) ps
+                                          , Match.rowSubst = []
+                                          , Match.rowJoin  = JoinId (Unique 0)  -- unused by coverage
+                                          , Match.rowOrder = []
+                                          , Match.rowIndex = ix }
+                              | (ix, (ps, _)) <- zip [0 ..] clauses ]
+                      cov = matchCoverage oracle arity rows
+                      pos = case eqs of (Abs.LDEqn lhs _ _ : _) -> lhsPos lhs; _ -> Nothing
+                  unless (covExhaustive cov) $
+                    addWarning (NonExhaustiveMatch pos gname)
+                  forM_ (covRedundant cov) $ \ix ->
+                    addWarning (RedundantClause pos gname ix)
   pure (topResults ++ sigOnlyBindings)
+
+-- | A bodyless top-level signature surfaces as a sentinel 'TypedDecl' (no
+-- params, body just the bound name referencing itself). Coverage must not warn
+-- on these -- they have no real clause head. (Mirrors 'isBodylessSig' in
+-- Elaborate; duplicated here because Infer cannot import Elaborate -- Elaborate
+-- imports Infer, so sharing would form a cycle.)
+isBodylessSentinel :: TypedDecl -> Bool
+isBodylessSentinel td = case tdClauses td of
+  [([], Ty.Texp _ (Ty.TVar v))] -> v == tdName td
+  _                             -> False
+
+-- | Build the constructor oracle the match compiler needs from the type env.
+-- DELIBERATE DUPLICATION of 'Wok.IR.Elaborate.buildOracle': Infer cannot import
+-- Elaborate (Elaborate imports Infer -> import cycle), so the oracle-building
+-- logic is copied here. Keep the two in sync if either changes.
+buildMatchOracle :: Env -> ConOracle
+buildMatchOracle env = ConOracle
+  { coArity = \c ->
+      case tupleArity c of
+        Just n  -> n
+        Nothing
+          | c == Tx.pack "Nil"  -> 0
+          | c == Tx.pack "Cons" -> 2
+          | Just ci <- lookupCon c env -> conArity ci
+          | otherwise -> 0
+  , coSiblings = \c ->
+      case tupleArity c of
+        Just n  -> Just [tupleTag n]
+        Nothing
+          | c `elem` [Tx.pack "Nil", Tx.pack "Cons"] -> Just [Tx.pack "Nil", Tx.pack "Cons"]
+          | Just ci <- lookupCon c env
+          , Just ti <- lookupTyCon (conTyCon ci) env -> Just (tcCons ti)
+          | otherwise -> Nothing
+  }
+  where
+    tupleArity t
+      | Tx.isPrefixOf (Tx.pack "Tuple") t
+      , [(n, "")] <- reads (Tx.unpack (Tx.drop 5 t)) = Just n
+      | otherwise = Nothing
+
+-- | Scan a head pattern (recursively, including nested inside tuples / cons /
+-- constructor args) for a shape the match compiler cannot lower. Returns a
+-- human-readable description of the first such shape, or Nothing if the pattern
+-- is fully supported. Used only for groups that ROUTE THROUGH the match
+-- compiler (see 'inferTopLetGroup'); single-clause cheap-path heads are exempt.
+unsupportedHeadPat :: Env -> TPat -> Maybe Tx.Text
+unsupportedHeadPat env = go
+  where
+    go (Ty.Tpat _ pnode) = case pnode of
+      Ty.TPList []      -> Nothing
+      Ty.TPList _       -> Just (Tx.pack "non-empty list literal pattern (use h :: t)")
+      Ty.TPTuple ps     -> firstJust (map go ps)
+      Ty.TPCons h t     -> firstJust [go h, go t]
+      Ty.TPCon c ps     -> case lookupRecordCon c env of
+        Just _  -> Just (Tx.pack "record-constructor pattern in a multi-clause/refutable head")
+        Nothing -> firstJust (map go ps)
+      _                 -> Nothing
+
+-- | First 'Just' in a list, or 'Nothing' if all are 'Nothing'.
+firstJust :: [Maybe a] -> Maybe a
+firstJust = listToMaybe . catMaybes
+
+-- | Translate a typed pattern into a match-compiler 'MPat' for COVERAGE only.
+-- DELIBERATE DUPLICATION of 'Wok.IR.Elaborate.toMPat' (cycle prevents sharing),
+-- with two differences so coverage never crashes and never alters typecheck
+-- success/failure:
+--   * a record-constructor pattern is treated as an irrefutable 'MVar Nothing'
+--     (records are single-constructor: one record clause counts as total);
+--   * a NON-EMPTY list-literal pattern is treated as 'MVar Nothing' (opaque /
+--     irrefutable for coverage). Elaboration still rejects these later; coverage
+--     must not crash type-checking, which currently succeeds for such programs.
+typedPatToMPat :: Env -> TPat -> MPat
+typedPatToMPat env (Ty.Tpat ty pnode) = MPat ty (go pnode)
+  where
+    go (Ty.TPVar v)    = MVar (Just v)
+    go Ty.TPWild       = MVar Nothing
+    go Ty.TPUnit       = MVar Nothing
+    go (Ty.TPLitI i)   = MLit (LInt i)
+    go (Ty.TPLitS s)   = MLit (LStr s)
+    go (Ty.TPLitC c)   = MLit (LChar c)
+    go (Ty.TPTuple ps) = MCon (tupleTag (length ps)) (map (typedPatToMPat env) ps)
+    go (Ty.TPList [])  = MCon (Tx.pack "Nil") []
+    go (Ty.TPList _)   = MVar Nothing   -- non-empty list literal: opaque for coverage
+    go (Ty.TPCons h t) = MCon (Tx.pack "Cons") [typedPatToMPat env h, typedPatToMPat env t]
+    go (Ty.TPCon c ps) = case lookupRecordCon c env of
+      Just _  -> MVar Nothing           -- record con: single-constructor, irrefutable
+      Nothing -> MCon c (map (typedPatToMPat env) ps)
 
 -- | Find the BNFC'Position of the LDSig that declared @name@. Multi-name
 -- sigs share the head LDSig's position.

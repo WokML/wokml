@@ -1,0 +1,6 @@
+module Main
+import Std.Base
+
+zipSum : [U64] -> [U64] -> U64
+zipSum (x :: xs) (y :: ys) = x + y + zipSum xs ys
+zipSum _         _         = 0

@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+describe : Option U64 -> U64
+describe (Some 0) = 100
+describe (Some _) = 200
+describe None     = 300
+
+main = describe (Some 0)

@@ -122,6 +122,12 @@ prettyWarning (TC.NonExhaustiveRecordPattern pos tag) =
     <> "\n  scrutinee of type `" <> Tx.unpack tag <> " + row _` is open (has extensions),"
     <> " but all arms are strict."
     <> "\n  add a `, ..` to one arm to cover the extension case, or use a wildcard arm."
+prettyWarning (TC.NonExhaustiveMatch pos name) =
+  "warning: non-exhaustive patterns in `" <> Tx.unpack name <> "`" <> showPos pos
+    <> "\n  the clause group does not cover all possible inputs."
+prettyWarning (TC.RedundantClause pos name idx) =
+  "warning: redundant clause #" <> show (idx + 1) <> " in `" <> Tx.unpack name <> "`" <> showPos pos
+    <> "\n  this clause can never match (it is shadowed by an earlier clause)."
 
 showPos :: TC.BNFC'Position -> String
 showPos (Just (l, c)) = " at line " <> show l <> ", col " <> show c

@@ -15,7 +15,8 @@ import qualified Data.Text as Tx
 import Wok.IR.Anf
 import Wok.IR.Name
 import Wok.TypeChecking.Env
-  ( Env, envVars, lookupCon, conArity, lookupRecordCon, rcFields
+  ( Env, envVars, lookupCon, conArity, conTyCon, lookupRecordCon, rcFields
+  , lookupTyCon, TyConInfo (..)
   , classOfMethod, lookupClass, ClassInfo (..) )
 import Wok.TypeChecking.Infer (TypedDecl (..))
 import Wok.TypeChecking.Typed
@@ -24,6 +25,8 @@ import Wok.TypeChecking.Typed
   , TExpr, TPat )
 import Wok.TypeChecking.Types
   ( CType (..), TyCon (..), Constraint (..), Evidence (..) )
+import Wok.IR.Match
+  ( MPat (..), MPatF (..), Row (..), ConOracle (..), compileMatch, tupleTag )
 import qualified Wok.TypeChecking.Solve as Solve
 
 -- ---------------------------------------------------------------------------
@@ -143,9 +146,6 @@ normAll (e:es) k = normName e $ \a -> normAll es $ \as -> k (a : as)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
-
-tupleTag :: Int -> Text
-tupleTag n = Tx.pack ("Tuple" ++ show n)
 
 -- | Look up the arity of a data constructor. Returns 0 for unknown constructors
 -- (treated as nullary, matching the existing behaviour for un-registered names).
@@ -711,9 +711,119 @@ buildSubPatFromPat tk p = case p of
 -- NOT produce a 'TopBind' -- the original elaboration only emitted binds for
 -- equations, never for bare signatures.
 isBodylessSig :: TypedDecl -> Bool
-isBodylessSig td = case (tdParams td, tdBody td) of
-  ([], Texp _ (TVar v)) -> v == tdName td
-  _                     -> False
+isBodylessSig td = case tdClauses td of
+  [([], Texp _ (TVar v))] -> v == tdName td
+  _                       -> False
+
+-- ---------------------------------------------------------------------------
+-- Multi-clause function heads (via the pure match compiler)
+
+-- | Build the constructor oracle the match compiler needs from the type env.
+-- Built-in structural tags (TupleN, Nil/Cons) are answered directly; user data
+-- constructors come from envCons/envTyCons.
+buildOracle :: Env -> ConOracle
+buildOracle env = ConOracle
+  { coArity = \c ->
+      case tupleArity c of
+        Just n  -> n
+        Nothing
+          | c == Tx.pack "Nil"  -> 0
+          | c == Tx.pack "Cons" -> 2
+          | Just ci <- lookupCon c env -> conArity ci
+          | otherwise -> 0
+  , coSiblings = \c ->
+      case tupleArity c of
+        Just n  -> Just [tupleTag n]
+        Nothing
+          | c `elem` [Tx.pack "Nil", Tx.pack "Cons"] -> Just [Tx.pack "Nil", Tx.pack "Cons"]
+          | Just ci <- lookupCon c env
+          , Just ti <- lookupTyCon (conTyCon ci) env -> Just (tcCons ti)
+          | otherwise -> Nothing
+  }
+  where
+    tupleArity t
+      | Tx.isPrefixOf (Tx.pack "Tuple") t
+      , [(n, "")] <- reads (Tx.unpack (Tx.drop 5 t)) = Just n
+      | otherwise = Nothing
+
+-- | Translate a typed pattern into a match-compiler 'MPat'. Record-constructor
+-- patterns are rejected: the flat decision-tree leaves cannot project record
+-- fields, so multi-clause / refutable record heads are a documented limitation.
+toMPat :: Env -> TPat -> MPat
+toMPat env (Tpat ty pnode) = MPat ty (go pnode)
+  where
+    go (TPVar v)    = MVar (Just v)
+    go TPWild       = MVar Nothing
+    go TPUnit       = MVar Nothing
+    go (TPLitI i)   = MLit (LInt i)
+    go (TPLitS s)   = MLit (LStr s)
+    go (TPLitC c)   = MLit (LChar c)
+    go (TPTuple ps) = MCon (tupleTag (length ps)) (map (toMPat env) ps)
+    go (TPList [])  = MCon (Tx.pack "Nil") []
+    go (TPList _)   = error "match: non-empty list literal pattern (use h :: t)"
+    go (TPCons h t) = MCon (Tx.pack "Cons") [toMPat env h, toMPat env t]
+    go (TPCon c ps) = case lookupRecordCon c env of
+      Just _  -> error ("match: record-constructor pattern not supported in a "
+                        <> "multi-clause / refutable head: " <> Tx.unpack c)
+      Nothing -> MCon c (map (toMPat env) ps)
+
+-- | The variables a clause head binds, in left-to-right order. This order is the
+-- contract between a clause's join-point parameters and the positional atoms the
+-- decision-tree leaf 'Jump's with.
+clauseVars :: [TPat] -> [(Text, CType)]
+clauseVars = concatMap patVars
+  where
+    patVars (Tpat ty (TPVar v))    = [(v, ty)]
+    patVars (Tpat _  (TPTuple ps)) = concatMap patVars ps
+    patVars (Tpat _  (TPList ps))  = concatMap patVars ps
+    patVars (Tpat _  (TPCons h t)) = patVars h ++ patVars t
+    patVars (Tpat _  (TPCon _ ps)) = concatMap patVars ps
+    patVars _                      = []   -- wildcard / unit / literal bind nothing
+
+-- | Compile a clause group into fresh argument binders plus a decision-tree body
+-- wrapped in one 'LetJoin' per clause. Each clause's body becomes a join point
+-- whose parameters are exactly its bound variables (left-to-right); the decision
+-- tree's leaves 'Jump' to the matching join with the captured atoms in order.
+compileClauses :: [([TPat], TExpr)] -> Elab ([Binder], Expr)
+compileClauses [] = error "compileClauses: empty clause group"
+compileClauses clauses@((firstPats, _) : _) = do
+  env <- asks ecEnv
+  let colTypes = map (\(Tpat ty _) -> ty) firstPats
+      arity    = length colTypes
+  paramNames <- mapM (const (bindFresh (Tx.pack "p"))) [1 .. arity]
+  let paramBinders = zipWith (`Binder` Unrestricted) paramNames colTypes
+      scruts       = map AVar paramNames
+  built <- mapM buildClauseJoin clauses     -- [(JoinId, [(Text,CType,Name)], Expr)]
+  let rows = [ Row { rowPats  = map (toMPat env) ps
+                   , rowSubst = []
+                   , rowJoin  = jid
+                   , rowOrder = [ v | (v, _, _) <- vars ]
+                   , rowIndex = ix }
+             | (ix, (ps, _), (jid, vars, _)) <- zip3 [0 ..] clauses built ]
+  tree <- lift (compileMatch (buildOracle env) scruts rows)
+  let wrapped = foldr
+        (\(jid, vars, jbody) acc ->
+            LetJoin jid [ Binder n Unrestricted t | (_, t, n) <- vars ] jbody acc)
+        tree built
+  pure (paramBinders, wrapped)
+  where
+    buildClauseJoin (ps, body) = do
+      jid <- lift freshJoin
+      triples <- mapM (\(v, t) -> do n <- bindFresh v; pure (v, t, n)) (clauseVars ps)
+      jbody <- withLocals [ (v, n) | (v, _, n) <- triples ] (elabTail body)
+      pure (jid, triples, jbody)
+
+-- | A head pattern that always matches (no decision needed). Single-clause heads
+-- composed entirely of irrefutable patterns keep the cheap 'elabParams' path so
+-- existing single-clause ANF is byte-identical. Record-constructor patterns are
+-- irrefutable (one constructor) and stay on that path too.
+irrefutableHead :: Env -> TPat -> Bool
+irrefutableHead env (Tpat _ pnode) = case pnode of
+  TPVar _   -> True
+  TPWild    -> True
+  TPUnit    -> True
+  TPCon c _ -> case lookupRecordCon c env of Just _ -> True; Nothing -> False
+  _         -> False
 
 -- | Elaborate one TypedDecl into a 'TopBind', given the resolved global Name.
 --
@@ -732,8 +842,19 @@ elabTopBind globals td = do
         [ (pName, bndName b) | ((pName, _), b) <- zip (tdEvidence td) evBinders ]
       evIdx = Set.fromList [ i | (_, Constraint _ (CTGen i)) <- tdEvidence td ]
   local (\ctx -> ctx { ecEvidence = evScope, ecEvidenceIdx = evIdx }) $ do
-    (paramBinders, extender) <- elabParams (tdParams td)
-    bodyExpr <- extender (elabTail (tdBody td))
+    env <- asks ecEnv
+    -- Single-clause irrefutable heads (plain variables / wildcards / unit, and
+    -- single-clause record-constructor heads) keep the cheap elabParams path so
+    -- existing ANF stays byte-identical. Any group of >1 clause, or a refutable
+    -- single-clause head, goes through the decision-tree match compiler.
+    (paramBinders, bodyExpr) <- case tdClauses td of
+      [(params, body)]
+        | all (irrefutableHead env) params -> do
+            (pbs, extender) <- elabParams params
+            be <- extender (elabTail body)
+            pure (pbs, be)
+      []      -> error ("elaborateModule: no clauses for " <> Tx.unpack (tdName td))
+      clauses -> compileClauses clauses
     pure (TopBind name (evBinders ++ paramBinders) bodyExpr)
   where
     errName t = error ("elaborateModule: top-level name not in env: " <> Tx.unpack t)
