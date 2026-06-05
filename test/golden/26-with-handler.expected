@@ -1,0 +1,16 @@
+ROUND-TRIP PARSE ERROR: syntax error at line 13, column 3 before `;'
+---first print---
+module Main;
+import Std . Base;
+effect Ask =
+{
+  ask : U64
+};
+useAsk : () -> U64 with Ask;
+useAsk u = Ask . ask + 1;
+main : U64;
+main = with
+{
+  Ask . ask -> 41
+}
+useAsk ()

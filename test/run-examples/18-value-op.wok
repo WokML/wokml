@@ -8,5 +8,5 @@ useAsk u = Ask.ask + 1
 
 main : U64
 main =
-  with { Ask.ask -> 41 }
+  with { Ask.ask k -> k 41 }
   useAsk ()

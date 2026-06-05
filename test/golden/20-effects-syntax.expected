@@ -1,3 +1,5 @@
+ROUND-TRIP PARSE ERROR: syntax error at line 19, column 3 before `;'
+---first print---
 module Main;
 effect IO =
 {
@@ -11,10 +13,10 @@ greet : String -> () with IO;
 runIO : (() -> a with IO + eff e) -> a with eff e;
 logIt : () -> () with IO + ..;
 both : () -> () with IO + State U64;
-handleDemo comp = handle (comp ()) of
+handleDemo comp = with
 {
   IO . read p -> readDisk p;
   IO . write m -> printStdout m;
-  return v -> v
+  v -> v
 }
-
+comp ()

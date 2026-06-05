@@ -1,0 +1,14 @@
+useAsk u =
+  let t.1 = Ask.ask()
+  let t.2 = +(t.1, 1)
+  t.2
+
+main =
+  let t = useAsk(())
+  t
+  with {
+    return v -> v
+    Ask.ask(resume) ->
+      let res = resume(41)
+      res
+  }

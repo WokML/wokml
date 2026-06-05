@@ -1641,15 +1641,16 @@ inferExprW mono (Abs.ECase scrutinee alts) = do
   checkRecordPatternCoverage (expPos scrutinee) sT alts
   altNodes <- mapM (inferAlt mono sT rT) alts
   pure (rT, Ty.Texp rT (Ty.TCase sNode altNodes))
--- Handler: `handle EXPR of { E.op args -> body ... ; return v -> r }`.
+-- Handler: `with { E.op args -> body ... ; v -> r } EXPR`.
 -- v1 (transparent operations, no resume): infer EXPR under a fresh sub-ambient
 -- effect row; the handled effects are those named by the arm heads; every
 -- operation of each handled effect must have an arm (coverage); each arm body
 -- has the operation's RESULT type and is checked under the OUTER ambient (so an
--- arm may itself perform effects -- effect translation); the optional `return`
--- arm transforms the final value. The result effect row is EXPR's effects minus
--- the handled ones, joined into the enclosing ambient.
-inferExprW mono (Abs.EHandle e arms) = inferHandler mono e arms
+-- arm may itself perform effects -- effect translation); the optional value
+-- arm (a bare pattern `v -> r`) transforms the final value. The result effect
+-- row is EXPR's effects minus the handled ones, joined into the enclosing
+-- ambient.
+inferExprW mono (Abs.EWith arms e) = inferHandler mono e arms
 
 inferHandler :: Map.Map Text (Type s) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
 inferHandler mono e arms = do
@@ -1657,7 +1658,7 @@ inferHandler mono e arms = do
   -- Split arms into operation arms and an optional return arm.
   let opArms = [ (en, op, ps, body, pos)
                | Abs.HArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body <- arms ]
-      retArms = [ (pos, v, body) | Abs.HReturn (Abs.VarId (pos, v)) body <- arms ]
+      retArms = [ (pos, v, body) | Abs.HVArm (Abs.VarId (pos, v)) body <- arms ]
   -- At most one `return` arm is allowed; reject a second rather than silently
   -- ignoring it.
   case retArms of
@@ -1668,6 +1669,10 @@ inferHandler mono e arms = do
   subAmbient0 <- freshRVar
   subRef <- liftST (newSTRef subAmbient0)
   (exprT, exprNode) <- withEffRow subRef (inferExprW mono e)
+  -- Allocate the handler answer type R up front: binder arms type their bodies
+  -- at R and bind `resume : T -> R`, and the value/return arm produces R. A
+  -- single shared metavar ties all of them together.
+  answerT <- freshTVar KStar
   -- The handled effects are the distinct effect names mentioned by arm heads.
   let handledEffects = Data.List.nub [ en | (en, _, _, _, _) <- opArms ]
   -- Coverage: every operation of each handled effect must have an arm.
@@ -1697,37 +1702,69 @@ inferHandler mono e arms = do
         Just opScheme -> do
           paramSubst <- instantiateParamSubst (eiParams eInfo)
           let opTy = substCTypeWith paramSubst (schemeBody opScheme)
+          -- The op's arity is the count of leading arrows of its (param-
+          -- substituted) type; a value op (e.g. `ask : U64`) has arity 0.
+          arity <- arrowArity opTy
+          -- Split the arm's patterns into the op's argument patterns (the first
+          -- `arity`) and an optional trailing continuation binder. An arm with
+          -- exactly `arity` patterns auto-resumes (today's behaviour); one with
+          -- `arity + 1` patterns binds the continuation as its last pattern.
+          let (argPs, binderPs) = splitAt arity ps
           -- Peel the op's argument types onto the arm's argument patterns.
-          patResults <- mapM inferAtomPat ps
+          patResults <- mapM inferAtomPat argPs
           let pTys  = map (\(t, _, _) -> t) patResults
               binds = concatMap (\(_, b, _) -> b) patResults
               argPatNodes = map (\(_, _, n) -> n) patResults
-              mono' = foldr (\(n, t) m -> Map.insert n t m) mono binds
+              mono1 = foldr (\(n, t) m -> Map.insert n t m) mono binds
           mResult <- peelArrowsWithArgUnify opTy pTys
           resultTy <- case mResult of
             Just r  -> pure r
             Nothing -> throwError (UnknownOperation (Just pos) en op)
-          (bodyT, bodyNode) <- inferExprW mono' body
-          unify (Just pos) bodyT resultTy
-          -- v1 has no resume binding in the surface syntax, so the resume name
-          -- is empty; transparent operations do not capture a continuation.
-          pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
+          case binderPs of
+            [] -> do
+              -- AUTO-RESUME: no continuation binder. The arm body has the op's
+              -- RESULT type and is implicitly resumed with it (today's behaviour).
+              -- The empty resume name signals the auto-wrap path to the elaborator.
+              (bodyT, bodyNode) <- inferExprW mono1 body
+              unify (Just pos) bodyT resultTy
+              pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
+            [Abs.APVar (Abs.VarId (_, kname))] -> do
+              -- CONTROL: the trailing pattern is the continuation binder `k`. The
+              -- arm body has the handler ANSWER type R; `resume : T -> R` (T is the
+              -- op's result type). The arrow carries a fresh open effect row so
+              -- that applying `k` in the body flows its effects into the outer
+              -- ambient (mirroring ordinary application; see EApp).
+              resumeRow <- freshRVar
+              let resumeTy = arrowT resultTy resumeRow answerT
+                  mono2    = Map.insert kname resumeTy mono1
+              (bodyT, bodyNode) <- inferExprW mono2 body
+              unify (Just pos) bodyT answerT
+              pure (Ty.TOpArm en op argPatNodes kname bodyNode)
+            _ ->
+              -- More than `arity + 1` patterns, or a non-variable continuation
+              -- binder: not a valid operation arm shape.
+              throwError (UnknownOperation (Just pos) en op)
   -- Discharge the handled effects from the handled expression's row, leaving
   -- the residual effects to flow outward.
   subRow <- liftST (readSTRef subRef)
   residual <- dischargeEffects subRow handledEffects
   emitRow Nothing residual
-  -- Apply the optional return arm to compute the handle's result type.
+  -- Apply the optional value arm to compute the handler's answer type R.
   case retArms of
-    []               ->
-      pure (exprT, Ty.Texp exprT (Ty.THandle exprNode opArmNodes))
+    []               -> do
+      -- No value arm: the return clause is the identity, so the answer type is
+      -- exactly the handled value's type.
+      unify Nothing answerT exprT
+      pure (answerT, Ty.Texp answerT (Ty.THandle exprNode opArmNodes))
     ((_, v, rb) : _) -> do
       let mono' = Map.insert v exprT mono
       (rT, rNode) <- inferExprW mono' rb
-      -- The return arm binds the handled value @v@ (type exprT) and transforms
-      -- it; represent the binder as a variable pattern annotated with exprT.
+      -- The value arm binds the handled value @v@ (type exprT) and transforms
+      -- it to the answer type R; represent the binder as a variable pattern
+      -- annotated with exprT.
+      unify Nothing rT answerT
       let retArm = Ty.TReturnArm (Ty.Tpat exprT (Ty.TPVar v)) rNode
-      pure (rT, Ty.Texp rT (Ty.THandle exprNode (opArmNodes ++ [retArm])))
+      pure (answerT, Ty.Texp answerT (Ty.THandle exprNode (opArmNodes ++ [retArm])))
 
 -- | Remove the given effect labels from a row (each label dropped once per
 -- occurrence is unnecessary in v1 -- effects are not duplicated by inference --
@@ -2435,6 +2472,25 @@ peelArrowsWithArgUnify ty (pTy : rest) = do
       unify Nothing pTy a
       peelArrowsWithArgUnify b rest
     _ -> pure Nothing  -- sig arity does not match pattern count
+
+-- | Count the leading arrows of an operation type -- its arity. This must agree
+-- with how 'peelArrowsWithArgUnify' consumes arguments (one 'TArr' per arg,
+-- ignoring the effect-row slot), so the args/continuation split point is right.
+-- A value op (e.g. @ask : U64@) has arity 0. The op type comes straight from a
+-- freshly-instantiated scheme body, but force through any links to be safe.
+arrowArity :: Type s -> TC s Int
+arrowArity ty = do
+  ty' <- force ty
+  case ty' of
+    TArr _ _ b -> (1 +) <$> arrowArity b
+    _          -> pure 0
+
+-- | Build a single-argument function type @T -> R@ riding the given effect row.
+-- 'TArr' carries an effect-row slot (this is a Koka-style effect language), so
+-- the row must be supplied; callers pass a fresh open row var, mirroring how
+-- ordinary application allocates a per-call row (see 'inferExprW' EApp).
+arrowT :: Type s -> Row s -> Type s -> Type s
+arrowT a row b = TArr a row b
 
 lhsAtomPats :: Abs.FunLHS -> [Abs.AtomPat]
 lhsAtomPats (Abs.LHSPre _ aps) = aps

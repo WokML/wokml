@@ -518,7 +518,7 @@ rewriteMethodRefs classMethods dictNm idx = go
       Abs.ELet ds a     -> Abs.ELet (map goLocal ds) (go a)
       Abs.ECase a alts  -> Abs.ECase (go a) (map goAlt alts)
       Abs.EIf a b c     -> Abs.EIf (go a) (go b) (go c)
-      Abs.EHandle a arms -> Abs.EHandle (go a) (map goArm arms)
+      Abs.EWith arms a  -> Abs.EWith (map goArm arms) (go a)
       _                 -> e
 
     goTail (Abs.ITail op a) = Abs.ITail (goOp op) (go a)
@@ -539,7 +539,7 @@ rewriteMethodRefs classMethods dictNm idx = go
     goWhere (Abs.WithWh ds) = Abs.WithWh (map goLocal ds)
     goAlt (Abs.AltC p a mw) = Abs.AltC p (go a) (goWhere mw)
     goArm (Abs.HArm c v ps a) = Abs.HArm c v ps (go a)
-    goArm (Abs.HReturn v a)   = Abs.HReturn v (go a)
+    goArm (Abs.HVArm v a)     = Abs.HVArm v (go a)
 
 -- | The parameter 'Abs.AtomPat's of a function LHS, in order. (Duplicated
 -- here rather than imported from 'Infer' to avoid an import cycle.)

@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+effect Exn a = { throw : String -> a }
+
+risky : Bool -> U64 with Exn U64
+risky b = if b then Exn.throw "boom" else 7
+
+main : U64
+main =
+  with { Exn.throw msg k -> 0
+         ; v -> v }
+  risky True

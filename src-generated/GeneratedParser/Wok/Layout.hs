@@ -28,19 +28,19 @@ data LayoutDelimiters
 
 layoutWords :: [(TokSymbol, LayoutDelimiters)]
 layoutWords =
-  [ ( TokSymbol "let" 36
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 53)) (Just (TokSymbol "}" 55))
+  [ ( TokSymbol "let" 35
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 50)) (Just (TokSymbol "}" 52))
     )
-  , ( TokSymbol "where" 51
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 53)) (Just (TokSymbol "}" 55))
+  , ( TokSymbol "where" 48
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 50)) (Just (TokSymbol "}" 52))
     )
-  , ( TokSymbol "of" 40
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 53)) (Just (TokSymbol "}" 55))
+  , ( TokSymbol "of" 39
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 50)) (Just (TokSymbol "}" 52))
     )
   ]
 
 layoutStopWords :: [TokSymbol]
-layoutStopWords = [TokSymbol "in" 33]
+layoutStopWords = [TokSymbol "in" 32]
 
 -- layout separators
 

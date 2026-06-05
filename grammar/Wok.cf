@@ -110,7 +110,7 @@ DLocal.   Decl ::= "local" Decl ;
 -- these words to the lexer's reserved set, keeping them out of VarId. When a
 -- feature ships, move its word out of here into that feature's real production.
 rules     ReservedKw ::= "contract" | "type" | "deriving" | "forall"
-                       | "do" | "record" | "row" | "fun" | "ctl" | "resume" ;
+                       | "do" | "record" | "row" | "fun" | "ctl" ;
 DReserved. Decl ::= ReservedKw ;
 
 -- Helper: comma-separated additional names for multi-name sigs (`f, (+), h : T`).
@@ -360,11 +360,16 @@ ELet.     Exp2 ::= "let" "{" [LocalDecl] "}" "in" Exp ;
 -- semantic pass should reject non-exhaustive empty alternatives.
 ECase.    Exp2 ::= "case" Exp "of" "{" [Alt] "}" ;
 EIf.      Exp2 ::= "if" Exp "then" Exp "else" Exp ;
--- Effect handlers. `of` is already a layout keyword, so the `{ ... }` block
--- is indentation-driven like `case ... of`.
-EHandle.  Exp2 ::= "handle" Exp "of" "{" [HandlerArm] "}" ;
+-- Effect handlers: `with { arms } computation` (flat prefix). The handler block
+-- uses EXPLICIT braces (`with` cannot be a layout keyword without breaking the
+-- type-level `with` in `T -> R with E`). The trailing Exp is the handled
+-- computation, consumed like a lambda body (EWith is Exp2, body is full Exp).
+-- A value arm (HVArm) is the return clause; the `return` keyword is gone. The
+-- optional continuation binder is the (arity+1)-th AtomPat on an operation arm,
+-- split from the op's arguments by the typechecker (Task 2), so HArm is unchanged.
+EWith.    Exp2 ::= "with" "{" [HandlerArm] "}" Exp ;
 HArm.     HandlerArm ::= ConId "." VarId [AtomPat] "->" Exp ;
-HReturn.  HandlerArm ::= "return" VarId "->" Exp ;
+HVArm.    HandlerArm ::= VarId "->" Exp ;
 separator HandlerArm ";" ;
 
 separator Exp "," ;   -- shared by EList and ETuple bodies

@@ -183,7 +183,7 @@ eitherResIdent tv s = treeFind resWords
 -- | The keywords and symbols of the language organized as binary search tree.
 resWords :: BTree
 resWords =
-  b "forall" 28
+  b "fixity" 27
     (b "]" 14
        (b ":" 7
           (b "->" 4
@@ -195,24 +195,23 @@ resWords =
           (b "class" 18
              (b "`" 16 (b "_" 15 N N) (b "case" 17 N N))
              (b "ctl" 20 (b "contract" 19 N N) N))
-          (b "effect" 25
-             (b "do" 23 (b "deriving" 22 N N) (b "eff" 24 N N))
-             (b "fixity" 27 (b "else" 26 N N) N))))
-    (b "resume" 42
-       (b "left" 35
-          (b "import" 32
-             (b "handle" 30 (b "fun" 29 N N) (b "if" 31 N N))
-             (b "instance" 34 (b "in" 33 N N) N))
-          (b "module" 39
-             (b "local" 37 (b "let" 36 N N) (b "looser" 38 N N))
-             (b "record" 41 (b "of" 40 N N) N)))
-       (b "type" 49
-          (b "than" 46
-             (b "right" 44 (b "return" 43 N N) (b "row" 45 N N))
-             (b "tighter" 48 (b "then" 47 N N) N))
-          (b "{" 53
-             (b "where" 51 (b "use" 50 N N) (b "with" 52 N N))
-             (b "}" 55 (b "|" 54 N N) N))))
+          (b "eff" 24
+             (b "do" 23 (b "deriving" 22 N N) N)
+             (b "else" 26 (b "effect" 25 N N) N))))
+    (b "record" 40
+       (b "left" 34
+          (b "import" 31
+             (b "fun" 29 (b "forall" 28 N N) (b "if" 30 N N))
+             (b "instance" 33 (b "in" 32 N N) N))
+          (b "looser" 37
+             (b "local" 36 (b "let" 35 N N) N)
+             (b "of" 39 (b "module" 38 N N) N)))
+       (b "use" 47
+          (b "then" 44
+             (b "row" 42 (b "right" 41 N N) (b "than" 43 N N))
+             (b "type" 46 (b "tighter" 45 N N) N))
+          (b "{" 50
+             (b "with" 49 (b "where" 48 N N) N) (b "}" 52 (b "|" 51 N N) N))))
   where
   b s n = B bs (TS bs n)
     where

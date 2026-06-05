@@ -482,10 +482,10 @@ elabKF tk _ (TCase scrut alts) =
 elabKF tk _ (TLet decls body) =
   elabLocalDecls decls (elabK tk body)
 
--- handle ... of { E.op ps -> body ; return v -> body }
+-- with { E.op ps -> body ; v -> body } EXPR
 elabKF tk _ (THandle e arms) = do
-  let opArmsSrc  = [ (effect, op, ps, body)
-                   | TOpArm effect op ps _resume body <- arms ]
+  let opArmsSrc  = [ (effect, op, ps, resume, body)
+                   | TOpArm effect op ps resume body <- arms ]
       retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
   handledBody <- elabK TRet e
   opArms <- mapM (elabOpArm tk) opArmsSrc
@@ -506,15 +506,29 @@ elabKF tk _ (THandle e arms) = do
       rbE <- elabK tk2 rb
       pure (Binder vN Unrestricted pty, rbE)
 
-    elabOpArm :: TailK -> (Text, Text, [TPat], TExpr) -> Elab OpArm
-    elabOpArm tk2 (effect, op, ps, body) = do
+    elabOpArm :: TailK -> (Text, Text, [TPat], Text, TExpr) -> Elab OpArm
+    elabOpArm tk2 (effect, op, ps, resumeName, body) = do
       (argBinders, extender) <- elabParams ps
       resumeN <- bindFresh (Tx.pack "resume")
-      armBody <- extender $ normName body $ \v -> do
-        res <- bindFresh (Tx.pack "res")
-        pure (Let (Binder res Unrestricted (teType body))
-                  (RApp (AVar resumeN) [v])
-                  (deliverAtom tk2 (AVar res)))
+      armBody <-
+        if Tx.null resumeName
+          then
+            -- AUTO-RESUME: let res = resume(body) in deliver res
+            extender $ normName body $ \v -> do
+              res <- bindFresh (Tx.pack "res")
+              pure (Let (Binder res Unrestricted (teType body))
+                        (RApp (AVar resumeN) [v])
+                        (deliverAtom tk2 (AVar res)))
+          else
+            -- CONTROL: bind the surface name to the resume binder; elaborate the
+            -- body as-is (it already has the answer type R).
+            extender $ withLocal resumeName resumeN (elabK tk2 body)
+      -- NOTE: the resume binder is annotated with `teType body`, which is the op
+      -- RESULT type T in the auto-resume branch (correct) but the ANSWER type R in
+      -- the control branch (imprecise: the continuation is T -> R). This field is
+      -- currently unused (the interpreter keys resume by name; no typed pass reads
+      -- it), so it is a latent placeholder. Fix when the typed-Core pass needs a
+      -- precise resume type -- it will need T threaded onto TOpArm (roadmap follow-up).
       pure (OpArm effect op argBinders (Binder resumeN Unrestricted (teType body)) armBody)
 
 -- Non-compound: name the result and deliver under tk

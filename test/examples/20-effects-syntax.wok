@@ -12,7 +12,8 @@ runIO : (() -> a with IO + eff e) -> a with eff e
 logIt : () -> () with IO + ..
 both : () -> () with IO + State U64
 
-handleDemo comp = handle (comp ()) of
-  IO.read p -> readDisk p
-  IO.write m -> printStdout m
-  return v -> v
+handleDemo comp =
+  with { IO.read p -> readDisk p
+       ; IO.write m -> printStdout m
+       ; v -> v }
+  comp ()

@@ -8,13 +8,15 @@ effect IO = { read : String -> String, write : String -> () }
 -- preserves the `eff e` tail, so a caller that still needs those effects keeps
 -- them. The arms are transparent: the body is the resume value.
 runIO : (() -> a with IO + eff e) -> a with eff e
-runIO comp = handle (comp ()) of
-  IO.read p -> p
-  IO.write m -> ()
-  return v -> v
+runIO comp =
+  with { IO.read p -> p
+       ; IO.write m -> ()
+       ; v -> v }
+  comp ()
 
 -- Handler with no return arm: result type is the handled expression's type.
 runIO2 : (() -> a with IO + eff e) -> a with eff e
-runIO2 comp = handle (comp ()) of
-  IO.read p -> p
-  IO.write m -> ()
+runIO2 comp =
+  with { IO.read p -> p
+       ; IO.write m -> () }
+  comp ()

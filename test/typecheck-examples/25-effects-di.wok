@@ -15,12 +15,14 @@ greet u = Logger.log "hello"
 -- Translate Logger -> IO: discharges Logger, the arm introduces IO, and the
 -- `eff e` tail is preserved.
 logToIO : (() -> a with Logger + eff e) -> a with IO + eff e
-logToIO c = handle (c ()) of
-  Logger.log m -> IO.write m
-  return v -> v
+logToIO c =
+  with { Logger.log m -> IO.write m
+       ; v -> v }
+  c ()
 
 -- Discharge IO entirely: only the `eff e` tail remains in the result row.
 runIO : (() -> a with IO + eff e) -> a with eff e
-runIO c = handle (c ()) of
-  IO.write m -> ()
-  return v -> v
+runIO c =
+  with { IO.write m -> ()
+       ; v -> v }
+  c ()

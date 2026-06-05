@@ -61,7 +61,6 @@ data ReservedKw
     | ReservedKw_row
     | ReservedKw_fun
     | ReservedKw_ctl
-    | ReservedKw_resume
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data SigName = SNBare VarId | SNParen VarSym
@@ -173,7 +172,7 @@ data Exp
     | ELet [LocalDecl] Exp
     | ECase Exp [Alt]
     | EIf Exp Exp Exp
-    | EHandle Exp [HandlerArm]
+    | EWith [HandlerArm] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixTail = ITail InfixOp Exp
@@ -188,8 +187,7 @@ data MaybeTrailing = TFNone | TFSome [RecordFieldExpr]
 data RecordFieldExpr = RFExpr VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
-data HandlerArm
-    = HArm ConId VarId [AtomPat] Exp | HReturn VarId Exp
+data HandlerArm = HArm ConId VarId [AtomPat] Exp | HVArm VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl

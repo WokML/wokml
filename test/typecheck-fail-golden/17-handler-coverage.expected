@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: HandlerCoverage (Just (9,3)) "IO" ["write"]
+typecheck: typecheck in Main: HandlerCoverage (Just (9,10)) "IO" ["write"]

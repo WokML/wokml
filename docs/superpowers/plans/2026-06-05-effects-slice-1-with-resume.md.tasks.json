@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-05-effects-slice-1-with-resume.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Grammar — with-prefix handler, value arm, drop handle/return, free resume",
+      "status": "completed",
+      "description": "**Goal:** New surface parses; handle/return gone.\n\n**Files:** grammar/Wok.cf:113,365-368; src-generated/GeneratedParser/Wok/*; test/examples/26-with-handler.wok\n\n**Verify:** cabal build && cabal run wok -- test/examples/26-with-handler.wok --dump-anf\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok\", \"test/examples/26-with-handler.wok\"], \"verifyCommand\": \"cabal build && cabal run wok -- test/examples/26-with-handler.wok --dump-anf\", \"acceptanceCriteria\": [\"EHandle/HReturn removed\", \"EWith + HVArm added, HArm unchanged\", \"resume freed from ReservedKw\", \"parser regenerated + patches reapplied + build green\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Typecheck — route EWith, arity-split binder, answer-type-first, resume typing",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** with{arms}rest typechecks; no-binder auto-resume (body:T), binder arms body:R with k:T->R; value arms = return clause.\n\n**Files:** src/Wok/TypeChecking/Infer.hs:1652,1654-1730 + arrowArity/arrowT; test/run-examples/16-exn-abort.wok, 17-choice-multishot.wok; test/typecheck-examples/26-with-handler.wok\n\n**Verify:** 16-exn-abort=>0; 17-choice-multishot=>30\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"test/run-examples/16-exn-abort.wok\", \"test/run-examples/17-choice-multishot.wok\", \"test/typecheck-examples/26-with-handler.wok\"], \"verifyCommand\": \"cabal run wok -- test/run-examples/16-exn-abort.wok --run; cabal run wok -- test/run-examples/17-choice-multishot.wok --run\", \"acceptanceCriteria\": [\"EWith routed to inferHandler with trailing Exp as computation\", \"arity-split: arity->auto-resume, arity+1->binder\", \"binder body typed at answer type R, k:T->R\", \"HVArm return clause + duplicate check\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Elaborate — bind continuation when present, auto-wrap when absent",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** binder arm elaborates body as-is (bound name=continuation, body delivers R); binder-less keeps auto-wrap.\n\n**Files:** src/Wok/IR/Elaborate.hs:485-518\n\n**Verify:** 17-choice-multishot=>30; 16-exn-abort=>0; 07-effect-ask=>42\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Elaborate.hs\"], \"verifyCommand\": \"cabal run wok -- test/run-examples/17-choice-multishot.wok --run; cabal run wok -- test/run-examples/16-exn-abort.wok --run\", \"acceptanceCriteria\": [\"empty resume name -> auto-wrap\", \"non-empty -> withLocal + elabK body, no wrap\", \"multishot=30, abort=0, ask=42\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Value operations end-to-end + runtime confirmation",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** arrow-less op (ask:U64) works: referenced Ask.ask performs+yields, dispatched zero-arg.\n\n**Files:** read-only Machine.hs:137-150, Infer.hs:1516-1534; test/run-examples/18-value-op.wok\n\n**Verify:** 18-value-op=>42\n\n```json:metadata\n{\"files\": [\"test/run-examples/18-value-op.wok\", \"test/run-golden/18-value-op.expected\", \"src/Wok/Interp/Machine.hs\"], \"verifyCommand\": \"cabal run wok -- test/run-examples/18-value-op.wok --run\", \"acceptanceCriteria\": [\"arrow-less op decl typechecks\", \"Ask.ask performs + yields U64\", \"value-op arm with binder works\", \"dispatchOp zero-arg ok\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Migrate handler examples to with-prefix; regenerate goldens",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** all handle/return examples use with form; full golden suite green.\n\n**Files:** test/run-examples/07-effect-ask.wok; test/typecheck-examples/24-effects-handle.wok,25-effects-di.wok; test/examples/20-effects-syntax.wok; test/typecheck-fail-examples/17-handler-coverage.wok,18-duplicate-return-arm.wok; affected goldens\n\n**Verify:** rg no handle in test; cabal test green\n\n```json:metadata\n{\"files\": [\"test/run-examples/07-effect-ask.wok\", \"test/typecheck-examples/24-effects-handle.wok\", \"test/typecheck-examples/25-effects-di.wok\", \"test/examples/20-effects-syntax.wok\", \"test/typecheck-fail-examples/17-handler-coverage.wok\", \"test/typecheck-fail-examples/18-duplicate-return-arm.wok\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"no handle/return in any test .wok\", \"07 => 42\", \"coverage + duplicate-return failures preserved\", \"cabal test green\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-05T00:00:00Z"
+}
