@@ -1,13 +1,17 @@
 module Main
 import Std.Base
 
-effect Exn a = { throw : String -> a }
+effect Exn = { throw : String -> Never }
 
-risky : Bool -> U64 with Exn U64
+risky : Bool -> U64 with Exn
 risky b = if b then Exn.throw "boom" else 7
 
-main : U64
+-- Reshaping handler: the computation's value type (U64) differs from the
+-- handler's answer type (Option U64), so a value arm is required. The throw
+-- arm aborts (binds k, never resumes -- exempt from the forgotten-resume lint
+-- because `throw`'s result is `Never`).
+main : Option U64
 main =
-  with { Exn.throw msg k -> 0
-         ; v -> v }
+  with { Exn.throw msg k -> None
+         ; v -> Some v }
   risky True

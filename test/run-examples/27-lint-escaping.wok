@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+effect Async = { await : U64 -> U64 }
+
+prog : () -> U64 with Async
+prog u = Async.await 7
+
+main : U64
+main =
+  with { Async.await fut k -> k fut
+         ; v               -> v }
+  prog ()

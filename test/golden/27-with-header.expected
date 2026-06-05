@@ -1,0 +1,17 @@
+ROUND-TRIP PARSE ERROR: syntax error at line 12, column 13 before `,'
+---first print---
+module Main;
+import Std . Base;
+effect State s =
+{
+  get : s, set : s -> ()
+};
+prog : () -> U64 with State U64;
+prog u = State . get;
+main : U64;
+main = with State
+{
+  get -> 0;
+  set s -> ()
+}
+prog ()

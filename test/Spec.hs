@@ -113,6 +113,7 @@ main = do
     , fieldAccessTests
     , recordPatternTests
     , rowShadowTests
+    , forgottenResumeTests
     , patternCoverageTests
     , matchWarningTests
     , blockLayoutTests
@@ -348,7 +349,7 @@ typedExprForTest env = goE
 
     goArm (Abs.HArm (Abs.ConId (_, en)) (Abs.VarId (_, op)) ps body) =
       Typed.TOpArm en op (map goAP ps) (T.pack "") (goE body)
-    goArm (Abs.HVArm (Abs.VarId (_, v)) body) =
+    goArm (Abs.HUArm (Abs.VarId (_, v)) _ body) =
       Typed.TReturnArm (tpa (Typed.TPVar v)) (goE body)
 
     goDecls :: [Abs.LocalDecl] -> [Typed.TLocalDecl Ty.CType]
@@ -3282,6 +3283,76 @@ rowShadowTests = testGroup "RowShadow"
   ]
 
 -- ---------------------------------------------------------------------------
+-- Forgotten-resume lint tests
+-- ---------------------------------------------------------------------------
+
+forgottenResumeTests :: TestTree
+forgottenResumeTests = testGroup "ForgottenResume"
+  [ testCase "named unreferenced binder on returning op warns" $ do
+      -- `State.get k -> 0`: get : s is a returning op and k is never used.
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "effect State s = { get : s }"
+            , "prog : () -> U64 with State U64"
+            , "prog u = State.get"
+            , "main : U64"
+            , "main ="
+            , "  with { State.get k -> 0"
+            , "         ; v -> v }"
+            , "  prog ()" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 1
+
+  , testCase "wildcard binder suppresses" $ do
+      -- `State.get _ -> 0`: explicit intentional discard; no warning.
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "effect State s = { get : s }"
+            , "prog : () -> U64 with State U64"
+            , "prog u = State.get"
+            , "main : U64"
+            , "main ="
+            , "  with { State.get _ -> 0"
+            , "         ; v -> v }"
+            , "  prog ()" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 0
+
+  , testCase "Never-result op is exempt" $ do
+      -- `throw : U64 -> Never`: a non-returning op never resumes, so a
+      -- named-but-unused binder is fine. (Avoid Bool/if: the `import Std.Base`
+      -- line is parsed but silently dropped by the inferProgramWith path, so
+      -- Std.Base names are NOT in scope -- only B.initialEnv primitives are.)
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "effect Exn = { throw : U64 -> Never }"
+            , "risky : () -> U64 with Exn"
+            , "risky u = Exn.throw 1"
+            , "main : U64"
+            , "main ="
+            , "  with { Exn.throw code k -> 0"
+            , "         ; v -> v }"
+            , "  risky ()" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 0
+
+  , testCase "referenced binder does not warn" $ do
+      -- `State.get k -> k 0`: the continuation is used, so the arm resumes.
+      let src = T.unlines
+            [ "module Main", "import Std.Base"
+            , "effect State s = { get : s }"
+            , "prog : () -> U64 with State U64"
+            , "prog u = State.get"
+            , "main : U64"
+            , "main ="
+            , "  with { State.get k -> k 0"
+            , "         ; v -> v }"
+            , "  prog ()" ]
+      (_, ws) <- expectOKWithWarnings src
+      length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 0
+  ]
+
+-- ---------------------------------------------------------------------------
 -- Pattern coverage tests
 -- ---------------------------------------------------------------------------
 
@@ -4587,7 +4658,7 @@ elaborateEffectsTests = testGroup "ElaborateEffects"
           compApp = Abs.EApp (Abs.EVar (varId (T.pack "comp"))) unitE
           mPat    = Abs.APVar (varId (T.pack "m"))
           writeArm = Abs.HArm (conId (T.pack "IO")) (varId (T.pack "write")) [mPat] Abs.EUnit
-          retArm  = Abs.HVArm (varId (T.pack "v")) (Abs.EVar (varId (T.pack "v")))
+          retArm  = Abs.HUArm (varId (T.pack "v")) [] (Abs.EVar (varId (T.pack "v")))
           expr    = Abs.EWith [writeArm, retArm] compApp
           result  = elaborateExprForTest effectTestEnv expr
       in do

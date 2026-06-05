@@ -173,6 +173,7 @@ tyConKey TcU64        = Tx.pack "U64"
 tyConKey TcU32        = Tx.pack "U32"
 tyConKey TcChar       = Tx.pack "Char"
 tyConKey TcString     = Tx.pack "String"
+tyConKey TcNever      = Tx.pack "Never"
 tyConKey TcBool       = Tx.pack "Bool"
 tyConKey TcUnit       = Tx.pack "Unit"
 tyConKey TcList       = Tx.pack "List"
@@ -286,6 +287,7 @@ resolveTyConName name
   | name == Tx.pack "U32"    = TcU32
   | name == Tx.pack "Char"   = TcChar
   | name == Tx.pack "String" = TcString
+  | name == Tx.pack "Never"  = TcNever
   | name == Tx.pack "Bool"   = TcBool
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
@@ -519,6 +521,7 @@ rewriteMethodRefs classMethods dictNm idx = go
       Abs.ECase a alts  -> Abs.ECase (go a) (map goAlt alts)
       Abs.EIf a b c     -> Abs.EIf (go a) (go b) (go c)
       Abs.EWith arms a  -> Abs.EWith (map goArm arms) (go a)
+      Abs.EWithH h hs arms a -> Abs.EWithH h hs (map goArm arms) (go a)
       _                 -> e
 
     goTail (Abs.ITail op a) = Abs.ITail (goOp op) (go a)
@@ -539,7 +542,7 @@ rewriteMethodRefs classMethods dictNm idx = go
     goWhere (Abs.WithWh ds) = Abs.WithWh (map goLocal ds)
     goAlt (Abs.AltC p a mw) = Abs.AltC p (go a) (goWhere mw)
     goArm (Abs.HArm c v ps a) = Abs.HArm c v ps (go a)
-    goArm (Abs.HVArm v a)     = Abs.HVArm v (go a)
+    goArm (Abs.HUArm v ps a)  = Abs.HUArm v ps (go a)
 
 -- | The parameter 'Abs.AtomPat's of a function LHS, in order. (Duplicated
 -- here rather than imported from 'Infer' to avoid an import cycle.)

@@ -45,6 +45,7 @@ data TyCon
   | TcU32
   | TcChar
   | TcString
+  | TcNever
   | TcBool
   | TcUnit
   | TcTuple Int

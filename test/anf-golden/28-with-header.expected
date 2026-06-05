@@ -1,0 +1,16 @@
+prog u =
+  let t = State.get()
+  t
+
+main =
+  let t = prog(())
+  t
+  with {
+    return v -> v
+    State.get(resume.1) ->
+      let res.1 = resume.1(0)
+      res.1
+    State.set(s, resume.2) ->
+      let res.2 = resume.2(())
+      res.2
+  }

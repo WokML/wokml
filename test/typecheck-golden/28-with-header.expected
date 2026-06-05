@@ -1,0 +1,2 @@
+main : U64
+prog : () -> U64 with State

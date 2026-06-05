@@ -1,0 +1,45 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-05-effects-slice-2-header-lint.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 1: Never bottom type + perform-site bottom elimination",
+      "status": "completed",
+      "description": "**Goal:** `effect Exn = { throw : String -> Never }` type-checks; `Exn.throw \"boom\"` usable at any type (perform-site freshening); abort handler runs.\n\n```json:metadata\n{\"files\":[\"src/Wok/TypeChecking/Types.hs\",\"src/Wok/TypeChecking/Class.hs\",\"src/Wok/TypeChecking/Builtins.hs\",\"src/Wok/IR/Anf.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"test/run-examples/19-exn-never.wok\"],\"verifyCommand\":\"cabal run wok -- test/run-examples/19-exn-never.wok --run\",\"acceptanceCriteria\":[\"Never resolves as type\",\"perform-site freshening makes Never polymorphic\",\"19-exn-never runs to 0\",\"clean build\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 2: MalformedHandlerArm error",
+      "status": "completed",
+      "description": "**Goal:** Bad arm pattern shape reports MalformedHandlerArm, not UnknownOperation.\n\n```json:metadata\n{\"files\":[\"src/Wok/TypeChecking/Error.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"test/typecheck-fail-examples/20-malformed-handler-arm.wok\"],\"verifyCommand\":\"cabal run wok -- test/typecheck-fail-examples/20-malformed-handler-arm.wok --run\",\"acceptanceCriteria\":[\"MalformedHandlerArm replaces UnknownOperation at arm-shape fallthrough\",\"message states expected shape\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 3: Effect-header grammar (EWithH, HUArm)",
+      "status": "pending",
+      "description": "**Goal:** `with State { get -> 0; set s -> () } e` parses; headerless still parses; value arm + unqualified op arm share HUArm.\n\n```json:metadata\n{\"files\":[\"grammar/Wok.cf\",\"src-generated/GeneratedParser/Wok\",\"test/examples/27-with-header.wok\"],\"verifyCommand\":\"cabal run wok -- test/examples/27-with-header.wok --dump-anf\",\"acceptanceCriteria\":[\"EWithH parses headed handler\",\"HUArm replaces HVArm\",\"no new grammar conflicts\",\"both manual patches reapplied\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 4: Header typechecking (resolve, coverage, empty-handler)",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Headed handler type-checks; unqualified arms resolve; ambiguity/out-of-header/empty-handler error; header = strict coverage contract.\n\n```json:metadata\n{\"files\":[\"src/Wok/TypeChecking/Infer.hs\",\"src/Wok/TypeChecking/Error.hs\",\"test/typecheck-examples/28-with-header.wok\",\"test/typecheck-fail-examples/21-header-ambiguous.wok\",\"test/typecheck-fail-examples/22-header-coverage.wok\",\"test/typecheck-fail-examples/23-effect-not-in-header.wok\",\"test/typecheck-fail-examples/24-empty-handler.wok\"],\"verifyCommand\":\"cabal run wok -- test/examples/27-with-header.wok --run\",\"acceptanceCriteria\":[\"EWithH routes with header\",\"unqualified resolution + ambiguity\",\"qualified-not-in-header error\",\"header coverage contract\",\"empty-handler error\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 5: Forgotten-resume lint (Never-exempt, _-suppressed)",
+      "status": "completed",
+      "blockedBy": [0],
+      "description": "**Goal:** Named binder unreferenced on returning op -> ForgottenResume warning; `_` suppresses; Never-result exempt; escaping no warning.\n\n```json:metadata\n{\"files\":[\"src/Wok/TypeChecking/Error.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"test/run-examples/25-lint-forgotten-warn.wok\",\"test/run-examples/26-lint-discard-wildcard.wok\",\"test/run-examples/27-lint-escaping.wok\"],\"verifyCommand\":\"cabal run wok -- test/run-examples/25-lint-forgotten-warn.wok --run\",\"acceptanceCriteria\":[\"named unreferenced binder on returning op warns\",\"wildcard binder suppresses\",\"Never-result exempt\",\"escaping continuation no warning\",\"lint is non-fatal\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 6: Migrate Exn to Never + reconcile corpus + final green",
+      "status": "completed",
+      "blockedBy": [0, 1, 2, 3, 4],
+      "description": "**Goal:** Exn examples use throw:String->Never; surface spec/roadmap/memory say _/Never; suite green.\n\n```json:metadata\n{\"files\":[\"test/run-examples/16-exn-abort.wok\",\"docs/superpowers/specs/2026-06-05-effect-handler-surface-syntax.md\",\"docs/superpowers/specs/2026-06-05-effect-handlers-ROADMAP.md\"],\"verifyCommand\":\"cabal test\",\"acceptanceCriteria\":[\"no phantom-param Exn remains\",\"surface spec reconciled to _/Never\",\"roadmap follow-ups resolved\",\"memory updated\",\"full suite green\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-05"
+}

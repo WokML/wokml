@@ -14,7 +14,7 @@ references this roadmap and contains that slice's bite-sized tasks.
 | Slice | Scope | State |
 |---|---|---|
 | 1 | Value ops + `with`-prefix handler, auto-resume default / binder-control, drop `handle`/`return` | DONE — merged to `main` (542 tests green) |
-| 2 | Optional effect header + forgotten-resume lint | designed |
+| 2 | Optional effect header + forgotten-resume lint + `Never` | implemented (branch `feat/effects-slice-2-header-lint`; pending full-branch review/merge) |
 | 3 | Bounded `(with H ; e)` handler scope | deferred (additive) |
 | 4 | Parameterized handlers -> scheduler / `spawn` / `par` / `Future` / `Control.Wok` | deferred |
 | X | One-shot multiplicity check + value restriction; cancellation (discontinue) | deferred, gated on ANF analysis |
@@ -59,18 +59,21 @@ or do-notation.
 - **Plan file:** `docs/superpowers/plans/2026-06-05-effects-slice-1-with-resume.md` (executed; 5 tasks, all reviewed).
 - **Follow-ups discovered during implementation** (non-blocking; carry into slice 2 or a printer/layout pass):
   1. **`with`-printer round-trip.** BNFC's layout-unaware `printTree` dedents the trailing `with`-body to column 0, so print->reparse fails; `test/golden/{20-effects-syntax,26-with-handler}.expected` pin a `ROUND-TRIP PARSE ERROR` (source parses + runs fine). Fix: emit a re-parseable layout for the `EWith` body.
-  2. **Malformed-arm error label.** A too-many-patterns / non-variable continuation binder throws `UnknownOperation` (misleading — the op IS known). Add a dedicated `MalformedHandlerArm`/arity error before the feature is user-facing.
+  2. **Malformed-arm error label.** ~~A too-many-patterns / non-variable continuation binder throws `UnknownOperation` (misleading — the op IS known). Add a dedicated `MalformedHandlerArm`/arity error before the feature is user-facing.~~ **RESOLVED (slice 2):** dedicated `MalformedHandlerArm SourceSpan Text Text` replaces the `UnknownOperation` throw at the malformed-arm fallthrough.
   3. **Resume-name sentinel.** `TOpArm` uses `Tx.empty` to mean "auto-resume"; consider `Maybe Text` to make the auto-resume-vs-control distinction total (cross-cutting: `Typed.hs` + `Infer.hs` + `Elaborate.hs`).
-  4. **Non-returning ops need an effect param.** `effect Exn = { throw : String -> a }` is rejected (op result vars must be effect params); the working form is `effect Exn a = { throw : String -> a }`. This affects the slice-2 forgotten-resume lint discriminator (the "non-returning op" check) — revisit when building the lint.
+  4. **Non-returning ops need an effect param.** ~~`effect Exn = { throw : String -> a }` is rejected (op result vars must be effect params); the working form is `effect Exn a = { throw : String -> a }`. This affects the slice-2 forgotten-resume lint discriminator (the "non-returning op" check) — revisit when building the lint.~~ **RESOLVED (slice 2):** non-returning is encoded as an uninhabited bottom type `Never` (built-in `TcNever`), not an effect param — `effect Exn = { throw : String -> Never }`. The lint discriminator is "result type is `Never`" (sound; no false positive on a `Reader r = { ask : r }`-style output-only param). Performing a `Never`-result op freshens its result to a type variable (ex-falso) so it is usable at any type. See `2026-06-05-effects-slice-2-design.md` §2.
   5. **Resume binder IR type annotation.** In `Elaborate.elabOpArm` the resume binder is annotated `teType body` — the op result type `T` in auto-resume (correct) but the answer type `R` in the control branch (imprecise; the continuation is `T -> R`). Latent today (field unused by the untyped interpreter). Fix when the typed-Core pass needs a precise resume type: thread `T` onto `TOpArm`. Commented at the site.
 
 ### Slice 2 — effect header + forgotten-resume lint
 
 - **Goal:** ergonomics + safety net for the binder-control case.
-- **Delivers:** `with E1 E2 { ... }` unqualified arms (ambiguity errors); the
-  "binder unreferenced on a returning op" lint + `discard` suppressor.
+- **Delivers:** `with E1 E2 { ... }` unqualified arms (strict coverage contract;
+  ambiguity / out-of-header / empty-handler errors); the "named binder unreferenced
+  on a returning op" lint with the `_` (wildcard) suppressor; the `Never` bottom
+  type + `MalformedHandlerArm` error.
 - **Depends on:** slice 1.
-- **Plan file:** _to be written._
+- **Plan file:** `docs/superpowers/plans/2026-06-05-effects-slice-2-header-lint.md` (executed; 6 tasks, all reviewed).
+- **Design file:** `docs/superpowers/specs/2026-06-05-effects-slice-2-design.md`.
 
 ### Slice 3 — bounded `(with H ; e)`
 

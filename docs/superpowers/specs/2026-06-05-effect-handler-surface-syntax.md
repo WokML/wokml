@@ -27,8 +27,7 @@ declared as a **value operation** (no arrow) so its use site needs no `()`.
 ```
 effect Ask    = { ask : U64 }                  -- value op: referenced as `Ask.ask`
 effect State s = { get : s, set : s -> () }      -- get is a value op; set takes an arg
-effect Exn    = { throw : String -> a }          -- result `a` (op-quantified, result-only)
-                                                 --   marks throw as NON-RETURNING
+effect Exn    = { throw : String -> Never }      -- result `Never` marks throw NON-RETURNING
 effect Choice = { flip : Bool }
 effect Async  = { await : Future a -> a }
 ```
@@ -38,9 +37,13 @@ nullary operation. Value operations remove that encoding. Referencing a value
 operation (`Ask.ask`) **performs the effect** each time it is evaluated (it is a
 request to the handler, like Koka's `val` operations, not a stored value).
 
-An operation whose declared result type is a type variable bound by the operation
-and occurring only in result position (e.g. `throw : String -> a`) is a
-**non-returning** operation; this is used by the lint in section 8.
+An operation whose declared result type is `Never` (wok's uninhabited bottom type;
+e.g. `throw : String -> Never`) is a **non-returning** operation; this is used by
+the lint in section 8. `Never` has no values, so the handler's continuation
+`k : Never -> R` is uncallable -- a non-returning op provably cannot resume. (wok
+forbids a free op-quantified result var like the older `throw : String -> a`, so
+`Never` is the encoding; performing a `Never`-result op yields a fresh type
+variable at the use site -- ex-falso -- so the result is usable at any type.)
 
 ## 2. Effect rows in types (unchanged)
 
@@ -241,15 +244,18 @@ The auto-resume default removes the "forgot to resume in a forwarding handler"
 footgun entirely (forwarding is the no-binder default and cannot drop the
 continuation). A narrow, optional lint remains for the control case:
 
-> **forgotten-resume lint:** if an operation arm binds a continuation `k`, the
-> binder is **not referenced anywhere in the body**, and the operation is a
-> *returning* operation (section 1), warn: the continuation is discarded -- did
-> you mean to resume, or to abort? Suppress an intentional abort with `discard`.
+> **forgotten-resume lint:** if an operation arm binds a **named** continuation
+> `k`, the binder is **not referenced anywhere in the body**, and the operation is
+> a *returning* operation (section 1), warn: the continuation is discarded -- did
+> you mean to resume, or to abort? Suppress an intentional abort by binding the
+> continuation to `_` (the wildcard) instead of a name.
 
 The trigger is binder-**unreferenced**, not binder-never-called: an escaping
 continuation (`Async.await fut k -> Blocked fut k`) references `k` and never
-warns. A non-returning operation (`throw`) is exempt, so genuine exceptions do not
-warn. `discard` is a lint suppressor, not a semantic keyword.
+warns. A non-returning operation (`throw : ... -> Never`) is exempt, so genuine
+exceptions do not warn. The suppressor is `_`, the existing wildcard pattern --
+not a new keyword; a wildcard binds nothing, so the continuation is structurally
+unreferenceable (explicit discard).
 
 ## 9. `case` is unchanged
 

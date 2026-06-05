@@ -128,6 +128,11 @@ prettyWarning (TC.NonExhaustiveMatch pos name) =
 prettyWarning (TC.RedundantClause pos name idx) =
   "warning: redundant clause #" <> show (idx + 1) <> " in `" <> Tx.unpack name <> "`" <> showPos pos
     <> "\n  this clause can never match (it is shadowed by an earlier clause)."
+prettyWarning (TC.ForgottenResume pos eff op) =
+  "warning: forgotten resume" <> showPos pos
+    <> ": the `" <> Tx.unpack eff <> "." <> Tx.unpack op <> "` arm binds a continuation it never uses."
+    <> "\n  the computation will be aborted without resuming the continuation; use `_` to"
+    <> "\n  discard intentionally, or reference the continuation to resume."
 
 showPos :: TC.BNFC'Position -> String
 showPos (Just (l, c)) = " at line " <> show l <> ", col " <> show c

@@ -734,10 +734,22 @@ resolveTyCon name
   | name == Tx.pack "U32"    = TcU32
   | name == Tx.pack "Char"   = TcChar
   | name == Tx.pack "String" = TcString
+  | name == Tx.pack "Never"  = TcNever
   | name == Tx.pack "Bool"   = TcBool
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
   | otherwise                       = TcUser name
+
+-- | Bottom elimination: if an operation's result type is @Never@, replace it
+-- with a fresh type variable so each perform of a non-returning operation is
+-- usable at any type (ex-falso). Non-@Never@ results are returned unchanged.
+freshenNeverResult :: Type s -> TC s (Type s)
+freshenNeverResult ty = do
+  ty' <- force ty
+  case ty' of
+    TArr a r b -> TArr a r <$> freshenNeverResult b
+    TCon TcNever [] -> freshTVar KStar
+    _ -> pure ty'
 
 -- ---------------------------------------------------------------------------
 -- Data declaration processing
@@ -1523,8 +1535,8 @@ inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (p
           -- type, so e.g. `State a`'s `get : () -> a` ties `a` to the `State a`
           -- in the row.
           paramSubst <- instantiateParamSubst (eiParams eInfo)
-          let opTy    = substCTypeWith paramSubst (schemeBody opScheme)
-              labelTy = case eiParams eInfo of
+          opTy <- freshenNeverResult (substCTypeWith paramSubst (schemeBody opScheme))
+          let labelTy = case eiParams eInfo of
                 []      -> TCon TcUnit []
                 [(i,_)] -> Map.findWithDefault (TCon TcUnit []) i paramSubst
                 ps      -> TCon (TcTuple (length ps))
@@ -1650,15 +1662,88 @@ inferExprW mono (Abs.ECase scrutinee alts) = do
 -- arm (a bare pattern `v -> r`) transforms the final value. The result effect
 -- row is EXPR's effects minus the handled ones, joined into the enclosing
 -- ambient.
-inferExprW mono (Abs.EWith arms e) = inferHandler mono e arms
+inferExprW mono (Abs.EWith arms e) = inferHandler mono [] Nothing e arms
+inferExprW mono (Abs.EWithH (Abs.ConId (hpos, h)) hs arms e) =
+  inferHandler mono (h : [ n | Abs.ConId (_, n) <- hs ]) (Just hpos) e arms
 
-inferHandler :: Map.Map Text (Type s) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
-inferHandler mono e arms = do
+-- | Classification of a single handler arm against the (possibly empty) header.
+-- An unqualified arm is resolved to either an operation arm (when its head names
+-- an operation of a header effect) or a value/return arm (when it has no
+-- arguments and matches no operation name).
+data ArmClass
+  = OpArmC Text Text [Abs.AtomPat] Abs.Exp (Int, Int)
+  | ValArmC Text Abs.Exp (Int, Int)
+
+classifyArm :: Env -> [Text] -> Abs.HandlerArm -> TC s ArmClass
+classifyArm env header arm = case arm of
+  Abs.HArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body -> do
+    unless (null header || en `elem` header) $
+      throwError (HandlerEffectNotInHeader (Just pos) en)
+    pure (OpArmC en op ps body pos)
+  Abs.HUArm (Abs.VarId (pos, name)) ps body ->
+    -- Resolve an unqualified arm against the header effects. NOTE: in a HEADERLESS
+    -- block (`header == []`) the match list is always empty, so a bare `name -> e`
+    -- is treated as a VALUE arm -- unqualified OPERATION arms require a header (or
+    -- qualify the arm). An unqualified op arm written without a header therefore
+    -- lands in the value-arm branch and, if there is more than one, surfaces as
+    -- DuplicateReturnArm rather than a header-resolution error.
+    case [ en | en <- header, declaresOp env en name ] of
+      [en] -> pure (OpArmC en name ps body pos)
+      []   -> if null ps
+                then pure (ValArmC name body pos)
+                else throwError (UnknownUnqualifiedOp (Just pos) name)
+      ens  -> throwError (HandlerOpAmbiguous (Just pos) name ens)
+  where
+    declaresOp e en op = case lookupEffect en e of
+      Just eInfo -> Map.member op (eiOps eInfo)
+      Nothing    -> False
+
+-- | Does the typed expression reference the given (surface) variable name?
+-- Conservative (shadowing ignored -> only ever suppresses the lint, never a
+-- false positive). Used by the forgotten-resume lint. Example of the accepted
+-- false negative: `State.get k -> \k -> k 0` reports k as referenced (the inner
+-- lambda's k matches), suppressing a warning the outer k arguably deserves. That
+-- trade is deliberate: we prefer a missed warning to nagging valid code.
+texpMentions :: Text -> Ty.Texp a -> Bool
+texpMentions name = goE
+  where
+    goE (Ty.Texp _ f) = goF f
+    goF f = case f of
+      Ty.TVar n            -> n == name
+      Ty.TQVar n _         -> n == name
+      Ty.TParenOp _        -> False
+      Ty.TLitI _           -> False
+      Ty.TLitS _           -> False
+      Ty.TLitC _           -> False
+      Ty.TUnit             -> False
+      Ty.TCon _            -> False
+      Ty.TProjCon _ _      -> False
+      Ty.TApp h xs         -> goE h || any goE xs
+      Ty.TLam _ b          -> goE b
+      Ty.TIf a b c         -> goE a || goE b || goE c
+      Ty.TTuple xs         -> any goE xs
+      Ty.TList xs          -> any goE xs
+      Ty.TProj e _         -> goE e
+      Ty.TRecord _ fs      -> any (goE . snd) fs
+      Ty.TRecordExt _ e fs -> goE e || any (goE . snd) fs
+      Ty.TLet ds b         -> any goD ds || goE b
+      Ty.TCase e alts      -> goE e || any goA alts
+      Ty.THandle e arms    -> goE e || any goArm arms
+    goD (Ty.TLocalDecl _ _ b)   = goE b
+    goA (Ty.TAlt _ ds b)        = any goD ds || goE b
+    goArm (Ty.TReturnArm _ b)   = goE b
+    goArm (Ty.TOpArm _ _ _ _ b) = goE b
+
+inferHandler :: Map.Map Text (Type s) -> [Text] -> Maybe (Int, Int) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
+inferHandler mono header headerPos e arms = do
   env <- currentEnv
-  -- Split arms into operation arms and an optional return arm.
-  let opArms = [ (en, op, ps, body, pos)
-               | Abs.HArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body <- arms ]
-      retArms = [ (pos, v, body) | Abs.HVArm (Abs.VarId (pos, v)) body <- arms ]
+  -- A handler with no arms handles nothing; reject rather than silently
+  -- producing an identity handler.
+  when (null arms) $ throwError (EmptyHandler headerPos)
+  -- Classify each arm against the header into an operation arm or a value arm.
+  classified <- mapM (classifyArm env header) arms
+  let opArms  = [ (en, op, ps, body, pos) | OpArmC en op ps body pos <- classified ]
+      retArms = [ (pos, v, body)          | ValArmC v body pos        <- classified ]
   -- At most one `return` arm is allowed; reject a second rather than silently
   -- ignoring it.
   case retArms of
@@ -1673,22 +1758,28 @@ inferHandler mono e arms = do
   -- at R and bind `resume : T -> R`, and the value/return arm produces R. A
   -- single shared metavar ties all of them together.
   answerT <- freshTVar KStar
-  -- The handled effects are the distinct effect names mentioned by arm heads.
-  let handledEffects = Data.List.nub [ en | (en, _, _, _, _) <- opArms ]
+  -- The handled effects: when a header is present it is the authoritative
+  -- "exactly these effects" set (so missing arms are coverage errors); without
+  -- a header, the distinct effect names mentioned by arm heads.
+  let handledEffects = if null header
+                         then Data.List.nub [ en | (en, _, _, _, _) <- opArms ]
+                         else header
   -- Coverage: every operation of each handled effect must have an arm.
   forM_ handledEffects $ \en ->
     case lookupEffect en env of
-      Nothing -> case opArms of
-        ((_, _, _, _, pos) : _) -> throwError (MissingEffectDecl (Just pos) en)
-        []                      -> throwError (MissingEffectDecl Nothing en)
+      Nothing -> do
+        let armPos = case opArms of ((_, _, _, _, p) : _) -> Just p; [] -> Nothing
+        throwError (MissingEffectDecl (maybe armPos Just headerPos) en)
       Just eInfo -> do
         let declaredOps = Map.keys (eiOps eInfo)
             handledOps  = [ op | (en', op, _, _, _) <- opArms, en' == en ]
             missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
         unless (null missing) $ do
+          -- Prefer a matching op-arm position; for a header effect with no arm
+          -- at all, fall back to the header position.
           let pos = case [ p | (en', _, _, _, p) <- opArms, en' == en ] of
                       (p : _) -> Just p
-                      []      -> Nothing
+                      []      -> headerPos
           throwError (HandlerCoverage pos en missing)
   -- Type each operation arm: bind its argument patterns to the op's argument
   -- types and check its body against the op's RESULT type. Arm bodies run under
@@ -1701,6 +1792,13 @@ inferHandler mono e arms = do
         Nothing -> throwError (UnknownOperation (Just pos) en op)
         Just opScheme -> do
           paramSubst <- instantiateParamSubst (eiParams eInfo)
+          -- NOTE: unlike the perform site (the `EProj` op-reference case), this
+          -- handler-arm path deliberately does NOT call `freshenNeverResult`. A
+          -- `Never` result must stay `Never` here so the arm's continuation is
+          -- typed `k : Never -> R` (uncallable -> a non-returning op cannot
+          -- resume) and an auto-resume arm body is forced to `Never`
+          -- (unconstructable). Freshening here would wrongly let an abort op
+          -- resume. Bottom elimination belongs only at the perform site.
           let opTy = substCTypeWith paramSubst (schemeBody opScheme)
           -- The op's arity is the count of leading arrows of its (param-
           -- substituted) type; a value op (e.g. `ask : U64`) has arity 0.
@@ -1728,6 +1826,17 @@ inferHandler mono e arms = do
               (bodyT, bodyNode) <- inferExprW mono1 body
               unify (Just pos) bodyT resultTy
               pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
+            [Abs.APWild] -> do
+              -- WILDCARD DISCARD: explicit intentional discard; body has the
+              -- answer type R; bind nothing; never lint. Resume-name sentinel
+              -- contract (shared with the elaborator): `Tx.empty` = auto-resume
+              -- (auto-wrap at the op result type); any NON-empty name = control
+              -- path (body is R, no auto-wrap). `"_"` is just a non-empty name
+              -- routing to the control path; binding the surface name `_` is
+              -- harmless because the body never references it.
+              (bodyT, bodyNode) <- inferExprW mono1 body
+              unify (Just pos) bodyT answerT
+              pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") bodyNode)
             [Abs.APVar (Abs.VarId (_, kname))] -> do
               -- CONTROL: the trailing pattern is the continuation binder `k`. The
               -- arm body has the handler ANSWER type R; `resume : T -> R` (T is the
@@ -1739,11 +1848,18 @@ inferHandler mono e arms = do
                   mono2    = Map.insert kname resumeTy mono1
               (bodyT, bodyNode) <- inferExprW mono2 body
               unify (Just pos) bodyT answerT
+              -- Forgotten-resume lint: a NAMED binder, unreferenced in the body,
+              -- on a RETURNING op (result /= Never). Wildcard arms (above) are the
+              -- intentional-discard escape hatch and never reach here.
+              resultTy' <- force resultTy
+              let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
+              unless (isNever || texpMentions kname bodyNode) $
+                addWarning (ForgottenResume (Just pos) en op)
               pure (Ty.TOpArm en op argPatNodes kname bodyNode)
             _ ->
               -- More than `arity + 1` patterns, or a non-variable continuation
               -- binder: not a valid operation arm shape.
-              throwError (UnknownOperation (Just pos) en op)
+              throwError (MalformedHandlerArm (Just pos) en op)
   -- Discharge the handled effects from the handled expression's row, leaving
   -- the residual effects to flow outward.
   subRow <- liftST (readSTRef subRef)
@@ -2888,6 +3004,7 @@ prettyCType (CTCon TcU64    []) = Tx.pack "U64"
 prettyCType (CTCon TcU32    []) = Tx.pack "U32"
 prettyCType (CTCon TcChar   []) = Tx.pack "Char"
 prettyCType (CTCon TcString []) = Tx.pack "String"
+prettyCType (CTCon TcNever  []) = Tx.pack "Never"
 prettyCType (CTCon TcBool   []) = Tx.pack "Bool"
 prettyCType (CTCon TcUnit   []) = Tx.pack "()"
 prettyCType (CTCon TcList [x]) =

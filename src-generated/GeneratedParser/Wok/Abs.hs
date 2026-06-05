@@ -173,6 +173,7 @@ data Exp
     | ECase Exp [Alt]
     | EIf Exp Exp Exp
     | EWith [HandlerArm] Exp
+    | EWithH ConId [ConId] [HandlerArm] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixTail = ITail InfixOp Exp
@@ -187,7 +188,8 @@ data MaybeTrailing = TFNone | TFSome [RecordFieldExpr]
 data RecordFieldExpr = RFExpr VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
-data HandlerArm = HArm ConId VarId [AtomPat] Exp | HVArm VarId Exp
+data HandlerArm
+    = HArm ConId VarId [AtomPat] Exp | HUArm VarId [AtomPat] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl

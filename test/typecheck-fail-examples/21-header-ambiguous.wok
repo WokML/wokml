@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+effect Reader = { ask : U64 }
+effect Config = { ask : U64 }
+
+prog : () -> U64 with Reader + Config
+prog u = Reader.ask + Config.ask
+
+main : U64
+main =
+  with Reader Config { ask -> 0 }
+  prog ()

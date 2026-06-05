@@ -81,6 +81,21 @@ data TypeError
     -- effect row (the enclosing function's @with@ clause lacks it).
   | UnknownOperation SourceSpan Text Text
     -- ^ @E.op@ where @op@ is not an operation of effect @E@ (effect, op).
+  | MalformedHandlerArm SourceSpan Text Text
+    -- ^ A handler arm for a KNOWN operation has an invalid pattern shape:
+    --   more than (op arity + 1) patterns, or a non-variable continuation
+    --   binder. Args: position, effect name, operation name.
+  | HandlerOpAmbiguous SourceSpan Text [Text]
+    -- ^ An unqualified handler-arm op name is declared by more than one header
+    --   effect. Args: position, op name, candidate effect names. Re-qualify.
+  | UnknownUnqualifiedOp SourceSpan Text
+    -- ^ An unqualified handler arm with arguments names no operation of any
+    --   header effect. Args: position, op name.
+  | HandlerEffectNotInHeader SourceSpan Text
+    -- ^ A qualified handler arm names an effect absent from the (non-empty)
+    --   header (a strict "exactly these effects" contract). Args: position, effect.
+  | EmptyHandler SourceSpan
+    -- ^ A `with { }` / `with E { }` with zero arms handles nothing. Args: position.
   | DuplicateOperation SourceSpan Text Text
     -- ^ Two operations with the same name in one effect decl (effect, op).
   | HandlerCoverage SourceSpan Text [Text]
@@ -147,4 +162,8 @@ data Warning
     -- ^ A function's clause group does not cover all inputs. Args: position, name.
   | RedundantClause SourceSpan Text Int
     -- ^ A clause can never match (shadowed). Args: position, name, 0-based clause index.
+  | ForgottenResume SourceSpan Text Text
+    -- ^ An operation arm binds a NAMED continuation never referenced in its
+    --   body, on a RETURNING operation (result /= Never). Args: position,
+    --   effect, operation. Suppress with a `_` (wildcard) binder.
   deriving (Eq, Show)

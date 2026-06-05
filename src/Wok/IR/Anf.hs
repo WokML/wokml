@@ -347,6 +347,7 @@ prettyCTypeLocal (CTCon TcU64    [])  = Tx.pack "U64"
 prettyCTypeLocal (CTCon TcU32    [])  = Tx.pack "U32"
 prettyCTypeLocal (CTCon TcChar   [])  = Tx.pack "Char"
 prettyCTypeLocal (CTCon TcString [])  = Tx.pack "String"
+prettyCTypeLocal (CTCon TcNever  [])  = Tx.pack "Never"
 prettyCTypeLocal (CTCon TcBool   [])  = Tx.pack "Bool"
 prettyCTypeLocal (CTCon TcUnit   [])  = Tx.pack "()"
 prettyCTypeLocal (CTCon TcList [x])   =

@@ -396,6 +396,7 @@ Exp2
   | 'case' Exp 'of' '{' ListAlt '}' { GeneratedParser.Wok.Abs.ECase $2 $5 }
   | 'if' Exp 'then' Exp 'else' Exp { GeneratedParser.Wok.Abs.EIf $2 $4 $6 }
   | 'with' '{' ListHandlerArm '}' Exp { GeneratedParser.Wok.Abs.EWith $3 $5 }
+  | 'with' ConId ListConId '{' ListHandlerArm '}' Exp { GeneratedParser.Wok.Abs.EWithH $2 $3 $5 $7 }
 
 MaybeTrailing :: { GeneratedParser.Wok.Abs.MaybeTrailing }
 MaybeTrailing
@@ -415,13 +416,16 @@ ListRecordFieldExpr
 HandlerArm :: { GeneratedParser.Wok.Abs.HandlerArm }
 HandlerArm
   : ConId '.' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HArm $1 $3 $4 $6 }
-  | VarId '->' Exp { GeneratedParser.Wok.Abs.HVArm $1 $3 }
+  | VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HUArm $1 $2 $4 }
 
 ListHandlerArm :: { [GeneratedParser.Wok.Abs.HandlerArm] }
 ListHandlerArm
   : {- empty -} { [] }
   | HandlerArm { (:[]) $1 }
   | HandlerArm ';' ListHandlerArm { (:) $1 $3 }
+
+ListConId :: { [GeneratedParser.Wok.Abs.ConId] }
+ListConId : {- empty -} { [] } | ConId ListConId { (:) $1 $2 }
 
 ListExp :: { [GeneratedParser.Wok.Abs.Exp] }
 ListExp

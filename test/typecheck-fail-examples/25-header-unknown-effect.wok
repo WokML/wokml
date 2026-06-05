@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+effect Ask = { ask : U64 }
+
+prog : () -> U64 with Ask
+prog u = Ask.ask
+
+main : U64
+main =
+  with Bogus { ask -> 0 }
+  prog ()

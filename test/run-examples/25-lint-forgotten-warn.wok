@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+effect State s = { get : s, set : s -> () }
+
+prog : () -> U64 with State U64
+prog u = State.get
+
+main : U64
+main =
+  with { State.get k    -> 0
+         ; State.set s k -> 0
+         ; v             -> v }
+  prog ()

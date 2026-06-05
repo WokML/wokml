@@ -367,10 +367,20 @@ EIf.      Exp2 ::= "if" Exp "then" Exp "else" Exp ;
 -- A value arm (HVArm) is the return clause; the `return` keyword is gone. The
 -- optional continuation binder is the (arity+1)-th AtomPat on an operation arm,
 -- split from the op's arguments by the typechecker (Task 2), so HArm is unchanged.
+-- Headerless handler (slice 1): every arm is dot-qualified.
 EWith.    Exp2 ::= "with" "{" [HandlerArm] "}" Exp ;
+-- Headed handler (slice 2): a non-empty ConId run names the handled effects so
+-- arms may drop the qualifier. The first ConId is mandatory (so an empty header
+-- cannot collide with EWith); the rest is a whitespace-separated [ConId] tail.
+EWithH.   Exp2 ::= "with" ConId [ConId] "{" [HandlerArm] "}" Exp ;
+-- Qualified operation arm (unchanged).
 HArm.     HandlerArm ::= ConId "." VarId [AtomPat] "->" Exp ;
-HVArm.    HandlerArm ::= VarId "->" Exp ;
+-- Unqualified arm: covers BOTH the value arm (`v -> e`, zero AtomPats) and an
+-- unqualified operation arm (`get -> e`, `set s -> e`). The typechecker classifies
+-- each by resolving the head name against the header. Replaces HVArm.
+HUArm.    HandlerArm ::= VarId [AtomPat] "->" Exp ;
 separator HandlerArm ";" ;
+separator ConId "" ;
 
 separator Exp "," ;   -- shared by EList and ETuple bodies
 
