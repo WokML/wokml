@@ -14,8 +14,8 @@ references this roadmap and contains that slice's bite-sized tasks.
 | Slice | Scope | State |
 |---|---|---|
 | 1 | Value ops + `with`-prefix handler, auto-resume default / binder-control, drop `handle`/`return` | DONE — merged to `main` (542 tests green) |
-| 2 | Optional effect header + forgotten-resume lint + `Never` | implemented (branch `feat/effects-slice-2-header-lint`; pending full-branch review/merge) |
-| 3 | Bounded `(with H ; e)` handler scope | deferred (additive) |
+| 2 | Optional effect header + forgotten-resume lint + `Never` | DONE — merged to `main` (562 tests green) |
+| 3 | Bounded `(with H e)` handler scope | DONE — merged to `main` (572 tests green) |
 | 4 | Parameterized handlers -> scheduler / `spawn` / `par` / `Future` / `Control.Wok` | deferred |
 | X | One-shot multiplicity check + value restriction; cancellation (discontinue) | deferred, gated on ANF analysis |
 
@@ -75,12 +75,17 @@ or do-notation.
 - **Plan file:** `docs/superpowers/plans/2026-06-05-effects-slice-2-header-lint.md` (executed; 6 tasks, all reviewed).
 - **Design file:** `docs/superpowers/specs/2026-06-05-effects-slice-2-design.md`.
 
-### Slice 3 — bounded `(with H ; e)`
+### Slice 3 — bounded `(with H e)`
 
 - **Goal:** nice syntax for partial handler scope.
-- **Note:** additive; bounded scope already exists semantically via lambda bodies,
-  so this is sugar, not new power.
-- **Plan file:** _to be written._
+- **Surface:** `(with H e)` (parenthesized prefix; no separator — `;` would
+  overload the arm separator, and a dedicated paren production conflicts with
+  `EParen`+`EWith`). The form already parses and routes through the existing
+  typechecker/elaborator/runtime, so there is no grammar/parser/typecheck change.
+- **Substance:** a runtime fix. A resuming handler in non-tail position did not
+  delimit its continuation; `resume` now rebinds the handler's answer-join to the
+  resume call site. Design: `2026-06-06-effects-slice-3-bounded-handlers-design.md`.
+- **Plan file:** `docs/superpowers/plans/2026-06-06-effects-slice-3-bounded-handlers.md`.
 
 ### Slice 4 — parameterized handlers, then the runtime
 

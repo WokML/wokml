@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+
+effect Choice = { flip : Bool }
+
+pick : () -> U64 with Choice
+pick u = if Choice.flip then 10 else 20
+
+-- Nested bounded multishot: inner handler bounded, its result used by an outer
+-- bounded multishot. Inner = 30; outer sums k True (30) + k False (30) = 60.
+main : U64
+main =
+  (with { Choice.flip k -> k True + k False
+          ; v -> v }
+    (if Choice.flip
+       then (with { Choice.flip k -> k True + k False ; v -> v } pick ())
+       else 0))

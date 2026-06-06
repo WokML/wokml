@@ -494,7 +494,10 @@ elabKF tk _ (THandle e arms) = do
     [] -> do
       vN <- bindFresh (Tx.pack "v")
       pure (Binder vN Unrestricted (teType e), deliverAtom tk (AVar vN))
-  pure (Handle handledBody (Handler retArm opArms))
+  let answerJoin = case tk of
+        TJump j -> Just j   -- value position: arms deliver via `jump j`
+        TRet    -> Nothing  -- tail position: arms tail-return; nothing to rebind
+  pure (Handle handledBody (Handler retArm opArms answerJoin))
   where
     elabReturnArm :: TailK -> TPat -> TExpr -> Elab (Binder, Expr)
     elabReturnArm tk2 (Tpat pty (TPVar v)) rb = do

@@ -11,7 +11,7 @@ import qualified Data.Map.Lazy as MapL
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
-  ( Alt (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
+  ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
   , OpArm (..), Rhs (..), TopBind (..) )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.Interp.Prim (primTable)
@@ -142,9 +142,31 @@ dispatchOp lbl op argVals kCur =
       case lookupOpArm lbl op h of
         Nothing -> Left (NoMatchingHandler lbl op)
         Just oa ->
-          -- resume v (called at continuation `after`) re-runs the delimited
-          -- frames with the handler RE-INSTALLED over `after` (deep handler).
-          let resumeVal = VCont (\after -> above (KHandle h hsc after))
+          -- Deep, multishot resume. When the handler is re-installed over the
+          -- resume call site `after`, its ANSWER join (the join its arms deliver
+          -- to in value position) must also deliver to `after` -- otherwise a
+          -- resumed sub-run's answer escapes via the static post-handler
+          -- continuation instead of returning to the resume call site. Rebind it
+          -- per resume; the TOP-LEVEL op arm below keeps the original `hsc`, so
+          -- the real post-handler work runs once on the final answer.
+          let reinstall after =
+                let hsc' = case hAnswerJoin h of
+                      -- INVARIANT: an answer-join is the single-result merge join
+                      -- `normName` creates for a value-position handler, so `ps` is
+                      -- exactly one binder. The `(pb : _)` guard takes that binder;
+                      -- if a future change ever pointed `hAnswerJoin` at a many-param
+                      -- join, the rebind is skipped (escape bug returns) rather than
+                      -- misbinding -- keep answer-joins single-param.
+                      Just j
+                        | Just (JoinPoint _ ps _ _) <- Map.lookup j (scJoins hsc)
+                        , (pb : _) <- ps ->
+                            hsc { scJoins =
+                                    Map.insert j
+                                      (JoinPoint hsc ps (Ret (AVar (bndName pb))) after)
+                                      (scJoins hsc) }
+                      _ -> hsc
+                in above (KHandle h hsc' after)
+              resumeVal = VCont reinstall
               env1 = bindBinders (oaArgs oa) argVals (scEnv hsc)
               env2 = bindBinder (oaResume oa) resumeVal env1
           in Right (Eval (oaBody oa) (Scope env2 (scJoins hsc)) kBelow)

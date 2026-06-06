@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+effect Ask = { ask : U64 }
+
+useAsk : () -> U64 with Ask
+useAsk u = Ask.ask + 1
+
+-- Auto-resume arm (no `k` binder) used in non-tail position via the bounded form.
+main : U64
+main = (with { Ask.ask -> 41 } useAsk ()) + 1

@@ -70,6 +70,11 @@ data Alt
 data Handler = Handler
   { hReturn :: (Binder, Expr)
   , hOps :: [OpArm]
+  , hAnswerJoin :: Maybe JoinId
+    -- ^ The join point this handler's arms deliver their answer to, when the
+    -- handler is in value (non-tail) position; Nothing in tail position. Used
+    -- by the interpreter to redirect a resumed sub-run's answer to the resume
+    -- call site instead of the static post-handler continuation.
   } deriving (Eq, Show)
 
 data OpArm = OpArm
@@ -138,7 +143,7 @@ collectAlt (AltLit _ e)    t = collectExpr e t
 collectAlt (AltDefault e)  t = collectExpr e t
 
 collectHandler :: Handler -> HintTable -> HintTable
-collectHandler (Handler ret ops) t =
+collectHandler (Handler ret ops _) t =
   let (rb, re) = ret
       t1 = collectExpr re (insertBinder rb t)
   in foldr collectOpArm t1 ops
@@ -307,7 +312,7 @@ renderAlt fmt tbl (AltDefault e) =
 -- Rendering Handler
 
 renderHandler :: BndFmt -> HintTable -> Handler -> Text
-renderHandler fmt tbl (Handler (rb, re) ops) =
+renderHandler fmt tbl (Handler (rb, re) ops _) =
   Tx.pack "with {"
     <> Tx.pack "\n"
     <> indent 2

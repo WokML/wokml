@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+effect Yield = { yield : U64 -> () }
+
+producer : () -> () with Yield
+producer u =
+  let a = Yield.yield 1 in
+  let b = Yield.yield 2 in
+  Yield.yield 3
+
+-- Generator (single resume per yield) spliced inline via the bounded form.
+-- Must collect [1,2,3] and prepend 100.
+main : [U64]
+main =
+  [100] ++ (with { Yield.yield x k -> [x] ++ k ()
+                   ; v             -> [] }
+             producer ())

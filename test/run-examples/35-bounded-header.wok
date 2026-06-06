@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+effect State s = { get : s, set : s -> () }
+effect Exn = { throw : String -> Never }
+
+prog : () -> U64 with State U64
+prog u = State.get
+
+risky : Bool -> U64 with Exn
+risky b = if b then Exn.throw "boom" else 7
+
+-- Bounded header form + bounded headerless form, both mid-block via let.
+main : U64
+main =
+  let a = (with State { get -> 5 ; set s -> () } prog ()) in
+  let b = (with { Exn.throw m k -> 0 ; v -> v } risky False) in
+  a + b

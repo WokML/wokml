@@ -99,9 +99,9 @@ serveAll reqs =
     handleRequest req)
 ```
 
-To bound a handler to less than a whole body today, extract a helper function (or
-a lambda) whose body is the handled computation. The dedicated bounded form
-`(with H ; e)` is a deferred, purely additive follow-up (section 10).
+To bound a handler to less than a whole body, parenthesize it: `(with H e)` scopes
+the handler to just `e`. This is the bounded form — additive surface over the
+prefix `with`, correct for all handler kinds (shipped in slice 3).
 
 ### 4.2 Stacking is flat
 
@@ -278,13 +278,16 @@ Goal checks: **decidable** -- handlers are second-class (they appear only in
 **Deterministic** -- nondeterminism (incl. racy scheduling) is a row effect.
 **Effect handlers** -- the one mechanism for all of the above.
 
-## 11. Deferred (additive, no lock-in) and non-goals
+## 11. Shipped additive features, deferred items, and non-goals
+
+Shipped (additive, no lock-in):
+
+- **Bounded handler scope `(with H e)`** -- **shipped (slice 3).** Parenthesized
+  prefix; no separator. (Slice 3's substance was the non-tail-resume delimiter fix,
+  not the syntax.)
 
 Deferred, each purely additive:
 
-- **Bounded handler scope `(with H ; e)`** -- recover today via helper/lambda
-  (their bodies are blocks). Bounded scope already exists semantically via lambda
-  bodies; this is only nicer syntax for it.
 - **Parameterized handlers** (`handler(s){...}`) for clean stateful `State`. The
   `State` arms above illustrate operation syntax, not yet a state-threading
   handler.
@@ -305,11 +308,22 @@ Non-goals (per predecessor): scoped/higher-order operations (`catch`, `local`,
   it under the `with`s above; reordering `with` lines changes meaning. Needs editor
   support to visualize handler scope.
 - **A `with` line can change the block's result type** (a reshaping value arm
-  applies to the whole rest of the block). At top level this is intended; combined
-  with the deferred bounded form, reshaping handlers that must be unpacked
-  mid-function require a helper.
+  applies to the whole rest of the block). At top level this is intended.
+  (resolved in slice 3: `let r = (with H e) in …` unpacks a reshaping handler
+  mid-function with no helper)
 - **Two body-type modes** for operation arms (op-result vs answer type). Mitigated
   by the visible binder cue.
+- **Deep re-entrant same-effect multishot is not yet fully enumerated.** When a
+  single handler's computation performs the *same* operation more than once in
+  sequence under a multishot arm (`flip k -> k True + k False`), only the first
+  combination is produced, not the full tree. Example: `pick` flips twice and the
+  handler sums both branches — the correct full enumeration is `66`, the runtime
+  currently yields `11` (first leaf only). This is a pre-existing
+  continuation-capture limitation (present since slice 1, independent of tail vs
+  bounded position — the slice-3 delimiter fix is behavior-preserving here) and is
+  pinned by `test/run-examples/37-known-reentrant-multishot-limitation.wok` so a
+  future fix is noticed. A correct multi-shot deep-handler capture is deferred with
+  the one-shot/multiplicity analysis (section 11).
 - **Async storage needs existentials** for heterogeneous parked continuations;
   mitigated by making `Future` a runtime primitive (the type is hidden in callback
   registration). A pure-ADT scheduler needs existential support -- deferred with
@@ -321,5 +335,5 @@ Non-goals (per predecessor): scoped/higher-order operations (`catch`, `local`,
    binder-control (sections 1, 4, 5, 6). Drop `handle`/`return`. Smallest unit
    that unlocks exceptions, multi-shot, and the async *shape* (without a runtime).
 2. Optional effect header (section 4.3) and the forgotten-resume lint (section 8).
-3. Bounded `(with H ; e)` form (section 11).
+3. Bounded `(with H e)` form (section 11).
 4. Parameterized handlers; then the scheduler, `Future`, and `Control.Wok`.

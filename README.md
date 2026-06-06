@@ -1,8 +1,16 @@
 # wok
 
-A Miranda-flavored functional language frontend, built with BNFC.
+A Miranda-flavored functional language, built with BNFC for the front end.
 
-**v1 is grammar only** -- lex + parse + pretty-print round-trip. No typechecker, no runtime, no semantics.
+The pipeline runs end to end: lex + parse + layout, name resolution, Hindley-Milner type inference with effect-row unification, elaboration to an ANF intermediate representation, and a stackless CEK interpreter that evaluates programs (`--run` runs `main`).
+
+## What's implemented
+
+- **Front end:** layout-aware parser, pretty-print round-trip, hierarchical modules (`module` / `import` / `use`, `local` visibility).
+- **Type system:** Hindley-Milner inference with **effect-row** unification, records (construction, projection, patterns, row extension), and single-parameter **`Eq` type classes** via dictionary passing.
+- **Pattern matching:** top-level multi-clause functions compile to decision trees (`Wok.IR.Match`); constructor / cons / record / literal / wildcard patterns.
+- **Algebraic effect handlers:** `with { ... }` prefix handlers; auto-resume by default, bind a continuation to take control (abort / once / multishot); optional effect header `with E { ... }`; the `Never` bottom type and the forgotten-resume lint; and the bounded `(with H e)` form (handler scoped to one expression). Deep, multishot resume. See `docs/superpowers/specs/2026-06-05-effect-handlers-ROADMAP.md` for the slice roadmap.
+- **Runtime:** ANF elaboration (`Wok.IR.Elaborate`) feeding a CEK interpreter (`Wok.Interp.Machine`). `--run` evaluates `main`; `--dump-anf` prints the elaborated IR.
 
 ## Build
 
@@ -19,12 +27,14 @@ cabal build
 cabal test
 ```
 
-The test suite runs every `test/examples/*.wok` file through a parse -> pretty-print -> re-parse round-trip and compares against golden files in `test/golden/`.
+The suite is golden-file based (`tasty-golden`) and covers the whole pipeline: parse round-trip (`test/examples/` vs `test/golden/`), name resolution (`test/resolve-examples/`), type checking (success in `test/typecheck-examples/`, expected failures in `test/typecheck-fail-examples/`), ANF elaboration (`test/anf-golden/`, `test/typed-anf-golden/`), and end-to-end evaluation (`test/run-examples/` vs `test/run-golden/`).
 
 ## Run the CLI
 
 ```bash
-cabal run wok -- test/examples/01-literals.wok
+cabal run wok -- test/examples/01-literals.wok          # parse + pretty-print
+cabal run wok -- test/run-examples/07-effect-ask.wok --run       # evaluate main
+cabal run wok -- test/run-examples/07-effect-ask.wok --dump-anf  # dump elaborated ANF
 ```
 
 ## Regenerate after editing `grammar/Wok.cf`
@@ -53,7 +63,10 @@ cabal test --test-options=--accept
   (pure-symbol operators; `.` is no longer a symbol character).
 - **Block delimiters:** indentation (layout rule) OR explicit `{` `;` `}`. Both work; mixing is fine.
 - **Conditional:** built-in `if c then a else b`.
-- **Pattern matching:** `case e of { p1 -> e1; p2 -> e2 }`.
+- **Pattern matching:** `case e of { p1 -> e1; p2 -> e2 }`; top-level functions may have multiple clauses, compiled to decision trees.
+- **Records:** construction `Point { x = 1, y = 2 }`, projection `p.x`, patterns `Point { x = a, .. }`, row extension `Point { ..p, x = 9 }`.
+- **Type classes:** `class Eq a where { (==) : a -> a -> Bool }` and `instance Eq U64 where { ... }` (single-parameter; dictionary-passing).
+- **Effect handlers:** `with { Exn.throw m k -> None ; v -> Some v } e` — prefix handlers over the rest of the block; an operation arm auto-resumes unless it binds a continuation; optional header `with State { get -> 0 ; set s -> () }`; bounded form `(with H e)` scopes the handler to one expression. The `Never` bottom type marks non-returning operations.
 - **Operator definitions** (all four equivalent):
   - `add x y = ...` -- prefix, alphabetic name
   - `(+) x y = ...` -- prefix, symbolic name in parens
@@ -97,8 +110,8 @@ These do not affect parsing but matter for downstream consumers (semantic pass, 
 
 ## Happy shift/reduce conflicts
 
-`cabal build` reports `shift/reduce conflicts: 28`, all in the expression layer (`Exp1 -> Exp1 . Exp2` — eager-juxtaposition application meets infix tail; the count rose from 24 to 28 due to the v2 pattern and projection rules). Happy resolves by default-shift, which gives the desired left-associative parse for `f x y` and clean separation for `f x + g y`. No tests have failed because of these. Documented and accepted; revisit if a future grammar change risks worsening them.
+`cabal build` reports **31** shift/reduce conflicts (summed across 6 LALR states; the bulk are in the expression layer `Exp1 -> Exp1 . Exp2` — eager-juxtaposition application meeting an infix tail; the count grew from 24 → 28 → 31 as the v2 pattern/projection rules and the effect-handler productions landed). Happy resolves by default-shift, which gives the desired left-associative parse for `f x y` and clean separation for `f x + g y`. No tests have failed because of these. Documented and accepted; revisit if a future grammar change risks worsening them.
 
 ## Deferred to v2+
 
-See `docs/superpowers/specs/2026-05-20-bnfc-wok-grammar-design.md` for the full deferred-features list. Highlights: floats, type classes, records, do-notation, mixfix-with-holes, `::` as expression-level cons, layout-filter improvements.
+See `docs/superpowers/specs/2026-05-20-bnfc-wok-grammar-design.md` for the full deferred-features list. Still deferred: floats, multi-parameter type classes, do-notation, mixfix-with-holes, `::` as an expression-level cons operator, layout-filter improvements. (Single-parameter type classes, records, and algebraic effect handlers have since landed — see "What's implemented" above.)

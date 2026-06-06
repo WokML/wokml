@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+effect Choice = { flip : Bool }
+
+pick : () -> U64 with Choice
+pick u = if Choice.flip then 10 else 20
+
+-- Handler result bound mid-block, then used. Must be 30.
+main : U64
+main =
+  let r = (with { Choice.flip k -> k True + k False
+                  ; v -> v }
+            pick ()) in
+  r

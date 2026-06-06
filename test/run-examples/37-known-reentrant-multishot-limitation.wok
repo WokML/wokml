@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+effect Choice = { flip : Bool }
+
+-- KNOWN LIMITATION (pinned, NOT correct). `pick` performs Choice.flip TWICE in
+-- sequence; the multishot arm `k True + k False` should enumerate the full tree:
+--   (10+1)+(10+2)+(20+1)+(20+2) = 66.
+-- The runtime currently yields 11 (the first leaf, 10+1) because deep re-entrant
+-- same-effect multishot is not yet fully enumerated. This is a pre-existing
+-- continuation-capture limitation (since slice 1; independent of tail/bounded
+-- position). The golden is `11` ON PURPOSE to pin current behavior so a future
+-- correct multi-shot capture is noticed (the golden will then need updating to 66).
+-- See surface-syntax spec section 12 "Known sharp edges".
+pick : () -> U64 with Choice
+pick u = (if Choice.flip then 10 else 20) + (if Choice.flip then 1 else 2)
+
+main : U64
+main = with { Choice.flip k -> k True + k False
+              ; v -> v }
+       pick ()

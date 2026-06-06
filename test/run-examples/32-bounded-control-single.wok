@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+effect Ask = { ask : U64 }
+
+prog : () -> U64 with Ask
+prog u = Ask.ask
+
+-- Single-shot control resume in non-tail position. Must be 42.
+main : U64
+main = 1 + (with { Ask.ask k -> k 41 } prog ())

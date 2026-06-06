@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+effect Choice = { flip : Bool }
+
+pick : () -> U64 with Choice
+pick u = if Choice.flip then 10 else 20
+
+-- Outer context BEFORE the handler: 1 + (10 + 20) = 31.
+main : U64
+main = 1 + (with { Choice.flip k -> k True + k False
+                   ; v -> v }
+             pick ())

@@ -3934,7 +3934,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Let (Anf.Binder res Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 41)])
                           (Anf.Ret (Anf.AVar res)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "41")
 
@@ -3945,7 +3945,7 @@ interpEffectTests = testGroup "InterpEffect"
             let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                            (Anf.RApp (Anf.AVar np) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
                            (Anf.Ret (Anf.AVar r))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) []
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) [] Nothing
             pure (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 5))) hdlr)
       in assertEval Map.empty e (T.pack "105")
 
@@ -3963,7 +3963,7 @@ interpEffectTests = testGroup "InterpEffect"
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
                         (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.Ret (Anf.ALit (Anf.LInt 7)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "7")
 
@@ -3990,7 +3990,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "Flip") (T.pack "flip")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) armBody
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "30")
 
@@ -4020,7 +4020,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
                           (Anf.Ret (Anf.AVar r)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm]
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "2")
 
@@ -4588,7 +4588,7 @@ topLevelIsROp lbl op expr = case expr of
 -- whose label and op match.
 isHandleWithOpArm :: T.Text -> T.Text -> Anf.Expr -> Bool
 isHandleWithOpArm lbl op expr = case expr of
-  Anf.Handle _ (Anf.Handler _ opArms) ->
+  Anf.Handle _ (Anf.Handler _ opArms _) ->
     any (\arm -> Anf.oaLabel arm == lbl && Anf.oaOp arm == op) opArms
   _ -> False
 
@@ -4667,7 +4667,7 @@ elaborateEffectsTests = testGroup "ElaborateEffects"
           (isHandleWithOpArm (T.pack "IO") (T.pack "write") result)
         -- check auto-resume: the op arm body contains RApp of the resume binder
         case result of
-          Anf.Handle _ (Anf.Handler _ (arm:_)) ->
+          Anf.Handle _ (Anf.Handler _ (arm:_) _) ->
             assertBool
               ("expected op arm body to contain RApp of resume binder, got body: "
                <> show (Anf.oaBody arm))
