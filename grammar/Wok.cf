@@ -189,6 +189,7 @@ APTuple.  AtomPat ::= "(" Pat "," [Pat] ")" ;   -- 2-or-more; single-element is 
 APList.   AtomPat ::= "[" [Pat] "]" ;
 APParen.  AtomPat ::= "(" Pat ")" ;
 PUnit.    AtomPat ::= "(" ")" ;          -- unit pattern; whitespace permitted: ( ), (   )
+APAs.     AtomPat ::= AtomPat "as" VarId ;   -- <atom pattern> as name; left-recursive, BNFC-friendly
 
 -- Record patterns.
 -- PRecord     : Point { x = a, y = b }       (strict, matches only exact Point)

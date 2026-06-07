@@ -40,42 +40,43 @@ import qualified Data.Text
   ']'        { PT _ (TS _ 14)    }
   '_'        { PT _ (TS _ 15)    }
   '`'        { PT _ (TS _ 16)    }
-  'case'     { PT _ (TS _ 17)    }
-  'class'    { PT _ (TS _ 18)    }
-  'contract' { PT _ (TS _ 19)    }
-  'ctl'      { PT _ (TS _ 20)    }
-  'data'     { PT _ (TS _ 21)    }
-  'deriving' { PT _ (TS _ 22)    }
-  'do'       { PT _ (TS _ 23)    }
-  'eff'      { PT _ (TS _ 24)    }
-  'effect'   { PT _ (TS _ 25)    }
-  'else'     { PT _ (TS _ 26)    }
-  'fixity'   { PT _ (TS _ 27)    }
-  'forall'   { PT _ (TS _ 28)    }
-  'fun'      { PT _ (TS _ 29)    }
-  'if'       { PT _ (TS _ 30)    }
-  'import'   { PT _ (TS _ 31)    }
-  'in'       { PT _ (TS _ 32)    }
-  'instance' { PT _ (TS _ 33)    }
-  'left'     { PT _ (TS _ 34)    }
-  'let'      { PT _ (TS _ 35)    }
-  'local'    { PT _ (TS _ 36)    }
-  'looser'   { PT _ (TS _ 37)    }
-  'module'   { PT _ (TS _ 38)    }
-  'of'       { PT _ (TS _ 39)    }
-  'record'   { PT _ (TS _ 40)    }
-  'right'    { PT _ (TS _ 41)    }
-  'row'      { PT _ (TS _ 42)    }
-  'than'     { PT _ (TS _ 43)    }
-  'then'     { PT _ (TS _ 44)    }
-  'tighter'  { PT _ (TS _ 45)    }
-  'type'     { PT _ (TS _ 46)    }
-  'use'      { PT _ (TS _ 47)    }
-  'where'    { PT _ (TS _ 48)    }
-  'with'     { PT _ (TS _ 49)    }
-  '{'        { PT _ (TS _ 50)    }
-  '|'        { PT _ (TS _ 51)    }
-  '}'        { PT _ (TS _ 52)    }
+  'as'       { PT _ (TS _ 17)    }
+  'case'     { PT _ (TS _ 18)    }
+  'class'    { PT _ (TS _ 19)    }
+  'contract' { PT _ (TS _ 20)    }
+  'ctl'      { PT _ (TS _ 21)    }
+  'data'     { PT _ (TS _ 22)    }
+  'deriving' { PT _ (TS _ 23)    }
+  'do'       { PT _ (TS _ 24)    }
+  'eff'      { PT _ (TS _ 25)    }
+  'effect'   { PT _ (TS _ 26)    }
+  'else'     { PT _ (TS _ 27)    }
+  'fixity'   { PT _ (TS _ 28)    }
+  'forall'   { PT _ (TS _ 29)    }
+  'fun'      { PT _ (TS _ 30)    }
+  'if'       { PT _ (TS _ 31)    }
+  'import'   { PT _ (TS _ 32)    }
+  'in'       { PT _ (TS _ 33)    }
+  'instance' { PT _ (TS _ 34)    }
+  'left'     { PT _ (TS _ 35)    }
+  'let'      { PT _ (TS _ 36)    }
+  'local'    { PT _ (TS _ 37)    }
+  'looser'   { PT _ (TS _ 38)    }
+  'module'   { PT _ (TS _ 39)    }
+  'of'       { PT _ (TS _ 40)    }
+  'record'   { PT _ (TS _ 41)    }
+  'right'    { PT _ (TS _ 42)    }
+  'row'      { PT _ (TS _ 43)    }
+  'than'     { PT _ (TS _ 44)    }
+  'then'     { PT _ (TS _ 45)    }
+  'tighter'  { PT _ (TS _ 46)    }
+  'type'     { PT _ (TS _ 47)    }
+  'use'      { PT _ (TS _ 48)    }
+  'where'    { PT _ (TS _ 49)    }
+  'with'     { PT _ (TS _ 50)    }
+  '{'        { PT _ (TS _ 51)    }
+  '|'        { PT _ (TS _ 52)    }
+  '}'        { PT _ (TS _ 53)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -229,6 +230,7 @@ AtomPat
   | '[' ListPat ']' { GeneratedParser.Wok.Abs.APList $2 }
   | '(' Pat ')' { GeneratedParser.Wok.Abs.APParen $2 }
   | '(' ')' { GeneratedParser.Wok.Abs.PUnit }
+  | AtomPat 'as' VarId { GeneratedParser.Wok.Abs.APAs $1 $3 }
   | ConId '{' '}' { GeneratedParser.Wok.Abs.PRecord $1 [] }
   | ConId '{' NEListRecordFieldPat '}' { GeneratedParser.Wok.Abs.PRecord $1 (reverse $3) }
   | ConId '{' NEListRecordFieldPat ',' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordOpen $1 (reverse $3) $5 }

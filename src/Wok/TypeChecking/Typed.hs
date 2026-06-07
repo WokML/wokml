@@ -66,6 +66,7 @@ data TpatF a
   | TPList [Tpat a]
   | TPCon Text [Tpat a]      -- constructor applied to sub-patterns
   | TPCons (Tpat a) (Tpat a) -- h :: t
+  | TPAs Text (Tpat a)       -- inner-pattern `as` name (binds whole to name)
   deriving (Show, Functor, Foldable, Traversable)
 
 type TExprS s = Texp (Type s)

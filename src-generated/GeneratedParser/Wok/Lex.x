@@ -183,7 +183,7 @@ eitherResIdent tv s = treeFind resWords
 -- | The keywords and symbols of the language organized as binary search tree.
 resWords :: BTree
 resWords =
-  b "fixity" 27
+  b "else" 27
     (b "]" 14
        (b ":" 7
           (b "->" 4
@@ -191,27 +191,27 @@ resWords =
           (b "=>" 11
              (b ";" 9 (b "::" 8 N N) (b "=" 10 N N))
              (b "\\" 13 (b "[" 12 N N) N)))
-       (b "data" 21
-          (b "class" 18
-             (b "`" 16 (b "_" 15 N N) (b "case" 17 N N))
-             (b "ctl" 20 (b "contract" 19 N N) N))
-          (b "eff" 24
-             (b "do" 23 (b "deriving" 22 N N) N)
-             (b "else" 26 (b "effect" 25 N N) N))))
-    (b "record" 40
-       (b "left" 34
-          (b "import" 31
-             (b "fun" 29 (b "forall" 28 N N) (b "if" 30 N N))
-             (b "instance" 33 (b "in" 32 N N) N))
-          (b "looser" 37
-             (b "local" 36 (b "let" 35 N N) N)
-             (b "of" 39 (b "module" 38 N N) N)))
-       (b "use" 47
-          (b "then" 44
-             (b "row" 42 (b "right" 41 N N) (b "than" 43 N N))
-             (b "type" 46 (b "tighter" 45 N N) N))
-          (b "{" 50
-             (b "with" 49 (b "where" 48 N N) N) (b "}" 52 (b "|" 51 N N) N))))
+       (b "ctl" 21
+          (b "case" 18
+             (b "`" 16 (b "_" 15 N N) (b "as" 17 N N))
+             (b "contract" 20 (b "class" 19 N N) N))
+          (b "do" 24
+             (b "deriving" 23 (b "data" 22 N N) N)
+             (b "effect" 26 (b "eff" 25 N N) N))))
+    (b "record" 41
+       (b "instance" 34
+          (b "if" 31
+             (b "forall" 29 (b "fixity" 28 N N) (b "fun" 30 N N))
+             (b "in" 33 (b "import" 32 N N) N))
+          (b "looser" 38
+             (b "let" 36 (b "left" 35 N N) (b "local" 37 N N))
+             (b "of" 40 (b "module" 39 N N) N)))
+       (b "use" 48
+          (b "then" 45
+             (b "row" 43 (b "right" 42 N N) (b "than" 44 N N))
+             (b "type" 47 (b "tighter" 46 N N) N))
+          (b "{" 51
+             (b "with" 50 (b "where" 49 N N) N) (b "}" 53 (b "|" 52 N N) N))))
   where
   b s n = B bs (TS bs n)
     where

@@ -1,6 +1,6 @@
 # wok examples
 
-Four runnable programs, smallest to largest. Each is a complete module with a
+Five runnable programs, smallest to largest. Each is a complete module with a
 `main`; run any of them with the `--run` flag:
 
 ```sh
@@ -16,11 +16,12 @@ to see the lowered intermediate representation.)
 | `state-accumulate.wok` | `State` + recursion + tuple destructuring `let` | `31` |
 | `expr-eval.wok` | recursion over a tree + `Writer` + `Except` | `Ok((11, [20, 23, 11]))` |
 | `mtl-machine.wok` | the full mtl stack: `Reader` + `Writer` + `State` + `Except` | `Ok(((4, 30), [10, 30]))` |
+| `as-patterns.wok` | `as`-patterns (`pat as name`) in a case arm, a single-clause head, and a multi-clause function | `[8, 5, 6, 7]` |
 
 Run them all:
 
 ```sh
-for f in collatz state-accumulate expr-eval mtl-machine; do
+for f in collatz state-accumulate expr-eval mtl-machine as-patterns; do
   printf '%-18s ' "$f"
   cabal run -v0 wok -- "examples/$f.wok" --run
 done
@@ -42,3 +43,8 @@ done
   whole run (swap in a `Boom` command to see `Err(...)`). The result nests as
   `Result ((count, finalState), log) String` — the shape mtl transformer stacks
   give you, minus the transformers.
+- **`as-patterns.wok`** — `pat as name` (name last) matches a structure AND binds
+  the whole value. `keepNonEmpty` returns the matched list via `whole` without
+  rebuilding it; `doubleUp n as m` is an irreducible `var as var` head; `dedupHead`
+  is a multi-clause function that collapses leading duplicates. `::` is pattern-only
+  in wok, so the expressions build lists with `[...]` and `++`.

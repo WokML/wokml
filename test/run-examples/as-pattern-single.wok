@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- case arm with a refutable as-pattern that binds the matched payload
+unwrapOr : U64 -> Option U64 -> U64
+unwrapOr d o = case o of
+  (Some x) as whole -> x
+  None -> d
+
+-- case arm as-pattern that reuses the whole value
+firstOrEmpty : [U64] -> [U64]
+firstOrEmpty xs = case xs of
+  (h :: t) as whole -> whole
+  [] -> []
+
+-- var as var (both bind the whole value)
+twice : U64 -> U64
+twice n as m = n + m
+
+main : U64
+main = unwrapOr 0 (Some 7) + twice 3 + (case firstOrEmpty [9] of (h :: _) as _w -> h ; [] -> 0)

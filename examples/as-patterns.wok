@@ -1,0 +1,30 @@
+-- As-patterns (`pat as name`, name LAST -- OCaml/F# style): match a structure
+-- AND bind the whole value to a name, so you can reuse it without rebuilding it.
+-- `::` is pattern-only in wok: it appears in the patterns below, but expressions
+-- build lists with literals `[...]` and `++` (append, from Std.Base).
+module Main
+import Std.Base
+
+-- case arm: name the whole list so the non-empty branch returns it as-is.
+keepNonEmpty : [U64] -> [U64]
+keepNonEmpty xs = case xs of
+  (h :: t) as whole -> whole
+  [] -> []
+
+-- single-clause function head: an irreducible `var as var` stays on the cheap
+-- single-Alt path -- both `n` and `m` bind the same argument.
+doubleUp : U64 -> U64
+doubleUp n as m = n + m
+
+-- multi-clause function (decision-tree path): collapse a leading duplicate and
+-- reuse the matched tail via the `whole` binding when nothing collapses.
+dedupHead : [U64] -> [U64]
+dedupHead (x :: y :: rest) as whole = case x == y of
+  True  -> dedupHead ([y] ++ rest)
+  False -> whole
+dedupHead other = other
+
+-- dedupHead [5,5,5,6] collapses the leading 5s -> [5,6]; keepNonEmpty [7] -> [7];
+-- doubleUp 4 -> 8, prepended as a single-element list. Result: [8, 5, 6, 7].
+main : [U64]
+main = [doubleUp 4] ++ dedupHead [5, 5, 5, 6] ++ keepNonEmpty [7]

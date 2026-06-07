@@ -678,6 +678,15 @@ elabPatF tk _  scrut (TPCon conName subPats) body = do
       (fieldBinders, wrapBody) <- buildSubPats tk subPats
       wrappedBody <- wrapBody body
       pure (AltCon conName fieldBinders wrappedBody)
+elabPatF tk ty scrut (TPAs name inner) body = do
+  -- `inner as name`: bind `name` to the WHOLE scrutinee (irrefutable Let), with
+  -- `name` in scope in the body, then match the inner pattern against the SAME
+  -- scrutinee. Refutability is the inner pattern's.
+  n <- bindFresh name
+  let body' = do
+        b <- withLocal name n body
+        pure (Let (Binder n Unrestricted ty) (RAtom scrut) b)
+  elabPat tk scrut inner body'
 
 -- | Build the field-projection let-chain for a list of (label, subPat) record
 -- field bindings, in declared order. Fields whose sub-pattern is a wildcard are
@@ -722,8 +731,7 @@ buildSubPats tk (p:ps) = do
       do n <- bindFresh (Tx.pack "t")
          let b = Binder n Unrestricted fty
              wrapNested inner = do
-               altBody <- wraps inner
-               alt <- elabPat tk (AVar n) p (pure altBody)
+               alt <- elabPat tk (AVar n) p (wraps inner)
                pure (Case (AVar n) [alt])
          pure (b : bs, wrapNested)
 
@@ -809,6 +817,7 @@ toMPat env (Tpat ty pnode) = MPat ty (go pnode)
       Just _  -> error ("match: record-constructor pattern not supported in a "
                         <> "multi-clause / refutable head: " <> Tx.unpack c)
       Nothing -> MCon c (map (toMPat env) ps)
+    go (TPAs name inner) = MAs name (toMPat env inner)
 
 -- | The variables a clause head binds, in left-to-right order. This order is the
 -- contract between a clause's join-point parameters and the positional atoms the
@@ -821,6 +830,7 @@ clauseVars = concatMap patVars
     patVars (Tpat _  (TPList ps))  = concatMap patVars ps
     patVars (Tpat _  (TPCons h t)) = patVars h ++ patVars t
     patVars (Tpat _  (TPCon _ ps)) = concatMap patVars ps
+    patVars (Tpat ty (TPAs name inner)) = (name, ty) : patVars inner
     patVars _                      = []   -- wildcard / unit / literal bind nothing
 
 -- | Compile a clause group into fresh argument binders plus a decision-tree body
@@ -866,6 +876,7 @@ irrefutableHead env (Tpat _ pnode) = case pnode of
   TPWild    -> True
   TPUnit    -> True
   TPCon c _ -> case lookupRecordCon c env of Just _ -> True; Nothing -> False
+  TPAs _ inner -> irrefutableHead env inner
   _         -> False
 
 -- | Elaborate one TypedDecl into a 'TopBind', given the resolved global Name.

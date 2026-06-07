@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- plain nested constructor matching (the pre-existing bug)
+flatten : Option (Option U64) -> U64
+flatten oo = case oo of
+  Some (Some n) -> n
+  Some None -> 0
+  None -> 99
+
+-- nested as-pattern under a constructor: n and m both bind the field
+nestedAs : Option U64 -> U64
+nestedAs o = case o of
+  Some (n as m) -> n + m
+  None -> 0
+
+main : U64
+main = flatten (Some (Some 7)) + nestedAs (Some 5)

@@ -95,6 +95,7 @@ data AtomPat
     | APList [Pat]
     | APParen Pat
     | PUnit
+    | APAs AtomPat VarId
     | PRecord ConId [RecordFieldPat]
     | PRecordOpen ConId [RecordFieldPat] PatRowTail
     | PRecordWild ConId PatRowTail

@@ -33,6 +33,7 @@ data MPatF
   = MVar (Maybe Text)   -- variable (Just v) or wildcard (Nothing)
   | MCon Text [MPat]    -- data constructor / TupleN / Nil / Cons
   | MLit Lit            -- literal
+  | MAs Text MPat       -- as-pattern: bind name to the matched value, then match inner
   deriving (Show)
 
 data ConOracle = ConOracle
@@ -73,11 +74,28 @@ mpatType (MPat t _) = t
 
 compileMatch :: ConOracle -> [Atom] -> [Row] -> Fresh Expr
 compileMatch _ _ [] = pure failLeaf
-compileMatch oracle scruts rows@(r0 : _)
-  | all isWildP (rowPats r0) = pure (jumpLeaf (bindRow scruts r0))
-  | otherwise = do
-      let i = chooseColumn scruts rows
-      switchOn oracle i scruts rows
+compileMatch oracle scruts rows0 =
+  case map (peelAsRow scruts) rows0 of
+    [] -> pure failLeaf
+    rows@(r0 : _)
+      | all isWildP (rowPats r0) -> pure (jumpLeaf (bindRow scruts r0))
+      | otherwise -> do
+          let i = chooseColumn scruts rows
+          switchOn oracle i scruts rows
+
+-- | Strip every top-level 'MAs' wrapper from each column, recording a binding of
+-- the as-name to that column's scrutinee atom. Nested as-patterns
+-- (@a as b as c@) all bind the same atom. Sub-patterns exposed later (as
+-- constructor fields surface as new columns) are peeled by the recursive
+-- 'compileMatch' call. After this, the matrix ops never observe an 'MAs'.
+peelAsRow :: [Atom] -> Row -> Row
+peelAsRow scruts r =
+  let peeled = zipWith peelCol scruts (rowPats r)
+  in r { rowPats  = map fst peeled
+       , rowSubst = rowSubst r ++ concatMap snd peeled }
+  where
+    peelCol a (MPat _ (MAs v p)) = let (p', bs) = peelCol a p in (p', (v, a) : bs)
+    peelCol _ p                  = (p, [])
 
 bindRow :: [Atom] -> Row -> Row
 bindRow scruts r =
@@ -149,6 +167,7 @@ buildHeadAlt oracle i scrutI others rows (MLit l) = do
   body <- compileMatch oracle others rows'
   pure (AltLit l body)
 buildHeadAlt _ _ _ _ _ (MVar _) = error "Match.buildHeadAlt: variable is not a head"
+buildHeadAlt _ _ _ _ _ (MAs _ _) = error "Match.buildHeadAlt: MAs should have been peeled by compileMatch"
 
 fieldTypesOf :: Text -> Int -> [Row] -> Int -> [CType]
 fieldTypesOf c i rows arity =
@@ -166,6 +185,7 @@ specCon c arity i scrutI r =
     MPat _ (MVar mv)  ->
       [ r { rowPats  = replicate arity wildField ++ removeAt i (rowPats r)
           , rowSubst = bindVar mv scrutI (rowSubst r) } ]
+    MPat _ (MAs _ _)  -> error "Match.specCon: MAs should have been peeled by compileMatch"
   where wildField = MPat (CTCon TcUnit []) (MVar Nothing)
 
 specLit :: Lit -> Int -> Atom -> Row -> [Row]
@@ -176,6 +196,7 @@ specLit l i scrutI r =
     MPat _ (MCon _ _)          -> []
     MPat _ (MVar mv)           ->
       [ r { rowPats = removeAt i (rowPats r), rowSubst = bindVar mv scrutI (rowSubst r) } ]
+    MPat _ (MAs _ _)           -> error "Match.specLit: MAs should have been peeled by compileMatch"
 
 buildDefault :: ConOracle -> Int -> Atom -> [Atom] -> [Row] -> [MPatF] -> Fresh (Maybe Alt)
 buildDefault oracle i scrutI others rows heads
@@ -219,11 +240,22 @@ matchCoverage oracle ncols rows =
        { covRedundant  = [ rowIndex r | r <- rows, not (rowIndex r `Set.member` reached) ]
        , covExhaustive = not anyFail }
   where
+    -- Coverage carries no scrutinee atoms, so an as-pattern binds nothing here;
+    -- it covers exactly what its inner pattern covers. Strip every top-level
+    -- 'MAs' per column before analysing.
+    stripAs :: MPat -> MPat
+    stripAs (MPat _ (MAs _ p)) = stripAs p
+    stripAs p                  = p
+
+    stripRow :: Row -> Row
+    stripRow r = r { rowPats = map stripAs (rowPats r) }
+
     analyze :: Int -> [Row] -> (Set Int, Bool)
-    analyze _ []          = (Set.empty, True)              -- fail reachable
-    analyze n rws@(r0 : _)
-      | all isWildP (rowPats r0) = (Set.singleton (rowIndex r0), False)
-      | otherwise =
+    analyze n rws0 = case map stripRow rws0 of
+      []         -> (Set.empty, True)                       -- fail reachable
+      rws@(r0 : _)
+        | all isWildP (rowPats r0) -> (Set.singleton (rowIndex r0), False)
+        | otherwise ->
           let i     = pickCol n rws
               heads = nubHeads [ rowPats r !! i | r <- rws ]
               nR    = n - 1
@@ -232,6 +264,7 @@ matchCoverage oracle ncols rows =
                       MCon c _ -> concatMap (specConP c (coArity oracle c) i) rws
                       MLit l   -> concatMap (specLitP l i) rws
                       MVar _   -> []
+                      MAs _ _  -> error "Match.matchCoverage: MAs should have been stripped"
                     n' = case h of MCon c _ -> coArity oracle c + nR; _ -> nR
                 in analyze n' rows'
               brs = map branch heads
@@ -262,6 +295,7 @@ matchCoverage oracle ncols rows =
       MPat _ (MLit _)                 -> []
       MPat _ (MVar _)                 ->
         [ r { rowPats = replicate arity wildField ++ removeAt i (rowPats r) } ]
+      MPat _ (MAs _ _)                -> error "Match.specConP: MAs should have been stripped"
       where wildField = MPat (CTCon TcUnit []) (MVar Nothing)
         -- NB: CTCon TcUnit [] is a never-read placeholder type. StrictData forces
         -- the field, so a lazy `error` thunk cannot be used here (matches Task 1).
@@ -271,3 +305,4 @@ matchCoverage oracle ncols rows =
       MPat _ (MLit _)            -> []
       MPat _ (MCon _ _)          -> []
       MPat _ (MVar _)            -> [ r { rowPats = removeAt i (rowPats r) } ]
+      MPat _ (MAs _ _)           -> error "Match.specLitP: MAs should have been stripped"

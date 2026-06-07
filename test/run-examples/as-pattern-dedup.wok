@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+dedupHead : [U64] -> [U64]
+dedupHead (x :: y :: rest) as whole = case x == y of
+  True  -> dedupHead ([y] ++ rest)
+  False -> whole
+dedupHead other = other
+
+main : [U64]
+main = dedupHead ([1] ++ [1] ++ [2] ++ [3])

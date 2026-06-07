@@ -269,6 +269,7 @@ instance Print GeneratedParser.Wok.Abs.AtomPat where
     GeneratedParser.Wok.Abs.APList pats -> prPrec i 0 (concatD [doc (showString "["), prt 0 pats, doc (showString "]")])
     GeneratedParser.Wok.Abs.APParen pat -> prPrec i 0 (concatD [doc (showString "("), prt 0 pat, doc (showString ")")])
     GeneratedParser.Wok.Abs.PUnit -> prPrec i 0 (concatD [doc (showString "("), doc (showString ")")])
+    GeneratedParser.Wok.Abs.APAs atompat varid -> prPrec i 0 (concatD [prt 0 atompat, doc (showString "as"), prt 0 varid])
     GeneratedParser.Wok.Abs.PRecord conid recordfieldpats -> prPrec i 0 (concatD [prt 0 conid, doc (showString "{"), prt 0 recordfieldpats, doc (showString "}")])
     GeneratedParser.Wok.Abs.PRecordOpen conid recordfieldpats patrowtail -> prPrec i 0 (concatD [prt 0 conid, doc (showString "{"), prt 0 recordfieldpats, doc (showString ","), prt 0 patrowtail, doc (showString "}")])
     GeneratedParser.Wok.Abs.PRecordWild conid patrowtail -> prPrec i 0 (concatD [prt 0 conid, doc (showString "{"), prt 0 patrowtail, doc (showString "}")])

@@ -393,6 +393,9 @@ typedExprForTest env = goE
     goAP (Abs.PRecord (Abs.ConId (_, t)) fps)          = recPat t fps
     goAP (Abs.PRecordOpen (Abs.ConId (_, t)) fps _)    = recPat t fps
     goAP (Abs.PRecordWild (Abs.ConId (_, t)) _)        = recPat t []
+    -- as-patterns work in the real pipeline; this lightweight test-helper parser
+    -- does not model them. Use the full-pipeline test path for as-pattern cases.
+    goAP (Abs.APAs _ _)                 = error "typedExprForTest: as-patterns unsupported in this test helper; use the full-pipeline path"
 
     recPat t fps =
       let provided = [ (l, goPat sp) | Abs.RFPat (Abs.VarId (_, l)) sp <- fps ]
@@ -3497,6 +3500,26 @@ matchWarningTests = testGroup "MatchWarnings"
             , "f 0 = 0" ]
       (_, ws) <- expectOKWithWarnings src
       length [ () | TErr.RedundantClause _ n _ <- ws, n == T.pack "f" ] @?= 1
+
+  , testCase "as-pattern head: coverage unchanged (still non-exhaustive)" $ do
+      -- A single-clause head that only matches `Some` is non-exhaustive whether
+      -- or not it carries an as-pattern; an as-pattern covers exactly what its
+      -- inner pattern covers, so the diagnostic must be identical.
+      let withAs = T.unlines
+            [ "module Main", "import Std.Base"
+            , "data Opt a = Non | Som a"
+            , "f : Opt U64 -> U64"
+            , "f (Som x) as w = x" ]
+          without = T.unlines
+            [ "module Main", "import Std.Base"
+            , "data Opt a = Non | Som a"
+            , "f : Opt U64 -> U64"
+            , "f (Som x) = x" ]
+      (_, wsAs)  <- expectOKWithWarnings withAs
+      (_, wsNot) <- expectOKWithWarnings without
+      let count ws = length [ () | TErr.NonExhaustiveMatch _ n <- ws, n == T.pack "f" ]
+      count wsAs  @?= 1
+      count wsAs  @?= count wsNot
   ]
 
 -- ---------------------------------------------------------------------------

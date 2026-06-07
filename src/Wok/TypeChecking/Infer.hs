@@ -1053,6 +1053,14 @@ inferAtomPat (Abs.APList (p : ps)) = do
   let ty = TCon TcList [firstT]
   pure (ty, firstBinds ++ restBinds, Ty.Tpat ty (Ty.TPList (firstNode : restNodes)))
 inferAtomPat (Abs.APParen p) = inferPat p
+-- As-pattern (`pat as name`): match via the inner pattern; bind `name` to the
+-- whole matched value, which has the inner pattern's type. Recurse into the
+-- inner AtomPat and wrap its node in TPAs; no new unification.
+inferAtomPat (Abs.APAs inner (Abs.VarId (_, name))) = do
+  -- `pat as name`: the inner pattern drives the match; `name` binds the WHOLE
+  -- matched value, so it has the inner pattern's type. No new unification.
+  (ty, innerBinds, innerNode) <- inferAtomPat inner
+  pure (ty, (name, ty) : innerBinds, Ty.Tpat ty (Ty.TPAs name innerNode))
 
 -- Strict record pattern: PRecord T { f1 = p1, ..., fn = pn }
 -- All declared fields must be present; no extras; produces a closed row.
@@ -2953,6 +2961,7 @@ inferTopLetGroup origin localDecls = do
                     Ty.TPCon c _ -> case lookupRecordCon c rejectEnv of
                       Just _  -> True
                       Nothing -> False
+                    Ty.TPAs _ inner -> cheapHead inner
                     _            -> False
                   cheapPath = case clauses of
                     [(ps, _)] -> all cheapHead ps
@@ -3056,6 +3065,7 @@ unsupportedHeadPat env = go
       Ty.TPCon c ps     -> case lookupRecordCon c env of
         Just _  -> Just (Tx.pack "record-constructor pattern in a multi-clause/refutable head")
         Nothing -> firstJust (map go ps)
+      Ty.TPAs _ inner   -> go inner
       _                 -> Nothing
 
 -- | First 'Just' in a list, or 'Nothing' if all are 'Nothing'.
@@ -3087,6 +3097,8 @@ typedPatToMPat env (Ty.Tpat ty pnode) = MPat ty (go pnode)
     go (Ty.TPCon c ps) = case lookupRecordCon c env of
       Just _  -> MVar Nothing           -- record con: single-constructor, irrefutable
       Nothing -> MCon c (map (typedPatToMPat env) ps)
+    go (Ty.TPAs _ inner) = let MPat _ m = typedPatToMPat env inner in m
+      -- `inner as name`: as-name is irrelevant to coverage; mirror the inner pattern
 
 -- | Find the BNFC'Position of the LDSig that declared @name@. Multi-name
 -- sigs share the head LDSig's position.
