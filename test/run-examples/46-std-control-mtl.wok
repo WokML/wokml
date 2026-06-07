@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Exercises the full mtl quartet (Reader/Writer/State/Except) composed in a
+-- single handler stack. Reader supplies a budget that is folded into each
+-- step's contribution, State threads a running total, Writer logs each step's
+-- contribution, and Except is in the row (composing cleanly) even though this
+-- happy path never throws. Wok's Std.Base has no comparison operator, so the
+-- demo proves "runs without losing state/log", not a guarded throw.
+step : U64 -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+step n =
+  let budget = Reader.ask in
+  let cur    = State.get in
+  let next   = cur + n in
+  let x1     = State.set next in
+  let x2     = Writer.tell [n] in
+  next + budget
+
+prog : () -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+prog u = let a = step 10 in let b = step 20 in step 30
+
+main : Result ((U64, U64), [U64]) String
+main =
+  with except in
+  with reader 100 in
+  with writer in
+  with state 0 in
+  prog ()

@@ -238,12 +238,6 @@ RecordFieldPat :: { GeneratedParser.Wok.Abs.RecordFieldPat }
 RecordFieldPat
   : VarId '=' Pat { GeneratedParser.Wok.Abs.RFPat $1 $3 }
 
-ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
-ListRecordFieldPat
-  : {- empty -} { [] }
-  | RecordFieldPat { (:[]) $1 }
-  | RecordFieldPat ',' ListRecordFieldPat { (:) $1 $3 }
-
 -- PATCH: left-recursive NEListRecordFieldPat to avoid the shift/reduce conflict
 --        with the trailing comma before `..` in PRecordOpen. The list is built
 --        in reversed order and reversed in the PRecord/PRecordOpen actions.
@@ -252,6 +246,12 @@ NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
 NEListRecordFieldPat
   : RecordFieldPat { [$1] }
   | NEListRecordFieldPat ',' RecordFieldPat { $3 : $1 }
+
+ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
+ListRecordFieldPat
+  : {- empty -} { [] }
+  | RecordFieldPat { (:[]) $1 }
+  | RecordFieldPat ',' ListRecordFieldPat { (:) $1 $3 }
 
 PatRowTail :: { GeneratedParser.Wok.Abs.PatRowTail }
 PatRowTail
@@ -397,6 +397,7 @@ Exp2
   | 'if' Exp 'then' Exp 'else' Exp { GeneratedParser.Wok.Abs.EIf $2 $4 $6 }
   | 'with' '{' ListHandlerArm '}' Exp { GeneratedParser.Wok.Abs.EWith $3 $5 }
   | 'with' ConId ListConId '{' ListHandlerArm '}' Exp { GeneratedParser.Wok.Abs.EWithH $2 $3 $5 $7 }
+  | 'with' VarId ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EWithRun $2 $3 $5 }
 
 MaybeTrailing :: { GeneratedParser.Wok.Abs.MaybeTrailing }
 MaybeTrailing
@@ -413,10 +414,18 @@ ListRecordFieldExpr
   | RecordFieldExpr { (:[]) $1 }
   | RecordFieldExpr ',' ListRecordFieldExpr { (:) $1 $3 }
 
+WithArg :: { GeneratedParser.Wok.Abs.WithArg }
+WithArg : Exp2 { GeneratedParser.Wok.Abs.WRArg $1 }
+
+ListWithArg :: { [GeneratedParser.Wok.Abs.WithArg] }
+ListWithArg
+  : {- empty -} { [] } | WithArg ListWithArg { (:) $1 $2 }
+
 HandlerArm :: { GeneratedParser.Wok.Abs.HandlerArm }
 HandlerArm
   : ConId '.' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HArm $1 $3 $4 $6 }
   | VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HUArm $1 $2 $4 }
+  | VarId '=' Exp { GeneratedParser.Wok.Abs.HParam $1 $3 }
 
 ListHandlerArm :: { [GeneratedParser.Wok.Abs.HandlerArm] }
 ListHandlerArm
@@ -437,6 +446,7 @@ LocalDecl :: { GeneratedParser.Wok.Abs.LocalDecl }
 LocalDecl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.LDEqn $1 $3 $4 }
   | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.LDSig $1 $2 $4 }
+  | '(' Pat ',' ListPat ')' '=' Exp { GeneratedParser.Wok.Abs.LDPat $2 $4 $7 }
 
 ListLocalDecl :: { [GeneratedParser.Wok.Abs.LocalDecl] }
 ListLocalDecl

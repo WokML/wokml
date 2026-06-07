@@ -1,0 +1,45 @@
+-- A recursive evaluator over an arithmetic expression tree. It walks the tree
+-- RECURSIVELY, logs every intermediate result with Writer, and aborts via
+-- Except when it hits a division by zero (caught with `== 0`, since the
+-- language only has equality, not ordering).
+module Main
+import Std.Base
+import Std.Control
+
+data Expr
+  = Lit U64
+  | Add Expr Expr
+  | Mul Expr Expr
+  | Div Expr Expr
+
+-- Evaluate a node. Every non-leaf logs its result, so the Writer log is the
+-- list of intermediate values in evaluation order. Division by zero throws.
+eval : Expr -> U64 with Writer [U64] + Except String
+eval e = case e of
+  Lit n   -> n
+  Add a b -> let
+               r = eval a + eval b
+               u = Writer.tell [r]
+             in r
+  Mul a b -> let r = eval a * eval b in
+             let u = Writer.tell [r] in
+             r
+  Div a b -> let x = eval a in
+             let y = eval b in
+             case y == 0 of
+               True  -> Except.throw "division by zero"
+               False -> let r = x / y in
+                        let u = Writer.tell [r] in
+                        r
+
+-- (3 + 4 * 5) / 2  ==  (3 + 20) / 2  ==  23 / 2  ==  11
+-- Logs each step: 20 (the Mul), 23 (the Add), 11 (the Div).
+-- Swap the `Lit 2` for `Lit 0` to see the Except path return `Err(...)`.
+program : Expr
+program = Div (Add (Lit 3) (Mul (Lit 4) (Lit 5))) (Lit 2)
+
+main : Result (U64, [U64]) String
+main =
+  with except in
+  with writer in
+  eval program

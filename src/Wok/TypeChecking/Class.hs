@@ -537,12 +537,14 @@ rewriteMethodRefs classMethods dictNm idx = go
     goTrailing Abs.TFNone       = Abs.TFNone
     goTrailing (Abs.TFSome fs)  = Abs.TFSome (map goField fs)
     goLocal (Abs.LDEqn lhs a mw) = Abs.LDEqn lhs (go a) (goWhere mw)
+    goLocal (Abs.LDPat p ps a)   = Abs.LDPat p ps (go a)
     goLocal d@(Abs.LDSig{})      = d
     goWhere Abs.NoWhere     = Abs.NoWhere
     goWhere (Abs.WithWh ds) = Abs.WithWh (map goLocal ds)
     goAlt (Abs.AltC p a mw) = Abs.AltC p (go a) (goWhere mw)
     goArm (Abs.HArm c v ps a) = Abs.HArm c v ps (go a)
     goArm (Abs.HUArm v ps a)  = Abs.HUArm v ps (go a)
+    goArm (Abs.HParam v a)    = Abs.HParam v (go a)
 
 -- | The parameter 'Abs.AtomPat's of a function LHS, in order. (Duplicated
 -- here rather than imported from 'Infer' to avoid an import cycle.)

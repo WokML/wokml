@@ -1,0 +1,61 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-07-effects-slice-4a-parameterized-handlers.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Grammar — HParam block entry + EWithRun (with…in)",
+      "status": "completed",
+      "description": "**Goal:** Parse `with State { s = 0 ; … } body` and `with state 0 in body`; no new conflicts; correct dangling-`in` layout.\n\n**Files:** grammar/Wok.cf; regen src-generated/; reapply Layout.hs + Par.y patches.\n\n**Verify:** cabal run -v0 wok -- /tmp/parse-smoke.wok --dump-anf (parses); cabal test.\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok/Layout.hs\", \"src-generated/GeneratedParser/Wok/Par.y\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"with State { s = 0 ; ... } parses\", \"with state 0 in body parses (dangling in ok)\", \"conflict count unchanged\", \"cabal test green\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: ANF hParam + runtime VContP two-arg resume",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Carry the handler param in hsc; re-install with the new value on deep resume via a two-arg VContP. No change for non-parameterized handlers.\n\n**Files:** src/Wok/IR/Anf.hs; src/Wok/Interp/Value.hs; src/Wok/Interp/Machine.hs.\n\n**Verify:** cabal build && cabal test → 572 pass.\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Anf.hs\", \"src/Wok/Interp/Value.hs\", \"src/Wok/Interp/Machine.hs\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"Handler hParam field + walkers updated\", \"VContP enter case (2 args)\", \"dispatchOp param rebind for Just; unchanged for Nothing\", \"cabal test green\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Typing — parameterized handler in inferHandler",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Bind param σ in arm/value-arm scope; check init:σ; type resume:σ→T→R in control arms.\n\n**Files:** src/Wok/TypeChecking/Infer.hs; src/Wok/TypeChecking/Typed.hs; test/typecheck-examples/43-state-param.wok; test/typecheck-fail-examples/44-state-swapped-resume.wok.\n\n**Verify:** cabal run -v0 wok -- test/typecheck-examples/43-state-param.wok; cabal test.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Typed.hs\", \"test/typecheck-examples/43-state-param.wok\", \"test/typecheck-fail-examples/44-state-swapped-resume.wok\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"classifyArm handles HParam\", \"param σ in scope; init checked\", \"resume σ→T→R; swapped args rejected\", \"TParamArm emitted\", \"cabal test green\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Elaboration — lower param + two-arg auto-resume (single State green)",
+      "status": "completed",
+      "blockedBy": [2, 3],
+      "description": "**Goal:** Lower TParamArm to `let pb = init in Handle … (hParam=Just pb)`; auto-resume passes resume(pb, body). Single-State program runs to (value, finalState).\n\n**Files:** src/Wok/IR/Elaborate.hs; test/run-examples/40-state-param.wok.\n\n**Verify:** cabal run -v0 wok -- test/run-examples/40-state-param.wok --run → (205, 105).\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Elaborate.hs\", \"test/run-examples/40-state-param.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/40-state-param.wok --run\", \"acceptanceCriteria\": [\"TParamArm lowers to let-seed + hParam=Just\", \"auto-resume two-arg pass for parameterized\", \"40-state-param => (205, 105)\", \"cabal test green\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Nested composition gate (RISK 1)",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** Prove the mechanism composes where the encoding failed — two parameterized handlers, interleaved ops, both params thread, both nesting orders.\n\n**Files:** test/run-examples/41-state-writer-nested.wok, 42-writer-state-nested.wok (+goldens).\n\n**Verify:** cabal run -v0 wok -- test/run-examples/41-state-writer-nested.wok --run → ((205, [100, 105]), 105).\n\n```json:metadata\n{\"files\": [\"test/run-examples/41-state-writer-nested.wok\", \"test/run-examples/42-writer-state-nested.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/41-state-writer-nested.wok --run\", \"acceptanceCriteria\": [\"41 => ((205,[100,105]),105)\", \"42 => ((205,105),[100,105])\", \"no param dropped (gate)\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: with…in runner sugar",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Desugar `with f a b in body` → `f a b (\\_ -> body)` in inferExprW.\n\n**Files:** src/Wok/TypeChecking/Infer.hs; test/run-examples/45-with-in-sugar.wok.\n\n**Verify:** cabal run -v0 wok -- test/run-examples/45-with-in-sugar.wok --run → (105, 105).\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"test/run-examples/45-with-in-sugar.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/45-with-in-sugar.wok --run\", \"acceptanceCriteria\": [\"EWithRun desugars to EApp runner (ELam [_] body)\", \"45 => (105, 105)\", \"cabal test green\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Control.Wok prelude + loader embedding + usage goldens",
+      "status": "completed",
+      "blockedBy": [5, 6],
+      "description": "**Goal:** Ship mtl quartet (Reader/Writer/State/Except) + terse runners as a second embedded prelude.\n\n**Files:** prelude/Control/Wok.wok; src/Wok/Prelude.hs; src/Wok/Loader.hs; wokml.cabal; test/run-examples/46-control-wok-mtl.wok, 47-state-runner-eval-exec.wok.\n\n**Verify:** cabal run -v0 wok -- test/run-examples/46-control-wok-mtl.wok --run; cabal test.\n\n```json:metadata\n{\"files\": [\"prelude/Control/Wok.wok\", \"src/Wok/Prelude.hs\", \"src/Wok/Loader.hs\", \"wokml.cabal\", \"test/run-examples/46-control-wok-mtl.wok\", \"test/run-examples/47-state-runner-eval-exec.wok\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"import Control.Wok resolves embedded\", \"mtl demo runs without losing state/log\", \"47 => ((105,105),105,105)\", \"cabal test green\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Docs reconciliation + branch review prep",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "**Goal:** Record slice 4a as shipped; prep full-branch review.\n\n**Files:** docs/superpowers/specs/2026-06-05-effect-handler-surface-syntax.md; docs/superpowers/specs/2026-06-05-effect-handlers-ROADMAP.md.\n\n**Verify:** cabal test (record count); docs consistent.\n\n```json:metadata\n{\"files\": [\"docs/superpowers/specs/2026-06-05-effect-handler-surface-syntax.md\", \"docs/superpowers/specs/2026-06-05-effect-handlers-ROADMAP.md\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"surface spec §11 shipped entry\", \"ROADMAP 4a DONE with green count\", \"full-branch review requested\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-07"
+}

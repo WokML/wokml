@@ -229,6 +229,7 @@ reorderDecl _ d@(DReserved{}) = Right d
 
 reorderLocalDecl :: FixityTable -> LocalDecl -> Either [ReorderError] LocalDecl
 reorderLocalDecl t (LDEqn lhs e mw) = LDEqn lhs <$> reorderExp t e <*> reorderMW t mw
+reorderLocalDecl t (LDPat p ps e)   = LDPat p ps <$> reorderExp t e
 reorderLocalDecl _ d@(LDSig{})      = Right d
 
 reorderMW :: FixityTable -> MaybeWhere -> Either [ReorderError] MaybeWhere

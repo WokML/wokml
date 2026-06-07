@@ -351,6 +351,8 @@ typedExprForTest env = goE
       Typed.TOpArm en op (map goAP ps) (T.pack "") (goE body)
     goArm (Abs.HUArm (Abs.VarId (_, v)) _ body) =
       Typed.TReturnArm (tpa (Typed.TPVar v)) (goE body)
+    goArm (Abs.HParam _ _) =
+      error "typedExprForTest: handler-local parameter (slice 4a) not supported in tests"
 
     goDecls :: [Abs.LocalDecl] -> [Typed.TLocalDecl Ty.CType]
     goDecls decls =
@@ -817,17 +819,21 @@ envOverlayTests = testGroup "envOverlay"
            Right _ -> assertFailure "expected Left"
 
   , testCase "tycon collision returns Left with NsTyCon" $
-      let tci = TE.TyConInfo Ty.KStar 0 []
-          a = TE.extendTyCon (T.pack "Foo") tci TE.emptyEnv
-          b = TE.extendTyCon (T.pack "Foo") tci TE.emptyEnv
+      -- A genuine collision requires DIFFERING entries under the same name
+      -- (byte-identical re-exports merge silently to support diamond imports).
+      let tciA = TE.TyConInfo Ty.KStar 0 []
+          tciB = TE.TyConInfo Ty.KStar 1 []
+          a = TE.extendTyCon (T.pack "Foo") tciA TE.emptyEnv
+          b = TE.extendTyCon (T.pack "Foo") tciB TE.emptyEnv
       in case TE.overlayEnvs a b of
            Left collisions -> collisions @?= [(TE.NsTyCon, T.pack "Foo")]
            Right _ -> assertFailure "expected Left"
 
   , testCase "con collision returns Left with NsCon" $
-      let ci = TE.ConInfo (Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])) 0 (T.pack "Bool")
-          a = TE.extendCon (T.pack "True") ci TE.emptyEnv
-          b = TE.extendCon (T.pack "True") ci TE.emptyEnv
+      let ciA = TE.ConInfo (Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])) 0 (T.pack "Bool")
+          ciB = TE.ConInfo (Ty.mkScheme [] (Ty.CTCon Ty.TcU64  [])) 0 (T.pack "Bool")
+          a = TE.extendCon (T.pack "True") ciA TE.emptyEnv
+          b = TE.extendCon (T.pack "True") ciB TE.emptyEnv
       in case TE.overlayEnvs a b of
            Left collisions -> collisions @?= [(TE.NsCon, T.pack "True")]
            Right _ -> assertFailure "expected Left"
@@ -839,23 +845,64 @@ envOverlayTests = testGroup "envOverlay"
       in TE.lookupEffect (T.pack "IO") env @?= Just ei
 
   , testCase "effect collision returns Left with NsEffect" $
-      let ei = TE.EffectInfo [] Map.empty
-          a  = TE.extendEffect (T.pack "IO") ei TE.emptyEnv
-          b  = TE.extendEffect (T.pack "IO") ei TE.emptyEnv
+      let eiA = TE.EffectInfo [] Map.empty
+          eiB = TE.EffectInfo []
+                  (Map.fromList [(T.pack "read", Ty.mkScheme [] (Ty.CTCon Ty.TcString []))])
+          a  = TE.extendEffect (T.pack "IO") eiA TE.emptyEnv
+          b  = TE.extendEffect (T.pack "IO") eiB TE.emptyEnv
       in case TE.overlayEnvs a b of
            Left collisions -> collisions @?= [(TE.NsEffect, T.pack "IO")]
            Right _ -> assertFailure "expected Left"
 
   , testCase "collisions across multiple namespaces are all reported" $
-      let s = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
-          tci = TE.TyConInfo Ty.KStar 0 []
-          a = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
-          b = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
+      let sA  = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
+          sB  = Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])
+          tciA = TE.TyConInfo Ty.KStar 0 []
+          tciB = TE.TyConInfo Ty.KStar 1 []
+          a = TE.extendTyCon (T.pack "X") tciA (TE.extendVar (T.pack "y") sA TE.emptyEnv)
+          b = TE.extendTyCon (T.pack "X") tciB (TE.extendVar (T.pack "y") sB TE.emptyEnv)
       in case TE.overlayEnvs a b of
            Left collisions ->
              Data.List.sort collisions @?=
                Data.List.sort [(TE.NsVar, T.pack "y"), (TE.NsTyCon, T.pack "X")]
            Right _ -> assertFailure "expected Left"
+
+  , testCase "byte-identical re-exported entries merge silently (diamond import)" $
+      -- A name present in BOTH inputs with the SAME value is not a
+      -- collision: this is what lets `Main` import both `Std.Base` and a
+      -- module that re-exports `Std.Base` without every shared name
+      -- clashing.
+      let s   = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
+          tci = TE.TyConInfo Ty.KStar 0 []
+          a = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
+          b = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
+      in case TE.overlayEnvs a b of
+           Right e -> do
+             TE.lookupVar (T.pack "y") e @?= Just s
+             TE.lookupTyCon (T.pack "X") e @?= Just tci
+           Left collisions ->
+             assertFailure ("expected silent merge, got: " ++ show collisions)
+
+  , testCase "same name + same type but different ORIGIN clashes (provenance)" $
+      -- Two modules each defining `foo : U64` (identical Scheme, distinct
+      -- origin) must be flagged. This is the regression provenance fixes.
+      let s = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
+          a = (TE.extendVar (T.pack "foo") s TE.emptyEnv)
+                { TE.envVarOrigin = Map.fromList [(T.pack "foo", T.pack "A")] }
+          b = (TE.extendVar (T.pack "foo") s TE.emptyEnv)
+                { TE.envVarOrigin = Map.fromList [(T.pack "foo", T.pack "B")] }
+      in case TE.overlayEnvs a b of
+           Left collisions -> collisions @?= [(TE.NsVar, T.pack "foo")]
+           Right _ -> assertFailure "expected Left (different origin)"
+
+  , testCase "same name + same type + same ORIGIN merges silently (diamond re-export)" $
+      -- A re-exported Std.Base name keeps origin "Std.Base" on both sides.
+      let s = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
+          mk = (TE.extendVar (T.pack "foo") s TE.emptyEnv)
+                 { TE.envVarOrigin = Map.fromList [(T.pack "foo", T.pack "Std.Base")] }
+      in case TE.overlayEnvs mk mk of
+           Right e  -> TE.lookupVar (T.pack "foo") e @?= Just s
+           Left col -> assertFailure ("expected silent merge, got: " ++ show col)
   ]
 
 sourceOriginTests :: TestTree
@@ -2331,12 +2378,22 @@ bodylessSigTests = testGroup "bodyless"
 
 loaderTests :: TestTree
 loaderTests = testGroup "loader"
-  [ testCase "loads entry + embedded Std.Base; topo order is Prelude first" $ do
+  [ testCase "loads entry + embedded preludes; topo order is Prelude first" $ do
       res <- Loader.loadProgram "test/loader-fixtures/01-entry-imports-base.wok" []
       case res of
         Right (entryName, modules) -> do
           entryName @?= T.pack "Main"
-          map Loader.lmName modules @?= [T.pack "Std.Base", T.pack "Main"]
+          -- Two preludes are always embedded: Std.Base and Std.Control (the
+          -- latter imports Std.Base). Std.Base must come first (nothing it
+          -- depends on); Main and Std.Control follow in some dependency-valid
+          -- order. Assert the leading prelude + the full set rather than a
+          -- brittle exact permutation of the tail.
+          let names = map Loader.lmName modules
+          case names of
+            (n0 : _) -> n0 @?= T.pack "Std.Base"
+            []       -> assertFailure "expected a non-empty module list"
+          Data.List.sort names @?=
+            Data.List.sort [T.pack "Std.Base", T.pack "Std.Control", T.pack "Main"]
         Left err -> assertFailure ("unexpected error: " ++ show err)
 
   , testCase "rejects file missing a module header" $ do
@@ -2455,20 +2512,16 @@ crossModuleFixityTests = testGroup "crossModuleFixity"
 crossModuleNameConflictTests :: TestTree
 crossModuleNameConflictTests = testGroup "crossModuleNameConflict"
   [ testCase "two imports exporting same name fail with env conflict" $ do
-      -- A and B both export `foo`. The entry imports both; the env
-      -- overlay in `Pipeline.typecheckProgram` detects the collision and
-      -- returns a Left starting with "env:".
+      -- A defines `foo : U64`, B defines `foo : U64` (SAME type, different
+      -- body). The entry imports both; the env overlay in
+      -- `Pipeline.typecheckProgram` detects two distinct ORIGINS for `foo`
+      -- (modules A and B) and returns a Left containing "env merge in ".
       --
-      -- NOTE on the assertion: the current pipeline contract is that
-      -- each module's envOut contains its seed env (B.initialEnv plus
-      -- transitive imports), so overlaying TWO non-Std.Base imports
-      -- always clashes on the builtin tycons (U64, (,), ...) BEFORE
-      -- the `foo` clash is reached. This is a known architectural
-      -- coarseness: env-merge surfaces SOME collision rather than
-      -- specifically the user-visible `foo`. The load-bearing claim
-      -- for this test is therefore "two imports exporting overlapping
-      -- names produce an env-merge error" — exact contents are
-      -- pipeline-defined.
+      -- This exercises binding provenance: env-merge flags a shared var
+      -- when its defining modules differ, even when the stored `Scheme`s are
+      -- identical. (Same-origin overlaps -- a diamond re-export -- still
+      -- merge silently.) Byte-identical re-exported builtin tycons also
+      -- merge silently; the surfaced collision is the cross-module `foo`.
       res <- Loader.loadProgram
                "test/loader-fixtures/09-name-conflict-entry.wok"
                [ "test/loader-fixtures/09-name-conflict-a.wok"
@@ -3934,7 +3987,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Let (Anf.Binder res Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 41)])
                           (Anf.Ret (Anf.AVar res)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "41")
 
@@ -3945,7 +3998,7 @@ interpEffectTests = testGroup "InterpEffect"
             let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                            (Anf.RApp (Anf.AVar np) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
                            (Anf.Ret (Anf.AVar r))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) [] Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) [] Nothing Nothing
             pure (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 5))) hdlr)
       in assertEval Map.empty e (T.pack "105")
 
@@ -3963,7 +4016,7 @@ interpEffectTests = testGroup "InterpEffect"
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
                         (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.Ret (Anf.ALit (Anf.LInt 7)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "7")
 
@@ -3990,7 +4043,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "Flip") (T.pack "flip")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) armBody
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "30")
 
@@ -4020,7 +4073,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
                           (Anf.Ret (Anf.AVar r)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "2")
 
@@ -4588,7 +4641,7 @@ topLevelIsROp lbl op expr = case expr of
 -- whose label and op match.
 isHandleWithOpArm :: T.Text -> T.Text -> Anf.Expr -> Bool
 isHandleWithOpArm lbl op expr = case expr of
-  Anf.Handle _ (Anf.Handler _ opArms _) ->
+  Anf.Handle _ (Anf.Handler _ opArms _ _) ->
     any (\arm -> Anf.oaLabel arm == lbl && Anf.oaOp arm == op) opArms
   _ -> False
 
@@ -4667,7 +4720,7 @@ elaborateEffectsTests = testGroup "ElaborateEffects"
           (isHandleWithOpArm (T.pack "IO") (T.pack "write") result)
         -- check auto-resume: the op arm body contains RApp of the resume binder
         case result of
-          Anf.Handle _ (Anf.Handler _ (arm:_) _) ->
+          Anf.Handle _ (Anf.Handler _ (arm:_) _ _) ->
             assertBool
               ("expected op arm body to contain RApp of resume binder, got body: "
                <> show (Anf.oaBody arm))

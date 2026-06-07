@@ -116,6 +116,9 @@ enter prims fv args k = case fv of
   VCont kb -> case args of
     [v] -> Right (Return v (kb k))
     _   -> Left (ArityError (Tx.pack "continuation expects exactly one argument"))
+  VContP f -> case args of
+    [param, result] -> Right (Return result (f param k))
+    _ -> Left (ArityError (Tx.pack "parameterized continuation expects exactly two arguments"))
   _ -> Left (NotAFunction (renderValue fv))
 
 matchAlts :: Value -> [Alt] -> Scope -> Kont -> Either RuntimeError Config
@@ -149,24 +152,30 @@ dispatchOp lbl op argVals kCur =
           -- continuation instead of returning to the resume call site. Rebind it
           -- per resume; the TOP-LEVEL op arm below keeps the original `hsc`, so
           -- the real post-handler work runs once on the final answer.
-          let reinstall after =
-                let hsc' = case hAnswerJoin h of
-                      -- INVARIANT: an answer-join is the single-result merge join
-                      -- `normName` creates for a value-position handler, so `ps` is
-                      -- exactly one binder. The `(pb : _)` guard takes that binder;
-                      -- if a future change ever pointed `hAnswerJoin` at a many-param
-                      -- join, the rebind is skipped (escape bug returns) rather than
-                      -- misbinding -- keep answer-joins single-param.
-                      Just j
-                        | Just (JoinPoint _ ps _ _) <- Map.lookup j (scJoins hsc)
-                        , (pb : _) <- ps ->
-                            hsc { scJoins =
-                                    Map.insert j
-                                      (JoinPoint hsc ps (Ret (AVar (bndName pb))) after)
-                                      (scJoins hsc) }
-                      _ -> hsc
-                in above (KHandle h hsc' after)
-              resumeVal = VCont reinstall
+          -- INVARIANT: an answer-join is the single-result merge join
+          -- `normName` creates for a value-position handler, so `ps` is
+          -- exactly one binder. The `(pb0 : _)` guard takes that binder;
+          -- if a future change ever pointed `hAnswerJoin` at a many-param
+          -- join, the rebind is skipped (escape bug returns) rather than
+          -- misbinding -- keep answer-joins single-param.
+          let answerRebind after sc =
+                case hAnswerJoin h of
+                  Just j
+                    | Just (JoinPoint _ ps _ _) <- Map.lookup j (scJoins sc)
+                    , (pb0 : _) <- ps ->
+                        sc { scJoins =
+                               Map.insert j
+                                 (JoinPoint sc ps (Ret (AVar (bndName pb0))) after)
+                                 (scJoins sc) }
+                  _ -> sc
+              resumeVal = case hParam h of
+                Nothing ->
+                  VCont (\after -> above (KHandle h (answerRebind after hsc) after))
+                Just pb ->
+                  VContP (\newParam after ->
+                    let hsc' = (answerRebind after hsc)
+                                 { scEnv = bindBinder pb newParam (scEnv hsc) }
+                    in above (KHandle h hsc' after))
               env1 = bindBinders (oaArgs oa) argVals (scEnv hsc)
               env2 = bindBinder (oaResume oa) resumeVal env1
           in Right (Eval (oaBody oa) (Scope env2 (scJoins hsc)) kBelow)

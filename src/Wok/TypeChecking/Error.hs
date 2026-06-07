@@ -102,6 +102,9 @@ data TypeError
     -- ^ A handler omits operations of the handled effect (effect, missing ops).
   | DuplicateReturnArm SourceSpan
     -- ^ A handler has more than one @return@ arm; only one is allowed.
+  | DuplicateHandlerParam SourceSpan
+    -- ^ A parameterized handler block declares more than one @name = init@
+    --   entry; a handler block may declare at most one such parameter.
   | UnknownClass Text
     -- ^ An instance references a class that has not been declared.
   | DuplicateClass Text

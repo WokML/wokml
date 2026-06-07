@@ -1,0 +1,16 @@
+-- Pure recursion, no effects: count how many Collatz steps it takes to reach 1.
+-- Even -> n/2, odd -> 3n+1. Uses only `mod`, `==`, and arithmetic (the language
+-- has equality but no ordering, which is all this needs).
+module Main
+import Std.Base
+
+collatz : U64 -> U64
+collatz n = case n == 1 of
+  True  -> 0
+  False -> case (mod n 2) == 0 of
+    True  -> 1 + collatz (n / 2)
+    False -> 1 + collatz (3 * n + 1)
+
+-- 27 is the classic small-but-long trajectory: 111 steps to reach 1.
+main : U64
+main = collatz 27

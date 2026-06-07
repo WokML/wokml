@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+-- A nested-tuple destructuring component type-checks but the case-compiler
+-- elaboration does not bind the inner binders, so it would silently
+-- miscompile into a runtime UnboundVar. It is rejected at typecheck instead:
+-- destructuring components must be a variable or `_` (use `case` for more).
+nest : (U64, (U64, U64))
+nest = (1, (2, 3))
+
+main : U64
+main = let (a, (b, c)) = nest in a + b + c

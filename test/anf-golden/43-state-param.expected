@@ -1,0 +1,26 @@
+runState i c =
+  let s = i
+  let t.1 = c(())
+  t.1
+  with {
+    return v ->
+      let t.3 = Tuple2(v, s)
+      t.3
+    State.get(resume.1) ->
+      let res = resume.1(s, s)
+      res
+    State.set(x, resume.2) ->
+      let t.2 = resume.2(x, ())
+      t.2
+  }
+
+prog u =
+  let t.3 = State.get()
+  let a = t.3
+  let t.1 = +(a, 1)
+  let t.2 = State.set(t.1)
+  t.2
+
+main =
+  let t = runState(0, prog)
+  t

@@ -75,6 +75,7 @@ data Handler = Handler
     -- handler is in value (non-tail) position; Nothing in tail position. Used
     -- by the interpreter to redirect a resumed sub-run's answer to the resume
     -- call site instead of the static post-handler continuation.
+  , hParam :: Maybe Binder          -- ^ handler-local parameter (slice 4a); Nothing = ordinary
   } deriving (Eq, Show)
 
 data OpArm = OpArm
@@ -143,9 +144,10 @@ collectAlt (AltLit _ e)    t = collectExpr e t
 collectAlt (AltDefault e)  t = collectExpr e t
 
 collectHandler :: Handler -> HintTable -> HintTable
-collectHandler (Handler ret ops _) t =
+collectHandler (Handler ret ops _ mparam) t =
   let (rb, re) = ret
-      t1 = collectExpr re (insertBinder rb t)
+      t0 = maybe t (`insertBinder` t) mparam
+      t1 = collectExpr re (insertBinder rb t0)
   in foldr collectOpArm t1 ops
 
 collectOpArm :: OpArm -> HintTable -> HintTable
@@ -312,7 +314,7 @@ renderAlt fmt tbl (AltDefault e) =
 -- Rendering Handler
 
 renderHandler :: BndFmt -> HintTable -> Handler -> Text
-renderHandler fmt tbl (Handler (rb, re) ops _) =
+renderHandler fmt tbl (Handler (rb, re) ops _ _) =
   Tx.pack "with {"
     <> Tx.pack "\n"
     <> indent 2

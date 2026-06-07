@@ -1,0 +1,3 @@
+main : ((), U64)
+prog : () -> () with State
+runState : forall a c b. a -> (() -> c with State + eff b) -> (c, a) with eff b

@@ -10,6 +10,8 @@
 module Wok.Prelude
   ( preludeName
   , preludeSource
+  , stdControlName
+  , stdControlSource
   ) where
 
 import Data.Text (Text)
@@ -26,4 +28,15 @@ preludeName = Tx.pack "Std.Base"
 preludeSource :: IO Text
 preludeSource = do
   path <- Paths_wok.getDataFileName "prelude/Std/Base.wok"
+  TIO.readFile path
+
+stdControlName :: Text
+stdControlName = Tx.pack "Std.Control"
+
+-- | Read the Std.Control embedded prelude source from the installed
+-- data-files location. Like Std.Base, the .wok file is the editable source
+-- of truth and is located at runtime via Paths_wok.getDataFileName.
+stdControlSource :: IO Text
+stdControlSource = do
+  path <- Paths_wok.getDataFileName "prelude/Std/Control.wok"
   TIO.readFile path

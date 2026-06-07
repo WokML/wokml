@@ -174,6 +174,7 @@ data Exp
     | EIf Exp Exp Exp
     | EWith [HandlerArm] Exp
     | EWithH ConId [ConId] [HandlerArm] Exp
+    | EWithRun VarId [WithArg] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixTail = ITail InfixOp Exp
@@ -188,12 +189,19 @@ data MaybeTrailing = TFNone | TFSome [RecordFieldExpr]
 data RecordFieldExpr = RFExpr VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
+data WithArg = WRArg Exp
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
 data HandlerArm
-    = HArm ConId VarId [AtomPat] Exp | HUArm VarId [AtomPat] Exp
+    = HArm ConId VarId [AtomPat] Exp
+    | HUArm VarId [AtomPat] Exp
+    | HParam VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl
-    = LDEqn FunLHS Exp MaybeWhere | LDSig SigName [SigNameComma] Type
+    = LDEqn FunLHS Exp MaybeWhere
+    | LDSig SigName [SigNameComma] Type
+    | LDPat Pat [Pat] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data MaybeWhere = NoWhere | WithWh [LocalDecl]

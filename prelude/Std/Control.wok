@@ -1,0 +1,18 @@
+module Std.Control
+import Std.Base
+
+effect Reader r = { ask : r }
+reader : r -> (() -> a with Reader r + eff e) -> a with eff e
+reader e c = with Reader { ask -> e } c ()
+
+effect State s = { get : s, set : s -> () }
+state : s -> (() -> a with State s + eff e) -> (a, s) with eff e
+state i c = with State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
+
+effect Writer w = { tell : w -> () }
+writer : (() -> a with Writer [w] + eff e) -> (a, [w]) with eff e
+writer c = with Writer { log = [] ; tell w k -> k (log ++ w) () ; v -> (v, log) } c ()
+
+effect Except e = { throw : e -> Never }
+except : (() -> a with Except e + eff r) -> Result a e with eff r
+except c = with Except { throw e k -> Err e ; v -> Ok v } c ()

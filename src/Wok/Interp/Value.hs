@@ -51,6 +51,7 @@ data Value
   | VClosure ~Env [Binder] Expr
   | VPrim Prim
   | VCont (Kont -> Kont)   -- a captured deep continuation; arg is the post-resume kont
+  | VContP (Value -> Kont -> Kont)   -- parameter-aware resume: \newParam after -> kont
 
 instance Show Value where
   show = Tx.unpack . renderValue
@@ -64,6 +65,7 @@ instance Eq Value where
   VClosure{}   == VClosure{}   = False
   VPrim{}      == VPrim{}      = False
   VCont{}      == VCont{}      = False
+  VContP{}     == VContP{}     = False
   _            == _            = False
 
 -- | A primitive: name (= hint), arity, args accumulated so far (for currying),
@@ -150,6 +152,7 @@ renderValue (VRecord t m) =
 renderValue VClosure{} = Tx.pack "<closure>"
 renderValue VPrim{}    = Tx.pack "<builtin>"
 renderValue VCont{}    = Tx.pack "<continuation>"
+renderValue VContP{}   = Tx.pack "<continuation>"
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)

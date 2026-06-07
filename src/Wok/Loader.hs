@@ -71,11 +71,14 @@ loadProgram
   -> [FilePath]        -- additional -I files (order preserved)
   -> IO (Either LoaderError (ModuleName, [LoadedModule]))
 loadProgram entry extras = runExceptT $ do
-  preludeText <- liftIO Prelude.preludeSource
-  preludeLM   <- liftEither (parseAndPrep "<Std.Base>" Embedded preludeText)
-  extraLMs    <- traverse (ExceptT . loadOne) extras
-  entryLM     <- ExceptT (loadOne entry)
-  mm          <- liftEither (buildMap (preludeLM : extraLMs ++ [entryLM]))
+  preludeText    <- liftIO Prelude.preludeSource
+  preludeLM      <- liftEither (parseAndPrep "<Std.Base>" Embedded preludeText)
+  stdControlText <- liftIO Prelude.stdControlSource
+  stdControlLM   <- liftEither (parseAndPrep "<Std.Control>" Embedded stdControlText)
+  extraLMs       <- traverse (ExceptT . loadOne) extras
+  entryLM        <- ExceptT (loadOne entry)
+  mm             <- liftEither
+                      (buildMap (preludeLM : stdControlLM : extraLMs ++ [entryLM]))
   ms          <- liftEither (topoSort mm)
   pure (lmName entryLM, ms)
 

@@ -16,7 +16,8 @@ references this roadmap and contains that slice's bite-sized tasks.
 | 1 | Value ops + `with`-prefix handler, auto-resume default / binder-control, drop `handle`/`return` | DONE — merged to `main` (542 tests green) |
 | 2 | Optional effect header + forgotten-resume lint + `Never` | DONE — merged to `main` (562 tests green) |
 | 3 | Bounded `(with H e)` handler scope | DONE — merged to `main` (572 tests green) |
-| 4 | Parameterized handlers -> scheduler / `spawn` / `par` / `Future` / `Control.Wok` | deferred |
+| 4a | Parameterized handlers + `with … in` runner sugar + `Std.Control` (mtl quartet) | DONE — feat/effects-slice-4a-parameterized-handlers (585 tests green) |
+| 4b | Scheduler / `spawn` / `par` / `Future` / `Std.Control` concurrency half | deferred |
 | X | One-shot multiplicity check + value restriction; cancellation (discontinue) | deferred, gated on ANF analysis |
 
 ## Design sources (read in this order)
@@ -87,13 +88,38 @@ or do-notation.
   resume call site. Design: `2026-06-06-effects-slice-3-bounded-handlers-design.md`.
 - **Plan file:** `docs/superpowers/plans/2026-06-06-effects-slice-3-bounded-handlers.md`.
 
-### Slice 4 — parameterized handlers, then the runtime
+### Slice 4a — parameterized handlers + `with … in` sugar + `Std.Control` (mtl)
 
-- **Goal:** clean stateful `State`, then real concurrency.
-- **Delivers (in order):** parameterized handlers; then scheduler / `spawn` / `par`
-  / a `Future` primitive (hides the existential for heterogeneous parked
-  continuations) / `Control.Wok` standard effects.
-- **Plan file(s):** _to be written, just-in-time._
+- **Status: implemented (585 green)** — `feat/effects-slice-4a-parameterized-handlers`.
+- **Goal:** clean, composable stateful `State`, and the mtl workhorse stack as flat
+  handlers.
+- **Delivers:** (1) parameterized handlers — a handler carries a local parameter
+  threaded through a **two-argument resume** `resume(newParam, result)`; auto-resume
+  threads it unchanged, a parameter change takes control. (2) the `with <runner> in
+  <body>` runner sugar (≡ `<runner> (\_ -> <body>)`), coherent with `let … in`,
+  stacked for multiple handlers. (3) `Std.Control` as a second embedded prelude with
+  `Reader`/`Writer`/`State`/`Except` + terse runners.
+- **Key finding (load-bearing):** the library-encoding shortcut (answer type `s -> …`,
+  no new mechanism) **does not compose** — stacking two parameterized handlers with
+  interleaved ops silently loses the outer parameter (proven both directions on the
+  live compiler). Parameter-in-the-frame composes; parameter-in-the-answer-type does
+  not. So the mechanism must be real (param in `hsc`, re-installed on the slice-3 deep
+  resume).
+- **Riskiest task (front-load):** the nested different-effect composition case
+  (`state` outside, `writer` inside, and the swap) — the exact case the encoding
+  failed. TDD anchor. Second: the dangling-`in` layout behaviour of `with … in`.
+- **Design file:** `docs/superpowers/specs/2026-06-07-effects-slice-4a-parameterized-handlers-design.md`.
+- **Plan file:** _to be written, just-in-time._
+- **Follow-ups discovered during implementation** (non-blocking):
+  1. **Diamond-import env-merge coarseness.** ~~`overlayEnvs` merges same-name/same-type re-exports silently to support the second embedded prelude; two distinct definitions sharing a name+type are no longer caught.~~ **RESOLVED (772c345):** `overlayEnvs` (`src/Wok/TypeChecking/Env.hs`) keys var-namespace conflict detection on **binding provenance** — `Env.envVarOrigin` (name → defining module), stamped in `Pipeline.hs`. A diamond re-export (same origin) merges; a genuine cross-module redefinition (different origin) errors, even with identical types. `lookupVar`/`extendVar`/inference unchanged.
+
+### Slice 4b — the concurrency runtime
+
+- **Goal:** real concurrency on top of parameterized handlers.
+- **Delivers:** scheduler / `spawn` / `par` / a `Future` primitive (hides the
+  existential for heterogeneous parked continuations) / the concurrency half of
+  `Std.Control`. Needs existential support for parked continuations.
+- **Plan file(s):** _to be written, just-in-time, after 4a lands._
 
 ### Cross-cutting (slice X) — checked properties
 

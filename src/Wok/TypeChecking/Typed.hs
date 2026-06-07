@@ -44,6 +44,7 @@ data TAlt a = TAlt (Tpat a) [TLocalDecl a] (Texp a)   -- pattern, where, body
 data THandlerArm a
   = TReturnArm (Tpat a) (Texp a)
   | TOpArm Text Text [Tpat a] Text (Texp a)   -- effect, op, args, resume-name, body
+  | TParamArm Text (Texp a)                   -- handler-local param: name + checked init (slice 4a)
   deriving (Show, Functor, Foldable, Traversable)
 
 -- | A local binding (let / where entry): name, params, body. (Sigs carry no

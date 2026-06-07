@@ -54,6 +54,19 @@ entrypoints Module ;
 --         { PRecordOpen $1 (reverse $3) $5 }
 --
 -- See commit e06ba60 `feat(tc): record patterns (Task 7)` for the applied patch.
+--
+-- POST-REGEN NOTE: src-generated/GeneratedParser/Wok/Par.y needs a third manual
+-- patch after every `bnfc` regeneration. BNFC does NOT emit an empty-record
+-- pattern rule for `ConId {}` (e.g. `Point {}`), and the left-recursive
+-- `NEListRecordFieldPat` above is 1-or-more (it has no empty alternative), so
+-- the empty record pattern is otherwise unparseable. Hand-add this AtomPat
+-- alternative alongside the other record-pattern rules:
+--
+--   AtomPat
+--     : ConId '{' '}' { GeneratedParser.Wok.Abs.PRecord $1 [] }
+--
+-- It produces the same `PRecord` node as the populated rule, with an empty
+-- field list. Keep it as the first of the `ConId '{' ... '}'` alternatives.
 layout toplevel ;
 layout "let", "where", "of" ;
 layout stop "in" ;
@@ -373,12 +386,21 @@ EWith.    Exp2 ::= "with" "{" [HandlerArm] "}" Exp ;
 -- arms may drop the qualifier. The first ConId is mandatory (so an empty header
 -- cannot collide with EWith); the rest is a whitespace-separated [ConId] tail.
 EWithH.   Exp2 ::= "with" ConId [ConId] "{" [HandlerArm] "}" Exp ;
+-- Runner sugar: `with <runner> <args> in <body>` ≡ `<runner> <args> (\_ -> <body>)`.
+-- VarId-headed (lowercase runner fn) so it never collides with EWithH (ConId-headed)
+-- or EWith (`{`-headed). slice 4a.
+EWithRun. Exp2 ::= "with" VarId [WithArg] "in" Exp ;
+WRArg.    WithArg ::= Exp2 ;
+separator WithArg "" ;
 -- Qualified operation arm (unchanged).
 HArm.     HandlerArm ::= ConId "." VarId [AtomPat] "->" Exp ;
 -- Unqualified arm: covers BOTH the value arm (`v -> e`, zero AtomPats) and an
 -- unqualified operation arm (`get -> e`, `set s -> e`). The typechecker classifies
 -- each by resolving the head name against the header. Replaces HVArm.
 HUArm.    HandlerArm ::= VarId [AtomPat] "->" Exp ;
+-- Handler-local parameter: a `name = init` seed entry inside the handler block.
+-- `=` distinguishes it from the `->` of op/value arms (HUArm/HArm). slice 4a.
+HParam.   HandlerArm ::= VarId "=" Exp ;
 separator HandlerArm ";" ;
 separator ConId "" ;
 
@@ -387,6 +409,14 @@ separator Exp "," ;   -- shared by EList and ETuple bodies
 -- Local decls (for `let` blocks; same shape allowed in `where` blocks in Task 9)
 LDEqn.    LocalDecl ::= FunLHS "=" Exp MaybeWhere ;
 LDSig.    LocalDecl ::= SigName [SigNameComma] ":" Type ;
+-- Tuple/wildcard destructuring bind: `let (a, b) = e`. The LHS is the inlined
+-- 2-or-more tuple shape (NOT a bare AtomPat), so a bare `x` never reduces toward
+-- it -- `x = e` stays an LDEqn value bind. The leading `(` plus a comma make this
+-- unambiguous: `(a, b)` is not a FunName (LDEqn/LHSPre) and `=` is not a VarSym
+-- (LHSInfSym), so `(a, b) = e` routes here without a reduce/reduce conflict on the
+-- shared bare-VarId state. Components are full Pat (covers `_` wildcards and
+-- nested tuples); refutable components are rejected in the type checker.
+LDPat.    LocalDecl ::= "(" Pat "," [Pat] ")" "=" Exp ;
 separator LocalDecl ";" ;
 
 -- Optional where-block attached to DEqn / LDEqn / AltC

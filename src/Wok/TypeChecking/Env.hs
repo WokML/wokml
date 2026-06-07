@@ -27,6 +27,7 @@ module Wok.TypeChecking.Env
   , extendInstance
   ) where
 
+import Data.List (nub)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -101,36 +102,80 @@ data Env = Env
   , envEffects    :: Map Text EffectInfo
   , envClasses    :: Map Text ClassInfo
   , envInstances  :: [InstanceInfo]
+  , -- | Binding provenance for the VAR namespace: var name -> defining
+    -- module name. Populated by the pipeline (each new var gets its
+    -- defining module's name) and unioned through 'overlayEnvs'. Lets
+    -- 'overlayEnvs' tell a benign diamond re-export (same origin) apart
+    -- from a genuine cross-module redefinition (different origin), even
+    -- when the two share an identical 'Scheme'. A var may have no recorded
+    -- origin (e.g. envs built directly via 'extendVar' in unit tests); in
+    -- that case 'overlayEnvs' falls back to comparing 'Scheme's.
+    envVarOrigin  :: Map Text Text
   }
   deriving (Eq, Show)
 
 emptyEnv :: Env
-emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty Map.empty []
+emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty Map.empty [] Map.empty
 
 -- | Tag for which of the six Env namespaces a name lives in.
 -- Used by 'overlayEnvs' to attribute collisions.
 data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect | NsClass
   deriving (Eq, Ord, Show)
 
--- | Left-biased union of two 'Env's. On any name collision in any of
+-- | Left-biased union of two 'Env's. On a name collision in any of
 -- the namespaces, returns 'Left' with one (namespace, name) pair
 -- per offending name. The order of pairs in the result is: envVars
 -- collisions first (in Map order), then envCons, then envTyCons, then
--- envRecordCons, then envEffects, then envClasses. Instances are
--- concatenated (no collision possible by name).
+-- envRecordCons, then envEffects, then envClasses.
+--
+-- A name present in BOTH inputs is flagged as a collision only when the two
+-- stored entries DIFFER. When both sides carry the identical entry the
+-- overlap is benign and merges silently. This is what makes diamond
+-- imports work: if @Main@ imports both @Std.Base@ and a module that
+-- itself re-exports @Std.Base@ (e.g. @Std.Control@), every shared
+-- @Std.Base@ name appears in both per-module envs with the same value, so
+-- it must not be reported as a conflict.
+--
+-- BINDING PROVENANCE (var namespace). For the var namespace the stored
+-- entry is only the 'Scheme' (the type), NOT the binding's body, so two
+-- genuinely different definitions sharing a name AND an identical type
+-- signature would be indistinguishable by value alone. To catch those we
+-- carry 'envVarOrigin' (var name -> defining module name), populated by the
+-- pipeline. A var present in both inputs is a clash iff its recorded
+-- origins are known on both sides and DIFFER (a genuine cross-module
+-- redefinition), or -- defensively, when an origin is missing -- its
+-- 'Scheme's differ. Same-origin overlaps are the diamond case (@Std.Base@
+-- re-exported through @Std.Control@ keeps origin @"Std.Base"@ on both
+-- sides) and merge silently. The two origin maps are unioned into the
+-- result.
+--
+-- Instances are concatenated and de-duplicated (a diamond would otherwise
+-- replay the same @Eq U64@ instance twice).
 --
 -- "Left-biased" means that on disjoint inputs the result is the
 -- straightforward union; the bias only matters at the API contract
--- level since we reject any actual overlap rather than silently picking
--- a side.
+-- level since we reject any actual differing overlap rather than silently
+-- picking a side.
 overlayEnvs :: Env -> Env -> Either [(EnvNs, Text)] Env
-overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1) (Env v2 c2 tc2 rc2 ef2 cl2 ii2) =
-  let varClash = Map.keys (Map.intersection v1 v2)
-      conClash = Map.keys (Map.intersection c1 c2)
-      tcClash  = Map.keys (Map.intersection tc1 tc2)
-      rcClash  = Map.keys (Map.intersection rc1 rc2)
-      efClash  = Map.keys (Map.intersection ef1 ef2)
-      clClash  = Map.keys (Map.intersection cl1 cl2)
+overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 o1) (Env v2 c2 tc2 rc2 ef2 cl2 ii2 o2) =
+  let differing m1 m2 =
+        Map.keys (Map.filter id (Map.intersectionWith (/=) m1 m2))
+      -- A shared var clashes when its origins are known and differ (a
+      -- genuine cross-module redefinition), or -- as a fallback when an
+      -- origin is missing -- when its stored 'Scheme's differ.
+      originDiffers k = case (Map.lookup k o1, Map.lookup k o2) of
+                          (Just a, Just b) -> a /= b
+                          _                -> False
+      schemeDiffers k = case (Map.lookup k v1, Map.lookup k v2) of
+                          (Just a, Just b) -> a /= b
+                          _                -> False
+      varClash = [ k | k <- Map.keys (Map.intersectionWith (\_ _ -> ()) v1 v2)
+                     , originDiffers k || schemeDiffers k ]
+      conClash = differing c1 c2
+      tcClash  = differing tc1 tc2
+      rcClash  = differing rc1 rc2
+      efClash  = differing ef1 ef2
+      clClash  = differing cl1 cl2
       clashes  =  [ (NsVar,       k) | k <- varClash ]
                ++ [ (NsCon,       k) | k <- conClash ]
                ++ [ (NsTyCon,     k) | k <- tcClash  ]
@@ -140,7 +185,8 @@ overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1) (Env v2 c2 tc2 rc2 ef2 cl2 ii2) =
   in case clashes of
        [] -> Right (Env (Map.union v1 v2) (Map.union c1 c2) (Map.union tc1 tc2)
                         (Map.union rc1 rc2) (Map.union ef1 ef2)
-                        (Map.union cl1 cl2) (ii1 ++ ii2))
+                        (Map.union cl1 cl2) (nub (ii1 ++ ii2))
+                        (Map.union o1 o2))
        _  -> Left clashes
 
 lookupVar :: Text -> Env -> Maybe Scheme

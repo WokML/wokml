@@ -17,6 +17,7 @@ module Wok.Pipeline
 import Control.Monad (foldM)
 import Data.Bifunctor (first)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified Data.Text as Tx
 
 import Wok.IR.Anf (CoreModule)
@@ -29,7 +30,7 @@ import Wok.Reordering
   )
 import qualified Wok.TypeChecking as TC
 import qualified Wok.TypeChecking.Builtins as B
-import Wok.TypeChecking.Env (emptyEnv, overlayEnvs)
+import Wok.TypeChecking.Env (emptyEnv, overlayEnvs, envVars, envVarOrigin)
 
 -- | Per-module result of the typecheck fold, carrying only what is needed
 -- for both typecheckProgram and elaborateProgram.
@@ -59,9 +60,18 @@ runPipelineFold _entryName = go Map.empty Map.empty Map.empty []
                       (foldM overlayEnvs envSeed importedEnvs)
       ast        <- first ((ctx "reorder" ++) . show)
                       (reorderModuleWith importsFix (lmAst m))
-      (envOut, decls, ws) <- first ((ctx "typecheck" ++) . show)
+      (envOut0, decls, ws) <- first ((ctx "typecheck" ++) . show)
                       (TC.inferProgramWith mergedEnv (lmOrigin m) ast)
-      let mr = ModResult decls envOut
+      -- Tag binding provenance for the var namespace: every var introduced
+      -- by THIS module (present in envOut0 but not in mergedEnv) gets origin
+      -- (lmName m); inherited names keep mergedEnv's origins. inferProgramWith
+      -- does not carry the origin field, so we recompute it explicitly here.
+      let newVarNames = Map.keysSet (envVars envOut0)
+                          `Set.difference` Map.keysSet (envVars mergedEnv)
+          origins'    = Map.union (envVarOrigin mergedEnv)
+                                  (Map.fromSet (const (lmName m)) newVarNames)
+          envOut      = envOut0 { envVarOrigin = origins' }
+          mr = ModResult decls envOut
       go (Map.insert (lmName m) mr         resultMap)
          (Map.insert (lmName m) envOut     envsByMod)
          (Map.insert (lmName m) (lmFixities m) fixByMod)

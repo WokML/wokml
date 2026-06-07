@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+effect IO = { read : String -> String, write : String -> () }
+
+-- A parameterized handler block may declare at most one `name = init`
+-- entry. A second one is rejected with a dedicated DuplicateHandlerParam
+-- error rather than the misleading DuplicateReturnArm.
+bad comp =
+  with { s = 0
+       ; s = 1
+       ; IO.read p -> resume(s, p)
+       ; IO.write m -> resume(s, ())
+       ; v -> v }
+  comp ()

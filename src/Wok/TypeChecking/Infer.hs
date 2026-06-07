@@ -1641,9 +1641,34 @@ inferExprW mono (Abs.ERecordExt (Abs.ConId (pos, conName)) spreadExpr mTrailing)
   pure (spreadT', Ty.Texp spreadT' (Ty.TRecordExt conName spreadNode fieldNodes))
 
 inferExprW mono (Abs.ELet localDecls body) =
-  inferLetGroup mono localDecls $ \m declNodes -> do
-    (bodyT, bodyNode) <- inferExprW m body
-    pure (bodyT, Ty.Texp bodyT (Ty.TLet declNodes bodyNode))
+  -- A tuple/wildcard pattern bind `let (a, b) = e in ...` is non-recursive and
+  -- has no place in the mutually-recursive named-group model. Desugar it to a
+  -- `case` at the surface level, preserving source order: every decl before the
+  -- first pattern bind forms a named let group; the pattern bind becomes a
+  -- single-alternative case whose body is the let of the remaining decls + body.
+  -- This reuses ALL existing case typing + elaboration machinery.
+  case splitAtPatBind localDecls of
+    Nothing ->
+      inferLetGroup mono localDecls $ \m declNodes -> do
+        (bodyT, bodyNode) <- inferExprW m body
+        pure (bodyT, Ty.Texp bodyT (Ty.TLet declNodes bodyNode))
+    Just (before, headPat, tailPats, rhs, after) -> do
+      mapM_ checkComponentPat (headPat : tailPats)
+      let tuplePat = Abs.APTuple headPat tailPats
+          inner = case after of
+                    [] -> body
+                    _  -> Abs.ELet after body
+          caseE = Abs.ECase rhs [Abs.AltC (Abs.PAtom tuplePat) inner Abs.NoWhere]
+          -- Splitting `before` into its own outer (non-recursive) ELet is sound
+          -- because this branch does not support mutual recursion across
+          -- sequential `let ... in let ...`: a `before` decl can only refer
+          -- forward to a later decl via nesting, which the split preserves, so
+          -- partitioning the group around the (non-recursive) pat-bind does not
+          -- change scoping.
+          rebuilt = case before of
+                      [] -> caseE
+                      _  -> Abs.ELet before caseE
+      inferExprW mono rebuilt
 inferExprW mono (Abs.ECase scrutinee alts) = do
   (sT, sNode) <- inferExprW mono scrutinee
   rT <- freshTVar KStar
@@ -1665,6 +1690,15 @@ inferExprW mono (Abs.ECase scrutinee alts) = do
 inferExprW mono (Abs.EWith arms e) = inferHandler mono [] Nothing e arms
 inferExprW mono (Abs.EWithH (Abs.ConId (hpos, h)) hs arms e) =
   inferHandler mono (h : [ n | Abs.ConId (_, n) <- hs ]) (Just hpos) e arms
+-- Runner sugar `with <runner> <args> in <body>` (slice 4a). This is a pure
+-- desugar: `with f a b in body` ≡ `f a b (\_ -> body)`. We build the surface
+-- application and elaborate it via the existing application/lambda path so all
+-- typing and elaboration is reused.
+inferExprW mono (Abs.EWithRun fVar wargs body) =
+  let runner = foldl (\acc warg -> Abs.EApp acc (withArgExp warg)) (Abs.EVar fVar) wargs
+      thunk  = Abs.ELam [Abs.APWild] body
+  in inferExprW mono (Abs.EApp runner thunk)
+  where withArgExp (Abs.WRArg e) = e
 
 -- | Classification of a single handler arm against the (possibly empty) header.
 -- An unqualified arm is resolved to either an operation arm (when its head names
@@ -1673,6 +1707,7 @@ inferExprW mono (Abs.EWithH (Abs.ConId (hpos, h)) hs arms e) =
 data ArmClass
   = OpArmC Text Text [Abs.AtomPat] Abs.Exp (Int, Int)
   | ValArmC Text Abs.Exp (Int, Int)
+  | ParamArmC Text Abs.Exp (Int, Int)   -- slice 4a: handler-local param `name = init`
 
 classifyArm :: Env -> [Text] -> Abs.HandlerArm -> TC s ArmClass
 classifyArm env header arm = case arm of
@@ -1693,6 +1728,11 @@ classifyArm env header arm = case arm of
                 then pure (ValArmC name body pos)
                 else throwError (UnknownUnqualifiedOp (Just pos) name)
       ens  -> throwError (HandlerOpAmbiguous (Just pos) name ens)
+  -- Handler-local parameter `name = init` (slice 4a). Bind `name` at a fresh
+  -- type sigma in scope of every arm and the value arm; `init` is checked at
+  -- sigma; control arms see `resume : sigma -> T -> R`.
+  Abs.HParam (Abs.VarId (pos, name)) initExp ->
+    pure (ParamArmC name initExp pos)
   where
     declaresOp e en op = case lookupEffect en e of
       Just eInfo -> Map.member op (eiOps eInfo)
@@ -1733,6 +1773,7 @@ texpMentions name = goE
     goA (Ty.TAlt _ ds b)        = any goD ds || goE b
     goArm (Ty.TReturnArm _ b)   = goE b
     goArm (Ty.TOpArm _ _ _ _ b) = goE b
+    goArm (Ty.TParamArm _ b)    = goE b
 
 inferHandler :: Map.Map Text (Type s) -> [Text] -> Maybe (Int, Int) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
 inferHandler mono header headerPos e arms = do
@@ -1742,8 +1783,9 @@ inferHandler mono header headerPos e arms = do
   when (null arms) $ throwError (EmptyHandler headerPos)
   -- Classify each arm against the header into an operation arm or a value arm.
   classified <- mapM (classifyArm env header) arms
-  let opArms  = [ (en, op, ps, body, pos) | OpArmC en op ps body pos <- classified ]
-      retArms = [ (pos, v, body)          | ValArmC v body pos        <- classified ]
+  let opArms    = [ (en, op, ps, body, pos) | OpArmC en op ps body pos <- classified ]
+      retArms   = [ (pos, v, body)          | ValArmC v body pos        <- classified ]
+      paramArms = [ (name, initE, pos)      | ParamArmC name initE pos  <- classified ]
   -- At most one `return` arm is allowed; reject a second rather than silently
   -- ignoring it.
   case retArms of
@@ -1758,6 +1800,21 @@ inferHandler mono header headerPos e arms = do
   -- at R and bind `resume : T -> R`, and the value/return arm produces R. A
   -- single shared metavar ties all of them together.
   answerT <- freshTVar KStar
+  -- Handler-local parameter (slice 4a): at most one `name = init` entry. Bind
+  -- `name` at a fresh type sigma; check `init : sigma`. The init seed is typed
+  -- under `mono` (it does NOT see the parameter name). The parameter name is
+  -- threaded via `monoP` into every op arm and the value arm.
+  mParam <- case paramArms of
+    []                 -> pure Nothing
+    [(name, initE, _)] -> do
+      paramTy <- freshTVar KStar
+      (initT, initNode) <- inferExprW mono initE
+      unify Nothing initT paramTy
+      pure (Just (name, paramTy, initNode))
+    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
+  let monoP = case mParam of
+        Just (name, ty, _) -> Map.insert name ty mono
+        Nothing            -> mono
   -- The handled effects: when a header is present it is the authoritative
   -- "exactly these effects" set (so missing arms are coverage errors); without
   -- a header, the distinct effect names mentioned by arm heads.
@@ -1813,7 +1870,7 @@ inferHandler mono header headerPos e arms = do
           let pTys  = map (\(t, _, _) -> t) patResults
               binds = concatMap (\(_, b, _) -> b) patResults
               argPatNodes = map (\(_, _, n) -> n) patResults
-              mono1 = foldr (\(n, t) m -> Map.insert n t m) mono binds
+              mono1 = foldr (\(n, t) m -> Map.insert n t m) monoP binds
           mResult <- peelArrowsWithArgUnify opTy pTys
           resultTy <- case mResult of
             Just r  -> pure r
@@ -1844,7 +1901,14 @@ inferHandler mono header headerPos e arms = do
               -- that applying `k` in the body flows its effects into the outer
               -- ambient (mirroring ordinary application; see EApp).
               resumeRow <- freshRVar
-              let resumeTy = arrowT resultTy resumeRow answerT
+              -- A parameterized handler gives `resume : sigma -> T -> R` (one
+              -- extra leading arrow for the threaded parameter); an unparameterized
+              -- handler keeps the slice-1 shape `resume : T -> R`. The leading
+              -- parameter arrow carries its own fresh open effect row.
+              paramRow <- freshRVar
+              let resumeTy = case mParam of
+                    Just (_, paramTy, _) -> arrowT paramTy paramRow (arrowT resultTy resumeRow answerT)
+                    Nothing              -> arrowT resultTy resumeRow answerT
                   mono2    = Map.insert kname resumeTy mono1
               (bodyT, bodyNode) <- inferExprW mono2 body
               unify (Just pos) bodyT answerT
@@ -1865,22 +1929,27 @@ inferHandler mono header headerPos e arms = do
   subRow <- liftST (readSTRef subRef)
   residual <- dischargeEffects subRow handledEffects
   emitRow Nothing residual
+  -- A parameter arm, when present, is emitted into the typed arm list so the
+  -- elaborator (Task 4) can see the seed. It is inert at the type level here.
+  let paramArmNodes = case mParam of
+        Just (name, _, initNode) -> [Ty.TParamArm name initNode]
+        Nothing                  -> []
   -- Apply the optional value arm to compute the handler's answer type R.
   case retArms of
     []               -> do
       -- No value arm: the return clause is the identity, so the answer type is
       -- exactly the handled value's type.
       unify Nothing answerT exprT
-      pure (answerT, Ty.Texp answerT (Ty.THandle exprNode opArmNodes))
+      pure (answerT, Ty.Texp answerT (Ty.THandle exprNode (paramArmNodes ++ opArmNodes)))
     ((_, v, rb) : _) -> do
-      let mono' = Map.insert v exprT mono
+      let mono' = Map.insert v exprT monoP
       (rT, rNode) <- inferExprW mono' rb
       -- The value arm binds the handled value @v@ (type exprT) and transforms
       -- it to the answer type R; represent the binder as a variable pattern
       -- annotated with exprT.
       unify Nothing rT answerT
       let retArm = Ty.TReturnArm (Ty.Tpat exprT (Ty.TPVar v)) rNode
-      pure (answerT, Ty.Texp answerT (Ty.THandle exprNode (opArmNodes ++ [retArm])))
+      pure (answerT, Ty.Texp answerT (Ty.THandle exprNode (paramArmNodes ++ opArmNodes ++ [retArm])))
 
 -- | Remove the given effect labels from a row (each label dropped once per
 -- occurrence is unnecessary in v1 -- effects are not duplicated by inference --
@@ -2088,6 +2157,15 @@ inferLetGroup
   -> (Map.Map Text (Type s) -> [Ty.TLocalDecl (Type s)] -> TC s a)
   -> TC s a
 inferLetGroup mono decls k = do
+  -- Tuple pattern binds are desugared at the `ELet` surface site. If one reaches
+  -- a named group (i.e. it appears in a `where` block, which is not desugared),
+  -- reject it with a clear directive rather than silently dropping it.
+  case [ () | Abs.LDPat{} <- decls ] of
+    (_ : _) -> throwError
+      (UnsupportedFeature Nothing
+        (Tx.pack "tuple pattern binding is only supported in `let ... in`, not \
+                 \in a `where` block; use `let` or `case`"))
+    [] -> pure ()
   let (sigs, eqns) = partitionLocalDecls decls
   sigMap <- buildSigMap sigs
   let groups = groupEquations eqns
@@ -2133,6 +2211,59 @@ partitionLocalDecls = foldr step ([], [])
   where
     step d@Abs.LDSig{} (ss, es) = (d : ss, es)
     step d@Abs.LDEqn{} (ss, es) = (ss, d : es)
+    -- Pattern binds are desugared to `case` at the `ELet` surface site before
+    -- reaching here. If one survives (e.g. inside a `where` block), it is
+    -- dropped from the named-group partition; inferLetGroup rejects it.
+    step Abs.LDPat{}   acc       = acc
+
+-- | Split a local-decl list at the first tuple pattern bind, returning the decls
+-- before it, the tuple's head and tail component patterns, its RHS, and the
+-- decls after it. Returns Nothing if there is no pattern bind in the list. The
+-- grammar guarantees a pattern bind's LHS is a 2-or-more tuple, so the head and
+-- tail components reconstruct an `APTuple`.
+splitAtPatBind
+  :: [Abs.LocalDecl]
+  -> Maybe ([Abs.LocalDecl], Abs.Pat, [Abs.Pat], Abs.Exp, [Abs.LocalDecl])
+splitAtPatBind = go []
+  where
+    go _ [] = Nothing
+    go acc (Abs.LDPat headPat tailPats rhs : rest) =
+      Just (reverse acc, headPat, tailPats, rhs, rest)
+    go acc (d : rest) = go (d : acc) rest
+
+-- | A tuple-component pattern must be a variable or `_` (the case-compiler
+-- elaboration only binds those). Anything richer -- a nested tuple,
+-- constructor, list, or literal -- is rejected and must use `case`. (A nested
+-- tuple type-checks but is NOT bound by elaboration, which would silently
+-- miscompile into a runtime UnboundVar; rejecting it here makes that a clear
+-- compile-time error.)
+checkComponentPat :: Abs.Pat -> TC s ()
+checkComponentPat (Abs.PAtom ap) = case ap of
+  Abs.APVar{}   -> pure ()
+  Abs.APWild    -> pure ()
+  Abs.APParen p -> checkComponentPat p
+  _ -> throwError
+    (UnsupportedFeature (atomPatPos ap)
+      (Tx.pack "pattern binding component must be a variable or `_`; \
+               \for richer patterns use `case`"))
+checkComponentPat _ = throwError
+  (UnsupportedFeature Nothing
+    (Tx.pack "pattern binding component must be a variable or `_`; \
+             \for richer patterns use `case`"))
+
+atomPatPos :: Abs.AtomPat -> Abs.BNFC'Position
+atomPatPos (Abs.APVar (Abs.VarId (p, _)))   = Just p
+atomPatPos (Abs.APLitI (Abs.WokInt (p, _))) = Just p
+atomPatPos (Abs.APCon modPath)              = Just (modPathPos modPath)
+atomPatPos (Abs.APList (p : _))             = patPos p
+atomPatPos _                                = Nothing
+
+-- | Best-effort source position for a pattern, drilling to the first
+-- position-carrying atom. Mirrors 'atomPatPos' for the nested case.
+patPos :: Abs.Pat -> Abs.BNFC'Position
+patPos (Abs.PAtom ap)     = atomPatPos ap
+patPos (Abs.PApp mp _ _)  = Just (modPathPos mp)
+patPos (Abs.PCons ap _)   = atomPatPos ap
 
 buildSigMap :: [Abs.LocalDecl] -> TC s (Map.Map Text Scheme)
 buildSigMap [] = pure Map.empty
@@ -2162,6 +2293,8 @@ groupEquations = Data.List.foldl' step []
 eqName :: Abs.LocalDecl -> Text
 eqName (Abs.LDEqn lhs _ _) = funLHSName lhs
 eqName (Abs.LDSig sn _ _) = sigNameText sn
+-- Pattern binds carry no name and are partitioned out before grouping.
+eqName Abs.LDPat{} = Tx.pack "<pattern-bind>"
 
 funLHSName :: Abs.FunLHS -> Text
 funLHSName (Abs.LHSPre fn _) = funNameText fn
@@ -2533,6 +2666,7 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
       closeRow ambient
       pure (arrowsWithEffect pTys bodyT ambient, mkDecl bodyNode)
 typeEquationWith _ _ Abs.LDSig{} = error "typeEquationWith: signature in equation list"
+typeEquationWith _ _ Abs.LDPat{} = error "typeEquationWith: pattern bind in equation list"
 
 -- | The effect row on the @n@-th arrow (1-indexed) of an instantiated sig type.
 -- A curried equation @f x y = body@ performs its effects only when fully

@@ -7,7 +7,7 @@ Supersedes: the surface design in `2026-06-05-effect-handlers-unified-case-desig
   both were rejected). The **Compilation and runtime model** section of that document
   remains current and is the lowering reference for this spec.
 Related: `docs/koka.md`, `docs/superpowers/specs/2026-06-05-multi-clause-match-compiler-design.md`
-Future module: `Control.Wok` (effect/handler prelude)
+Future module: `Std.Control` (effect/handler prelude)
 
 ## Goals this design serves
 
@@ -231,8 +231,8 @@ parProg u =
   scheduler resume it later. It composes with the `with`-prefix because the
   captured continuation re-installs its handler on resume (deep handlers).
 
-The scheduler, `spawn`/`par`, the `Future` primitive, and `Control.Wok` are
-deferred (section 10).
+The scheduler, `spawn`/`par`, the `Future` primitive, and the concurrency half of
+`Std.Control` are deferred (section 10).
 
 ## 8. Coverage and the forgotten-resume lint
 
@@ -286,13 +286,38 @@ Shipped (additive, no lock-in):
   prefix; no separator. (Slice 3's substance was the non-tail-resume delimiter fix,
   not the syntax.)
 
+- **Parameterized handlers** -- **shipped (slice 4a).** A handler carries a local
+  parameter via an in-block `name = init` seed:
+  `with State { s = 0 ; get -> s ; set x k -> k x () ; v -> (v, s) }`. The local
+  parameter is read by op/value arms; auto-resume threads it unchanged; a parameter
+  change takes control and calls a **two-argument** `resume(newParam, result)`. The
+  parameter lives in the handler frame (re-installed on the slice-3 deep resume), so
+  stacking two parameterized handlers with interleaved ops composes (the
+  answer-type library encoding did not).
+
+- **`with <runner> in <body>` runner sugar** -- **shipped (slice 4a).** Equivalent
+  to `<runner> (\_ -> <body>)`; coherent with `let … in`, stacked for multiple
+  handlers.
+
+- **Parameterized handlers** -- **shipped (slice 4a).** A handler block may carry an
+  in-block `name = init` parameter seed threaded through a two-argument
+  `resume(newParam, result)`; auto-resume threads it unchanged.
+
+- **`Std.Control` (mtl quartet)** -- **shipped (slice 4a).** A second embedded
+  prelude: `Reader`/`Writer`/`State`/`Except` + exactly one terse runner each
+  (`reader`/`state`/`writer`/`except`); no `eval`/`exec` split (the `state` runner
+  returns the full `(value, finalState)` pair).
+
+- **Tuple destructuring-`let`** -- **shipped (slice 4a).** `let (a, _) = e in …`
+  projects a runner's pair result without `fst`/`snd` (tuple-only; refutable and
+  constructor patterns out of scope).
+
 Deferred, each purely additive:
 
-- **Parameterized handlers** (`handler(s){...}`) for clean stateful `State`. The
-  `State` arms above illustrate operation syntax, not yet a state-threading
-  handler.
-- **Scheduler / `spawn` / `par` runtime**, the `Future` primitive, `Control.Wok`
-  standard effects.
+- **Scheduler / `spawn` / `par` runtime**, the `Future` primitive, the concurrency
+  half of `Std.Control`.
+- **Named-handler aliases**, `State@tag` effect tagging, general-`Monoid` `Writer`
+  (list-specialized for now).
 - **One-shot multiplicity check + value restriction enforcement** (generalize
   only at `<>`), gated on the ANF analysis phase. The flagship checked property is
   one-shot `resume`; double-resume of a one-shot continuation is a compile error.
@@ -336,4 +361,4 @@ Non-goals (per predecessor): scoped/higher-order operations (`catch`, `local`,
    that unlocks exceptions, multi-shot, and the async *shape* (without a runtime).
 2. Optional effect header (section 4.3) and the forgotten-resume lint (section 8).
 3. Bounded `(with H e)` form (section 11).
-4. Parameterized handlers; then the scheduler, `Future`, and `Control.Wok`.
+4. Parameterized handlers; then the scheduler, `Future`, and `Std.Control`.

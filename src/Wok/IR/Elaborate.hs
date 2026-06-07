@@ -487,45 +487,71 @@ elabKF tk _ (THandle e arms) = do
   let opArmsSrc  = [ (effect, op, ps, resume, body)
                    | TOpArm effect op ps resume body <- arms ]
       retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
+      paramSrc   = [ (name, initE) | TParamArm name initE <- arms ]
   handledBody <- elabK TRet e
-  opArms <- mapM (elabOpArm tk) opArmsSrc
+  -- Allocate the handler-local parameter binder up front (slice 4a). The SAME
+  -- `pn` flows into: withLocal (so arm bodies see the param), hParamB (so the
+  -- runtime re-installs it on resume), and the wrapping `let pn = init`.
+  mParam <- case paramSrc of
+    []                -> pure Nothing
+    ((name, initE):_) -> do
+      pn <- bindFresh name
+      pure (Just (pn, name, initE))
+  opArms <- mapM (elabOpArm tk mParam) opArmsSrc
   retArm <- case retArmsSrc of
-    ((pat, rb) : _) -> elabReturnArm tk pat rb
+    ((pat, rb) : _) -> elabReturnArm tk mParam pat rb
     [] -> do
       vN <- bindFresh (Tx.pack "v")
       pure (Binder vN Unrestricted (teType e), deliverAtom tk (AVar vN))
   let answerJoin = case tk of
         TJump j -> Just j   -- value position: arms deliver via `jump j`
         TRet    -> Nothing  -- tail position: arms tail-return; nothing to rebind
-  pure (Handle handledBody (Handler retArm opArms answerJoin))
+      hParamB = fmap (\(pn, _, initE) -> Binder pn Unrestricted (teType initE)) mParam
+      core    = Handle handledBody (Handler retArm opArms answerJoin hParamB)
+  case mParam of
+    Nothing             -> pure core
+    Just (pn, _, initE) ->
+      -- Seed the handler-local param: `let pn = init in Handle …`. The let wraps
+      -- the WHOLE Handle so `pn` is in scope when the handler is captured.
+      normName initE $ \a ->
+        pure (Let (Binder pn Unrestricted (teType initE)) (RAtom a) core)
   where
-    elabReturnArm :: TailK -> TPat -> TExpr -> Elab (Binder, Expr)
-    elabReturnArm tk2 (Tpat pty (TPVar v)) rb = do
+    elabReturnArm :: TailK -> Maybe (Name, Text, TExpr) -> TPat -> TExpr -> Elab (Binder, Expr)
+    elabReturnArm tk2 mParam (Tpat pty (TPVar v)) rb = do
       vN <- bindFresh v
-      rbE <- withLocal v vN (elabK tk2 rb)
+      rbE <- paramWrap mParam (withLocal v vN (elabK tk2 rb))
       pure (Binder vN Unrestricted pty, rbE)
-    elabReturnArm tk2 (Tpat pty _) rb = do
+    elabReturnArm tk2 mParam (Tpat pty _) rb = do
       vN <- bindFresh (Tx.pack "v")
-      rbE <- elabK tk2 rb
+      rbE <- paramWrap mParam (elabK tk2 rb)
       pure (Binder vN Unrestricted pty, rbE)
 
-    elabOpArm :: TailK -> (Text, Text, [TPat], Text, TExpr) -> Elab OpArm
-    elabOpArm tk2 (effect, op, ps, resumeName, body) = do
+    -- Make the handler-local param name resolve to its binder inside an arm.
+    paramWrap :: Maybe (Name, Text, TExpr) -> Elab a -> Elab a
+    paramWrap (Just (pn, nm, _)) = withLocal nm pn
+    paramWrap Nothing            = id
+
+    elabOpArm :: TailK -> Maybe (Name, Text, TExpr) -> (Text, Text, [TPat], Text, TExpr) -> Elab OpArm
+    elabOpArm tk2 mParam (effect, op, ps, resumeName, body) = do
       (argBinders, extender) <- elabParams ps
       resumeN <- bindFresh (Tx.pack "resume")
       armBody <-
         if Tx.null resumeName
           then
-            -- AUTO-RESUME: let res = resume(body) in deliver res
-            extender $ normName body $ \v -> do
+            -- AUTO-RESUME: let res = resume(param, body) in deliver res. In a
+            -- parameterized handler the current param is the FIRST resume arg.
+            paramWrap mParam $ extender $ normName body $ \v -> do
               res <- bindFresh (Tx.pack "res")
+              let call = case mParam of
+                    Just (pn, _, _) -> RApp (AVar resumeN) [AVar pn, v]
+                    Nothing         -> RApp (AVar resumeN) [v]
               pure (Let (Binder res Unrestricted (teType body))
-                        (RApp (AVar resumeN) [v])
+                        call
                         (deliverAtom tk2 (AVar res)))
           else
             -- CONTROL: bind the surface name to the resume binder; elaborate the
             -- body as-is (it already has the answer type R).
-            extender $ withLocal resumeName resumeN (elabK tk2 body)
+            paramWrap mParam $ extender $ withLocal resumeName resumeN (elabK tk2 body)
       -- NOTE: the resume binder is annotated with `teType body`, which is the op
       -- RESULT type T in the auto-resume branch (correct) but the ANSWER type R in
       -- the control branch (imprecise: the continuation is T -> R). This field is
