@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+effect Choice = { flip : Bool }
+
+useChoice : () -> U64 with Choice
+useChoice u = case Choice.flip of
+  True  -> 1
+  False -> 0
+
+main : U64
+main =
+  with { Choice.flip k -> k True + k False }
+  useChoice ()

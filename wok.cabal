@@ -95,6 +95,7 @@ library
         Wok.IR.Anf
         Wok.IR.Elaborate
         Wok.IR.Match
+        Wok.IR.Multiplicity
         Wok.Interp
         Wok.Interp.Value
         Wok.Interp.Prim

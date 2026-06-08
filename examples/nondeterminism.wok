@@ -1,0 +1,32 @@
+-- USE CASE: nondeterminism / backtracking search (the canonical multi-shot case).
+-- A multi-shot handler `flip k -> k True ++ k False` is now a COMPILE ERROR, so we
+-- write the search explicitly with `List` (the list monad IS reified multi-shot).
+-- This finds every (a, b) with a, b in 1..n and a + b == target.
+module Main
+import Std.Base
+
+-- Std.Base has no list combinators; define the two we need.
+concatMapL : (a -> [b]) -> [a] -> [b]
+concatMapL f xs = case xs of
+  []      -> []
+  y :: ys -> f y ++ concatMapL f ys
+
+range : U64 -> U64 -> [U64]   -- [lo, lo+1, ..., hi-1]
+range lo hi = case lo == hi of
+  True  -> []
+  False -> [lo] ++ range (lo + 1) hi
+
+-- The list-monad encoding of:
+--   do { a <- choice [1..n]; b <- choice [1..n]; guard (a + b == target); pure (a, b) }
+solutions : U64 -> U64 -> [(U64, U64)]
+solutions n target =
+  concatMapL (\a ->
+    concatMapL (\b ->
+      case a + b == target of
+        True  -> [(a, b)]
+        False -> [])
+      (range 1 (n + 1)))
+    (range 1 (n + 1))
+
+main : [(U64, U64)]
+main = solutions 6 7

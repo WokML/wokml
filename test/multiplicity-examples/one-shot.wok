@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+effect Tick = { tick : U64 -> U64 }
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  with { Tick.tick x k -> k (x + 1) }
+  useTick ()

@@ -18,7 +18,8 @@ references this roadmap and contains that slice's bite-sized tasks.
 | 3 | Bounded `(with H e)` handler scope | DONE — merged to `main` (572 tests green) |
 | 4a | Parameterized handlers + `with … in` runner sugar + `Std.Control` (mtl quartet) | DONE — feat/effects-slice-4a-parameterized-handlers (585 tests green) |
 | 4b | Scheduler / `spawn` / `par` / `Future` / `Std.Control` concurrency half | deferred |
-| X | One-shot multiplicity check + value restriction; cancellation (discontinue) | deferred, gated on ANF analysis |
+| X (analysis) | One-shot multiplicity = **affine (no-dup) analysis** on continuation binders; multi-shot handler = compile error | DONE — feat/one-shot-multiplicity (652 tests green); see `2026-06-09-one-shot-multiplicity-analysis-design.md` |
+| X (rest) | ~~value restriction~~ (DROPPED as unnecessary under one-shot-as-law); cancellation (discontinue) as the no-drop second consumer | deferred |
 
 ## Design sources (read in this order)
 
@@ -123,14 +124,25 @@ or do-notation.
 
 ### Cross-cutting (slice X) — checked properties
 
-- One-shot `resume` multiplicity check (declared-one-shot + witnessed second resume
-  = compile error; also gates one-shot stack-switch vs copyable-multishot codegen).
-- Value restriction: generalize only at `<>` — required before shipping multi-shot
-  + mutable state soundly.
-- Cancellation (discontinue) as the SECOND consumer of a one-shot continuation;
-  design the multiplicity analysis for "resumed XOR cancelled," not resume-only.
-- Gated on the ANF analysis substrate (see [higher-ir-direction]); not part of
-  slice 1.
+**Re-anchored 2026-06-09** (design: `2026-06-09-one-shot-multiplicity-analysis-design.md`).
+wok makes **one-shot the law**: an affine (no-dup) analysis on continuation binders,
+NOT a declared-one-shot opt-in and NOT multi-shot-as-a-property.
+
+- **Analysis half — DONE** (`feat/one-shot-multiplicity`): `Wok.IR.Multiplicity` computes a
+  `{0,1,ω}` cardinality per handler arm over `Wok.IR.Anf`; a provably multi-shot (`ω`) arm is
+  a compile error (`--run` rejects it; `--dump-multiplicity` shows the number). Backtracking is
+  reshaped to explicit `List`; events/streams/async to one-shot pull + recursion.
+- **Value restriction: DROPPED as unnecessary.** The polymorphic-ref hazard requires
+  duplication; no multi-shot → no hazard → no value restriction. (Reverses the earlier "feed a
+  value restriction" framing; `ndet`-for-concurrency is unaffected — only `amb`/backtracking-
+  as-handler is gone.)
+- **Cancellation (discontinue)** = the deferred **no-drop** second consumer of the continuation;
+  it upgrades affine → linear once wok grows a resource type needing exactly-once. The `0`-shot
+  detection here is the groundwork.
+- The interpreter is UNCHANGED — the law is a reversible frontend gate, not a runtime
+  amputation (immutable `Kont` keeps multi-shot capability).
+- Ran on the existing ANF substrate (see [higher-ir-direction]); no typed-Core prerequisite,
+  no grammar change.
 
 ## Cross-cutting invariants (hold across all slices)
 

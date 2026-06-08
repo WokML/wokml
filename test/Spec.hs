@@ -31,7 +31,7 @@ import qualified Wok.SourceOrigin as SO
 import qualified Wok.Prelude as Prelude
 import qualified Wok.Loader as Loader
 import qualified Wok.Pipeline as Pipeline
-import Wok.IR.Name (Unique (..), Name (..), runFresh, freshUnique, freshName, freshJoin)
+import Wok.IR.Name (Unique (..), Name (..), JoinId (..), runFresh, freshUnique, freshName, freshJoin)
 import qualified Wok.IR.Anf as Anf
 import Wok.IR.Elaborate (elaborateModule)
 import qualified Wok.IR.Elaborate as Elab
@@ -40,6 +40,9 @@ import qualified Wok.Interp.Prim as IP
 import qualified Wok.Interp.Machine as IM
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
+import qualified Wok.IR.Multiplicity as Mult
+import Wok.IR.Multiplicity (Card (..))
+import Wok.IR.Anf
 import qualified Wok.Interp as Interp
 import qualified System.Directory as Dir
 import qualified Control.Monad
@@ -62,6 +65,8 @@ main = do
   anfFiles           <- findByExtension [".wok"] "test/typecheck-examples"
   typedAnfFiles      <- findByExtension [".wok"] "test/typecheck-examples"
   runFiles           <- findByExtension [".wok"] "test/run-examples"
+  multFiles          <- findByExtension [".wok"] "test/multiplicity-examples"
+  multFailFiles      <- findByExtension [".wok"] "test/multiplicity-fail-examples"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -144,6 +149,7 @@ main = do
     , eqElaborateTests
     , matchCompilerTests
     , matchCoverageTests
+    , multiplicityUnitTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -168,6 +174,12 @@ main = do
         [ goldenVsString (takeBaseName f) (runGoldenFor f) (runProgramHarness f)
         | f <- runFiles
         ]
+    , testGroup "multiplicity golden"
+        [ goldenVsString (takeBaseName f) (multGoldenFor f) (multDumpHarness f)
+        | f <- multFiles ]
+    , testGroup "multiplicity fail golden"
+        [ goldenVsString (takeBaseName f) (multFailGoldenFor f) (multFailHarness f)
+        | f <- multFailFiles ]
     ]
 
 goldenFor :: FilePath -> FilePath
@@ -253,6 +265,34 @@ typedAnfElaborateHarness path = do
       case Pipeline.elaborateProgram entryName ms of
         Left s  -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
         Right cm -> pure (BL.pack (T.unpack (Anf.prettyModuleTyped cm) <> "\n"))
+
+multGoldenFor :: FilePath -> FilePath
+multGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/multiplicity-golden"
+
+multDumpHarness :: FilePath -> IO BL.ByteString
+multDumpHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgram entryName ms of
+        Left s  -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
+        Right cm -> pure (BL.pack (T.unpack (Mult.prettyMultiplicity cm) <> "\n"))
+
+multFailGoldenFor :: FilePath -> FilePath
+multFailGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/multiplicity-fail-golden"
+
+multFailHarness :: FilePath -> IO BL.ByteString
+multFailHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
+    Right (entryName, ms) ->
+      case Pipeline.elaborateCheckedFull entryName ms of
+        Left s  -> pure (BL.pack (s <> "\n"))
+        Right _ -> pure (BL.pack "UNEXPECTED: elaboration succeeded (no multishot error)\n")
 
 -- | The "extended" env an ordinary user module sees: B.initialEnv with the
 -- Std.Base prelude's decls layered on top. Used by unit tests that need to
@@ -5696,3 +5736,102 @@ matchCoverageTests = testGroup "MatchCoverage"
           cov  = M.matchCoverage oracle 1 rows
       M.covExhaustive cov @?= False
   ]
+
+multiplicityUnitTests :: TestTree
+multiplicityUnitTests = testGroup "multiplicity (unit)"
+  [ testGroup "lattice"
+      [ testCase "addC One One = Many"    $ Mult.addC One One    @?= Many
+      , testCase "addC Zero One = One"    $ Mult.addC Zero One   @?= One
+      , testCase "addC One Many = Many"   $ Mult.addC One Many   @?= Many
+      , testCase "joinC One One = One"    $ Mult.joinC One One   @?= One
+      , testCase "joinC Zero Many = Many" $ Mult.joinC Zero Many @?= Many
+      , testCase "joinC Zero Zero = Zero" $ Mult.joinC Zero Zero @?= Zero
+      ]
+  , testGroup "cardOf"
+      [ testCase "drop (no resume) = Zero" $
+          Mult.cardOf kName (Ret unit) @?= Zero
+      , testCase "single direct resume = One" $
+          Mult.cardOf kName resumeOnce @?= One
+      , testCase "two sequenced resumes = Many" $
+          Mult.cardOf kName resumeTwiceSeq @?= Many
+      , testCase "resume in two case arms = One (branch join)" $
+          Mult.cardOf kName resumeInBothArms @?= One
+      , testCase "continuation returned = Many (escape)" $
+          Mult.cardOf kName (Ret (AVar kName)) @?= Many
+      , testCase "continuation passed to a call = Many (escape)" $
+          Mult.cardOf kName escapeIntoCall @?= Many
+      , testCase "continuation captured in a closure = Many" $
+          Mult.cardOf kName escapeIntoLam @?= Many
+      , testCase "continuation in LetRec body = Many" $
+          Mult.cardOf kName escapeIntoLetRec @?= Many
+      , testCase "resume inside a nested Handle arm = Many" $
+          Mult.cardOf kName handleArmCapture @?= Many
+      , testCase "jump to an unknown join = Many" $
+          Mult.cardOf kName (Jump (JoinId (Unique 50)) []) @?= Many
+      , testCase "resume in a join reached from two case arms = One" $
+          Mult.cardOf kName joinFromTwoArms @?= One
+      ]
+  , testGroup "analyzeModule"
+      [ testCase "clean module = no errors" $
+          Mult.analyzeModule (modWith resumeOnceArm) @?= []
+      , testCase "multishot arm = one error" $
+          Mult.analyzeModule (modWith multishotArm)
+            @?= [Mult.MultishotResume (T.pack "Choice") (T.pack "flip")]
+      ]
+  ]
+  where
+    kName  = Name (T.pack "k") (Unique 1)
+    fName  = Name (T.pack "f") (Unique 2)
+    ty     = Ty.CTCon Ty.TcUnit []
+    bnd n  = Binder n Unrestricted ty
+    unit   = ALit LUnit
+    resumeOnce = Let (bnd (Name (T.pack "r") (Unique 10)))
+                     (RApp (AVar kName) [unit]) (Ret unit)
+    resumeTwiceSeq =
+      Let (bnd (Name (T.pack "a") (Unique 11))) (RApp (AVar kName) [unit])
+        (Let (bnd (Name (T.pack "b") (Unique 12))) (RApp (AVar kName) [unit])
+          (Ret unit))
+    resumeInBothArms =
+      Case (ALit (LInt 0))
+        [ AltCon (T.pack "A") [] resumeOnce
+        , AltCon (T.pack "B") [] resumeOnce ]
+    escapeIntoCall =
+      Let (bnd (Name (T.pack "c") (Unique 13)))
+          (RApp (AVar fName) [AVar kName]) (Ret unit)
+    escapeIntoLam =
+      Let (bnd (Name (T.pack "g") (Unique 14)))
+          (RLam [bnd (Name (T.pack "x") (Unique 15))]
+                (Let (bnd (Name (T.pack "r2") (Unique 16)))
+                     (RApp (AVar kName) [AVar (Name (T.pack "x") (Unique 15))])
+                     (Ret unit)))
+          (Ret unit)
+    escapeIntoLetRec =
+      LetRec [ ( bnd (Name (T.pack "loop") (Unique 17))
+               , [bnd (Name (T.pack "x") (Unique 18))]
+               , Let (bnd (Name (T.pack "r3") (Unique 19)))
+                     (RApp (AVar kName) [unit]) (Ret unit) ) ]
+             (Ret unit)
+    handleArmCapture =
+      Handle (Ret unit)
+        (Handler (bnd (Name (T.pack "v") (Unique 20)), Ret unit)
+          [ OpArm (T.pack "E") (T.pack "op") []
+              (bnd (Name (T.pack "rk") (Unique 21)))
+              (Let (bnd (Name (T.pack "r4") (Unique 22)))
+                   (RApp (AVar kName) [unit]) (Ret unit)) ]
+          Nothing Nothing Nothing)
+    joinFromTwoArms =
+      LetJoin (JoinId (Unique 60)) []
+        (Let (bnd (Name (T.pack "r5") (Unique 61)))
+             (RApp (AVar kName) [unit]) (Ret unit))
+        (Case (ALit (LInt 0))
+          [ AltCon (T.pack "A") [] (Jump (JoinId (Unique 60)) [])
+          , AltCon (T.pack "B") [] (Jump (JoinId (Unique 60)) []) ])
+    handlerWith oa =
+      Handler (bnd (Name (T.pack "v") (Unique 90)), Ret unit) [oa] Nothing Nothing Nothing
+    modWith oa =
+      CoreModule [ TopBind (Name (T.pack "main") (Unique 91)) []
+                     (Handle (Ret unit) (handlerWith oa)) ]
+    resumeOnceArm =
+      OpArm (T.pack "Tick") (T.pack "tick") [] (bnd kName) resumeOnce
+    multishotArm =
+      OpArm (T.pack "Choice") (T.pack "flip") [] (bnd kName) resumeTwiceSeq

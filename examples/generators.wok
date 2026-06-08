@@ -1,0 +1,20 @@
+-- USE CASE: generators / streams.
+-- Under one-shot-as-law this is STILL an effect handler: `yield x k -> [x] ++ k ()`
+-- resumes the continuation exactly ONCE (one-shot), so it passes the law. The
+-- "many values" come from the PRODUCER's own recursion, not from resuming twice.
+module Main
+import Std.Base
+
+effect Yield = { yield : U64 -> () }
+
+-- Producer: yields lo, lo+1, ..., hi-1, driven by its own recursion.
+count : U64 -> U64 -> () with Yield
+count lo hi = case lo == hi of
+  True  -> ()
+  False -> let u = Yield.yield lo in count (lo + 1) hi
+
+-- Handler collects the stream into a list. One resume per yield => one-shot.
+main : [U64]
+main =
+  with { Yield.yield x k -> [x] ++ k () ; v -> [] }
+  count 1 7

@@ -12,6 +12,7 @@ module Wok.Pipeline
   ( typecheckProgram
   , elaborateProgram
   , elaborateProgramFull
+  , elaborateCheckedFull
   ) where
 
 import Control.Monad (foldM)
@@ -21,6 +22,7 @@ import qualified Data.Set as Set
 import qualified Data.Text as Tx
 
 import Wok.IR.Anf (CoreModule)
+import Wok.IR.Multiplicity (analyzeModule, renderMultiplicityError)
 import Wok.IR.Elaborate (elaborateModule, elaborateModulesShared)
 import Wok.Loader (LoadedModule (..), ModuleName)
 import Wok.Reordering
@@ -111,3 +113,18 @@ elaborateProgramFull entryName ms = do
   let mods = [ (modName, mrEnvOut mr, mrDecls mr)
              | (modName, mr) <- Map.toList resultMap ]
   Right (elaborateModulesShared mods)
+
+-- | Whole-program elaboration plus the one-shot multiplicity law: a multi-shot
+-- handler is rejected here as a compile error (stringified, like other v1
+-- pipeline errors).
+elaborateCheckedFull
+  :: ModuleName
+  -> [LoadedModule]
+  -> Either String CoreModule
+elaborateCheckedFull entryName ms = do
+  cm <- elaborateProgramFull entryName ms
+  case analyzeModule cm of
+    []   -> Right cm
+    errs -> Left (Tx.unpack
+                    (Tx.intercalate (Tx.pack "\n")
+                       (map renderMultiplicityError errs)))

@@ -1,0 +1,55 @@
+-- USE CASE: probabilistic programming (weighted nondeterminism).
+-- A distribution is a [(value, weight)] list; `bindD` is the probability monad's
+-- bind (weights multiply across independent draws). This is multi-shot semantics
+-- made explicit as data -- no multi-shot handler needed. We compute the law of
+-- the sum of two fair dice and read off P(sum == 7) = favourable / total.
+module Main
+import Std.Base
+
+concatMapL : (a -> [b]) -> [a] -> [b]
+concatMapL f xs = case xs of
+  []      -> []
+  y :: ys -> f y ++ concatMapL f ys
+
+-- A fair die: faces 1..6, each with weight 1.
+die : [(U64, U64)]
+die = [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+
+-- Monadic bind for the (value, weight) distribution: draw x from d, then y from
+-- (f x); the joint outcome y carries the product of the two weights.
+bindD : [(U64, U64)] -> (U64 -> [(U64, U64)]) -> [(U64, U64)]
+bindD d f =
+  concatMapL (\p ->
+    let (x, w) = p in
+    concatMapL (\q ->
+      let (y, w2) = q in [(y, w * w2)])
+      (f x))
+    d
+
+-- Distribution of the sum of two independent dice.
+twoDiceSum : [(U64, U64)]
+twoDiceSum =
+  bindD die (\a ->
+  bindD die (\b ->
+    [(a + b, 1)]))
+
+-- Total weight of the distribution.
+totalWeight : [(U64, U64)] -> U64
+totalWeight d = case d of
+  []      -> 0
+  p :: ps -> let (x, w) = p in w + totalWeight ps
+
+-- Weight of the outcomes whose value equals `target`.
+weightOf : U64 -> [(U64, U64)] -> U64
+weightOf target d = case d of
+  []      -> 0
+  p :: ps -> let (x, w) = p in
+             case x == target of
+               True  -> w + weightOf target ps
+               False -> weightOf target ps
+
+-- (favourable, total) for the event "sum == 7" -- expect (6, 36).
+main : (U64, U64)
+main =
+  let dist = twoDiceSum in
+  (weightOf 7 dist, totalWeight dist)

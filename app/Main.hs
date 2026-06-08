@@ -9,6 +9,7 @@ import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
 import Wok.IR.Anf (prettyModuleTyped)
+import Wok.IR.Multiplicity (prettyMultiplicity)
 import qualified Wok.Interp as Interp
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
@@ -19,9 +20,9 @@ import qualified Wok.TypeChecking as TC
 -- ----------------------------------------------------------------
 
 usage :: String
-usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --run]"
+usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --dump-multiplicity | --run]"
 
-data CliMode = ModePrintSchemes | ModeDumpAnf | ModeRun
+data CliMode = ModePrintSchemes | ModeDumpAnf | ModeDumpMultiplicity | ModeRun
 
 main :: IO ()
 main = do
@@ -38,6 +39,7 @@ parseCli = go Nothing [] ModePrintSchemes
     go _        _  _  ["-I"]               = Left ("-I requires an argument\n" ++ usage)
     go e        xs md ("-I" : f : rest)    = go e (f : xs) md rest
     go e        xs _  ("--dump-anf" : rest) = go e xs ModeDumpAnf rest
+    go e        xs _  ("--dump-multiplicity" : rest) = go e xs ModeDumpMultiplicity rest
     go e        xs _  ("--run" : rest)      = go e xs ModeRun rest
     go Nothing  xs md (a : rest)           = go (Just a) xs md rest
     go (Just _) _  _  (a : _)             =
@@ -56,7 +58,10 @@ runApp entry extras mode = do
       ModeDumpAnf -> case Pipeline.elaborateProgram entryName ms of
         Left msg  -> hPutStrLn stderr msg >> exitFailure
         Right cm  -> TIO.putStrLn (prettyModuleTyped cm)
-      ModeRun -> case Pipeline.elaborateProgramFull entryName ms of
+      ModeDumpMultiplicity -> case Pipeline.elaborateProgram entryName ms of
+        Left msg  -> hPutStrLn stderr msg >> exitFailure
+        Right cm  -> TIO.putStrLn (prettyMultiplicity cm)
+      ModeRun -> case Pipeline.elaborateCheckedFull entryName ms of
         Left msg -> hPutStrLn stderr msg >> exitFailure
         Right cm -> case Interp.runModule cm of
           Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure

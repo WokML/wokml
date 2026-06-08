@@ -1,6 +1,6 @@
 # wok examples
 
-Six runnable programs, smallest to largest. Each is a complete module with a
+Nine runnable programs, smallest to largest. Each is a complete module with a
 `main`; run any of them with the `--run` flag:
 
 ```sh
@@ -18,11 +18,19 @@ to see the lowered intermediate representation.)
 | `mtl-machine.wok` | the full mtl stack: `Reader` + `Writer` + `State` + `Except` | `Ok(((4, 30), [10, 30]))` |
 | `as-patterns.wok` | `as`-patterns (`pat as name`) in a case arm, a single-clause head, and a multi-clause function | `[8, 5, 6, 7]` |
 | `named-instances.wok` | named effect instances — two independent `State U64` cells, handle-typed helper params | `(((), 105), 0)` |
+| `generators.wok` | a generator/stream as a **one-shot** handler (`yield x k -> [x] ++ k ()`) | `[1, 2, 3, 4, 5, 6]` |
+| `nondeterminism.wok` | backtracking search via explicit `List` (the list monad = reified multi-shot) | `[(1, 6), (2, 5), (3, 4), (4, 3), (5, 2), (6, 1)]` |
+| `probabilistic.wok` | probabilistic programming via a weighted-`List` distribution monad; `P(sum == 7)` for two dice | `(6, 36)` |
+
+The last three show how the **multi-shot** use cases (backtracking, probabilistic
+inference, generators) are expressed under wok's one-shot-handler law. The thinking
+behind that — the control/data duality, "the list monad is reified multi-shot" — is
+written up in [`../docs/expressing-multishot-under-one-shot.md`](../docs/expressing-multishot-under-one-shot.md).
 
 Run them all:
 
 ```sh
-for f in collatz state-accumulate expr-eval mtl-machine as-patterns named-instances; do
+for f in collatz state-accumulate expr-eval mtl-machine as-patterns named-instances generators nondeterminism probabilistic; do
   printf '%-18s ' "$f"
   cabal run -v0 wok -- "examples/$f.wok" --run
 done
@@ -55,3 +63,20 @@ done
   by type (handle → perform, record → project). `sumProd` is the clincher — two
   `State U64` cells told apart by name alone. Handles are second-class (scoped,
   can't escape their `with`).
+- **`generators.wok`** — a generator is **one-shot**, not multi-shot: each
+  `Yield.yield x k -> [x] ++ k ()` resumes once, and the producer's recursion
+  (`count`) drives the "many." `--dump-multiplicity` reports `Yield.yield : 1`, so it
+  is a legal handler under the one-shot law.
+- **`nondeterminism.wok`** — the multi-shot handler `flip k -> k True ++ k False` is a
+  compile error, so backtracking is written explicitly with `List`. `concatMapL`'s
+  lambda is the continuation `k` made first-class; `[]` is the pruned (0-shot) branch,
+  `[(a, b)]` a successful one. The list monad *is* reified multi-shot.
+- **`probabilistic.wok`** — probabilistic inference as weighted nondeterminism: a
+  distribution is `[(value, weight)]`, and `bindD` is `concatMap` that multiplies
+  weights across independent draws. Computes `P(sum == 7)` for two fair dice as
+  `(6, 36)`. No multi-shot handler — the weighted list *names* the branching a
+  multi-shot `sample` would have forked.
+
+See [`../docs/expressing-multishot-under-one-shot.md`](../docs/expressing-multishot-under-one-shot.md)
+for the conceptual walkthrough of why these encodings recover full multi-shot
+expressiveness under the one-shot-handler law.
