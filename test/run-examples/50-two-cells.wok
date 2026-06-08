@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Two INDEPENDENT named State cells of the SAME type (State U64), both minted by
+-- the one prelude `state` runner. `prog` increments `count` then folds the
+-- incremented count into `total`. Routing follows the names `count`/`total`, not
+-- the (identical) type, so the cells stay distinct: after one step count = 1 and
+-- total = 1. The nested runners wrap the result, so main is
+-- ((prog_result, total_final), count_final) = ((((), 1), 1)).
+prog : State U64 -> State U64 -> ()
+prog count total =
+  let u = count.set (count.get + 1) in
+  total.set (total.get + count.get)
+
+main : (((), U64), U64)
+main = with count = state 0 in with total = state 0 in prog count total

@@ -391,6 +391,14 @@ EWithH.   Exp2 ::= "with" ConId [ConId] "{" [HandlerArm] "}" Exp ;
 -- VarId-headed (lowercase runner fn) so it never collides with EWithH (ConId-headed)
 -- or EWith (`{`-headed). slice 4a.
 EWithRun. Exp2 ::= "with" VarId [WithArg] "in" Exp ;
+-- Named-instance introduction (named effect instances feature, Task 1). Both
+-- bind a fresh lowercase `VarId` instance name with `=`, then `in` the body.
+-- The `=` immediately after `with VarId` disambiguates from EWithRun (no `=`)
+-- and EWithH (ConId-headed). The binder is a bare VarId: deliberately
+-- SIGIL-FREE (no `&`). EWithNamed names a runner application; EWithNamedH
+-- names a primitive handler block.
+EWithNamed.  Exp2 ::= "with" VarId "=" VarId [WithArg] "in" Exp ;
+EWithNamedH. Exp2 ::= "with" VarId "=" ConId "{" [HandlerArm] "}" "in" Exp ;
 WRArg.    WithArg ::= Exp2 ;
 separator WithArg "" ;
 -- Qualified operation arm (unchanged).

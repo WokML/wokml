@@ -18,3 +18,4 @@ src-generated/GeneratedParser/Wok/Doc.txt
 
 # Happy's .hs output for Par.y (cabal compiles Par.y in dist-newstyle; no need to commit)
 src-generated/GeneratedParser/Wok/Par.hs
+.ghc-build/

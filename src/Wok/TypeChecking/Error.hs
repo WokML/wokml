@@ -71,6 +71,11 @@ data TypeError
     -- contravariant (parameter) position, where it cannot thread and could
     -- only drop effects/fields. Use a named tail (@eff e@ / @row r@) to carry
     -- it through. E.g. @(a -> b with ..) -> ...@ is rejected; use @eff e@.
+  | AmbiguousAccessor SourceSpan Text
+    -- ^ A dot accessor @x.op@ whose receiver's type could not be resolved to a
+    -- record or an effect-instance handle (an unsolved metavar after forcing).
+    -- The dispatch is type-directed, so an unannotated receiver is ambiguous:
+    -- annotate the receiver (e.g. @(c : State U64).get@). Args: position, label.
   | NotARecord SourceSpan CType
     -- ^ Field access was attempted on a value whose type is not a record.
     -- Algebraic-effects (v1) errors.
@@ -137,6 +142,15 @@ data TypeError
     -- ^ A function-head clause group routed through the match compiler contains a
     -- pattern shape the compiler cannot lower. Args: position, function name,
     -- a human description of the unsupported pattern.
+  | CarrierEscape SourceSpan Text
+    -- ^ A second-class effect-instance handle (or a closure capturing one)
+    -- escapes its scope. The carrier rule (named effect instances, §4.3) permits
+    -- a handle to appear ONLY as the receiver of a named perform (@x.op@) or as
+    -- an argument passed into a handle-typed parameter slot. Anywhere else
+    -- (returned, stored in a constructor/record/tuple, put in a list, or captured
+    -- by an escaping closure) is rejected: "instance handle cannot escape its
+    -- scope". Args: position (the enclosing binding, since the typed AST carries
+    -- no per-node span), the offending binding's name.
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint

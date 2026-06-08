@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- Carrier rule (§4.3): a PARTIAL APPLICATION that captures a handle is a closure
+-- of arrow type that has closed over the handle, exactly like a lambda. Here
+-- `peek c : () -> U64` captures `c`; binding it to `f` and returning `f` would
+-- let the handle outlive its scope (the returned function performs `c.get` after
+-- the handler is gone). Rejected: "instance handle cannot escape its scope".
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a) -> a
+state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+
+peek : State U64 -> () -> U64
+peek c u = c.get
+
+escape = with c = state 7 in
+  let f = peek c in
+  f

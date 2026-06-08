@@ -1,0 +1,59 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-08-named-effect-instances.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Grammar \u2014 named-introduction productions",
+      "status": "completed",
+      "description": "Add EWithNamed (`with x = runner args in body`) and EWithNamedH (`with x = Effect {arms} in body`) to grammar/Wok.cf; regen BNFC; reapply 3 manual patches; conflict count unchanged. Binder is VarId (so `with &x` is a parse error). GUARDRAIL: no `&` syntax.\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok/Par.y\", \"src-generated/GeneratedParser/Wok/Layout.hs\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"two named-with productions parse\", \"with &x is a parse error\", \"shift/reduce conflict count unchanged\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: IR + runtime \u2014 instance ids, VInst, routing by id",
+      "status": "completed",
+      "description": "ROp gains leading Maybe Atom; Handler gains hSelf::Maybe Binder; add VInst Unique; Handle binds self; findHandler/dispatchOp take Maybe Unique (Nothing=nearest unchanged, Just u=nearest frame whose hSelf unique==u). 591 tests still pass.\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Anf.hs\", \"src/Wok/Interp/Value.hs\", \"src/Wok/Interp/Machine.hs\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"VInst Unique added\", \"findHandler by Maybe Unique, ambient unchanged\", \"591 tests pass\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Type checker \u2014 effect-as-type, type-directed dot, named-with inference",
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
+      "description": "Effect name in type position \u2192 handle type (TcEffect). EProj dispatch by receiver type: handle\u2192perform off-row, record\u2192projection, metavar\u2192Accessor constraint or 'ambiguous accessor; annotate' error. Infer EWithNamed and EWithNamedH.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Types.hs\", \"src/Wok/TypeChecking/Infer.hs\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"prog : State U64 -> State U64 -> () checks, row omits State\", \"unannotated bump c = c.get errors\", \"record projection still works\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Elaboration \u2014 named perform/primitive lowering",
+      "status": "completed",
+      "blockedBy": [
+        2,
+        3
+      ],
+      "description": "Typed named-perform \u2192 ROp (Just instanceAtom) effect op atoms; EWithNamedH typed node \u2192 Handle with Handler.hSelf set. Ambient unchanged.\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Elaborate.hs\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"count.get -> ROp (Just (AVar count))\", \"with self = State{} in -> Handle hSelf=self\", \"ambient anf goldens unchanged\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Carrier rule \u2014 type-based escape check",
+      "status": "completed",
+      "blockedBy": [
+        3
+      ],
+      "description": "Post-inference pass: a carrier (free vars include an in-scope handle binder of type TcEffect) may appear only as a .op head or a handle-typed arg; reject return/store/list/escaping-closure; allow local closure capture. Bounded.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Carrier.hs\"], \"verifyCommand\": \"cabal build && cabal test\", \"acceptanceCriteria\": [\"return/store/list/escaping-closure of a handle error\", \"local closure capture allowed\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Prelude runners + end-to-end examples",
+      "status": "completed",
+      "blockedBy": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "description": "Update Control.wok runners to pass self-handle via `with self = Effect {\u2026} in c self`. Add run-examples: two-cells, sumProd (same-type), aliasing, mixed-row. Untagged examples stay green. Full cabal test green.\n\n```json:metadata\n{\"files\": [\"prelude/Std/Control.wok\", \"test/run-examples\", \"test/run-golden\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"two independent State cells\", \"sumProd same-type correct\", \"aliasing well-defined\", \"untagged examples unchanged\", \"all tests green\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-08"
+}

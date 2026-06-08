@@ -1,7 +1,7 @@
 module Wok.IR.Elaborate
   ( elaborateExprForTest      -- test seam: Env -> TExpr -> Expr
   , elaborateModule           -- full module elaboration: Env -> [TypedDecl] -> CoreModule
-  , elaborateModulesShared    -- whole-program: [(Env, [TypedDecl])] -> CoreModule
+  , elaborateModulesShared    -- whole-program: [(moduleName, Env, [TypedDecl])] -> CoreModule
   ) where
 
 import Control.Monad.Reader
@@ -15,7 +15,7 @@ import qualified Data.Text as Tx
 import Wok.IR.Anf
 import Wok.IR.Name
 import Wok.TypeChecking.Env
-  ( Env, envVars, lookupCon, conArity, conTyCon, lookupRecordCon, rcFields
+  ( Env, envVars, envVarOrigin, lookupCon, conArity, conTyCon, lookupRecordCon, rcFields
   , lookupTyCon, TyConInfo (..)
   , classOfMethod, lookupClass, ClassInfo (..) )
 import Wok.TypeChecking.Infer (TypedDecl (..))
@@ -109,6 +109,7 @@ isCompound :: TexpF CType -> Bool
 isCompound (TIf{})     = True
 isCompound (TCase{})   = True
 isCompound (THandle{}) = True
+isCompound (TWithNamedH{}) = True
 isCompound _           = False
 
 -- | Elaborate an expression and name any non-trivial computation with a fresh
@@ -360,7 +361,13 @@ elabRhsF ty (TCon c) k = do
   k rhs
 
 -- Effect-operation reference (zero-argument): E.op
-elabRhsF _ (TProjCon effect op) k = k (ROp effect op [])
+elabRhsF _ (TProjCon effect op) k = k (ROp Nothing effect op [])
+
+-- Named perform `instance.op` (zero-argument). Normalize the instance node to
+-- an atom and route the op through it: `ROp (Just instanceAtom) effect op []`.
+-- Mirrors the ambient `TProjCon` case, but with the routing instance.
+elabRhsF _ (TPerformOn inst effect op) k =
+  normName inst $ \ia -> k (ROp (Just ia) effect op [])
 
 -- Application: head + args. Head being a constructor or effect op is visible.
 elabRhsF ty (TApp hd args) k =
@@ -370,7 +377,11 @@ elabRhsF ty (TApp hd args) k =
         a <- conArityOf c
         rhs <- saturateCon ty c atoms a
         k rhs
-      Texp _ (TProjCon effect op) -> k (ROp effect op atoms)
+      Texp _ (TProjCon effect op) -> k (ROp Nothing effect op atoms)
+      -- Named perform applied (e.g. `count.set x`): normalize the receiver
+      -- instance to an atom, route through it: `ROp (Just ia) effect op atoms`.
+      Texp _ (TPerformOn inst effect op) ->
+        normName inst $ \ia -> k (ROp (Just ia) effect op atoms)
       -- Constrained-identifier as APP head: lower with the arg atoms, so a
       -- class method is case-projected then applied inside its alt, and an
       -- ordinary constrained function gets its dicts as leading args.
@@ -447,6 +458,7 @@ elabRhsF _ (TRecordExt t spreadExpr overrideFields) k =
 elabRhsF ty node@(TIf{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(TCase{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(THandle{}) k = elabCompoundRhs ty node k
+elabRhsF ty node@(TWithNamedH{}) k = elabCompoundRhs ty node k
 
 elabRhsF _ (TLet decls body) k = elabLocalDecls decls (elabRhs body k)
 
@@ -482,8 +494,30 @@ elabKF tk _ (TCase scrut alts) =
 elabKF tk _ (TLet decls body) =
   elabLocalDecls decls (elabK tk body)
 
--- with { E.op ps -> body ; v -> body } EXPR
-elabKF tk _ (THandle e arms) = do
+-- with { E.op ps -> body ; v -> body } EXPR  (ambient handler: hSelf = Nothing)
+elabKF tk _ (THandle e arms) = elabHandle tk e arms Nothing
+
+-- with self = Effect { arms } in body  (named primitive handler). The self
+-- binder's Unique IS the runtime instance id (Task 2: `Handle` binds
+-- `self -> VInst (nameUniq selfBinder)`), so the SAME binder must be `hSelf`
+-- AND in scope for the body — that way a `self.op` perform inside the body
+-- routes to this frame. The self binder's type is erased at runtime; the
+-- effect-as-type isn't a Core type, so reuse the body's Core type as a
+-- well-formed stand-in (mirrors how other binders here borrow `teType`).
+elabKF tk _ (TWithNamedH self arms body) = do
+  selfN <- bindFresh self
+  let selfBinder = Binder selfN Unrestricted (teType body)
+  withLocal self selfN (elabHandle tk body arms (Just selfBinder))
+
+-- Non-compound: name the result and deliver under tk
+elabKF tk ty node = elabRhsF ty node (deliverRhs tk ty)
+
+-- | Shared lowering for both ambient (`THandle`) and named (`TWithNamedH`)
+-- handlers. `mSelf` is the self-instance binder for a named handler (set as
+-- `hSelf`) or `Nothing` for an ambient one; the caller is responsible for
+-- putting a named handler's self binder in scope for `e` before calling.
+elabHandle :: TailK -> TExpr -> [THandlerArm CType] -> Maybe Binder -> Elab Expr
+elabHandle tk e arms mSelf = do
   let opArmsSrc  = [ (effect, op, ps, resume, body)
                    | TOpArm effect op ps resume body <- arms ]
       retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
@@ -507,7 +541,7 @@ elabKF tk _ (THandle e arms) = do
         TJump j -> Just j   -- value position: arms deliver via `jump j`
         TRet    -> Nothing  -- tail position: arms tail-return; nothing to rebind
       hParamB = fmap (\(pn, _, initE) -> Binder pn Unrestricted (teType initE)) mParam
-      core    = Handle handledBody (Handler retArm opArms answerJoin hParamB)
+      core    = Handle handledBody (Handler retArm opArms answerJoin hParamB mSelf)
   case mParam of
     Nothing             -> pure core
     Just (pn, _, initE) ->
@@ -559,9 +593,6 @@ elabKF tk _ (THandle e arms) = do
       -- it), so it is a latent placeholder. Fix when the typed-Core pass needs a
       -- precise resume type -- it will need T threaded onto TOpArm (roadmap follow-up).
       pure (OpArm effect op argBinders (Binder resumeN Unrestricted (teType body)) armBody)
-
--- Non-compound: name the result and deliver under tk
-elabKF tk ty node = elabRhsF ty node (deliverRhs tk ty)
 
 -- ---------------------------------------------------------------------------
 -- Tail position elaboration
@@ -934,23 +965,51 @@ elaborateModule env tds =
                   (filter (not . isBodylessSig) tds)
     pure (CoreModule binds)
 
--- | Elaborate several modules into one CoreModule, minting global names ONCE
--- from the union of all modules' value-level vars so cross-module references
--- share identity. Each module elaborates with its OWN env but the SHARED
--- globals map.
-elaborateModulesShared :: [(Env, [TypedDecl])] -> CoreModule
+-- | Elaborate several modules into one CoreModule. Each top-level value-level
+-- global is identified by its DEFINING module, keyed @(definingModule, name)@,
+-- and given ONE canonical 'Name'. A module that defines a name shadowing one it
+-- also imports (e.g. a user @state@ over @Std.Control.state@) therefore gets a
+-- DISTINCT runtime binding from the imported one: each module's own references
+-- resolve to its own definition, and cross-module references resolve to the
+-- importee's. Without this, two modules defining the same bare name would
+-- collapse onto a single 'Name' and the last 'TopBind' would silently win in
+-- 'runModule's @gEnv@.
+--
+-- Each entry is @(definingModule, env, tds)@; @env@ is the module's own
+-- post-import environment and @envVarOrigin env@ maps each visible name to the
+-- module that defined it.
+elaborateModulesShared :: [(Text, Env, [TypedDecl])] -> CoreModule
 elaborateModulesShared mods =
   runFresh $ do
-    let allVarNames = Map.keys (Map.unions [ envVars env | (env, _) <- mods ])
-    gpairs <- mapM (\t -> (,) t <$> freshName t) allVarNames
-    let globals = Map.fromList gpairs
-    binds <- concat <$> mapM (elabOne globals) mods
+    -- Every (definingModule, name) pair across all modules. A name is keyed by
+    -- the module that DEFINES it (via envVarOrigin), defaulting to the module
+    -- whose env we are reading when no origin is recorded (a module's own
+    -- freshly introduced names).
+    let qualifiedKeys =
+          [ (originKey, name)
+          | (modName, env, _) <- mods
+          , name <- Map.keys (envVars env)
+          , let originKey = Map.findWithDefault modName name (envVarOrigin env)
+          ]
+    -- Mint one Name per distinct (origin, name) key.
+    gpairs <- mapM (\k -> (,) k <$> freshName (snd k))
+                   (dedup qualifiedKeys)
+    let globalByKey = Map.fromList gpairs
+    binds <- concat <$> mapM (elabOne globalByKey) mods
     pure (CoreModule binds)
   where
-    elabOne globals (env, tds) =
-      mapM (\td -> runReaderT (elabTopBind globals td)
-                              (ElabCtx env Map.empty globals Map.empty Set.empty))
-           (filter (not . isBodylessSig) tds)
+    dedup = Map.keys . Map.fromList . map (\k -> (k, ()))
+    -- A module's view: each name it can see resolves to the canonical Name for
+    -- (definingModule, name).
+    elabOne globalByKey (modName, env, tds) =
+      let globals = Map.fromList
+            [ (name, globalByKey Map.! key)
+            | name <- Map.keys (envVars env)
+            , let key = (Map.findWithDefault modName name (envVarOrigin env), name)
+            ]
+      in mapM (\td -> runReaderT (elabTopBind globals td)
+                                 (ElabCtx env Map.empty globals Map.empty Set.empty))
+              (filter (not . isBodylessSig) tds)
 
 -- ---------------------------------------------------------------------------
 -- Public test seam

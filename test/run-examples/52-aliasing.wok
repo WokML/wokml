@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Aliasing: instance identity is a RUNTIME property (the id the handle carries),
+-- not a type property -- exactly as two U64 parameters are distinguished by value,
+-- not by their (identical) type. `bump2` takes two State U64 handles and adds 1
+-- via each. Passing ONE instance as BOTH arguments is permitted and well-defined:
+-- the two `set`s route to the SAME cell, so it advances twice. From seed 10:
+-- a.get=10 -> a.set 11 ; b.get(=a)=11 -> b.set 12. Final cell = 12.
+bump2 : State U64 -> State U64 -> ()
+bump2 a b =
+  let u = a.set (a.get + 1) in
+  b.set (b.get + 1)
+
+-- main = (bump2_result, cell_final) = (((), 12)).
+main : ((), U64)
+main = with cell = state 10 in bump2 cell cell

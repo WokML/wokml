@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+
+-- Carrier rule: two handles collected into a list escape their scopes -- a
+-- list element is not a handle slot. Rejected.
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a) -> a
+state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+
+listed = with c1 = state 0 in with c2 = state 0 in [c1, c2]

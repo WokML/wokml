@@ -51,6 +51,13 @@ data TyCon
   | TcTuple Int
   | TcList
   | TcUser Text
+  -- | An effect-instance HANDLE type. @TcEffect "State"@ applied to args
+  -- (e.g. @TCon (TcEffect "State") [U64]@) is the type of a named effect
+  -- instance bound by a named @with@ form (@with s = state 0 in ...@). The
+  -- dot accessor dispatches a named perform off such a value (see
+  -- 'Wok.TypeChecking.Infer.inferProjection'). Distinct from 'TcUser', which
+  -- tags ordinary (data) type constructors.
+  | TcEffect Text
   deriving (Eq, Ord, Show)
 
 data Type s

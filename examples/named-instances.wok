@@ -1,0 +1,57 @@
+-- Named effect instances: hold MULTIPLE reachable instances of ONE effect.
+--
+-- Today a plain `with state 0 in` gives you one cell; a second one shadows it
+-- (nearest-handler wins). Naming the instance fixes that: `with count = state 0
+-- in ...` introduces an instance bound to `count`, and you perform through the
+-- name -- `count.get`, `count.set x`. Two named cells are independent.
+--
+-- Key ideas you can see below:
+--   * The instance's TYPE is the effect itself: `State U64`. No sigil, no wrapper.
+--   * The dot is resolved by the receiver's type: an effect handle PERFORMS,
+--     a record PROJECTS. (So `count.get` performs; `point.x` projects.)
+--   * Handle-taking helpers ANNOTATE their parameters (`c : State U64`), and the
+--     effect is DISCHARGED by the caller's cell -- such a helper's `with` row is
+--     empty (it does not itself perform an ambient State).
+--   * Handles are SECOND-CLASS: scoped to their `with`, they cannot be returned,
+--     stored in data, or captured by an escaping closure.
+module Main
+import Std.Base
+import Std.Control
+
+-- A helper over ONE caller-supplied cell. Its parameter type is the effect; its
+-- own effect row is empty (the State is the caller's).
+bump : State U64 -> ()
+bump c = c.set $ c.get + 1
+
+-- A helper over TWO cells. Routing follows the names `from`/`to`, not the
+-- (identical) type: move everything from `from` into `to`.
+transfer : State U64 -> State U64 -> ()
+transfer from to =
+  let amt = from.get in
+  let z   = from.set 0 in
+  to.set (to.get + amt)
+
+-- The clincher: TWO instances of the SAME type, folded over a list at once.
+-- There is no distinct type to tell `sum` from `prod` -- they ARE both
+-- `State U64`. Only the names distinguish them.
+sumProd : State U64 -> State U64 -> [U64] -> ()
+sumProd sum prod xs = case xs of
+  [] -> ()
+  x :: rest ->
+    let a = sum.set  (sum.get  + x) in
+    let b = prod.set (prod.get * x) in
+    sumProd sum prod rest
+
+-- main opens two independent cells `a` (seeded 100) and `b` (seeded 5) and
+-- transfers a -> b: afterwards a = 0, b = 105. The two nested `state` runners
+-- each return an `(answer, finalState)` pair, so the whole expression is
+--   ((transfer_answer, b_final), a_final) = ((((), 105), 0)).
+--
+-- Try editing main to `with sum = state 0 in with prod = state 1 in
+-- sumProd sum prod [1,2,3,4]` -- you'll get sum = 10 and prod = 24, two
+-- same-typed cells kept apart by name alone.
+main : (((), U64), U64)
+main =
+  with a = state 100 in
+  with b = state 5 in
+  transfer a b

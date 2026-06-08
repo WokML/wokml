@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- The clincher: TWO instances of the SAME type (both State U64), folding one list
+-- into two accumulators at once. `sum` accumulates additively (seed 0) and `prod`
+-- multiplicatively (seed 1). Only the names tell the two State U64 cells apart;
+-- routing follows `sum.set` vs `prod.set`, never a type. Over [1,2,3,4]:
+-- sum = 1+2+3+4 = 10, prod = 1*2*3*4 = 24.
+sumProd : State U64 -> State U64 -> [U64] -> ()
+sumProd sum prod xs = case xs of
+  []        -> ()
+  x :: rest ->
+    let a = sum.set  (sum.get  + x) in
+    let b = prod.set (prod.get * x) in
+    sumProd sum prod rest
+
+-- main = ((sumProd_result, prod_final), sum_final) = ((((), 24), 10)).
+main : (((), U64), U64)
+main =
+  with sum  = state 0 in
+  with prod = state 1 in
+  sumProd sum prod [1, 2, 3, 4]

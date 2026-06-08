@@ -1,6 +1,6 @@
 # wok examples
 
-Five runnable programs, smallest to largest. Each is a complete module with a
+Six runnable programs, smallest to largest. Each is a complete module with a
 `main`; run any of them with the `--run` flag:
 
 ```sh
@@ -17,11 +17,12 @@ to see the lowered intermediate representation.)
 | `expr-eval.wok` | recursion over a tree + `Writer` + `Except` | `Ok((11, [20, 23, 11]))` |
 | `mtl-machine.wok` | the full mtl stack: `Reader` + `Writer` + `State` + `Except` | `Ok(((4, 30), [10, 30]))` |
 | `as-patterns.wok` | `as`-patterns (`pat as name`) in a case arm, a single-clause head, and a multi-clause function | `[8, 5, 6, 7]` |
+| `named-instances.wok` | named effect instances — two independent `State U64` cells, handle-typed helper params | `(((), 105), 0)` |
 
 Run them all:
 
 ```sh
-for f in collatz state-accumulate expr-eval mtl-machine as-patterns; do
+for f in collatz state-accumulate expr-eval mtl-machine as-patterns named-instances; do
   printf '%-18s ' "$f"
   cabal run -v0 wok -- "examples/$f.wok" --run
 done
@@ -48,3 +49,9 @@ done
   rebuilding it; `doubleUp n as m` is an irreducible `var as var` head; `dedupHead`
   is a multi-clause function that collapses leading duplicates. `::` is pattern-only
   in wok, so the expressions build lists with `[...]` and `++`.
+- **`named-instances.wok`** — multiple reachable instances of one effect. `with
+  count = state 0 in …` introduces a named instance; you perform through the name
+  (`count.get`). The instance's type IS the effect (`State U64`); the dot resolves
+  by type (handle → perform, record → project). `sumProd` is the clincher — two
+  `State U64` cells told apart by name alone. Handles are second-class (scoped,
+  can't escape their `with`).

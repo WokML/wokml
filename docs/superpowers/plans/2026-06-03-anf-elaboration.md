@@ -543,6 +543,7 @@ git commit -am "feat(ir): elaborate let/where/case with join points and pattern 
 - [ ] `ERecordExt T spread (TFSome extra)` → spread normalized, then extended/overwritten with `extra` fields (label-keyed merge).
 - [ ] `EProj e (VarId l)` where `e` is not an effect head → `RProj l atom`.
 - [ ] Record patterns `PRecord`/`PRecordOpen`/`PRecordWild` bind named fields by label.
+- [ ] **(Carried from Task 3 review)** Unsaturated / value-position constructors (an arity>0 constructor used without all its arguments, e.g. `map Just xs`, or a bare `ECon` of arity>0) eta-expand to a lambda using the constructor arity from `envCons`/`ConInfo`. Bare nullary constructors stay `RCon c []`. This is the first real use of `ecEnv`, so DELETE the temporary `_useElabCtxEnv` accessor hack added to `Elaborate.hs` in Task 3.
 
 **Verify:** `cabal test --test-options="-p ElaborateRecords"` → pass.
 

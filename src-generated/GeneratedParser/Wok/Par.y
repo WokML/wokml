@@ -400,6 +400,8 @@ Exp2
   | 'with' '{' ListHandlerArm '}' Exp { GeneratedParser.Wok.Abs.EWith $3 $5 }
   | 'with' ConId ListConId '{' ListHandlerArm '}' Exp { GeneratedParser.Wok.Abs.EWithH $2 $3 $5 $7 }
   | 'with' VarId ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EWithRun $2 $3 $5 }
+  | 'with' VarId '=' VarId ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EWithNamed $2 $4 $5 $7 }
+  | 'with' VarId '=' ConId '{' ListHandlerArm '}' 'in' Exp { GeneratedParser.Wok.Abs.EWithNamedH $2 $4 $6 $9 }
 
 MaybeTrailing :: { GeneratedParser.Wok.Abs.MaybeTrailing }
 MaybeTrailing

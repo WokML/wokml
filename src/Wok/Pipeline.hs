@@ -108,5 +108,6 @@ elaborateProgramFull
   -> Either String CoreModule
 elaborateProgramFull entryName ms = do
   (resultMap, _warns) <- runPipelineFold entryName ms
-  let mods = [ (mrEnvOut mr, mrDecls mr) | mr <- Map.elems resultMap ]
+  let mods = [ (modName, mrEnvOut mr, mrDecls mr)
+             | (modName, mr) <- Map.toList resultMap ]
   Right (elaborateModulesShared mods)

@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+-- Carrier rule (named effect instances, §4.3): a named instance handle is
+-- second-class and may not escape its scope. Returning the bare handle from the
+-- `with` body is rejected: "instance handle cannot escape its scope".
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a) -> a
+state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+
+leaky = with count = state 0 in count

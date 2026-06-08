@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+
+-- Carrier rule: a closure that CAPTURES a handle and then ESCAPES (here it is
+-- returned as the result) is rejected. `\x -> count.set x` captures `count`;
+-- returning it would let the handle outlive its scope through the closure.
+effect State s = { get : s, set : s -> () }
+
+leakClosure : State U64 -> (U64 -> ())
+leakClosure count = \x -> count.set x

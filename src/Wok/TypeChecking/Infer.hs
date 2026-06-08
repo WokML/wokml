@@ -41,12 +41,13 @@ import Wok.TypeChecking.Env
   , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
 import Wok.TypeChecking.Error (TypeError (..), Warning (..))
 import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
-import Wok.TypeChecking.Unify (force, forceRow, freeze, freezeTolerant, rewriteRow, unify, rewriteRowStrict)
+import Wok.TypeChecking.Unify (force, forceRow, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
 import Wok.TypeChecking.Types
   ( CRow (..), CType (..), Constraint (..), Kind (..), Level (..), RVar (..), Row (..)
   , Scheme (..), mkScheme, TyCon (..), TVar (..), Type (..) )
 import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
 import qualified Wok.TypeChecking.Typed as Ty
+import Wok.TypeChecking.Carrier (checkCarriers)
 import Wok.IR.Match
   ( ConOracle (..), Coverage (..), MPat (..), MPatF (..)
   , matchCoverage, tupleTag )
@@ -531,13 +532,19 @@ translateSig env ty = do
                   cRow <- buildCRowFromFields fields
                   pure (CTRecord name cRow)
             _ ->
-              -- Regular TyCon path.
+              -- Regular TyCon path. An effect name in type position denotes an
+              -- instance-handle type @TcEffect E@ (named effect instances).
               case lookupTyCon name env' of
                 Just info
                   | tcArity info == 0 -> pure (CTCon (resolveTyCon name) [])
                   | otherwise -> throwError
                       (ArityMismatch (Just pos) name (tcArity info) 0)
-                Nothing -> throwError (UnknownTyCon (Just pos) name)
+                Nothing -> case lookupEffect name env' of
+                  Just eInfo
+                    | length (eiParams eInfo) == 0 -> pure (CTCon (TcEffect name) [])
+                    | otherwise -> throwError
+                        (ArityMismatch (Just pos) name (length (eiParams eInfo)) 0)
+                  Nothing -> throwError (UnknownTyCon (Just pos) name)
         goT (Abs.TApp f x) = do
           let (h, args) = collectApp f x
           case h of
@@ -550,7 +557,14 @@ translateSig env ty = do
                       CTCon (resolveTyCon name) <$> mapM goT args
                   | otherwise -> throwError
                       (ArityMismatch (Just pos) name (tcArity info) (length args))
-                Nothing -> throwError (UnknownTyCon (Just pos) name)
+                Nothing -> case lookupEffect name env' of
+                  -- Saturated effect application `State U64` -> a handle type.
+                  Just eInfo
+                    | length (eiParams eInfo) == length args ->
+                        CTCon (TcEffect name) <$> mapM goT args
+                    | otherwise -> throwError
+                        (ArityMismatch (Just pos) name (length (eiParams eInfo)) (length args))
+                  Nothing -> throwError (UnknownTyCon (Just pos) name)
             _ -> throwError
                   (UnsupportedFeature Nothing
                     (Tx.pack "non-tycon type application"))
@@ -1707,6 +1721,68 @@ inferExprW mono (Abs.EWithRun fVar wargs body) =
       thunk  = Abs.ELam [Abs.APWild] body
   in inferExprW mono (Abs.EApp runner thunk)
   where withArgExp (Abs.WRArg e) = e
+-- Named-instance introduction forms (named effect instances feature). The
+-- grammar (Task 1) parses these into EWithNamed / EWithNamedH; their type
+-- checking, elaboration, and runtime are added in later tasks. Until then,
+-- reject them explicitly so the surface parses but does not silently mistype.
+-- Named-instance runner sugar: `with name = fVar wargs in body`. Like
+-- 'EWithRun' (`with f a b in body ≡ f a b (\_ -> body)`) but binds the runner's
+-- thunk parameter to NAME instead of `_`. The runner's thunk parameter is the
+-- effect-instance handle (e.g. `State s`), so `name.op` in the body dispatches
+-- as a named perform (see 'inferProjection').
+inferExprW mono (Abs.EWithNamed (Abs.VarId (npos, name)) fVar wargs body) = do
+  -- Build and infer the runner application `fVar wargs` (NOT yet applied to a
+  -- thunk). We must NOT desugar to a raw `runner (\name -> body)` and re-infer
+  -- bottom-up: that leaves `name`'s type an unsolved metavar while `name.op` is
+  -- dispatched, so the type-directed dot ('inferProjection') reports
+  -- 'AmbiguousAccessor'. Instead we drive checking-mode by hand: read the
+  -- runner's thunk parameter type to learn the instance HANDLE type, bind
+  -- `name : handleTy` BEFORE inferring the body, then rebuild the typed node as
+  -- the application `runner (\name -> body)` so elaboration is unchanged.
+  let withArgExp (Abs.WRArg ex) = ex
+      runnerE = foldl (\acc warg -> Abs.EApp acc (withArgExp warg)) (Abs.EVar fVar) wargs
+  (runnerT, runnerNode) <- inferExprW mono runnerE
+  runnerT' <- force runnerT
+  case runnerT' of
+    TArr thunkTy appRow resultTy -> do
+      thunkTy' <- force thunkTy
+      case thunkTy' of
+        TArr handleTy bodyRow bodyResultTy -> do
+          -- Bind the instance handle and infer the body under a fresh sub-ambient
+          -- (mirroring 'ELam'): the body's performed effects must flow into the
+          -- runner's declared thunk row (`bodyRow`, e.g. `State s + eff e`),
+          -- NOT into the enclosing equation. We unify the collected sub-ambient
+          -- with `bodyRow` rather than closing it to empty, so the runner's
+          -- declared effects (the handled effect + the residual `eff e`) are
+          -- honoured.
+          let mono' = Map.insert name handleTy mono
+          ambient0 <- freshRVar
+          effRef <- liftST (newSTRef ambient0)
+          (bodyT, bodyNode) <- withEffRow effRef (inferExprW mono' body)
+          bodyAmbient <- liftST (readSTRef effRef)
+          unifyRow Nothing bodyAmbient bodyRow
+          unify Nothing bodyT bodyResultTy
+          -- The runner's own effects (whatever calling `runner` performs, e.g.
+          -- the residual `eff e`) propagate into the enclosing ambient, mirroring
+          -- the application path ('EApp').
+          emitRow Nothing appRow
+          -- Rebuild the typed node as `runner (\name -> body)` so Task 4's
+          -- TApp/TLam lowering is reused verbatim; the lambda binder carries
+          -- `name : handleTy`, and `bodyNode` already holds the correctly
+          -- dispatched 'TPerformOn' nodes.
+          let nameBinder = Ty.Tpat handleTy (Ty.TPVar name)
+              lamNode    = Ty.Texp thunkTy (Ty.TLam [nameBinder] bodyNode)
+              node       = Ty.Texp resultTy (Ty.TApp runnerNode [lamNode])
+          pure (resultTy, node)
+        _ -> throwError (UnsupportedFeature (Just npos)
+               ("`with " <> name <> " = ...`: runner's thunk parameter is not a function (expected a thunk taking the instance handle)"))
+    _ -> throwError (UnsupportedFeature (Just npos)
+           ("`with " <> name <> " = ...`: runner is not a function (it must take a thunk)"))
+-- Named primitive handler: `with self = Effect { arms } in body`. This is the
+-- handler machinery of 'inferHandler' PLUS binding `self` to the effect-handle
+-- type in the body's scope, so `self.op` performs on this handler instance.
+inferExprW mono (Abs.EWithNamedH selfV effCon arms body) =
+  inferNamedHandler mono selfV effCon arms body
 
 -- | Classification of a single handler arm against the (possibly empty) header.
 -- An unqualified arm is resolved to either an operation arm (when its head names
@@ -1772,11 +1848,13 @@ texpMentions name = goE
       Ty.TTuple xs         -> any goE xs
       Ty.TList xs          -> any goE xs
       Ty.TProj e _         -> goE e
+      Ty.TPerformOn e _ _  -> goE e
       Ty.TRecord _ fs      -> any (goE . snd) fs
       Ty.TRecordExt _ e fs -> goE e || any (goE . snd) fs
       Ty.TLet ds b         -> any goD ds || goE b
       Ty.TCase e alts      -> goE e || any goA alts
       Ty.THandle e arms    -> goE e || any goArm arms
+      Ty.TWithNamedH _ arms e -> any goArm arms || goE e
     goD (Ty.TLocalDecl _ _ b)   = goE b
     goA (Ty.TAlt _ ds b)        = any goD ds || goE b
     goArm (Ty.TReturnArm _ b)   = goE b
@@ -1959,6 +2037,127 @@ inferHandler mono header headerPos e arms = do
       let retArm = Ty.TReturnArm (Ty.Tpat exprT (Ty.TPVar v)) rNode
       pure (answerT, Ty.Texp answerT (Ty.THandle exprNode (paramArmNodes ++ opArmNodes ++ [retArm])))
 
+-- | Infer a named primitive handler `with self = Effect { arms } in body`.
+--
+-- This is the operation-arm machinery of 'inferHandler' specialised to a SINGLE
+-- effect, PLUS binding @self@ to that effect's instance-handle type in the
+-- body's scope. Two differences from 'inferHandler' make the param-tying sound:
+--
+--   * ONE shared parameter substitution. 'inferHandler' instantiates the
+--     effect's params freshly per op arm; here we instantiate ONCE and reuse it
+--     for every arm AND for the handle type @self : TcEffect Effect <params>@,
+--     so @self.op@ (a named perform; see 'inferProjection') ties to the same
+--     @s@ the arms handle. A wrong tie here would silently mis-thread the state
+--     type, so the substitution must be shared, not re-minted.
+--
+--   * NO ambient-row discharge. Named performs are routed to @self@ and never
+--     reach the ambient row (the 'TPerformOn' path does not 'emitEffect'), so
+--     there is nothing to discharge. The body is inferred under the CURRENT
+--     ambient, so any OTHER (ambient) effects it performs flow outward normally.
+inferNamedHandler
+  :: Map.Map Text (Type s)
+  -> Abs.VarId -> Abs.ConId -> [Abs.HandlerArm] -> Abs.Exp
+  -> TC s (Type s, TExprS s)
+inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms body = do
+  env <- currentEnv
+  when (null arms) $ throwError (EmptyHandler (Just epos))
+  eInfo <- case lookupEffect effName env of
+    Nothing -> throwError (MissingEffectDecl (Just epos) effName)
+    Just i  -> pure i
+  -- Classify each arm against the single-effect header.
+  classified <- mapM (classifyArm env [effName]) arms
+  let opArms    = [ (en, op, ps, b, pos) | OpArmC en op ps b pos <- classified ]
+      retArms   = [ (pos, v, b)          | ValArmC v b pos        <- classified ]
+      paramArms = [ (name, initE, pos)   | ParamArmC name initE pos <- classified ]
+  case retArms of
+    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
+    _                      -> pure ()
+  -- Coverage: every operation of the handled effect must have an arm.
+  let declaredOps = Map.keys (eiOps eInfo)
+      handledOps  = [ op | (_, op, _, _, _) <- opArms ]
+      missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
+  unless (null missing) $
+    throwError (HandlerCoverage (Just epos) effName missing)
+  -- ONE shared parameter substitution (fresh metavars), reused for the handle
+  -- type and every arm.
+  paramSubst <- instantiateParamSubst (eiParams eInfo)
+  let handleArgs = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
+                   | (i, _) <- eiParams eInfo ]
+      handleTy   = TCon (TcEffect effName) handleArgs
+  answerT <- freshTVar KStar
+  -- Handler-local parameter (slice 4a): at most one `name = init`.
+  mParam <- case paramArms of
+    []                 -> pure Nothing
+    [(name, initE, _)] -> do
+      paramTy <- freshTVar KStar
+      (initT, initNode) <- inferExprW mono initE
+      unify Nothing initT paramTy
+      pure (Just (name, paramTy, initNode))
+    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
+  let monoP = case mParam of
+        Just (name, ty, _) -> Map.insert name ty mono
+        Nothing            -> mono
+  -- Type each operation arm. Mirrors 'inferHandler', but using the SHARED
+  -- paramSubst (no per-arm re-instantiation) so the op types tie to @handleTy@.
+  opArmNodes <- forM opArms $ \(en, op, ps, b, pos) ->
+    case Map.lookup op (eiOps eInfo) of
+      Nothing -> throwError (UnknownOperation (Just pos) en op)
+      Just opScheme -> do
+        let opTy = substCTypeWith paramSubst (schemeBody opScheme)
+        arity <- arrowArity opTy
+        let (argPs, binderPs) = splitAt arity ps
+        patResults <- mapM inferAtomPat argPs
+        let pTys  = map (\(t, _, _) -> t) patResults
+            binds = concatMap (\(_, bnd, _) -> bnd) patResults
+            argPatNodes = map (\(_, _, n) -> n) patResults
+            mono1 = foldr (\(n, t) m -> Map.insert n t m) monoP binds
+        mResult <- peelArrowsWithArgUnify opTy pTys
+        resultTy <- case mResult of
+          Just r  -> pure r
+          Nothing -> throwError (UnknownOperation (Just pos) en op)
+        case binderPs of
+          [] -> do
+            (bodyT, bodyNode) <- inferExprW mono1 b
+            unify (Just pos) bodyT resultTy
+            pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
+          [Abs.APWild] -> do
+            (bodyT, bodyNode) <- inferExprW mono1 b
+            unify (Just pos) bodyT answerT
+            pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") bodyNode)
+          [Abs.APVar (Abs.VarId (_, kname))] -> do
+            resumeRow <- freshRVar
+            paramRow  <- freshRVar
+            let resumeTy = case mParam of
+                  Just (_, paramTy, _) -> arrowT paramTy paramRow (arrowT resultTy resumeRow answerT)
+                  Nothing              -> arrowT resultTy resumeRow answerT
+                mono2    = Map.insert kname resumeTy mono1
+            (bodyT, bodyNode) <- inferExprW mono2 b
+            unify (Just pos) bodyT answerT
+            resultTy' <- force resultTy
+            let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
+            unless (isNever || texpMentions kname bodyNode) $
+              addWarning (ForgottenResume (Just pos) en op)
+            pure (Ty.TOpArm en op argPatNodes kname bodyNode)
+          _ -> throwError (MalformedHandlerArm (Just pos) en op)
+  -- The body sees @self : handleTy@. Ambient effects of the body flow outward
+  -- unchanged (we do NOT open a sub-ambient -- named performs never touch it).
+  let monoSelf = Map.insert self handleTy monoP
+  (bodyT, bodyNode) <- inferExprW monoSelf body
+  let paramArmNodes = case mParam of
+        Just (name, _, initNode) -> [Ty.TParamArm name initNode]
+        Nothing                  -> []
+  case retArms of
+    []               -> do
+      -- No value arm: the answer type is exactly the body's type.
+      unify Nothing answerT bodyT
+      pure (answerT, Ty.Texp answerT (Ty.TWithNamedH self (paramArmNodes ++ opArmNodes) bodyNode))
+    ((_, v, rb) : _) -> do
+      let monoRet = Map.insert v bodyT monoP
+      (rT, rNode) <- inferExprW monoRet rb
+      unify Nothing rT answerT
+      let retArm = Ty.TReturnArm (Ty.Tpat bodyT (Ty.TPVar v)) rNode
+      pure (answerT, Ty.Texp answerT (Ty.TWithNamedH self (paramArmNodes ++ opArmNodes ++ [retArm]) bodyNode))
+
 -- | Remove the given effect labels from a row (each label dropped once per
 -- occurrence is unnecessary in v1 -- effects are not duplicated by inference --
 -- so we drop ALL occurrences of each handled label). Returns the residual row
@@ -1980,12 +2179,34 @@ dischargeEffects row handled = do
 -- it when the head constructor is not a declared effect.
 inferProjection :: Map.Map Text (Type s) -> Abs.Exp -> (Int, Int) -> Text -> TC s (Type s, TExprS s)
 inferProjection mono e pos label = do
+  env <- currentEnv
   (eT, eNode) <- inferExprW mono e
   eT' <- force eT
   case eT' of
+    -- Record field projection (today's behaviour).
     TRecord _ row -> do
       (fieldT, _rest) <- rewriteRowStrict (Just pos) label row
       pure (fieldT, Ty.Texp fieldT (Ty.TProj eNode label))
+    -- Named perform: the receiver is an effect-instance handle `E args`. The
+    -- accessor `e.op` performs `op` on THIS instance (off the ambient row, so
+    -- NO emitEffect). The op is instantiated against the handle's OWN type
+    -- args, so e.g. `(c : State U64).get : U64` ties the result to the U64 in
+    -- the handle (rather than a fresh metavar).
+    TCon (TcEffect en) params ->
+      case lookupEffect en env of
+        Nothing -> throwError (MissingEffectDecl (Just pos) en)
+        Just eInfo -> case Map.lookup label (eiOps eInfo) of
+          Nothing -> throwError (UnknownOperation (Just pos) en label)
+          Just opScheme -> do
+            -- Tie the op's param substitution to the handle's type args (in
+            -- eiParams order) instead of fresh metavars.
+            let paramSubst = Map.fromList (zip (map fst (eiParams eInfo)) params)
+            opTy <- freshenNeverResult (substCTypeWith paramSubst (schemeBody opScheme))
+            pure (opTy, Ty.Texp opTy (Ty.TPerformOn eNode en label))
+    -- Anything else (incl. an unsolved metavar after force): the receiver's
+    -- type is neither a record nor an effect handle. Because the accessor is
+    -- type-directed, an unannotated receiver is ambiguous -- annotate it.
+    TVar _ -> throwError (AmbiguousAccessor (Just pos) label)
     _ -> do
       cT <- freeze eT'
       throwError (NotARecord (Just pos) cT)
@@ -2851,8 +3072,37 @@ inferProgramTC seedEnv origin decls = do
   withEnv (const env1i) $ do
     tds <- inferTopLetGroup origin localDecls
     env2 <- currentEnv
+    -- Carrier rule (named effect instances, §4.3): a second-class escape check
+    -- over the frozen typed AST. A handle (or a closure capturing one) may not
+    -- escape its scope. Runs after inference because handle-ness is read off
+    -- types. Surfaces here so a violating program fails type-checking. The
+    -- resolver reads a callee's DECLARED parameter types off its scheme (env
+    -- vars + constructors + the just-inferred locals), so a polymorphic param a
+    -- handle merely flowed into is NOT mistaken for a genuine handle slot.
+    let localSchemes = Map.fromList [ (tdName td, tdScheme td) | td <- tds ]
+        resolveParams n =
+          case Map.lookup n localSchemes of
+            Just s  -> Just (schemeParamTypes s)
+            Nothing -> case lookupVar n env2 of
+              Just s  -> Just (schemeParamTypes s)
+              Nothing -> case lookupCon n env2 of
+                Just ci -> Just (schemeParamTypes (conScheme ci))
+                Nothing -> Nothing
+    forM_ tds $ \td ->
+      either throwError pure
+        (checkCarriers resolveParams Nothing (tdName td) (tdClauses td))
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
+
+-- | The declared parameter types of a scheme, in order, by peeling its body's
+-- arrows. Polymorphic positions remain 'CTGen' — this is exactly the property
+-- the carrier rule relies on to distinguish a genuine handle-typed parameter
+-- from a polymorphic slot a handle merely flowed into.
+schemeParamTypes :: Scheme -> [CType]
+schemeParamTypes = go . schemeBody
+  where
+    go (CTArr a _ b) = a : go b
+    go _             = []
 
 -- | Convert a top-level Decl to zero or more LocalDecls so we can reuse
 -- the existing inferLetGroup machinery.
@@ -3164,6 +3414,9 @@ prettyCType (CTCon (TcTuple _) xs) =
 prettyCType (CTCon (TcUser n) []) = n
 prettyCType (CTCon (TcUser n) xs) =
   Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTCon (TcEffect n) []) = n
+prettyCType (CTCon (TcEffect n) xs) =
+  Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
@@ -3187,6 +3440,8 @@ prettyCTypeArg t = prettyCType t
 prettyCTypeAtom :: CType -> Text
 prettyCTypeAtom t@CTArr{} = Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t@(CTCon (TcUser _) (_:_)) =
+  Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
+prettyCTypeAtom t@(CTCon (TcEffect _) (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t = prettyCType t
 

@@ -1,0 +1,14 @@
+runLocal i =
+  let t.2 = s.State.set(i)
+  let u = t.2
+  let t.1 = s.State.get()
+  t.1
+  with s = {
+    return v -> v
+    State.get(resume.1) ->
+      let res = resume.1(i)
+      res
+    State.set(x, resume.2) ->
+      let t.3 = resume.2(())
+      t.3
+  }

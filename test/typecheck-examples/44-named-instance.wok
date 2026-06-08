@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+
+effect State s = { get : s, set : s -> () }
+
+runLocal : U64 -> U64
+runLocal i = with s = State { get -> i ; set x k -> k () ; v -> v } in let u = s.set i in s.get

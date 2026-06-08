@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+-- Carrier rule (§4.3): a partial application capturing a handle is rejected even
+-- when returned DIRECTLY (not via a let-binder). `peek c : () -> U64` is the
+-- `with` body's result, so the handle `c` escapes through the returned closure.
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a) -> a
+state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+
+peek : State U64 -> () -> U64
+peek c u = c.get
+
+escape2 = with c = state 7 in peek c

@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Mixed row: a handle PARAMETER (`cell : State U64`) sits beside an AMBIENT
+-- effect (`Writer [U64]`). The handle is NOT part of the row -- performing on
+-- `cell` is routed by the value, not advertised in the effect set -- so `logged`
+-- declares just `with Writer [U64]`. State is absent from the row. The ambient
+-- `Writer.tell` is handled by the enclosing `writer` runner; `cell` by the
+-- enclosing `state` runner.
+logged : State U64 -> U64 with Writer [U64]
+logged cell =
+  let old = cell.get in
+  let u   = cell.set (old + 100) in
+  let w   = Writer.tell [old] in
+  cell.get
+
+-- The state runner wraps writer's ((result, log)) result:
+-- ((logged_result, log), cell_final) = (((105, [5]), 105)) from seed 5.
+main : ((U64, [U64]), U64)
+main =
+  with cell = state 5 in
+  with writer in
+  logged cell

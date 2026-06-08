@@ -45,7 +45,10 @@ data Rhs
   | RApp Atom [Atom]             -- f a b   (n-ary; saturated by elaboration)
   | RCon Text [Atom]             -- Cons x xs
   | RLam [Binder] Expr           -- \x y -> e
-  | ROp Text Text [Atom]         -- E.op a  (effect label, op name, args)
+  | ROp (Maybe Atom) Text Text [Atom]
+    -- ^ inst.E.op a  (instance handle, effect label, op name, args).
+    -- The leading 'Maybe Atom' is the named-instance handle through which the
+    -- operation is performed; 'Nothing' = ambient (route to nearest handler).
   | RRecord Text [(Text, Atom)]  -- T { l = a }
   | RProj Text Atom              -- a.l
   deriving (Eq, Show)
@@ -76,6 +79,7 @@ data Handler = Handler
     -- by the interpreter to redirect a resumed sub-run's answer to the resume
     -- call site instead of the static post-handler continuation.
   , hParam :: Maybe Binder          -- ^ handler-local parameter (slice 4a); Nothing = ordinary
+  , hSelf :: Maybe Binder           -- ^ self-instance binder (named handler); Nothing = ordinary
   } deriving (Eq, Show)
 
 data OpArm = OpArm
@@ -122,7 +126,7 @@ collectRhs (RAtom a)       t = collectAtom a t
 collectRhs (RApp f xs)     t = foldr collectAtom t (f : xs)
 collectRhs (RCon _ xs)     t = foldr collectAtom t xs
 collectRhs (RLam ps e)     t = collectExpr e (insertBinders ps t)
-collectRhs (ROp _ _ xs)    t = foldr collectAtom t xs
+collectRhs (ROp minst _ _ xs) t = foldr collectAtom t (maybe xs (: xs) minst)
 collectRhs (RRecord _ flds) t = foldr (\(_, a) acc -> collectAtom a acc) t flds
 collectRhs (RProj _ a)     t = collectAtom a t
 
@@ -144,10 +148,11 @@ collectAlt (AltLit _ e)    t = collectExpr e t
 collectAlt (AltDefault e)  t = collectExpr e t
 
 collectHandler :: Handler -> HintTable -> HintTable
-collectHandler (Handler ret ops _ mparam) t =
+collectHandler (Handler ret ops _ mparam mself) t =
   let (rb, re) = ret
       t0 = maybe t (`insertBinder` t) mparam
-      t1 = collectExpr re (insertBinder rb t0)
+      ts = maybe t0 (`insertBinder` t0) mself
+      t1 = collectExpr re (insertBinder rb ts)
   in foldr collectOpArm t1 ops
 
 collectOpArm :: OpArm -> HintTable -> HintTable
@@ -230,8 +235,9 @@ renderRhs fmt tbl (RLam ps e) =
     <> (if null ps then Tx.pack "" else renderBinders fmt tbl ps <> Tx.pack " ")
     <> Tx.pack "-> "
     <> renderExpr fmt tbl e
-renderRhs _   tbl (ROp lbl op xs) =
-  lbl <> Tx.pack "." <> op
+renderRhs _   tbl (ROp minst lbl op xs) =
+  maybe (Tx.pack "") (\a -> renderAtom tbl a <> Tx.pack ".") minst
+    <> lbl <> Tx.pack "." <> op
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
@@ -314,8 +320,10 @@ renderAlt fmt tbl (AltDefault e) =
 -- Rendering Handler
 
 renderHandler :: BndFmt -> HintTable -> Handler -> Text
-renderHandler fmt tbl (Handler (rb, re) ops _ _) =
-  Tx.pack "with {"
+renderHandler fmt tbl (Handler (rb, re) ops _ _ mself) =
+  Tx.pack "with"
+    <> maybe (Tx.pack "") (\sb -> Tx.pack " " <> renderBinder fmt tbl sb <> Tx.pack " =") mself
+    <> Tx.pack " {"
     <> Tx.pack "\n"
     <> indent 2
          (arrowBody (Tx.pack "return " <> renderBinder fmt tbl rb <> Tx.pack " ->")

@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Per-activation routing under RE-ENTRY. `f` recurses; each recursive call
+-- installs a NEW same-site cell (`inner = state 99`) while the OUTER cell `c`
+-- is threaded down unchanged. The load-bearing soundness invariant: the outer
+-- `c` must keep routing to ITS OWN frame, not collapse onto the inner same-site
+-- frames minted at each depth. The depth-tag on each cell keeps activations
+-- apart, so `c.get` at the base case still reads the outermost seed 7.
+-- main = (with c = state 7 in ...) so the outer state runner wraps the U64 7:
+-- (result, c_final) = (7, 7).
+f : U64 -> State U64 -> U64
+f n c = case n == 0 of
+  True  -> c.get
+  False -> let (res, ign) = (with inner = state 99 in f (n - 1) c) in res
+
+main : (U64, U64)
+main = with c = state 7 in f 3 c

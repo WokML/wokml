@@ -90,6 +90,7 @@ library
         Wok.TypeChecking.Builtins
         Wok.TypeChecking.Solve
         Wok.TypeChecking.Typed
+        Wok.TypeChecking.Carrier
         Wok.IR.Name
         Wok.IR.Anf
         Wok.IR.Elaborate

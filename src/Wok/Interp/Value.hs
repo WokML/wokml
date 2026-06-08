@@ -6,6 +6,7 @@ module Wok.Interp.Value
   , Scope (..)
   , emptyScope
   , Kont (..)
+  , kontDepth
   , Config (..)
   , Step (..)
   , Prim (..)
@@ -52,6 +53,12 @@ data Value
   | VPrim Prim
   | VCont (Kont -> Kont)   -- a captured deep continuation; arg is the post-resume kont
   | VContP (Value -> Kont -> Kont)   -- parameter-aware resume: \newParam after -> kont
+  | VInst Unique !Int      -- a named effect-instance handle. Identity = the
+                           -- handler self-binder Unique (the install SITE) paired
+                           -- with a per-ACTIVATION tag (the Kont depth at install).
+                           -- The tag distinguishes two activations of the SAME
+                           -- runner site that coexist (nested), so two same-typed
+                           -- instances minted by one prelude runner route apart.
 
 instance Show Value where
   show = Tx.unpack . renderValue
@@ -66,6 +73,7 @@ instance Eq Value where
   VPrim{}      == VPrim{}      = False
   VCont{}      == VCont{}      = False
   VContP{}     == VContP{}     = False
+  VInst a ta   == VInst b tb   = a == b && ta == tb
   _            == _            = False
 
 -- | A primitive: name (= hint), arity, args accumulated so far (for currying),
@@ -90,7 +98,23 @@ data Kont
   = KDone
   | KLet Binder Expr Scope Kont   -- bind the produced value to Binder, then run Expr in Scope
   | KApp [Value] Kont             -- over-application: apply the produced value to these args
-  | KHandle Handler Scope Kont    -- effect delimiter
+  | KHandle Handler !Int Scope Kont
+      -- effect delimiter. The Int is the activation tag (Kont depth at install)
+      -- that, with the handler's self-binder Unique, identifies this activation
+      -- for named (id-routed) dispatch. Ambient dispatch ignores it.
+
+-- | Number of frames in a continuation. Used as the per-activation tag when a
+-- named handler is installed: distinct COEXISTING (nested) activations of one
+-- runner site sit at strictly different depths, so the tag tells them apart.
+-- (Sequential activations may reuse a depth, but they never coexist, so the
+-- reuse is harmless.)
+kontDepth :: Kont -> Int
+kontDepth = go 0
+  where
+    go !n KDone              = n
+    go !n (KLet _ _ _ k)     = go (n + 1) k
+    go !n (KApp _ k)         = go (n + 1) k
+    go !n (KHandle _ _ _ k)  = go (n + 1) k
 
 -- | Machine configuration.
 data Config
@@ -153,6 +177,7 @@ renderValue VClosure{} = Tx.pack "<closure>"
 renderValue VPrim{}    = Tx.pack "<builtin>"
 renderValue VCont{}    = Tx.pack "<continuation>"
 renderValue VContP{}   = Tx.pack "<continuation>"
+renderValue (VInst _ _) = Tx.pack "<instance>"
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)

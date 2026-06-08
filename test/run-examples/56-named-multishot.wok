@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- A NAMED state instance (`count = state 0`) sitting under a MULTISHOT handler
+-- (`Choice.flip` resumes twice: `k True + k False`) must behave EXACTLY like
+-- the ambient `State` would in the identical structure. The body increments
+-- `count` once per resumption and returns `count.get`; with two resumptions the
+-- final count is 2 and the summed body result is 1 + 2 = 3, so the state runner
+-- yields (3, 2).
+--   The identical AMBIENT program -- `with state 0 in (with {Choice.flip k ->
+--   k True + k False ; v -> v} (let b = Choice.flip in let u = State.set
+--   (State.get + 1) in State.get))` -- also yields (3, 2). This example pins
+--   named == ambient under multishot.
+effect Choice = { flip : Bool }
+
+main : (U64, U64)
+main =
+  with count = state 0 in
+    (with { Choice.flip k -> k True + k False ; v -> v }
+      (let b = Choice.flip in
+       let u = count.set (count.get + 1) in
+       count.get))

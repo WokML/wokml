@@ -1,0 +1,13 @@
+ROUND-TRIP PARSE ERROR: syntax error at line 5, column 10 before `,'
+---first print---
+module Main;
+prog count total = total;
+state i c = with self = State
+{
+  s = i;
+  get -> s;
+  set x k -> k x ();
+  v -> (v, s)
+}
+in c self;
+main = with count = state 0 in with total = state 0 in prog count total

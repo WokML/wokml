@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Back-compat mixing: a NAMED handler (`count = state 5`) also answers a BARE
+-- ambient perform (`State.get`, no capability binder). The named runner is the
+-- enclosing State handler, so the ambient get resolves against it and reads the
+-- seed 5; the state runner wraps the result: (State.get, count_final) = (5, 5).
+main : (U64, U64)
+main = with count = state 5 in State.get

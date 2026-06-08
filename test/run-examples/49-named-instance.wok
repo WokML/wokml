@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+
+effect State s = { get : s, set : s -> () }
+
+state : s -> (State s -> a with State s + eff e) -> (a, s) with eff e
+state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
+
+main : (U64, U64)
+main = with count = state 0 in count.get

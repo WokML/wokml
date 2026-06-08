@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+-- Carrier rule: storing a handle inside a data constructor lets it escape. The
+-- argument of `Some` is a polymorphic slot (`a`), not a handle slot, so the
+-- handle escaping into it is rejected.
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a) -> a
+state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+
+boxed = with count = state 0 in Some count

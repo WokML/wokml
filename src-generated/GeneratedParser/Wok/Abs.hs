@@ -176,6 +176,8 @@ data Exp
     | EWith [HandlerArm] Exp
     | EWithH ConId [ConId] [HandlerArm] Exp
     | EWithRun VarId [WithArg] Exp
+    | EWithNamed VarId VarId [WithArg] Exp
+    | EWithNamedH VarId ConId [HandlerArm] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixTail = ITail InfixOp Exp

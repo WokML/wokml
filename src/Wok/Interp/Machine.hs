@@ -33,7 +33,7 @@ returnTo _     _ KDone               = Left (PrimError (Tx.pack "internal: retur
 returnTo _     v (KLet b body sc k)  =
   Right (Eval body sc { scEnv = bindBinder b v (scEnv sc) } k)
 returnTo prims v (KApp args k)       = enter prims v args k
-returnTo _     v (KHandle h hsc k)   =
+returnTo _     v (KHandle h _ hsc k) =
   -- Normal completion of a handled computation: run the return arm.
   let (rb, rbody) = hReturn h
   in Right (Eval rbody hsc { scEnv = bindBinder rb v (scEnv hsc) } k)
@@ -68,7 +68,19 @@ evalExpr prims expr sc k = case expr of
       Just (JoinPoint jsc ps jbody jk) ->
         Right (Eval jbody jsc { scEnv = bindBinders ps vs (scEnv jsc) } jk)
 
-  Handle e h -> Right (Eval e sc (KHandle h sc k))   -- dispatch lands in Task 4
+  Handle e h ->
+    -- A named handler binds its self-instance binder to a VInst carrying the
+    -- binder's Unique (the install SITE) and this activation's tag (the Kont
+    -- depth here). Two coexisting activations of one runner site differ in
+    -- depth, so two same-typed instances minted by one prelude runner get
+    -- distinct VInsts and route apart. The frame stores the same tag so named
+    -- dispatch can match it. The scope is shared by the handled expression AND
+    -- captured by the KHandle, so the instance handle resolves consistently.
+    let tag = kontDepth k
+        sc' = case hSelf h of
+                Just sb -> sc { scEnv = bindBinder sb (VInst (nameUniq (bndName sb)) tag) (scEnv sc) }
+                Nothing -> sc
+    in Right (Eval e sc' (KHandle h tag sc' k))
 
 evalRhs :: PrimTable -> Binder -> Rhs -> Expr -> Scope -> Kont -> Either RuntimeError Config
 evalRhs prims b rhs body sc k = case rhs of
@@ -87,9 +99,14 @@ evalRhs prims b rhs body sc k = case rhs of
     fv <- resolveAtom prims sc f
     vs <- mapM (resolveAtom prims sc) as
     enter prims fv vs (KLet b body sc k)
-  ROp lbl op as -> do
+  ROp minst lbl op as -> do
     vs <- mapM (resolveAtom prims sc) as
-    dispatchOp lbl op vs (KLet b body sc k)   -- defined in Task 4
+    mTargetVal <- traverse (resolveAtom prims sc) minst
+    mTarget <- case mTargetVal of
+      Nothing            -> Right Nothing
+      Just (VInst u tag) -> Right (Just (u, tag))
+      Just other         -> Left (PrimError (Tx.pack ("internal: instance handle not a VInst: " <> show other)))
+    dispatchOp mTarget lbl op vs (KLet b body sc k)
   where
     cont v = Right (Eval body sc { scEnv = bindBinder b v (scEnv sc) } k)
 
@@ -137,11 +154,11 @@ matchAlts v alts sc k = go alts
 -- | An operation: find the nearest matching handler, capture the delimited
 -- continuation above it as a builder, bind the op args and a (deep, multi-shot)
 -- resume, and run the arm under the handler's below-continuation.
-dispatchOp :: Text -> Text -> [Value] -> Kont -> Either RuntimeError Config
-dispatchOp lbl op argVals kCur =
-  case findHandler lbl op kCur of
+dispatchOp :: Maybe (Unique, Int) -> Text -> Text -> [Value] -> Kont -> Either RuntimeError Config
+dispatchOp mTarget lbl op argVals kCur =
+  case findHandler mTarget lbl op kCur of
     Nothing -> Left (NoMatchingHandler lbl op)
-    Just (above, h, hsc, kBelow) ->
+    Just (above, h, hTag, hsc, kBelow) ->
       case lookupOpArm lbl op h of
         Nothing -> Left (NoMatchingHandler lbl op)
         Just oa ->
@@ -168,14 +185,17 @@ dispatchOp lbl op argVals kCur =
                                  (JoinPoint sc ps (Ret (AVar (bndName pb0))) after)
                                  (scJoins sc) }
                   _ -> sc
+              -- Re-install the handler over the resume site with the ORIGINAL
+              -- activation tag (`hTag`), so a handle captured in the resumed
+              -- body still id-routes to this same activation.
               resumeVal = case hParam h of
                 Nothing ->
-                  VCont (\after -> above (KHandle h (answerRebind after hsc) after))
+                  VCont (\after -> above (KHandle h hTag (answerRebind after hsc) after))
                 Just pb ->
                   VContP (\newParam after ->
                     let hsc' = (answerRebind after hsc)
                                  { scEnv = bindBinder pb newParam (scEnv hsc) }
-                    in above (KHandle h hsc' after))
+                    in above (KHandle h hTag hsc' after))
               env1 = bindBinders (oaArgs oa) argVals (scEnv hsc)
               env2 = bindBinder (oaResume oa) resumeVal env1
           in Right (Eval (oaBody oa) (Scope env2 (scJoins hsc)) kBelow)
@@ -183,16 +203,26 @@ dispatchOp lbl op argVals kCur =
 -- | Walk outward from the operation's continuation to the nearest KHandle that
 -- covers (label, op). Returns: a builder that re-prepends the frames above the
 -- handler, the matched handler, its captured scope, and the continuation below.
-findHandler :: Text -> Text -> Kont -> Maybe (Kont -> Kont, Handler, Scope, Kont)
-findHandler lbl op = go id
+findHandler :: Maybe (Unique, Int) -> Text -> Text -> Kont
+            -> Maybe (Kont -> Kont, Handler, Int, Scope, Kont)
+findHandler mTarget lbl op = go id
   where
     go _   KDone               = Nothing
     go acc (KLet b e sc k)     = go (acc . KLet b e sc) k
     go acc (KApp vs k)         = go (acc . KApp vs) k
-    go acc (KHandle h sc k)
-      | covers h               = Just (acc, h, sc, k)
-      | otherwise              = go (acc . KHandle h sc) k
-      where covers hh = any (\a -> oaLabel a == lbl && oaOp a == op) (hOps hh)
+    go acc (KHandle h tag sc k)
+      | matches h              = Just (acc, h, tag, sc, k)
+      | otherwise              = go (acc . KHandle h tag sc) k
+      where
+        matches hh = coversOp hh && instOk hh
+        coversOp hh = any (\a -> oaLabel a == lbl && oaOp a == op) (hOps hh)
+        -- Ambient (Nothing) matches any covering handler (today's behaviour).
+        -- A named target matches only the handler whose self-binder Unique = u
+        -- AND whose activation tag = t (so two activations of one runner site
+        -- are told apart; the Unique alone collides across activations).
+        instOk hh = case mTarget of
+          Nothing      -> True
+          Just (u, t)  -> (nameUniq . bndName <$> hSelf hh) == Just u && tag == t
 
 lookupOpArm :: Text -> Text -> Handler -> Maybe OpArm
 lookupOpArm lbl op h =

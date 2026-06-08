@@ -399,6 +399,8 @@ instance Print GeneratedParser.Wok.Abs.Exp where
     GeneratedParser.Wok.Abs.EWith handlerarms exp -> prPrec i 2 (concatD [doc (showString "with"), doc (showString "{"), prt 0 handlerarms, doc (showString "}"), prt 0 exp])
     GeneratedParser.Wok.Abs.EWithH conid conids handlerarms exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 conid, prt 0 conids, doc (showString "{"), prt 0 handlerarms, doc (showString "}"), prt 0 exp])
     GeneratedParser.Wok.Abs.EWithRun varid withargs exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 varid, prt 0 withargs, doc (showString "in"), prt 0 exp])
+    GeneratedParser.Wok.Abs.EWithNamed varid1 varid2 withargs exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 varid1, doc (showString "="), prt 0 varid2, prt 0 withargs, doc (showString "in"), prt 0 exp])
+    GeneratedParser.Wok.Abs.EWithNamedH varid conid handlerarms exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 varid, doc (showString "="), prt 0 conid, doc (showString "{"), prt 0 handlerarms, doc (showString "}"), doc (showString "in"), prt 0 exp])
 
 instance Print GeneratedParser.Wok.Abs.InfixTail where
   prt i = \case

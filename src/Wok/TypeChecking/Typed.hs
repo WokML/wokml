@@ -31,11 +31,17 @@ data TexpF a
   | TQVar Text [(Text, a)]          -- constrained-identifier use: name + [(class, classArgType)]
   | TProj (Texp a) Text             -- record field projection
   | TProjCon Text Text              -- E.op effect projection (label, op)
+  | TPerformOn (Texp a) Text Text   -- instance.op named perform: instance, effect, op
   | TRecord Text [(Text, Texp a)]
   | TRecordExt Text (Texp a) [(Text, Texp a)]
   | TLet [TLocalDecl a] (Texp a)
   | TCase (Texp a) [TAlt a]
   | THandle (Texp a) [THandlerArm a]
+  -- | Named primitive handler `with self = Effect { arms } in body`. Carries
+  -- the self-instance binder name, the handler arms, and the typed body. The
+  -- elaborator (Task 4) lowers it to @Handle body (Handler ... { hSelf = Just
+  -- self })@. Args: self-binder name, arms, body.
+  | TWithNamedH Text [THandlerArm a] (Texp a)
   deriving (Show, Functor, Foldable, Traversable)
 
 data TAlt a = TAlt (Tpat a) [TLocalDecl a] (Texp a)   -- pattern, where, body

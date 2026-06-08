@@ -179,6 +179,7 @@ tyConKey TcUnit       = Tx.pack "Unit"
 tyConKey TcList       = Tx.pack "List"
 tyConKey (TcTuple n)  = Tx.pack "Tuple" <> Tx.pack (show n)
 tyConKey (TcUser t)   = t
+tyConKey (TcEffect t) = Tx.pack "Effect$" <> t
 
 -- ---------------------------------------------------------------------------
 -- Pure Abs.Type -> CType translation

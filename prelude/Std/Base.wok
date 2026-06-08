@@ -9,6 +9,7 @@ fixity /= left looser than +
 fixity && left looser than ==
 fixity || left looser than &&
 fixity ++ right
+
 fixity $  right looser than ||
 
 data Bool = True | False

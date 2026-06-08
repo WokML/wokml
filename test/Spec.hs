@@ -86,6 +86,8 @@ main = do
     , dataTests
     , effectDeclTests
     , effectSigTests
+    , namedInstanceTests
+    , carrierRuleTests
     , effectGrammarTests
     , effectOpTests
     , effectHandlerTests
@@ -1590,6 +1592,244 @@ effectSigTests = testGroup "Wok.TypeChecking.EffectSig"
   ]
   where
     isInfixOfStr needle hay = T.pack needle `T.isInfixOf` T.pack hay
+
+-- Named effect instances (Task 3): an effect name in TYPE position is an
+-- instance-handle type; the dot accessor is type-directed (handle -> named
+-- perform off the instance, NOT the ambient row; record -> field; unresolved ->
+-- ambiguous-accessor error); and the two named `with` forms infer. These run
+-- through `schemeOf` (inference only) since lowering is Task 4.
+namedInstanceTests :: TestTree
+namedInstanceTests = testGroup "Wok.TypeChecking.NamedInstance"
+  [ testGroup "effect-as-type + type-directed perform"
+      [ -- A handle-typed parameter: `count.set`/`count.get` are NAMED performs
+        -- off the instance, so they do NOT add `State` to the ambient row.
+        testCase "named perform off a handle param stays off the row" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "prog : State U64 -> State U64 -> ()"
+            , T.pack "prog count total = let b = count.set count.get in total.set total.get"
+            ]
+            (T.pack "prog")
+            @?= Right (T.pack "State U64 -> State U64 -> ()")
+
+      , -- The op's result type ties to the handle's OWN type argument (the U64
+        -- in `State U64`): `b.get : U64` feeds `a.set : U64 -> ()`, so both
+        -- handles tie to U64 independently.
+        testCase "two same-typed handles tie independently to U64" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "sumProd : State U64 -> State U64 -> ()"
+            , T.pack "sumProd a b = a.set b.get"
+            ]
+            (T.pack "sumProd")
+            @?= Right (T.pack "State U64 -> State U64 -> ()")
+
+      , -- A handle-typed parameter coexists with an ambient effect row: the
+        -- named perform stays off the row, leaving only `IO` on the arrow.
+        testCase "handle param coexists with an ambient IO row" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "effect IO = { write : String -> () }"
+            , T.pack "logged : State U64 -> () with IO"
+            , T.pack "logged s = let b = s.set s.get in IO.write \"bumped\""
+            ]
+            (T.pack "logged")
+            @?= Right (T.pack "State U64 -> () with IO")
+
+      , -- Record projection still dispatches by type (regression guard for the
+        -- type-directed dot). The nominal row is printed by prettyScheme.
+        testCase "record field projection still works (regression)" $
+          schemeOf
+            [ T.pack "data Point = Point { x : U64, y : U64 }"
+            , T.pack "getX : Point -> U64"
+            , T.pack "getX p = p.x"
+            ]
+            (T.pack "getX")
+            @?= Right (T.pack "Point { x,y, } -> U64")
+      ]
+
+  , testGroup "ambiguous accessor (unannotated receiver)"
+      [ testCase "unannotated `c.get` is an ambiguous-accessor error" $
+          case schemeOf
+                 [ T.pack "effect State s = { get : s, set : s -> () }"
+                 , T.pack "bump c = c.get"
+                 ]
+                 (T.pack "bump") of
+            Left msg -> assertBool ("expected AmbiguousAccessor, got: " ++ msg)
+                          (T.pack "AmbiguousAccessor" `T.isInfixOf` T.pack msg)
+            Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+      ]
+
+  , testGroup "named with-forms"
+      [ -- EWithNamedH: a named primitive handler. `s.get`/`s.set` in the body
+        -- are named performs routed to `s`; the body's other ambient effects
+        -- (none here) flow out. The whole `with` yields the body's value type.
+        testCase "named primitive handler binds self and infers the body" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "runLocal : U64 -> U64"
+            , T.pack "runLocal i = with s = State { get -> i ; set x k -> k () ; v -> v } in s.get"
+            ]
+            (T.pack "runLocal")
+            @?= Right (T.pack "U64 -> U64")
+
+      , -- GUARDRAIL for the deliberate no-`&` design: capability binders are
+        -- plain names (`with x = ...`). There is no `&` sigil token, so a
+        -- `with &x = ...` header must fail to parse. Locks the surface syntax
+        -- decision (see effect-surface-syntax-final / at-token-reserved memos).
+        testCase "a sigil-prefixed capability binder (with &x) fails to parse" $
+          case parse (T.pack "module Main\nmain = with &x = state 0 in x") of
+            Left _  -> pure ()
+            Right _ -> assertFailure "expected a parse error for `with &x`, got a successful parse"
+      ]
+  ]
+
+-- | The carrier rule (named effect instances, §4.3): a second-class escape check
+-- run after inference. A handle (or a closure capturing one) may appear only as
+-- a perform receiver or in a handle-typed parameter slot; anywhere else it is
+-- rejected. The golden fail-examples 51-54 pin the four canonical REJECT cases
+-- end-to-end (through the runner desugar); these unit tests lock the ALLOW path
+-- (which must keep type-checking) and the soundness case (a handle through a
+-- polymorphic parameter still escapes), plus the inline-form rejections.
+carrierRuleTests :: TestTree
+carrierRuleTests = testGroup "Wok.TypeChecking.CarrierRule"
+  [ testGroup "ALLOW (must still type-check)"
+      [ -- Performs through a handle parameter return non-handle values; nothing
+        -- escapes. (Same shape as the prog/sumProd named-instance tests.)
+        testCase "performs through a handle param do not escape" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "prog : State U64 -> State U64 -> ()"
+            , T.pack "prog count total = let b = count.set count.get in total.set total.get"
+            ]
+            (T.pack "prog")
+            @?= Right (T.pack "State U64 -> State U64 -> ()")
+
+      , -- A handle passed into a handle-typed parameter slot (condition 2).
+        testCase "passing handles to handle-typed params is allowed" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "prog : State U64 -> State U64 -> ()"
+            , T.pack "prog count total = total.set count.get"
+            , T.pack "caller : State U64 -> State U64 -> ()"
+            , T.pack "caller x y = prog x y"
+            ]
+            (T.pack "caller")
+            @?= Right (T.pack "State U64 -> State U64 -> ()")
+
+      , -- A closure capturing a handle, USED LOCALLY (called, never returned or
+        -- stored), is allowed. The final result is a U64, not a carrier.
+        testCase "a local closure capturing a handle, used in place, is allowed" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "prog : State U64 -> U64"
+            , T.pack "prog count = let f = \\x -> count.set x in let z = f 5 in count.get"
+            ]
+            (T.pack "prog")
+            @?= Right (T.pack "State U64 -> U64")
+
+      , -- A PARTIAL APPLICATION capturing a handle, used locally (called, never
+        -- returned or stored), is allowed — mirrors the literal-closure case.
+        -- `peek count : () -> U64` captures `count` but is invoked in place; only
+        -- the U64 result escapes.
+        testCase "a local partial application capturing a handle, used in place, is allowed" $
+          schemeOf
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "peek : State U64 -> () -> U64"
+            , T.pack "peek c u = c.get"
+            , T.pack "prog : State U64 -> U64"
+            , T.pack "prog count = let f = peek count in let v = f () in v"
+            ]
+            (T.pack "prog")
+            @?= Right (T.pack "State U64 -> U64")
+      ]
+
+  , testGroup "REJECT (carrier escapes its scope)"
+      [ -- A bare handle returned.
+        testCase "returning a bare handle escapes" $
+          assertCarrierEscape
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "leak : State U64 -> State U64"
+            , T.pack "leak c = c"
+            ]
+            (T.pack "leak")
+
+      , -- A handle stored in a constructor (a polymorphic slot).
+        testCase "storing a handle in a constructor escapes" $
+          assertCarrierEscape
+            [ T.pack "data Box a = Box a"
+            , T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "leak : State U64 -> Box (State U64)"
+            , T.pack "leak c = Box c"
+            ]
+            (T.pack "leak")
+
+      , -- A handle collected into a list.
+        testCase "collecting handles in a list escapes" $
+          assertCarrierEscape
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "leak : State U64 -> State U64 -> [State U64]"
+            , T.pack "leak a b = [a, b]"
+            ]
+            (T.pack "leak")
+
+      , -- A returned closure capturing a handle.
+        testCase "returning a closure that captures a handle escapes" $
+          assertCarrierEscape
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "leak : State U64 -> (U64 -> ())"
+            , T.pack "leak count = \\x -> count.set x"
+            ]
+            (T.pack "leak")
+
+      , -- A partial application capturing a handle, let-bound and then RETURNED
+        -- (the C1 bug): `peek count : () -> U64` closes over `count`; returning it
+        -- lets the handle outlive its scope. Must be rejected like a returned
+        -- lambda.
+        testCase "returning a let-bound partial application that captures a handle escapes" $
+          assertCarrierEscape
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "peek : State U64 -> () -> U64"
+            , T.pack "peek c u = c.get"
+            , T.pack "leak : State U64 -> (() -> U64)"
+            , T.pack "leak count = let f = peek count in f"
+            ]
+            (T.pack "leak")
+
+      , -- A partial application capturing a handle, returned DIRECTLY (no
+        -- let-binder). Same escape, caught at the partial application's own
+        -- position.
+        testCase "returning a partial application that captures a handle escapes" $
+          assertCarrierEscape
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "peek : State U64 -> () -> U64"
+            , T.pack "peek c u = c.get"
+            , T.pack "leak : State U64 -> (() -> U64)"
+            , T.pack "leak count = peek count"
+            ]
+            (T.pack "leak")
+
+      , -- SOUNDNESS: a handle passed to a POLYMORPHIC parameter escapes, even
+        -- though the call-site arrow looks handle-typed. The declared (generic)
+        -- param of `identity` is a type variable, NOT a handle slot.
+        testCase "a handle through a polymorphic parameter still escapes" $
+          assertCarrierEscape
+            [ T.pack "effect State s = { get : s, set : s -> () }"
+            , T.pack "identity : a -> a"
+            , T.pack "identity x = x"
+            , T.pack "leak : State U64 -> State U64"
+            , T.pack "leak c = identity c"
+            ]
+            (T.pack "leak")
+      ]
+  ]
+  where
+    assertCarrierEscape declLines name =
+      case schemeOf declLines name of
+        Left msg
+          | T.pack "CarrierEscape" `T.isInfixOf` T.pack msg -> pure ()
+          | otherwise -> assertFailure ("expected CarrierEscape, got: " ++ msg)
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
 
 -- The eff/row domain split is enforced by the grammar, not the typechecker:
 -- `eff` only appears in an EffectRow (right of `with`) and `row` only in a
@@ -4002,7 +4242,7 @@ interpEffectTests = testGroup "InterpEffect"
             p <- freshName (T.pack "p"); resume <- freshName (T.pack "resume")
             res <- freshName (T.pack "res"); v <- freshName (T.pack "v")
             let comp = Anf.Let (Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                         (Anf.ROp (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
+                         (Anf.ROp Nothing (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
                          (Anf.Ret (Anf.AVar a))
                 arm = Anf.OpArm (T.pack "Ask") (T.pack "ask")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
@@ -4010,7 +4250,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Let (Anf.Binder res Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 41)])
                           (Anf.Ret (Anf.AVar res)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "41")
 
@@ -4021,7 +4261,7 @@ interpEffectTests = testGroup "InterpEffect"
             let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                            (Anf.RApp (Anf.AVar np) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
                            (Anf.Ret (Anf.AVar r))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) [] Nothing Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) [] Nothing Nothing Nothing
             pure (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 5))) hdlr)
       in assertEval Map.empty e (T.pack "105")
 
@@ -4033,13 +4273,13 @@ interpEffectTests = testGroup "InterpEffect"
             a <- freshName (T.pack "a"); p <- freshName (T.pack "p")
             resume <- freshName (T.pack "resume"); v <- freshName (T.pack "v")
             let comp = Anf.Let (Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                         (Anf.ROp (T.pack "Abort") (T.pack "abort") [Anf.ALit Anf.LUnit])
+                         (Anf.ROp Nothing (T.pack "Abort") (T.pack "abort") [Anf.ALit Anf.LUnit])
                          (Anf.Ret (Anf.AVar a))
                 arm = Anf.OpArm (T.pack "Abort") (T.pack "abort")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])]
                         (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.Ret (Anf.ALit (Anf.LInt 7)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "7")
 
@@ -4055,7 +4295,7 @@ interpEffectTests = testGroup "InterpEffect"
             r0 <- freshName (T.pack "r0"); r1 <- freshName (T.pack "r1")
             s <- freshName (T.pack "s"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
             let comp = Anf.Let (Anf.Binder b Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                         (Anf.ROp (T.pack "Flip") (T.pack "flip") [Anf.ALit Anf.LUnit])
+                         (Anf.ROp Nothing (T.pack "Flip") (T.pack "flip") [Anf.ALit Anf.LUnit])
                          (Anf.Case (Anf.AVar b)
                            [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 10)))
                            , Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 20))) ])
@@ -4066,7 +4306,7 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "Flip") (T.pack "flip")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) armBody
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing Nothing
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "30")
 
@@ -4085,9 +4325,9 @@ interpEffectTests = testGroup "InterpEffect"
             r <- freshName (T.pack "r"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
             let comp =
                   Anf.Let (Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                    (Anf.ROp (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
+                    (Anf.ROp Nothing (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
                     (Anf.Let (Anf.Binder y Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                      (Anf.ROp (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
+                      (Anf.ROp Nothing (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
                       (Anf.Let (Anf.Binder s Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                         (Anf.RApp (Anf.AVar np) [Anf.AVar x, Anf.AVar y])
                         (Anf.Ret (Anf.AVar s))))
@@ -4096,15 +4336,59 @@ interpEffectTests = testGroup "InterpEffect"
                         (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
                           (Anf.Ret (Anf.AVar r)))
-                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing
+                hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing Nothing
             pure (Anf.Handle comp hdlr)
+      in assertEval Map.empty e (T.pack "2")
+
+  , testCase "named instance routes past nearest handler to its own handler" $
+      -- Outer handler is NAMED (self-binder sb); inner handler is ambient.
+      -- Both handle E.op. Inside the inner handler's scope we perform E.op
+      -- THROUGH the outer instance (ROp (Just (AVar sb))). Ambient routing
+      -- would hit the inner handler (-> 1); named routing must skip it and
+      -- reach the outer (-> 2). The discriminator is the returned value 2.
+      --   outer (named sb): E.op -> resume 2
+      --   inner (ambient) : E.op -> resume 1
+      --   body            : let x = sb.E.op () in ret x
+      let e = runFresh $ do
+            sb <- freshName (T.pack "sb")
+            x  <- freshName (T.pack "x")
+            pIn <- freshName (T.pack "pIn"); rIn <- freshName (T.pack "rIn")
+            pOut <- freshName (T.pack "pOut"); rOut <- freshName (T.pack "rOut")
+            vIn <- freshName (T.pack "vIn"); vOut <- freshName (T.pack "vOut")
+            armIn <- freshName (T.pack "armIn"); armOut <- freshName (T.pack "armOut")
+            let unit = Ty.CTCon Ty.TcUnit []
+                resumeBody resume rb val =
+                  Anf.Let (Anf.Binder rb Anf.Unrestricted unit)
+                    (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt val)])
+                    (Anf.Ret (Anf.AVar rb))
+                body =
+                  Anf.Let (Anf.Binder x Anf.Unrestricted unit)
+                    (Anf.ROp (Just (Anf.AVar sb)) (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
+                    (Anf.Ret (Anf.AVar x))
+                innerArm =
+                  Anf.OpArm (T.pack "E") (T.pack "op")
+                    [Anf.Binder pIn Anf.Unrestricted unit]
+                    (Anf.Binder rIn Anf.Unrestricted unit)
+                    (resumeBody rIn armIn 1)
+                innerHdlr =
+                  Anf.Handler (Anf.Binder vIn Anf.Unrestricted unit, Anf.Ret (Anf.AVar vIn))
+                    [innerArm] Nothing Nothing Nothing
+                outerArm =
+                  Anf.OpArm (T.pack "E") (T.pack "op")
+                    [Anf.Binder pOut Anf.Unrestricted unit]
+                    (Anf.Binder rOut Anf.Unrestricted unit)
+                    (resumeBody rOut armOut 2)
+                outerHdlr =
+                  Anf.Handler (Anf.Binder vOut Anf.Unrestricted unit, Anf.Ret (Anf.AVar vOut))
+                    [outerArm] Nothing Nothing (Just (Anf.Binder sb Anf.Unrestricted unit))
+            pure (Anf.Handle (Anf.Handle body innerHdlr) outerHdlr)
       in assertEval Map.empty e (T.pack "2")
 
   , testCase "unhandled operation errors" $
       let e = runFresh $ do
             a <- freshName (T.pack "a")
             pure $ Anf.Let (Anf.Binder a Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                     (Anf.ROp (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
+                     (Anf.ROp Nothing (T.pack "Ask") (T.pack "ask") [Anf.ALit Anf.LUnit])
                      (Anf.Ret (Anf.AVar a))
       in case IM.evalExprWith Map.empty e of
            Left (IV.NoMatchingHandler l o) -> (l, o) @?= (T.pack "Ask", T.pack "ask")
@@ -4650,21 +4934,21 @@ effectTestEnv =
 -- Searches through the outermost Let if present.
 hasROp :: T.Text -> T.Text -> Anf.Expr -> Bool
 hasROp lbl op e = case e of
-  Anf.Let _ (Anf.ROp l o _) _ -> l == lbl && o == op
+  Anf.Let _ (Anf.ROp _ l o _) _ -> l == lbl && o == op
   Anf.Ret (Anf.AVar _)          -> False  -- bare atom, no ROp
   _                              -> False
 
 -- | Check that an ROp (not an RApp/RProj) appears in the outermost binding.
 topLevelIsROp :: T.Text -> T.Text -> Anf.Expr -> Bool
 topLevelIsROp lbl op expr = case expr of
-  Anf.Let _ (Anf.ROp l o _) _ -> l == lbl && o == op
+  Anf.Let _ (Anf.ROp _ l o _) _ -> l == lbl && o == op
   _                             -> False
 
 -- | Check that the outermost expression is a Handle with at least one OpArm
 -- whose label and op match.
 isHandleWithOpArm :: T.Text -> T.Text -> Anf.Expr -> Bool
 isHandleWithOpArm lbl op expr = case expr of
-  Anf.Handle _ (Anf.Handler _ opArms _ _) ->
+  Anf.Handle _ (Anf.Handler _ opArms _ _ _) ->
     any (\arm -> Anf.oaLabel arm == lbl && Anf.oaOp arm == op) opArms
   _ -> False
 
@@ -4743,7 +5027,7 @@ elaborateEffectsTests = testGroup "ElaborateEffects"
           (isHandleWithOpArm (T.pack "IO") (T.pack "write") result)
         -- check auto-resume: the op arm body contains RApp of the resume binder
         case result of
-          Anf.Handle _ (Anf.Handler _ (arm:_) _ _) ->
+          Anf.Handle _ (Anf.Handler _ (arm:_) _ _ _) ->
             assertBool
               ("expected op arm body to contain RApp of resume binder, got body: "
                <> show (Anf.oaBody arm))
