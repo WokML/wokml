@@ -2,6 +2,7 @@ module Wok.IR.Elaborate
   ( elaborateExprForTest      -- test seam: Env -> TExpr -> Expr
   , elaborateModule           -- full module elaboration: Env -> [TypedDecl] -> CoreModule
   , elaborateModulesShared    -- whole-program: [(moduleName, Env, [TypedDecl])] -> CoreModule
+  , elaborateModulesSharedWithGlobals  -- as above, also returning the (module,name) -> Name map
   ) where
 
 import Control.Monad.Reader
@@ -979,7 +980,16 @@ elaborateModule env tds =
 -- post-import environment and @envVarOrigin env@ maps each visible name to the
 -- module that defined it.
 elaborateModulesShared :: [(Text, Env, [TypedDecl])] -> CoreModule
-elaborateModulesShared mods =
+elaborateModulesShared = fst . elaborateModulesSharedWithGlobals
+
+-- | As 'elaborateModulesShared', but also return the canonical-identity map
+-- keyed by @(definingModule, name)@. A downstream pass that needs the IDENTITY
+-- of a specific global (e.g. the multiplicity law needs the genuine
+-- @(Std.Control, "__coro_susp")@ escape sink, NOT a user binding merely hinted
+-- the same) reads it here instead of guessing from a hint.
+elaborateModulesSharedWithGlobals
+  :: [(Text, Env, [TypedDecl])] -> (CoreModule, Map.Map (Text, Text) Name)
+elaborateModulesSharedWithGlobals mods =
   runFresh $ do
     -- Every (definingModule, name) pair across all modules. A name is keyed by
     -- the module that DEFINES it (via envVarOrigin), defaulting to the module
@@ -996,7 +1006,7 @@ elaborateModulesShared mods =
                    (dedup qualifiedKeys)
     let globalByKey = Map.fromList gpairs
     binds <- concat <$> mapM (elabOne globalByKey) mods
-    pure (CoreModule binds)
+    pure (CoreModule binds, globalByKey)
   where
     dedup = Map.keys . Map.fromList . map (\k -> (k, ()))
     -- A module's view: each name it can see resolves to the canonical Name for

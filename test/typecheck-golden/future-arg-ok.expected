@@ -1,0 +1,3 @@
+main : U64
+passes : Future U64 U64 U64 -> ()
+useIt : Future U64 U64 U64 -> ()

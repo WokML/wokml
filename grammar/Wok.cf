@@ -75,6 +75,7 @@ Module.   Module ::= [Decl] ;
 
 DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
 DSig.     Decl ::= SigName [SigNameComma] ":" Type ;   -- multi-name sig; name may be VarId or (VarSym)
+DExtern.  Decl ::= "extern" SigName [SigNameComma] ":" Type ; -- explicit compiler-hole primitive; same shape as a bodyless DSig but intentional (no lint)
 DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
 DEffect.  Decl ::= "effect" ConId [VarId] "=" "{" [RecordFieldType] "}" ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;

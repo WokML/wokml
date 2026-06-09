@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- Carrier rule: an inline-produced Future (not let-bound) stored in a tuple
+-- must be rejected with CarrierEscape.
+producer : () -> U64 with Coro U64 U64
+producer _ = (Coro.suspend 42) + 1
+leakTup : () -> (Future U64 U64 U64, U64)
+leakTup _ = (start producer, 1)
+main : U64
+main = 0

@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+import Std.Control
+effect Log = { emit : U64 -> () }
+producer : () -> U64 with Coro U64 U64 + Log
+producer _ = let x = Coro.suspend 42 in let u = Log.emit x in x
+main : U64
+main =
+  let s = start producer in
+  resume s 1

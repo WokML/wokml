@@ -223,6 +223,12 @@ real semantics. (Note: a per-op surface marker forks the shared `RecordFieldType
 `grammar/Wok.cf:303`, used by records and data too; an effect-level `once effect …` prefix is
 the cheaper option. Both are 4b's problem.)
 
+**Landed (2026-06-09, `feat/one-shot-escape`):** as the narrow trusted-once relaxation for
+`__coro_susp` (the escape sink) in `Wok.IR.Multiplicity`. Rather than a general
+`opMultiplicity` table, the shipped form is a targeted check: the `__coro_susp` builtin is
+certified `One` by a trusted-once case in `cardOf`'s `ROp` branch, restoring
+`elaborateCheckedFull`. No user-facing `once` marker was needed for this slice.
+
 The FFI shape is uniform regardless: every FFI op is one-shot (perform → suspend one
 continuation → runtime resumes it once); whether it resumes *immediately* (sync) or *later,
 parked* (async) is the **escape/representation axis** (slice 4b), not the **count axis** (this

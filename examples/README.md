@@ -19,6 +19,7 @@ to see the lowered intermediate representation.)
 | `as-patterns.wok` | `as`-patterns (`pat as name`) in a case arm, a single-clause head, and a multi-clause function | `[8, 5, 6, 7]` |
 | `named-instances.wok` | named effect instances — two independent `State U64` cells, handle-typed helper params | `(((), 105), 0)` |
 | `generators.wok` | a generator/stream as a **one-shot** handler (`yield x k -> [x] ++ k ()`) | `[1, 2, 3, 4, 5, 6]` |
+| `coroutine.wok` | one-shot escaping continuation: `start`/`value`/`resume` with an opaque second-class affine `Future` | `421` |
 | `nondeterminism.wok` | backtracking search via explicit `List` (the list monad = reified multi-shot) | `[(1, 6), (2, 5), (3, 4), (4, 3), (5, 2), (6, 1)]` |
 | `probabilistic.wok` | probabilistic programming via a weighted-`List` distribution monad; `P(sum == 7)` for two dice | `(6, 36)` |
 

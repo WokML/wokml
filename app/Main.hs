@@ -58,9 +58,14 @@ runApp entry extras mode = do
       ModeDumpAnf -> case Pipeline.elaborateProgram entryName ms of
         Left msg  -> hPutStrLn stderr msg >> exitFailure
         Right cm  -> TIO.putStrLn (prettyModuleTyped cm)
-      ModeDumpMultiplicity -> case Pipeline.elaborateProgram entryName ms of
-        Left msg  -> hPutStrLn stderr msg >> exitFailure
-        Right cm  -> TIO.putStrLn (prettyMultiplicity cm)
+      -- Whole-program elaboration: the proof artifact must include handler arms
+      -- defined in imported modules (e.g. the prelude `Coro.suspend` arm that
+      -- desugars to the genuine `__coro_susp` escape sink), so the dump agrees
+      -- with what the one-shot law (`elaborateCheckedFull`) accepts. The trusted
+      -- escape-sink identity is resolved by the pipeline.
+      ModeDumpMultiplicity -> case Pipeline.elaborateProgramFullTrusted entryName ms of
+        Left msg          -> hPutStrLn stderr msg >> exitFailure
+        Right (cm, trust) -> TIO.putStrLn (prettyMultiplicity trust cm)
       ModeRun -> case Pipeline.elaborateCheckedFull entryName ms of
         Left msg -> hPutStrLn stderr msg >> exitFailure
         Right cm -> case Interp.runModule cm of

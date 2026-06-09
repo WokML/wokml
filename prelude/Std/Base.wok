@@ -16,16 +16,16 @@ data Bool = True | False
 data Option a = Some a | None
 data Result t e = Ok t | Err e
 
-(+)  : U64 -> U64 -> U64
-(-)  : U64 -> U64 -> U64
-(*)  : U64 -> U64 -> U64
-(/)  : U64 -> U64 -> U64
-div  : U64 -> U64 -> U64
-mod  : U64 -> U64 -> U64
-(&&) : Bool -> Bool -> Bool
-(||) : Bool -> Bool -> Bool
-(++) : [a] -> [a] -> [a]
-($)  : (a -> b) -> a -> b
+extern (+)  : U64 -> U64 -> U64
+extern (-)  : U64 -> U64 -> U64
+extern (*)  : U64 -> U64 -> U64
+extern (/)  : U64 -> U64 -> U64
+extern div  : U64 -> U64 -> U64
+extern mod  : U64 -> U64 -> U64
+extern (&&) : Bool -> Bool -> Bool
+extern (||) : Bool -> Bool -> Bool
+extern (++) : [a] -> [a] -> [a]
+extern ($)  : (a -> b) -> a -> b
 
 id : a -> a
 id x = x
@@ -33,9 +33,9 @@ id x = x
 const : a -> b -> a
 const x y = x
 
-eqU64 : U64 -> U64 -> Bool
-eqU32 : U32 -> U32 -> Bool
-u32   : U64 -> U32 -- we hardcoded all number literal to U64 sorry
+extern eqU64 : U64 -> U64 -> Bool
+extern eqU32 : U32 -> U32 -> Bool
+extern u32   : U64 -> U32 -- we hardcoded all number literal to U64 sorry
 
 not : Bool -> Bool
 not x = case x of

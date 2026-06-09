@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+-- Part 1 gate: `extern` is the trust anchor for the soundness analyses, so only
+-- the standard prelude may mint one. A UserFile declaring an `extern` is rejected
+-- with ExternNotAllowed (it could otherwise forge the trusted reader/escape-sink
+-- identity the affine + one-shot analyses key on).
+extern foo : U64 -> U64
+main : U64
+main = foo 0

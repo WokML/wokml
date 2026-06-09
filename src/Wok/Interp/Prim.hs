@@ -27,7 +27,77 @@ prims =
   , boolOp (Tx.pack "||") (||)
   , appendP
   , dollarP
+  , coroSuspP
+  , coroUnwrapP
+  , coroValueP
+  , coroResumeP
+  , coroDoneP
+  , coroCancelP
   ]
+
+-- | `__coro_susp x k` packs the yielded value `x` and
+-- the captured resume continuation `k` (a VCont, held below the boundary) into a
+-- `Suspended` future. The host shim exists only to ERASE the continuation's wok
+-- type (in the suspend arm `k : b -> answer`, but the Suspended field wants
+-- `b -> r`); at runtime it is a plain two-field constructor build. `resume`/
+-- `value` are ordinary wok projections over the resulting VCon, and applying the
+-- stored VCont re-installs the Coro handler via dispatchOp (deep re-install).
+coroSuspP :: Prim
+coroSuspP = mkPrim (Tx.pack "__coro_susp") 2 $ \args -> case args of
+  [x, k] -> Right (PRDone (VCon (Tx.pack "Suspended") [x, k]))
+  _      -> Left (ArityError (Tx.pack "__coro_susp"))
+
+-- | Resuming the stored continuation re-installs the Coro
+-- handler's value arm (`v -> Completed v`), so `k v` returns `Completed r`. This
+-- peels that one layer to the raw `r`; anything else passes through unchanged
+-- (so a producer that resumes without suspending again still returns its value).
+coroUnwrapP :: Prim
+coroUnwrapP = mkPrim (Tx.pack "__coro_unwrap") 1 $ \args -> case args of
+  [VCon t [r]] | t == Tx.pack "Completed" -> Right (PRDone r)
+  [v]                                     -> Right (PRDone v)
+  _ -> Left (ArityError (Tx.pack "__coro_unwrap"))
+
+-- | `value s` projects the yielded value out of a `Suspended` future (the `a`
+-- the producer suspended with). Non-consuming: it does not touch the captured
+-- continuation. This is the prelude's @extern value@ reader prim (bound by name);
+-- the affine check trusts it by extern identity. Errors on any non-Suspended
+-- shape (a Completed future has no yielded value to read).
+coroValueP :: Prim
+coroValueP = mkPrim (Tx.pack "value") 1 $ \args -> case args of
+  [VCon t [x, _]] | t == Tx.pack "Suspended" -> Right (PRDone x)
+  [v] -> Left (PrimError (Tx.pack "value: not a suspended future: " <> renderValue v))
+  _   -> Left (ArityError (Tx.pack "value"))
+
+-- | `__coro_resume s v` applies the captured continuation `k` (stored in the
+-- `Suspended` future) to the resume payload `v` under the current kont. This
+-- re-installs the Coro handler via dispatchOp's deep re-install, so the
+-- producer's tail runs and returns through the value arm, ultimately producing
+-- a `Completed` future. Errors on any non-Suspended shape.
+coroResumeP :: Prim
+coroResumeP = mkPrim (Tx.pack "__coro_resume") 2 $ \args -> case args of
+  [VCon t [_, k], v] | t == Tx.pack "Suspended" -> Right (PRApply k [v])
+  [s, _] -> Left (PrimError (Tx.pack "__coro_resume: not a suspended future: " <> renderValue s))
+  _      -> Left (ArityError (Tx.pack "__coro_resume"))
+
+-- | `__coro_done v` tags a normally-returned producer result as a `Completed`
+-- future. The Coro handler's value arm (`v -> __coro_done v`) uses this so a
+-- producer that runs to completion (after resume) yields a Completed future,
+-- which `__coro_unwrap` then peels to the raw `r`.
+coroDoneP :: Prim
+coroDoneP = mkPrim (Tx.pack "__coro_done") 1 $ \args -> case args of
+  [v] -> Right (PRDone (VCon (Tx.pack "Completed") [v]))
+  _   -> Left (ArityError (Tx.pack "__coro_done"))
+
+-- | `__coro_cancel s` consumes the future without resuming it: it drops the
+-- captured continuation and returns unit. Like `resume`, it is a CONSUMING use
+-- (the affine consumption check in 'Wok.TypeChecking.Carrier' forbids a future
+-- from being consumed more than once across @resume@ XOR @cancel@). At runtime
+-- there is nothing to run down; the continuation is simply discarded. Unit is
+-- @VLit LUnit@ (the same value the `()` literal lowers to).
+coroCancelP :: Prim
+coroCancelP = mkPrim (Tx.pack "__coro_cancel") 1 $ \args -> case args of
+  [_] -> Right (PRDone (VLit LUnit))
+  _   -> Left (ArityError (Tx.pack "__coro_cancel"))
 
 -- | (u32) : narrow a U64 to U32. v1 models integers as unbounded 'Integer' and
 -- does NOT model modular wrapping (consistent with the U64 arithmetic prims), so

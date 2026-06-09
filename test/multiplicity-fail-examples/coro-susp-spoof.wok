@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- C2: a USER binding named `__coro_susp` must NOT inherit the trusted-once
+-- relaxation. The relaxation keys on the genuine prelude prim's IDENTITY, not
+-- its hint text, so this user `__coro_susp` (which is genuinely multi-shot:
+-- `k 1 + k 2`) is rejected. Before the fix the hint-text match falsely
+-- certified the `Tick.tick` arm `1` and it RAN to 3.
+effect Tick = { tick : U64 -> U64 }
+
+__coro_susp : (U64 -> U64) -> U64
+__coro_susp k = k 1 + k 2
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 0
+
+main : U64
+main =
+  with { Tick.tick n k -> __coro_susp k }
+  useTick ()

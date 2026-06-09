@@ -19,3 +19,10 @@ src-generated/GeneratedParser/Wok/Doc.txt
 # Happy's .hs output for Par.y (cabal compiles Par.y in dist-newstyle; no need to commit)
 src-generated/GeneratedParser/Wok/Par.hs
 .ghc-build/
+
+# Transient Claude harness lock files (per-plan docs/*.tasks.json stay tracked)
+.claude/*.lock
+
+# Local dev scratch swept into the branch by mistake (not slice artifacts)
+.ghci
+REVIEW.md

@@ -26,6 +26,9 @@ initialEnv = emptyEnv
     listKind :: Kind
     listKind = KArrow KStar KStar
 
+    futureKind :: Kind
+    futureKind = KArrow KStar (KArrow KStar (KArrow KStar KStar))
+
     tyConEntries :: [(Text, TyConInfo)]
     tyConEntries =
       [ ("U64",    TyConInfo KStar 0 [])
@@ -35,6 +38,7 @@ initialEnv = emptyEnv
       , ("Char",   TyConInfo KStar 0 [])
       , ("()",     TyConInfo KStar 0 [])
       , ("[]",     TyConInfo listKind 1 [])
+      , ("Future", TyConInfo futureKind 3 [])
       ] ++ [ (tupleName n, TyConInfo (tupleKind n) n []) | n <- [2 .. 16] ]
 
     tupleName :: Int -> Text

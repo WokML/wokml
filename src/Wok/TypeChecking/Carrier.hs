@@ -29,12 +29,15 @@
 -- fixpoint.
 module Wok.TypeChecking.Carrier
   ( checkCarriers
+  , checkFutureAffine
   ) where
 
 import Data.Text (Text)
+import qualified Data.Text as Tx
 import qualified Data.Set as Set
 import Data.Set (Set)
 
+import Wok.IR.Multiplicity (Card (..), joinC, addC)
 import Wok.TypeChecking.Error (TypeError (..), SourceSpan)
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
 import Wok.TypeChecking.Typed
@@ -59,9 +62,19 @@ type ParamResolver = Text -> Maybe [CType]
 
 -- | The invariant context threaded through the walk.
 data Ctx = Ctx
-  { ctxResolve :: ParamResolver
-  , ctxSpan    :: SourceSpan
-  , ctxName    :: Text
+  { ctxResolve    :: ParamResolver
+  , ctxSpan       :: SourceSpan
+  , ctxName       :: Text
+  , ctxHandlerArm :: Bool
+    -- ^ True ONLY for the IMMEDIATE top-level check of a handler arm body (the
+    -- arm's answer expression). Reset to False when 'check' recurses into children
+    -- via 'recurse', so nested sub-expressions of an arm body receive the normal
+    -- check. This single-level flag exempts the DIRECT arm body of a Coro handler
+    -- (e.g. @__coro_done v@ or @__coro_susp x k@) from the inline-Future escape
+    -- rule: those saturated calls are the structural Future constructors for the
+    -- handler's answer type, not propagations of an existing Future. Any deeper
+    -- escapes inside the arm body (e.g. storing a Future in a list) are still
+    -- caught because the flag is False by the time 'recurse' reaches them.
   }
 
 -- | The per-position mutable state threaded through the walk.
@@ -82,7 +95,7 @@ checkCarriers
   :: ParamResolver -> SourceSpan -> Text -> [([TPat], TExpr)] -> Either TypeError ()
 checkCarriers resolve sp name clauses = mapM_ checkClause clauses
   where
-    ctx = Ctx resolve sp name
+    ctx = Ctx resolve sp name False
     checkClause (pats, body) =
       let env0 = Env (Set.unions (map handleBindersOfPat pats))
                      (Set.unions (map patVars pats))
@@ -101,7 +114,17 @@ check ctx env allowed e@(Texp _ node)
   -- recursion below. So only the direct-escape forms are checked against
   -- @allowed@; everything else simply recurses.
   | directlyEscapes (envCarriers env) e, not allowed = err ctx
-  | otherwise = recurse ctx env node
+  -- An INLINE-PRODUCED Future (a saturated call whose result type is a Future,
+  -- e.g. @start producer@) is a second-class carrier that must not escape even
+  -- when there are no carrier variables in scope. This fires in any non-allowed
+  -- position EXCEPT the immediate top-level body of a handler arm (where the
+  -- call IS the structural answer-type constructor for the handler, e.g.
+  -- @__coro_done v@ / @__coro_susp x k@ inside 'start'). The 'ctxHandlerArm'
+  -- flag is set to True only for that single level and is reset to False
+  -- (via 'recurse') before any child expressions are checked, so nested
+  -- escapes (e.g. @[start producer]@ inside an arm) are still caught.
+  | isInlineFutureApp e, not allowed, not (ctxHandlerArm ctx) = err ctx
+  | otherwise = recurse (ctx { ctxHandlerArm = False }) env node
 
 -- | The value forms that carry a handle out of their position: a bare carrier
 -- variable, a closure (lambda) whose free variables capture a handle, or a
@@ -110,6 +133,11 @@ check ctx env allowed e@(Texp _ node)
 -- closure just like a lambda — @peek c@ (with @peek : State U64 -> () -> U64@)
 -- is a @() -> U64@ value that has closed over the handle @c@ — so it escapes for
 -- the same reason and must be flagged identically.
+--
+-- Inline-produced Futures (saturated @TApp@ with Future result type) are NOT
+-- handled here; they are caught by the separate 'isInlineFutureApp' guard in
+-- 'check', which threads the 'ctxHandlerArm' flag to exempt the immediate bodies
+-- of handler arms (the structural Future constructors).
 directlyEscapes :: Set Text -> TExpr -> Bool
 directlyEscapes carriers e@(Texp ty node) = case node of
   TVar n     -> Set.member n carriers
@@ -133,6 +161,23 @@ capturesHandleClosure :: Set Text -> CType -> TExpr -> Bool
 capturesHandleClosure carriers ty e = case ty of
   CTArr {} -> not (Set.null (Set.intersection (freeVars e) carriers))
   _        -> False
+
+-- | Is this a saturated call (@TApp@) whose result type is a Future? Such an
+-- expression is an INLINE-PRODUCED Future — it is a second-class carrier value
+-- even though it was never bound to a name and does not appear in the carrier
+-- variable set. Typical example: @start producer@ at a return / list / tuple
+-- position. This check is used alongside 'directlyEscapes' in 'check' to cover
+-- the gap where no carrier variable is in scope (the Future is brand-new).
+--
+-- The @TApp@ restriction is intentional: handler-installation forms (@THandle@,
+-- @TWithNamedH@) are the STRUCTURAL constructors of Futures and are never
+-- carriers themselves; they are handled by the @_ -> False@ fallthrough in
+-- 'directlyEscapes'. A @TVar@ / @TQVar@ bare reference to a Future variable is
+-- already caught by 'directlyEscapes' via the carrier set. Only a saturated
+-- call (a non-arrow @TApp@) needs this additional check.
+isInlineFutureApp :: TExpr -> Bool
+isInlineFutureApp (Texp ty (TApp _ _)) = isFutureType ty
+isInlineFutureApp _ = False
 
 -- | Recurse into a node's children, setting each child's @allowed@ flag and
 -- extending the environment where a binder is introduced.
@@ -244,10 +289,18 @@ checkAlt ctx env (TAlt pat decls body) =
 
 -- | Check a handler arm. Op-arm patterns and the resume binder bind ordinary
 -- values; the arm body is a non-allowed position.
+--
+-- The arm body is the STRUCTURAL answer-type constructor of the handler. For a
+-- @Coro@ handler the arm bodies are @__coro_done v@ and @__coro_susp x k@, both
+-- saturated @TApp@s that produce a @Future@ — but they ARE the answer, not an
+-- escape. We set 'ctxHandlerArm' to @True@ for the immediate body check only.
+-- 'check' resets it to @False@ before entering 'recurse', so only the flat top
+-- level of the arm body is exempted; any nested escapes (e.g. @[start p]@ inside
+-- an arm) still fire the inline-Future error.
 checkArm :: Ctx -> Env -> THandlerArm CType -> Either TypeError ()
 checkArm ctx env arm = case arm of
-  TReturnArm pat body    -> check ctx (bindPats env [pat]) False body
-  TOpArm _ _ pats _ body -> check ctx (bindPats env pats) False body
+  TReturnArm pat body    -> check (ctx { ctxHandlerArm = True }) (bindPats env [pat]) False body
+  TOpArm _ _ pats _ body -> check (ctx { ctxHandlerArm = True }) (bindPats env pats) False body
   TParamArm _ initE      -> check ctx env False initE
 
 -- | Extend the environment with a pattern's binders: all names join @locals@;
@@ -288,9 +341,12 @@ bindDecls env decls = env
       ]
     typeOf (Texp t _) = t
 
--- | Is this an effect-instance handle type?
+-- | Is this an effect-instance handle type, or a Future handle?
+-- Both @CTCon (TcEffect _) _@ (named effect-instance handles) and
+-- @CTCon TcFuture _@ (coroutine futures) are second-class and must not escape.
 isHandleType :: CType -> Bool
 isHandleType (CTCon (TcEffect _) _) = True
+isHandleType (CTCon TcFuture _)     = True
 isHandleType _                       = False
 
 -- | A parameter slot into which a carrier may be passed (condition 2, extended):
@@ -412,3 +468,346 @@ freeVarsArm arm = case arm of
     (freeVars body `Set.difference` Set.unions (map patVars pats))
       `Set.difference` Set.singleton res
   TParamArm _ initE        -> freeVars initE
+
+-- ---------------------------------------------------------------------------
+-- Affine consumption bound on Futures (slice 4b, Task 5).
+--
+-- A coroutine 'Future' is consumed AT MOST ONCE, by @resume@ XOR @cancel@.
+-- Reading it via @value@ is non-consuming (any number of times). Futures are
+-- second-class (the carrier rule keeps them syntactically local), so this is a
+-- LOCAL, post-inference analysis over the same frozen typed AST as
+-- 'checkCarriers'.
+--
+-- It is a SIBLING pass to the carrier walk rather than an extension of it: the
+-- carrier walk's job (and its @allowed@/positional plumbing) is escape, an
+-- orthogonal concern; counting consuming uses with the {0,1,ω} cardinality
+-- lattice reads far more clearly on its own, and reuses only the Future-binder
+-- identification ('handleBindersOfPat' already classifies a @TcFuture@ binder).
+-- We reuse the 'Card' lattice from "Wok.IR.Multiplicity" (@joinC@ for branch =
+-- max, @addC@ for sequence = saturating sum) rather than reinventing it; that
+-- pass is over ANF 'Expr', so we replicate ONLY the sequence/branch combination
+-- here over the typed 'TExpr'.
+--
+-- For each Future-typed binding in a clause body, we compute the consuming-use
+-- cardinality of that binding over the expression in whose SCOPE it lives, and
+-- reject any binding that reaches 'Many'. Conservative: a consuming use whose
+-- future argument is anything other than a bare reference to the binding (an
+-- alias, a computed future, etc.) over-approximates to 'Many' (see
+-- 'consumeCard'), so unanalyzable flow is rejected, consistent with the carrier
+-- rule's locality.
+-- ---------------------------------------------------------------------------
+
+-- | The non-consuming reader registry, resolved by EXTERN IDENTITY. A Future
+-- passed as an argument to a trusted reader is provably NOT consumed (it is only
+-- read), so it contributes 'Zero'; everything else that takes a Future argument
+-- is treated as a consumer (it MIGHT consume it), contributing 'One' — see
+-- 'consumeApp'.
+--
+-- The registry is the set of prelude @extern@ reader prims (currently @value@).
+-- Trust is by EXTERN IDENTITY, not by
+-- name text: a callee is trusted only when the name is a reader AND it resolves,
+-- at THIS module's scope, to the prelude extern — i.e. it is neither locally
+-- shadowed (a @let value = …@) NOR redefined by this module at the top level (a
+-- user @value : Future … -> …@). The Part 1 gate guarantees only the prelude can
+-- mint an @extern@, so "imported reader name, not own-module-defined, not locally
+-- bound" is exactly the prelude reader's identity. A user binding named @value@
+-- is a regular (non-extern) function and is NOT trusted — it is treated as a
+-- consumer.
+--
+-- @rdrShadows@ is the set of reader names this module REDEFINES at the top level
+-- (passed in from inference); such a name is the module's own binding, not the
+-- prelude extern, so it must not be trusted even at a free occurrence.
+data ReaderTrust = ReaderTrust
+  { rtReaders    :: Set Text   -- ^ the prelude extern reader names
+  , rtShadows    :: Set Text   -- ^ reader names this module redefines at top level
+  }
+
+-- | The prelude extern reader names. This IS the @extern@ reader prim declared in
+-- @Std.Control@ (@value@); the Part 1 gate guarantees no UserFile can forge an
+-- @extern@ by this name, so recognising it (combined with the not-redefined /
+-- not-locally-shadowed checks below) keys trust on the prelude extern's identity.
+preludeReaderNames :: Set Text
+preludeReaderNames = Set.singleton (Tx.pack "value")
+
+-- | Check the affine consumption bound for one binding's clauses. Mirrors
+-- 'checkCarriers': the clause params may themselves bind futures (a parameter of
+-- Future type), so they seed the in-scope future set; the body is then walked,
+-- and each future binding is checked against its scope as it is introduced.
+--
+-- @ownTopLevel@ is the set of names this module DEFINES at the top level; any
+-- reader name in it is a user redefinition (not the prelude extern) and is NOT
+-- trusted (it is treated as a consumer).
+checkFutureAffine :: Set Text -> SourceSpan -> Text -> [([TPat], TExpr)] -> Either TypeError ()
+checkFutureAffine ownTopLevel sp name clauses = mapM_ checkClause clauses
+  where
+    trust = ReaderTrust preludeReaderNames
+                        (Set.intersection preludeReaderNames ownTopLevel)
+    checkClause (pats, body) =
+      let seeded = Set.unions (map futureBindersOfPat pats)
+      in do
+        -- Param-bound futures: their scope is the whole body.
+        mapM_ (checkBinder body) (Set.toList seeded)
+        walk trust sp name body
+
+    checkBinder scope fut
+      | consumeCard trust fut scope == Many = Left (FutureConsumedTwice sp fut)
+      | otherwise                            = Right ()
+
+-- | Walk an expression looking for Future-binder INTRODUCTIONS. At each
+-- introduction, the future's consumption over its scope is checked; the walk
+-- then descends into all sub-expressions so nested introductions are reached.
+-- (The per-binder card is computed independently over its scope, so this walk
+-- only needs to FIND introductions, not thread any count.)
+walk :: ReaderTrust -> SourceSpan -> Text -> TExpr -> Either TypeError ()
+walk trust sp name (Texp _ node) = case node of
+  TLitI _      -> ok
+  TLitS _      -> ok
+  TLitC _      -> ok
+  TUnit        -> ok
+  TVar _       -> ok
+  TCon _       -> ok
+  TParenOp _   -> ok
+  TQVar _ _    -> ok
+  TProjCon _ _ -> ok
+
+  TApp h args         -> walk trust sp name h >> mapM_ (walk trust sp name) args
+  TLam pats body      -> introducedBy (Set.unions (map futureBindersOfPat pats)) body
+                           >> walk trust sp name body
+  TIf c a b           -> mapM_ (walk trust sp name) [c, a, b]
+  TTuple xs           -> mapM_ (walk trust sp name) xs
+  TList xs            -> mapM_ (walk trust sp name) xs
+  TProj e _           -> walk trust sp name e
+  TPerformOn recv _ _ -> walk trust sp name recv
+  TRecord _ fs        -> mapM_ (walk trust sp name . snd) fs
+  TRecordExt _ e fs   -> walk trust sp name e >> mapM_ (walk trust sp name . snd) fs
+
+  -- A let group introduces futures: each Future-typed binding's scope is the
+  -- (potentially mutually recursive) group body plus the RHSs of the group. We
+  -- check consumption over the group body (where the binder is used downstream);
+  -- then descend into RHSs and the body for nested introductions.
+  TLet decls body ->
+    let futs = futureBindersOfDecls decls
+    in do mapM_ (checkBinder body) (Set.toList futs)
+          mapM_ (\(TLocalDecl _ _ rhs) -> walk trust sp name rhs) decls
+          walk trust sp name body
+
+  TCase scrut alts -> walk trust sp name scrut >> mapM_ walkAlt alts
+
+  THandle e arms ->
+    walk trust sp name e >> mapM_ walkArm arms
+
+  TWithNamedH _ arms body ->
+    mapM_ walkArm arms >> walk trust sp name body
+  where
+    ok = Right ()
+    checkBinder scope fut
+      | consumeCard trust fut scope == Many = Left (FutureConsumedTwice sp fut)
+      | otherwise                            = Right ()
+    introducedBy futs scope =
+      mapM_ (checkBinder scope) (Set.toList futs)
+    walkAlt (TAlt pat decls altBody) =
+      let futs = Set.union (futureBindersOfPat pat) (futureBindersOfDecls decls)
+      in do mapM_ (checkBinder altBody) (Set.toList futs)
+            mapM_ (\(TLocalDecl _ _ rhs) -> walk trust sp name rhs) decls
+            walk trust sp name altBody
+    walkArm arm = case arm of
+      TReturnArm pat body    -> introducedBy (futureBindersOfPat pat) body >> walk trust sp name body
+      TOpArm _ _ pats _ body -> introducedBy (Set.unions (map futureBindersOfPat pats)) body
+                                  >> walk trust sp name body
+      TParamArm _ initE      -> walk trust sp name initE
+
+-- | Consuming-use cardinality of the Future binding @s@ in an expression. Reuses
+-- the {0,1,ω} lattice: 'addC' for sequence (both run), 'joinC' for branch (one
+-- arm runs).
+--
+-- THE RULE (conservative, inter-procedurally sound without summaries). A Future
+-- that appears as an ARGUMENT to ANY application contributes 'One' consumption,
+-- EXCEPT when the callee is the trusted NON-consuming reader (@value@, by extern
+-- identity), where it contributes 'Zero'. Rationale: the carrier rule lets
+-- a future flow into a Future-typed parameter slot, so a helper @useit f =
+-- resume f n@ called twice double-resumes; counting the future-as-argument as a
+-- consumption catches that without an inter-procedural summary. Only @value@ is
+-- provably non-consuming, so only it is whitelisted. @resume@/@cancel@ are
+-- consumers like any other callee — they need no special case under this rule.
+-- (Precise inter-procedural consumption — threading a future through a
+-- non-consuming helper more than once, or recursion for chaining — is DEFERRED
+-- with chaining, 4b′/4b″.)
+--
+-- ALIASING. A future is second-class, so the only way to make a second name for
+-- it is @let t = s@ (or a case-decl binding @t = s@) — a binding whose RHS is a
+-- bare reference to an in-scope alias of @s@. Such a @t@ joins the alias set for
+-- that binding's scope, so a consuming use of @t@ counts against @s@. This is the
+-- conservative closure the carrier rule's locality guarantees is sufficient:
+-- the carrier rule already forbids a future flowing into any non-handle slot, so
+-- it cannot be aliased through an arbitrary function — only through a direct
+-- let/case rebinding, which is exactly what we track here.
+--
+-- CAPTURE. A future captured by a closure ('TLam') whose body mentions it is
+-- over-approximated to 'Many' (it could be consumed any number of times when the
+-- closure runs), unless a parameter shadows it.
+consumeCard :: ReaderTrust -> Text -> TExpr -> Card
+consumeCard trust s = go (Set.singleton s) Set.empty
+  where
+    -- @aliases@: the set of names currently referring to the same future as @s@.
+    -- @locals@: the LOCAL binders (params/let/lambda/case/arm) in scope at this
+    -- point. It is part of the reader's identity check: a @value@ that is locally
+    -- bound (a shadow) is NOT the prelude extern reader, so it must count as a
+    -- consumer (see 'isNonConsumingReader'). Combined with the not-redefined-at-
+    -- top-level check ('rtShadows', threaded in from inference) and the Part 1
+    -- gate (only the prelude can mint an @extern@), a FREE, non-redefined reader
+    -- name resolves to the prelude extern reader by identity.
+    go :: Set Text -> Set Text -> TExpr -> Card
+    go aliases locals (Texp _ node) = case node of
+      TLitI _      -> Zero
+      TLitS _      -> Zero
+      TLitC _      -> Zero
+      TUnit        -> Zero
+      TCon _       -> Zero
+      TParenOp _   -> Zero
+      TProjCon _ _ -> Zero
+
+      -- A bare reference, NOT the first arg of a consuming call (that is handled
+      -- in TApp): a non-consuming occurrence (a value read, an alias RHS already
+      -- accounted for at its binding, etc.). Scores Zero.
+      TVar _       -> Zero
+      TQVar _ _    -> Zero
+
+      TApp h args -> consumeApp aliases locals h args
+
+      TLam pats body
+        | not (Set.null (Set.intersection aliases (Set.unions (map patVars pats)))) -> Zero
+        | not (Set.null (Set.intersection aliases (freeVars body)))                 -> Many
+        | otherwise                                                                  -> Zero
+
+      TIf c a b   -> addC (go aliases locals c) (joinC (go aliases locals a) (go aliases locals b))
+      TTuple xs   -> foldr (addC . go aliases locals) Zero xs
+      TList xs    -> foldr (addC . go aliases locals) Zero xs
+      TProj e _   -> go aliases locals e
+      TPerformOn recv _ _ -> go aliases locals recv
+      TRecord _ fs        -> foldr (addC . go aliases locals . snd) Zero fs
+      TRecordExt _ e fs   -> addC (go aliases locals e) (foldr (addC . go aliases locals . snd) Zero fs)
+
+      -- A let group may bind new aliases of the future (a binding @t = <alias>@).
+      -- The new aliases are in scope of the body (and, conservatively, of the
+      -- group's RHSs, since the group is potentially recursive). Shadowing
+      -- removes a name from the alias set; every bound name joins @locals@ (so a
+      -- locally-bound @value@ is no longer the trusted reader).
+      TLet decls body ->
+        let aliases' = extendAliases aliases decls
+            locals'  = Set.union locals (Set.fromList [ n | TLocalDecl n _ _ <- decls ])
+            rhss = foldr (addC . declCard aliases' locals') Zero decls
+        in addC rhss (go aliases' locals' body)
+
+      TCase scrut alts ->
+        addC (go aliases locals scrut) (foldr (joinC . altCard aliases locals) Zero alts)
+
+      THandle e arms ->
+        addC (go aliases locals e) (foldr (addC . armCard aliases locals) Zero arms)
+
+      TWithNamedH _ arms body ->
+        addC (foldr (addC . armCard aliases locals) Zero arms) (go aliases locals body)
+
+    -- An application @h a1 .. an@. Each argument that is a bare reference to an
+    -- alias of the future is a CONSUMPTION (One) — UNLESS the callee is the
+    -- trusted non-consuming reader (the prelude @extern value@, by identity: a
+    -- free reader name not redefined by this module), where it contributes Zero.
+    -- Arguments that are not bare future aliases recurse ordinarily (they may
+    -- contain further uses), and so does the head.
+    consumeApp aliases locals h args =
+      let headCard = go aliases locals h
+          reader   = isNonConsumingReader locals h
+          argCard a
+            | bareAlias aliases a = if reader then Zero else One
+            | otherwise           = go aliases locals a
+      in addC headCard (foldr (addC . argCard) Zero args)
+
+    -- Is the callee the prelude extern reader, by IDENTITY? The name must be a
+    -- reader name ('rtReaders'), AND not locally bound (a @let value = …@ shadow
+    -- is the local binding, not the extern), AND not redefined by this module at
+    -- the top level (@rtShadows@ — a user @value : Future … -> …@ is a regular,
+    -- non-extern binding). The Part 1 gate guarantees only the prelude can mint an
+    -- @extern@, so a reader name that survives both checks resolves to the prelude
+    -- extern reader. Anything else falls through to the default consumer treatment.
+    isNonConsumingReader locals (Texp _ hf) = case hf of
+      TVar n     -> trusted n locals
+      TQVar n _  -> trusted n locals
+      TParenOp n -> trusted n locals
+      _          -> False
+    trusted n locals =
+      Set.member n (rtReaders trust)
+        && not (Set.member n locals)
+        && not (Set.member n (rtShadows trust))
+
+    -- A bare reference to an alias of the future (used to detect @let t = s@).
+    bareAlias aliases (Texp _ a) = case a of
+      TVar n    -> Set.member n aliases
+      TQVar n _ -> Set.member n aliases
+      _         -> False
+
+    -- Extend the alias set with any nullary binding whose RHS is a bare alias.
+    extendAliases aliases decls = foldr add aliases decls
+      where add (TLocalDecl n pats rhs) acc
+              | null pats && bareAlias aliases rhs = Set.insert n acc
+              | otherwise                          = acc
+
+    declCard aliases locals (TLocalDecl _ pats rhs)
+      | not (Set.null (Set.intersection aliases (Set.unions (map patVars pats)))) = Zero
+      | otherwise = go aliases (Set.union locals (Set.unions (map patVars pats))) rhs
+
+    altCard aliases locals (TAlt pat decls body)
+      | not (Set.null (Set.intersection aliases (patVars pat))) = Zero
+      | otherwise =
+          let aliases' = extendAliases aliases decls
+              locals'  = Set.unions [ locals, patVars pat
+                                    , Set.fromList [ n | TLocalDecl n _ _ <- decls ] ]
+              rhss = foldr (addC . declCard aliases' locals') Zero decls
+          in addC rhss (go aliases' locals' body)
+
+    armCard aliases locals arm = case arm of
+      TReturnArm pat body
+        | not (Set.null (Set.intersection aliases (patVars pat))) -> Zero
+        | otherwise -> go aliases (Set.union locals (patVars pat)) body
+      TOpArm _ _ pats _ body
+        | not (Set.null (Set.intersection aliases (Set.unions (map patVars pats)))) -> Zero
+        | otherwise -> go aliases (Set.union locals (Set.unions (map patVars pats))) body
+      TParamArm _ initE -> go aliases locals initE
+
+-- | The Future-typed binders introduced by a pattern (a @TcFuture@ binder), reusing
+-- the same type predicate the carrier rule uses, restricted to futures.
+futureBindersOfPat :: TPat -> Set Text
+futureBindersOfPat (Tpat ty p) = case p of
+  TPVar n
+    | isFutureType ty -> Set.singleton n
+    | otherwise       -> Set.empty
+  TPWild      -> Set.empty
+  TPLitI _    -> Set.empty
+  TPLitS _    -> Set.empty
+  TPLitC _    -> Set.empty
+  TPUnit      -> Set.empty
+  TPTuple ps  -> Set.unions (map futureBindersOfPat ps)
+  TPList ps   -> Set.unions (map futureBindersOfPat ps)
+  TPCon _ ps  -> Set.unions (map futureBindersOfPat ps)
+  TPCons h t  -> Set.union (futureBindersOfPat h) (futureBindersOfPat t)
+  TPAs n inner ->
+    let rest = futureBindersOfPat inner
+    in if isFutureType ty then Set.insert n rest else rest
+
+-- | The Future-typed binders introduced by a let/where group: a binding whose
+-- (peeled) result type is a Future, or whose pattern binds a future.
+futureBindersOfDecls :: [TLocalDecl CType] -> Set Text
+futureBindersOfDecls decls = Set.unions
+  [ binders
+  | TLocalDecl n pats rhs <- decls
+  , let resultIsFuture = null pats && isFutureType (typeOf rhs)
+        patFuts = Set.unions (map futureBindersOfPat pats)
+        binders = (if resultIsFuture then Set.singleton n else Set.empty)
+                    `Set.union` patFuts
+  ]
+  where typeOf (Texp t _) = t
+
+-- | Is this specifically a coroutine 'Future' handle type? (A subset of
+-- 'isHandleType' — effect-instance handles are NOT subject to the consumption
+-- bound, only futures are.)
+isFutureType :: CType -> Bool
+isFutureType (CTCon TcFuture _) = True
+isFutureType _                  = False

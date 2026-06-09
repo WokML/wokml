@@ -276,9 +276,13 @@ multDumpHarness path = do
   case result of
     Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
     Right (entryName, ms) ->
-      case Pipeline.elaborateProgram entryName ms of
-        Left s  -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
-        Right cm -> pure (BL.pack (T.unpack (Mult.prettyMultiplicity cm) <> "\n"))
+      -- Whole-program: the proof artifact must include handler arms from
+      -- imported modules (the prelude `Coro.suspend` arm desugars to the genuine
+      -- `__coro_susp` escape sink), matching what the law accepts. The trusted
+      -- escape-sink identity is resolved by the pipeline.
+      case Pipeline.elaborateProgramFullTrusted entryName ms of
+        Left s            -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
+        Right (cm, trust) -> pure (BL.pack (T.unpack (Mult.prettyMultiplicity trust cm) <> "\n"))
 
 multFailGoldenFor :: FilePath -> FilePath
 multFailGoldenFor f =
@@ -4045,7 +4049,7 @@ interpPrimTests :: TestTree
 interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
-        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$"])
+        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","__coro_susp","__coro_unwrap","value","__coro_resume","__coro_done","__coro_cancel"])
   , testCase "addition" $
       case runPrim (T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
@@ -5749,33 +5753,41 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
       ]
   , testGroup "cardOf"
       [ testCase "drop (no resume) = Zero" $
-          Mult.cardOf kName (Ret unit) @?= Zero
+          Mult.cardOf trustedSusp kName (Ret unit) @?= Zero
       , testCase "single direct resume = One" $
-          Mult.cardOf kName resumeOnce @?= One
+          Mult.cardOf trustedSusp kName resumeOnce @?= One
       , testCase "two sequenced resumes = Many" $
-          Mult.cardOf kName resumeTwiceSeq @?= Many
+          Mult.cardOf trustedSusp kName resumeTwiceSeq @?= Many
       , testCase "resume in two case arms = One (branch join)" $
-          Mult.cardOf kName resumeInBothArms @?= One
+          Mult.cardOf trustedSusp kName resumeInBothArms @?= One
       , testCase "continuation returned = Many (escape)" $
-          Mult.cardOf kName (Ret (AVar kName)) @?= Many
+          Mult.cardOf trustedSusp kName (Ret (AVar kName)) @?= Many
       , testCase "continuation passed to a call = Many (escape)" $
-          Mult.cardOf kName escapeIntoCall @?= Many
+          Mult.cardOf trustedSusp kName escapeIntoCall @?= Many
       , testCase "continuation captured in a closure = Many" $
-          Mult.cardOf kName escapeIntoLam @?= Many
+          Mult.cardOf trustedSusp kName escapeIntoLam @?= Many
       , testCase "continuation in LetRec body = Many" $
-          Mult.cardOf kName escapeIntoLetRec @?= Many
+          Mult.cardOf trustedSusp kName escapeIntoLetRec @?= Many
       , testCase "resume inside a nested Handle arm = Many" $
-          Mult.cardOf kName handleArmCapture @?= Many
+          Mult.cardOf trustedSusp kName handleArmCapture @?= Many
       , testCase "jump to an unknown join = Many" $
-          Mult.cardOf kName (Jump (JoinId (Unique 50)) []) @?= Many
+          Mult.cardOf trustedSusp kName (Jump (JoinId (Unique 50)) []) @?= Many
       , testCase "resume in a join reached from two case arms = One" $
-          Mult.cardOf kName joinFromTwoArms @?= One
+          Mult.cardOf trustedSusp kName joinFromTwoArms @?= One
+      , testCase "genuine __coro_susp with resume binder = One (trusted-once)" $
+          Mult.cardOf trustedSusp kName coroSuspResume @?= One
+      , testCase "spoofed __coro_susp (distinct identity) = Many (C2)" $
+          Mult.cardOf trustedSusp kName spoofCoroSuspResume @?= Many
+      , testCase "genuine __coro_susp but empty trusted set = Many" $
+          Mult.cardOf Set.empty kName coroSuspResume @?= Many
+      , testCase "non-coro_susp call with resume binder = Many (control)" $
+          Mult.cardOf trustedSusp kName fooCallResume @?= Many
       ]
   , testGroup "analyzeModule"
       [ testCase "clean module = no errors" $
-          Mult.analyzeModule (modWith resumeOnceArm) @?= []
+          Mult.analyzeModule Set.empty (modWith resumeOnceArm) @?= []
       , testCase "multishot arm = one error" $
-          Mult.analyzeModule (modWith multishotArm)
+          Mult.analyzeModule Set.empty (modWith multishotArm)
             @?= [Mult.MultishotResume (T.pack "Choice") (T.pack "flip")]
       ]
   ]
@@ -5831,6 +5843,33 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
     modWith oa =
       CoreModule [ TopBind (Name (T.pack "main") (Unique 91)) []
                      (Handle (Ret unit) (handlerWith oa)) ]
+    -- Trusted-once relaxation: handing the resume binder to a GENUINE once-sink
+    -- extern (__coro_susp) counts as One. The relaxation keys on the prim's
+    -- IDENTITY (its Unique) being in the trusted once-sink SET, not its hint text,
+    -- so `trustedSusp` carries the canonical Unique of the genuine sink (Unique
+    -- 70). A user binding hinted the same with a DIFFERENT Unique is NOT in the
+    -- set, hence NOT trusted (C2) — see `spoofCoroSuspResume`.
+    trustedSusp  = Set.singleton (Unique 70)
+    coroSuspName = Name (T.pack "__coro_susp") (Unique 70)
+    -- A USER binding hinted `__coro_susp` but with a distinct identity.
+    spoofSuspName = Name (T.pack "__coro_susp") (Unique 80)
+    fooName      = Name (T.pack "foo")         (Unique 71)
+    xName        = Name (T.pack "x")           (Unique 72)
+    -- Let _ = __coro_susp x k; Ret ()
+    coroSuspResume =
+      Let (bnd (Name (T.pack "s") (Unique 73)))
+          (RApp (AVar coroSuspName) [AVar xName, AVar kName])
+          (Ret unit)
+    -- Let _ = <user __coro_susp> x k; Ret ()  -- spoof: distinct identity = Many
+    spoofCoroSuspResume =
+      Let (bnd (Name (T.pack "s3") (Unique 81)))
+          (RApp (AVar spoofSuspName) [AVar xName, AVar kName])
+          (Ret unit)
+    -- Let _ = foo x k; Ret ()  -- non-trusted head should still be Many
+    fooCallResume =
+      Let (bnd (Name (T.pack "s2") (Unique 74)))
+          (RApp (AVar fooName) [AVar xName, AVar kName])
+          (Ret unit)
     resumeOnceArm =
       OpArm (T.pack "Tick") (T.pack "tick") [] (bnd kName) resumeOnce
     multishotArm =

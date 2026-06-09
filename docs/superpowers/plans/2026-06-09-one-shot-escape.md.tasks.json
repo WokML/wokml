@@ -1,0 +1,54 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-09-one-shot-escape.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Spike — minimal escaping coroutine (STOP-GATE)",
+      "status": "completed",
+      "description": "**Goal:** Smallest escaping coroutine type-checks + runs under a synchronous resumer; resolve the host-op hook shape, the Future value representation, and the resume-vs-deep-re-install semantics (spec §5.2). STOP-GATE: if it forces a first-class Future, stop and surface.\n\n**Files:** src/Wok/Interp/Machine.hs:157-201, src/Wok/Interp/Value.hs:48-77, /tmp/coro-spike.wok, spec §5.2.\n\n**Verify:** cabal build && cabal run -v0 wok -- /tmp/coro-spike.wok --run -> 421\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/Machine.hs\", \"src/Wok/Interp/Value.hs\", \"docs/superpowers/specs/2026-06-09-one-shot-escape-design.md\"], \"verifyCommand\": \"cabal build && cabal run -v0 wok -- /tmp/coro-spike.wok --run\", \"acceptanceCriteria\": [\"single-suspend/single-resume example types and runs to expected value\", \"resume re-establishes the coro handler\", \"§5.2 decision (single-shot vs chaining) written into spec\", \"STOP if first-class Future is forced\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Register the Future type",
+      "status": "completed",
+      "blockedBy": [0],
+      "description": "**Goal:** Future a b r is a known built-in tycon (arity 3); signatures mentioning it type-check.\n\n**Files:** src/Wok/TypeChecking/Builtins.hs, TyCon enum (TcFuture), src/Wok/TypeChecking/Infer.hs resolveTyCon, test/typecheck-examples/future-type-mentions.wok.\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/typecheck-examples/future-type-mentions.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/typecheck-examples/future-type-mentions.wok\", \"acceptanceCriteria\": [\"Future U64 U64 U64 signature type-checks\", \"Future has arity 3 / kind *->*->*->*\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Make Future second-class (carrier rule)",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Future-typed bindings are second-class; returning/storing/listing -> CarrierEscape.\n\n**Files:** src/Wok/TypeChecking/Carrier.hs (isHandleType ~292), test/typecheck-fail-examples/future-escapes-return.wok + .expected.\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Carrier.hs\", \"test/typecheck-fail-examples/future-escapes-return.wok\", \"test/typecheck-fail-examples/future-escapes-return.expected\"], \"verifyCommand\": \"cabal run -v0 wok -- test/typecheck-fail-examples/future-escapes-return.wok\", \"acceptanceCriteria\": [\"isHandleType (CTCon TcFuture _) = True\", \"function returning a Future -> CarrierEscape\", \"storing a Future in a constructor/list -> CarrierEscape\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Trusted-once escape op + reject await-twice",
+      "status": "completed",
+      "blockedBy": [0, 1],
+      "description": "**Goal:** Handing the continuation to the trusted minting op is certified 1; resuming a future twice -> MultishotResume.\n\n**Files:** src/Wok/IR/Multiplicity.hs (~88), test/typecheck-fail-examples/future-await-twice.wok + .expected, test/run-examples/coro-escape.wok, test/golden/coro-escape.multiplicity.expected.\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Multiplicity.hs\", \"test/typecheck-fail-examples/future-await-twice.wok\", \"test/typecheck-fail-examples/future-await-twice.expected\", \"test/run-examples/coro-escape.wok\", \"test/golden/coro-escape.multiplicity.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"escape op certified 1 in --dump-multiplicity\", \"resume s a + resume s b -> MultishotResume\", \"existing multiplicity goldens stay green\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: coro capability + passing examples",
+      "status": "completed",
+      "blockedBy": [0, 3],
+      "description": "**Goal:** Promote spike machinery to a clean with coro in / start/resume/value capability; single-shot (421) and fixed multi-driver (64) run via golden tests; resume re-establishes the capability; resume's row carries the tail's re-performed effects.\n\n**Files:** src/Wok/Interp/Machine.hs, src/Wok/Interp/Value.hs, prelude/Std/Control.wok, src/Wok/TypeChecking/Infer.hs, test/run-examples/coro-multi-driver.wok, test/golden/{coro-escape,coro-multi-driver}.expected.\n\n**Verify:** coro-escape.wok -> 421; coro-multi-driver.wok -> 64\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/Machine.hs\", \"src/Wok/Interp/Value.hs\", \"prelude/Std/Control.wok\", \"src/Wok/TypeChecking/Infer.hs\", \"test/run-examples/coro-multi-driver.wok\", \"test/golden/coro-escape.expected\", \"test/golden/coro-multi-driver.expected\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/coro-escape.wok --run\", \"acceptanceCriteria\": [\"coro-escape.wok -> 421\", \"coro-multi-driver.wok -> 64\", \"resume re-establishes the capability\", \"resume's result type carries re-performed effects (residual row)\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Type resume-xor-cancel + unhandled-reperform negative",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** A future is resume XOR cancel (<=1 total), typed now; a resumed tail re-performing an unhandled effect is a type error.\n\n**Files:** src/Wok/IR/Multiplicity.hs, prelude/Std/Control.wok (cancel), src/Wok/TypeChecking/Infer.hs, test/typecheck-fail-examples/{future-resume-then-cancel,future-reperform-unhandled}.wok + .expected.\n\n**Verify:** cabal test\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Multiplicity.hs\", \"prelude/Std/Control.wok\", \"src/Wok/TypeChecking/Infer.hs\", \"test/typecheck-fail-examples/future-resume-then-cancel.wok\", \"test/typecheck-fail-examples/future-resume-then-cancel.expected\", \"test/typecheck-fail-examples/future-reperform-unhandled.wok\", \"test/typecheck-fail-examples/future-reperform-unhandled.expected\"], \"verifyCommand\": \"cabal test\", \"acceptanceCriteria\": [\"resume s v then cancel s -> MultishotResume\", \"tail re-performing an unhandled effect -> unhandled-effect type error\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Examples, docs, memory",
+      "status": "completed",
+      "blockedBy": [4, 5],
+      "description": "**Goal:** Ship a commented example, update roadmap + multiplicity §7 cross-ref + memory; optionally add s.resume/s.value dot ergonomics if cheap.\n\n**Files:** examples/coroutine.wok, examples/README.md, docs/superpowers/specs/2026-06-05-effect-handlers-ROADMAP.md, docs/superpowers/specs/2026-06-09-one-shot-multiplicity-analysis-design.md, memory + MEMORY.md.\n\n**Verify:** examples/coroutine.wok runs; cabal test green\n\n```json:metadata\n{\"files\": [\"examples/coroutine.wok\", \"examples/README.md\", \"docs/superpowers/specs/2026-06-05-effect-handlers-ROADMAP.md\", \"docs/superpowers/specs/2026-06-09-one-shot-multiplicity-analysis-design.md\"], \"verifyCommand\": \"cabal run -v0 wok -- examples/coroutine.wok --run && cabal test\", \"acceptanceCriteria\": [\"examples/coroutine.wok runs\", \"roadmap slice-4b row reflects shipped+deferred scope\", \"memory written + MEMORY.md pointer added\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-09T04:05:00Z"
+}

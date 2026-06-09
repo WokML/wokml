@@ -1,0 +1,9 @@
+useIt s =
+  ()
+
+passes s =
+  let t = useIt(s)
+  t
+
+main =
+  0

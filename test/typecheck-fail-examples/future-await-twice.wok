@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+producer : () -> U64 with Coro U64 U64
+producer _ = (Coro.suspend 42) + 1
+main : U64
+main =
+  let s = start producer in
+  resume s 1 + resume s 2

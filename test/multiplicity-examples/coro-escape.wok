@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M2: the end-to-end --dump-multiplicity proof artifact for the escaping
+-- one-shot coroutine. The prelude `Coro.suspend` arm desugars to the genuine
+-- `__coro_susp` escape sink, which the trusted-once relaxation certifies `1`.
+-- This is the golden that would have surfaced C2 (a spoofed `__coro_susp` would
+-- NOT be certified, since the relaxation now keys on the prim's identity).
+producer : () -> U64 with Coro U64 U64
+producer _ = (Coro.suspend 42) + 1
+
+main : U64
+main =
+  let s = start producer in
+  resume s (value s * 10)

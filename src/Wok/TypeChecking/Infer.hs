@@ -47,7 +47,7 @@ import Wok.TypeChecking.Types
   , Scheme (..), mkScheme, TyCon (..), TVar (..), Type (..) )
 import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
 import qualified Wok.TypeChecking.Typed as Ty
-import Wok.TypeChecking.Carrier (checkCarriers)
+import Wok.TypeChecking.Carrier (checkCarriers, checkFutureAffine)
 import Wok.IR.Match
   ( ConOracle (..), Coverage (..), MPat (..), MPatF (..)
   , matchCoverage, tupleTag )
@@ -752,6 +752,7 @@ resolveTyCon name
   | name == Tx.pack "Bool"   = TcBool
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
+  | name == Tx.pack "Future" = TcFuture
   | otherwise                       = TcUser name
 
 -- | Bottom elimination: if an operation's result type is @Never@, replace it
@@ -3064,14 +3065,27 @@ inferProgramTC seedEnv origin decls = do
   instB <- either throwError (pure . concat)
              (mapM (Class.instanceBindings [ d | d@Abs.DClass{} <- decls ])
                    [ d | d@Abs.DInstance{} <- decls ])
-  -- Convert top-level decls to LocalDecl form for reuse of inferLetGroup
+  -- Convert top-level decls to LocalDecl form for reuse of inferLetGroup.
+  -- `extern` decls normalize to bodyless LDSigs here; their names are collected
+  -- separately so the bodyless-sig lint is suppressed for them (extern is
+  -- explicit intent, not an accidental missing body).
   let localDecls = concatMap toLocalDecl (decls ++ instB)
+      externs    = externNames decls
   -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup.
   -- Warnings (BodylessBinding, RowShadow, …) are emitted into the TC
   -- monad's warning channel via addWarning; they are collected by runTC.
   withEnv (const env1i) $ do
-    tds <- inferTopLetGroup origin localDecls
+    tds <- inferTopLetGroup origin externs localDecls
     env2 <- currentEnv
+    -- Part 1 gate: `extern` is the trust anchor for the soundness analyses (the
+    -- one-shot relaxation's escape sink and the affine check's non-consuming
+    -- reader are recognised by EXTERN IDENTITY — see C2/C3). Only the standard
+    -- prelude (Embedded origin) may mint an `extern`; a UserFile that declared
+    -- one could forge that trusted identity. Reject any `extern` in a UserFile.
+    case origin of
+      Embedded   -> pure ()
+      UserFile _ -> forM_ (externDecls decls) $ \(n, pos) ->
+        throwError (ExternNotAllowed (Just pos) n)
     -- Carrier rule (named effect instances, §4.3): a second-class escape check
     -- over the frozen typed AST. A handle (or a closure capturing one) may not
     -- escape its scope. Runs after inference because handle-ness is read off
@@ -3091,8 +3105,33 @@ inferProgramTC seedEnv origin decls = do
     forM_ tds $ \td ->
       either throwError pure
         (checkCarriers resolveParams Nothing (tdName td) (tdClauses td))
+    -- Affine consumption bound on Futures (slice 4b, Task 5): beside the carrier
+    -- rule, a second LOCAL post-inference pass rejecting a coroutine Future
+    -- consumed more than once (resume XOR cancel; value reads do not count).
+    -- Reader names this module REDEFINES with a regular (non-extern) top-level
+    -- binding: such a name is the module's own function, NOT the prelude extern
+    -- reader, so the affine check must not trust it. An `extern` reader (the
+    -- prelude's own `value`) is excluded — it IS the trusted identity. UserFiles
+    -- have no externs (Part 1 gate), so every reader-named UserFile def lands here.
+    let ownNonExtern = Set.fromList [ tdName td | td <- tds
+                                    , not (Set.member (tdName td) externs) ]
+    forM_ tds $ \td ->
+      either throwError pure
+        (checkFutureAffine ownNonExtern Nothing (tdName td) (tdClauses td))
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
+
+-- | The @extern@ declarations in a module, as (name, position) pairs (one entry
+-- per name, expanding comma-separated names). Used by the Part 1 gate to reject
+-- any @extern@ in a UserFile module.
+externDecls :: [Abs.Decl] -> [(Text, (Int, Int))]
+externDecls = concatMap go
+  where
+    go (Abs.DExtern sn extras _) =
+      (sigNameText sn, sigNamePos sn)
+        : [ (sigNameText x, sigNamePos x) | Abs.SNCons x <- extras ]
+    go (Abs.DLocal d) = go d
+    go _              = []
 
 -- | The declared parameter types of a scheme, in order, by peeling its body's
 -- arrows. Polymorphic positions remain 'CTGen' — this is exactly the property
@@ -3109,7 +3148,25 @@ schemeParamTypes = go . schemeBody
 toLocalDecl :: Abs.Decl -> [Abs.LocalDecl]
 toLocalDecl (Abs.DEqn lhs body mw) = [Abs.LDEqn lhs body mw]
 toLocalDecl (Abs.DSig sn extras ty) = [Abs.LDSig sn extras ty]
+-- An `extern` decl is a compiler-hole primitive: same shape as a bodyless
+-- DSig (prim by name, sentinel TypedDecl), so it normalizes to an LDSig and
+-- flows through the identical inference path. The ONLY difference is that the
+-- bodyless-sig lint is suppressed for these names (see 'externNames' /
+-- 'inferTopLetGroup'), since `extern` is explicit intent.
+toLocalDecl (Abs.DExtern sn extras ty) = [Abs.LDSig sn extras ty]
 toLocalDecl _ = []
+
+-- | The set of names declared by `extern` decls. The bodyless-sig warning must
+-- not fire for these (extern is an explicit primitive marker, not an accidental
+-- missing body). DLocal-wrapped externs are unwrapped so `local extern f : T`
+-- is recognised too.
+externNames :: [Abs.Decl] -> Set.Set Text
+externNames = Set.fromList . concatMap go
+  where
+    go (Abs.DExtern sn extras _) = sigNameText sn : map commaName extras
+    go (Abs.DLocal d)            = go d
+    go _                         = []
+    commaName (Abs.SNCons sn) = sigNameText sn
 
 -- | Type the top-level declarations as one big mutually-recursive let,
 -- returning one 'TypedDecl' per binding in binding order. Each binding with a
@@ -3119,8 +3176,8 @@ toLocalDecl _ = []
 -- warnings (e.g. bodyless top-level sigs in UserFile origin) are emitted into
 -- the TC monad's warning channel via 'addWarning' and collected by 'runTC'.
 inferTopLetGroup
-  :: Origin -> [Abs.LocalDecl] -> TC s [TypedDecl]
-inferTopLetGroup origin localDecls = do
+  :: Origin -> Set.Set Text -> [Abs.LocalDecl] -> TC s [TypedDecl]
+inferTopLetGroup origin externs localDecls = do
   let (sigs, eqns) = partitionLocalDecls localDecls
   sigMap <- buildSigMap sigs
   let groups        = groupEquations eqns
@@ -3186,7 +3243,10 @@ inferTopLetGroup origin localDecls = do
   case origin of
     Embedded   -> pure ()
     UserFile _ -> forM_ sigOnlyNames $ \n ->
-      addWarning (BodylessBinding n (sigPos sigs n))
+      -- `extern` decls are explicit primitive markers; their bodyless-ness is
+      -- intentional, so they are exempt from the bodyless-sig lint.
+      when (not (Set.member n externs)) $
+        addWarning (BodylessBinding n (sigPos sigs n))
   -- Reject head-pattern shapes the match compiler cannot lower BEFORE the
   -- coverage check runs, so no bogus RedundantClause/NonExhaustiveMatch warning
   -- precedes the error and elaboration never reaches its raw `error`. This is a
@@ -3417,6 +3477,8 @@ prettyCType (CTCon (TcUser n) xs) =
 prettyCType (CTCon (TcEffect n) []) = n
 prettyCType (CTCon (TcEffect n) xs) =
   Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTCon TcFuture xs) =
+  Tx.concat [Tx.pack "Future", Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
@@ -3442,6 +3504,8 @@ prettyCTypeAtom t@CTArr{} = Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t@(CTCon (TcUser _) (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t@(CTCon (TcEffect _) (_:_)) =
+  Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
+prettyCTypeAtom t@(CTCon TcFuture (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t = prettyCType t
 

@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.Control
+-- C1: a Future threaded through RECURSION is consumed many times. `loop`
+-- resumes its Future parameter on every iteration; the fix counts the future
+-- passed to the recursive `loop` call as a consumption, so the False arm's
+-- `resume f 1 + loop (n - 1) f` = Many.
+producer : () -> U64 with Coro U64 U64
+producer _ = (Coro.suspend 42) + 1
+loop : U64 -> Future U64 U64 U64 -> U64
+loop n f =
+  case eqU64 n 0 of
+    True -> 0
+    False -> resume f 1 + loop (n - 1) f
+main : U64
+main =
+  let s = start producer in
+  loop 3 s

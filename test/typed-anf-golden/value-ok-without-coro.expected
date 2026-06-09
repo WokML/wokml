@@ -1,0 +1,6 @@
+value x : U64 =
+  x
+
+main =
+  let t : U64 = value(7)
+  t

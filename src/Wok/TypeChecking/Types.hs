@@ -50,6 +50,7 @@ data TyCon
   | TcUnit
   | TcTuple Int
   | TcList
+  | TcFuture
   | TcUser Text
   -- | An effect-instance HANDLE type. @TcEffect "State"@ applied to args
   -- (e.g. @TCon (TcEffect "State") [U64]@) is the type of a named effect

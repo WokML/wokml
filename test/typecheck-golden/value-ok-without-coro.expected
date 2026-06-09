@@ -1,0 +1,2 @@
+main : U64
+value : U64 -> U64

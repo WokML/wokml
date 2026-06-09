@@ -151,6 +151,26 @@ data TypeError
     -- by an escaping closure) is rejected: "instance handle cannot escape its
     -- scope". Args: position (the enclosing binding, since the typed AST carries
     -- no per-node span), the offending binding's name.
+  | FutureConsumedTwice SourceSpan Text
+    -- ^ A coroutine 'Future' binding is consumed more than once along a single
+    -- control-flow path. A future is consumed by @resume@ XOR @cancel@, at most
+    -- once total; @value@ reads are non-consuming. This affine bound is a LOCAL
+    -- analysis (futures are second-class via the carrier rule) run after
+    -- inference, beside 'CarrierEscape': it counts consuming uses (sequence =
+    -- sum, branch = max) of each Future-typed binding within a function body and
+    -- rejects any count > 1. Conservative: aliasing or unanalyzable flow that
+    -- could consume twice is rejected (sound over-approximation). Args: position
+    -- (the enclosing binding, since the typed AST carries no per-node span), the
+    -- offending future binding's name.
+  | ExternNotAllowed SourceSpan Text
+    -- ^ A UserFile module contains an @extern@ declaration. @extern@ marks a
+    -- compiler-hole primitive bound to a host prim by name, and it is the trust
+    -- anchor for the soundness analyses (the one-shot relaxation's escape sink and
+    -- the affine check's non-consuming reader are recognised by EXTERN IDENTITY,
+    -- not by name). Allowing a user to mint an @extern@ would let them forge that
+    -- identity, so @extern@ is permitted ONLY in the standard prelude (Embedded
+    -- origin). Args: position (the enclosing binding; the typed AST carries no
+    -- per-node span) and the offending extern name.
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint

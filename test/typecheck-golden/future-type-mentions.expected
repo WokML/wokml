@@ -1,0 +1,2 @@
+ignore : Future U64 U64 U64 -> ()
+main : U64

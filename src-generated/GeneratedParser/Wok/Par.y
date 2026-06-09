@@ -51,32 +51,33 @@ import qualified Data.Text
   'eff'      { PT _ (TS _ 25)    }
   'effect'   { PT _ (TS _ 26)    }
   'else'     { PT _ (TS _ 27)    }
-  'fixity'   { PT _ (TS _ 28)    }
-  'forall'   { PT _ (TS _ 29)    }
-  'fun'      { PT _ (TS _ 30)    }
-  'if'       { PT _ (TS _ 31)    }
-  'import'   { PT _ (TS _ 32)    }
-  'in'       { PT _ (TS _ 33)    }
-  'instance' { PT _ (TS _ 34)    }
-  'left'     { PT _ (TS _ 35)    }
-  'let'      { PT _ (TS _ 36)    }
-  'local'    { PT _ (TS _ 37)    }
-  'looser'   { PT _ (TS _ 38)    }
-  'module'   { PT _ (TS _ 39)    }
-  'of'       { PT _ (TS _ 40)    }
-  'record'   { PT _ (TS _ 41)    }
-  'right'    { PT _ (TS _ 42)    }
-  'row'      { PT _ (TS _ 43)    }
-  'than'     { PT _ (TS _ 44)    }
-  'then'     { PT _ (TS _ 45)    }
-  'tighter'  { PT _ (TS _ 46)    }
-  'type'     { PT _ (TS _ 47)    }
-  'use'      { PT _ (TS _ 48)    }
-  'where'    { PT _ (TS _ 49)    }
-  'with'     { PT _ (TS _ 50)    }
-  '{'        { PT _ (TS _ 51)    }
-  '|'        { PT _ (TS _ 52)    }
-  '}'        { PT _ (TS _ 53)    }
+  'extern'   { PT _ (TS _ 28)    }
+  'fixity'   { PT _ (TS _ 29)    }
+  'forall'   { PT _ (TS _ 30)    }
+  'fun'      { PT _ (TS _ 31)    }
+  'if'       { PT _ (TS _ 32)    }
+  'import'   { PT _ (TS _ 33)    }
+  'in'       { PT _ (TS _ 34)    }
+  'instance' { PT _ (TS _ 35)    }
+  'left'     { PT _ (TS _ 36)    }
+  'let'      { PT _ (TS _ 37)    }
+  'local'    { PT _ (TS _ 38)    }
+  'looser'   { PT _ (TS _ 39)    }
+  'module'   { PT _ (TS _ 40)    }
+  'of'       { PT _ (TS _ 41)    }
+  'record'   { PT _ (TS _ 42)    }
+  'right'    { PT _ (TS _ 43)    }
+  'row'      { PT _ (TS _ 44)    }
+  'than'     { PT _ (TS _ 45)    }
+  'then'     { PT _ (TS _ 46)    }
+  'tighter'  { PT _ (TS _ 47)    }
+  'type'     { PT _ (TS _ 48)    }
+  'use'      { PT _ (TS _ 49)    }
+  'where'    { PT _ (TS _ 50)    }
+  'with'     { PT _ (TS _ 51)    }
+  '{'        { PT _ (TS _ 52)    }
+  '|'        { PT _ (TS _ 53)    }
+  '}'        { PT _ (TS _ 54)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -111,6 +112,7 @@ Decl :: { GeneratedParser.Wok.Abs.Decl }
 Decl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.DEqn $1 $3 $4 }
   | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
+  | 'extern' SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DExtern $2 $3 $5 }
   | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
   | 'effect' ConId ListVarId '=' '{' ListRecordFieldType '}' { GeneratedParser.Wok.Abs.DEffect $2 $3 $6 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }

@@ -1,0 +1,6 @@
+value x =
+  x
+
+main =
+  let t = value(7)
+  t

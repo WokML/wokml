@@ -216,6 +216,7 @@ reorderAst t (Module ds) = Module <$> traverse (reorderDecl t) ds
 reorderDecl :: FixityTable -> Decl -> Either [ReorderError] Decl
 reorderDecl t (DEqn lhs e mw) = DEqn lhs <$> reorderExp t e <*> reorderMW t mw
 reorderDecl _ d@(DSig{})      = Right d
+reorderDecl _ d@(DExtern{})   = Right d  -- compiler-hole primitive; no body to reorder
 reorderDecl _ d@(DData{})     = Right d
 reorderDecl _ d@(DEffect{})   = Right d  -- operation types contain no exprs to reorder
 reorderDecl _ d@(DClass{})    = Right d  -- fully typechecked + desugared downstream; passed through here

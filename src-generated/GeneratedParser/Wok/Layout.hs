@@ -28,19 +28,19 @@ data LayoutDelimiters
 
 layoutWords :: [(TokSymbol, LayoutDelimiters)]
 layoutWords =
-  [ ( TokSymbol "let" 36
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 51)) (Just (TokSymbol "}" 53))
+  [ ( TokSymbol "let" 37
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
     )
-  , ( TokSymbol "where" 49
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 51)) (Just (TokSymbol "}" 53))
+  , ( TokSymbol "where" 50
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
     )
-  , ( TokSymbol "of" 40
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 51)) (Just (TokSymbol "}" 53))
+  , ( TokSymbol "of" 41
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 52)) (Just (TokSymbol "}" 54))
     )
   ]
 
 layoutStopWords :: [TokSymbol]
-layoutStopWords = [TokSymbol "in" 33]
+layoutStopWords = [TokSymbol "in" 34]
 
 -- layout separators
 
@@ -104,6 +104,7 @@ resolveLayout topLayout =
     -- decls). Do NOT add the separator on the layout-open branch.
     | isLayoutOpen t0
       = t0 : res (Just t0) (Explicit : st) ts
+
     | isParenOpen t0
       = maybeInsertSeparator pt t0 st $
         t0 : res (Just t0) (Explicit : st) ts

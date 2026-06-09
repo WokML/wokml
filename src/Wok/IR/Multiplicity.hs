@@ -11,9 +11,11 @@ module Wok.IR.Multiplicity
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
-import Wok.IR.Name (Name, JoinId)
+import Wok.IR.Name (Name, JoinId, Unique, nameUniq)
 import Wok.IR.Anf
 
 -- | The {0,1,omega} cardinality lattice on continuation use. Zero <= One <= Many.
@@ -46,8 +48,17 @@ mentionsAny r = any (mentionsAtom r)
 -- | The affine analysis: an upper bound on how many times `r` is invoked in `e`.
 -- Type-free; the single soundness rule is that any occurrence of `r` that is NOT
 -- the head of a saturated application is an escape and yields Many.
-cardOf :: Name -> Expr -> Card
-cardOf r = go Map.empty
+--
+-- @onceSinks@ is the set of canonical 'Unique's of the prelude's trusted once-
+-- sink @extern@ prims (the escape sinks that resume their continuation argument
+-- at most once; currently just @__coro_susp@), resolved in the pipeline from the
+-- elaborated global-name map BY EXTERN IDENTITY. The trusted-once relaxation
+-- fires ONLY for an application head whose identity (its 'Unique') is in this
+-- set; a USER binding merely HINTED @__coro_susp@ has a different 'Unique' and is
+-- NOT in the set, so it is NOT trusted. An empty set (Std.Control not loaded, so
+-- no genuine escape exists) means the relaxation never fires.
+cardOf :: Set Unique -> Name -> Expr -> Card
+cardOf onceSinks r = go Map.empty
   where
     go :: Map JoinId Card -> Expr -> Card
     go env e = case e of
@@ -77,10 +88,23 @@ cardOf r = go Map.empty
     goAlt env (AltLit _ b)   = go env b
     goAlt env (AltDefault b) = go env b
 
+    -- Trusted-once axiom: handing the resume binder to a genuine prelude once-sink
+    -- @extern@ (currently @__coro_susp@) is One. The runtime guarantees the future
+    -- created from the continuation is resumed at most once. The prelude @start@
+    -- desugars to a suspend arm that hands @k@ to @__coro_susp@, so this clause is
+    -- LIVE whenever Std.Control's coro surface is used. The match is on the
+    -- resolved prim IDENTITY (its 'Unique') being in the trusted once-sink set,
+    -- NOT the hint text: a user-defined top-level @__coro_susp@ has a distinct
+    -- 'Unique' and is correctly NOT trusted. Do NOT broaden this relaxation beyond
+    -- the genuine escape-sink identities.
+    isCoroSusp f = Set.member (nameUniq f) onceSinks
+
     cardRhs rhs = case rhs of
       RApp (AVar f) as
         | f == r ->
             addC One (if mentionsAny r as then Many else Zero)
+      RApp (AVar f) as
+        | isCoroSusp f && mentionsAny r as -> One
       RApp _ as        -> if mentionsAny r as then Many else Zero
       RAtom a          -> if mentionsAtom r a then Many else Zero
       RCon _ as        -> if mentionsAny r as then Many else Zero
@@ -158,15 +182,16 @@ opArmsInHandler (Handler (_, re) ops _ _ _) =
   opArmsInExpr re ++ concatMap (\oa -> oa : opArmsInExpr (oaBody oa)) ops
 
 -- | The card of an arm's continuation: walk the body, keyed on the resume binder.
-armCard :: OpArm -> Card
-armCard oa = cardOf (bndName (oaResume oa)) (oaBody oa)
+armCard :: Set Unique -> OpArm -> Card
+armCard onceSinks oa = cardOf onceSinks (bndName (oaResume oa)) (oaBody oa)
 
--- | The consumer: every multi-shot arm is an error.
-analyzeModule :: CoreModule -> [MultiplicityError]
-analyzeModule cm =
+-- | The consumer: every multi-shot arm is an error. @onceSinks@ is the set of
+-- canonical 'Unique's of the genuine once-sink @extern@ prims (see 'cardOf').
+analyzeModule :: Set Unique -> CoreModule -> [MultiplicityError]
+analyzeModule onceSinks cm =
   [ MultishotResume (oaLabel oa) (oaOp oa)
   | oa <- opArmsInModule cm
-  , armCard oa == Many ]
+  , armCard onceSinks oa == Many ]
 
 renderMultiplicityError :: MultiplicityError -> Text
 renderMultiplicityError (MultishotResume lbl op) =
@@ -177,10 +202,12 @@ renderMultiplicityError (MultishotResume lbl op) =
     ]
 
 -- | The proof artifact: one `label.op : 0|1|ω` line per arm, module order.
-prettyMultiplicity :: CoreModule -> Text
-prettyMultiplicity cm =
+-- @onceSinks@ is the same trusted escape-sink identity set 'analyzeModule' uses
+-- (resolved in the pipeline), so the dump agrees with what the law accepts.
+prettyMultiplicity :: Set Unique -> CoreModule -> Text
+prettyMultiplicity onceSinks cm =
   Tx.intercalate (Tx.pack "\n")
-    [ Tx.concat [ oaLabel oa, Tx.pack ".", oaOp oa, Tx.pack " : ", renderCard (armCard oa) ]
+    [ Tx.concat [ oaLabel oa, Tx.pack ".", oaOp oa, Tx.pack " : ", renderCard (armCard onceSinks oa) ]
     | oa <- opArmsInModule cm ]
 
 renderCard :: Card -> Text

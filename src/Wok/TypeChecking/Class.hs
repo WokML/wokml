@@ -177,6 +177,7 @@ tyConKey TcNever      = Tx.pack "Never"
 tyConKey TcBool       = Tx.pack "Bool"
 tyConKey TcUnit       = Tx.pack "Unit"
 tyConKey TcList       = Tx.pack "List"
+tyConKey TcFuture     = Tx.pack "Future"
 tyConKey (TcTuple n)  = Tx.pack "Tuple" <> Tx.pack (show n)
 tyConKey (TcUser t)   = t
 tyConKey (TcEffect t) = Tx.pack "Effect$" <> t

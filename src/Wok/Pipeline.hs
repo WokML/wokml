@@ -12,18 +12,26 @@ module Wok.Pipeline
   ( typecheckProgram
   , elaborateProgram
   , elaborateProgramFull
+  , elaborateProgramFullTrusted
   , elaborateCheckedFull
   ) where
 
 import Control.Monad (foldM)
 import Data.Bifunctor (first)
+import Data.Maybe (mapMaybe)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as Tx
 
 import Wok.IR.Anf (CoreModule)
 import Wok.IR.Multiplicity (analyzeModule, renderMultiplicityError)
-import Wok.IR.Elaborate (elaborateModule, elaborateModulesShared)
+import Wok.IR.Name (Name, Unique, nameUniq)
+import Wok.IR.Elaborate
+  ( elaborateModule
+  , elaborateModulesShared
+  , elaborateModulesSharedWithGlobals
+  )
 import Wok.Loader (LoadedModule (..), ModuleName)
 import Wok.Reordering
   ( emptyFixityTable
@@ -114,6 +122,43 @@ elaborateProgramFull entryName ms = do
              | (modName, mr) <- Map.toList resultMap ]
   Right (elaborateModulesShared mods)
 
+-- | Whole-program elaboration, also returning the trusted ONCE-SINK identities:
+-- the set of canonical 'Unique's of the GENUINE prelude once-sink @extern@ prims
+-- (currently @(Std.Control, "__coro_susp")@), resolved from the elaborated
+-- global-name map by DEFINING MODULE + name (extern identity), NOT by hint text.
+-- A user binding merely hinted @__coro_susp@ lives in a different module and so
+-- has a distinct identity — it is NOT in the set, hence NOT trusted (C2). The set
+-- is empty when Std.Control is not loaded (no genuine escape exists).
+elaborateProgramFullTrusted
+  :: ModuleName
+  -> [LoadedModule]
+  -> Either String (CoreModule, Set Unique)
+elaborateProgramFullTrusted entryName ms = do
+  (resultMap, _warns) <- runPipelineFold entryName ms
+  let mods = [ (modName, mrEnvOut mr, mrDecls mr)
+             | (modName, mr) <- Map.toList resultMap ]
+      (cm, globalByKey) = elaborateModulesSharedWithGlobals mods
+      onceSinks = resolveTrusted globalByKey onceSinkKeys
+  Right (cm, onceSinks)
+
+-- | The defining module of the genuine prelude coro prims.
+stdControlModule :: Tx.Text
+stdControlModule = Tx.pack "Std.Control"
+
+-- | The trusted once-sink @extern@ prims, by @(definingModule, name)@: an
+-- @extern@ whose semantics is to resume its continuation argument at most once.
+-- Currently just @__coro_susp@ (the escape sink @start@ desugars to). This is the
+-- C2 registry — a fixed set of prelude extern identities, resolved to 'Unique's.
+onceSinkKeys :: [(Tx.Text, Tx.Text)]
+onceSinkKeys = [ (stdControlModule, Tx.pack "__coro_susp") ]
+
+-- | Resolve a set of @(module, name)@ extern keys to the canonical 'Unique's they
+-- map to in the elaborated global map (silently dropping any not present, e.g.
+-- when Std.Control is not loaded).
+resolveTrusted :: Map.Map (Tx.Text, Tx.Text) Name -> [(Tx.Text, Tx.Text)] -> Set Unique
+resolveTrusted globalByKey keys =
+  Set.fromList (mapMaybe (\k -> nameUniq <$> Map.lookup k globalByKey) keys)
+
 -- | Whole-program elaboration plus the one-shot multiplicity law: a multi-shot
 -- handler is rejected here as a compile error (stringified, like other v1
 -- pipeline errors).
@@ -122,8 +167,8 @@ elaborateCheckedFull
   -> [LoadedModule]
   -> Either String CoreModule
 elaborateCheckedFull entryName ms = do
-  cm <- elaborateProgramFull entryName ms
-  case analyzeModule cm of
+  (cm, trusted) <- elaborateProgramFullTrusted entryName ms
+  case analyzeModule trusted cm of
     []   -> Right cm
     errs -> Left (Tx.unpack
                     (Tx.intercalate (Tx.pack "\n")

@@ -20,6 +20,7 @@ data Module = Module [Decl]
 data Decl
     = DEqn FunLHS Exp MaybeWhere
     | DSig SigName [SigNameComma] Type
+    | DExtern SigName [SigNameComma] Type
     | DData ConId [VarId] [ConDef]
     | DEffect ConId [VarId] [RecordFieldType]
     | DFixity FixName FixAssoc [FixRel]

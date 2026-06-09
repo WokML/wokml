@@ -1,0 +1,1 @@
+typecheck: typecheck in Main: ExternNotAllowed (Just (7,8)) "foo"

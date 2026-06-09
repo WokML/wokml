@@ -17,7 +17,7 @@ references this roadmap and contains that slice's bite-sized tasks.
 | 2 | Optional effect header + forgotten-resume lint + `Never` | DONE — merged to `main` (562 tests green) |
 | 3 | Bounded `(with H e)` handler scope | DONE — merged to `main` (572 tests green) |
 | 4a | Parameterized handlers + `with … in` runner sugar + `Std.Control` (mtl quartet) | DONE — feat/effects-slice-4a-parameterized-handlers (585 tests green) |
-| 4b | Scheduler / `spawn` / `par` / `Future` / `Std.Control` concurrency half | deferred |
+| 4b | **Escape primitive**: one-shot second-class affine `Future`, synchronous resumer, `start`/`value`/`resume`/`cancel`, affine consumption check, trusted-once relaxation | **DONE** — `feat/one-shot-escape` (681 tests green, pending full-branch review); scheduler/parallelism half deferred (layer 3) |
 | X (analysis) | One-shot multiplicity = **affine (no-dup) analysis** on continuation binders; multi-shot handler = compile error | DONE — feat/one-shot-multiplicity (652 tests green); see `2026-06-09-one-shot-multiplicity-analysis-design.md` |
 | X (rest) | ~~value restriction~~ (DROPPED as unnecessary under one-shot-as-law); cancellation (discontinue) as the no-drop second consumer | deferred |
 
@@ -114,13 +114,30 @@ or do-notation.
 - **Follow-ups discovered during implementation** (non-blocking):
   1. **Diamond-import env-merge coarseness.** ~~`overlayEnvs` merges same-name/same-type re-exports silently to support the second embedded prelude; two distinct definitions sharing a name+type are no longer caught.~~ **RESOLVED (772c345):** `overlayEnvs` (`src/Wok/TypeChecking/Env.hs`) keys var-namespace conflict detection on **binding provenance** — `Env.envVarOrigin` (name → defining module), stamped in `Pipeline.hs`. A diamond re-export (same origin) merges; a genuine cross-module redefinition (different origin) errors, even with identical types. `lookupVar`/`extendVar`/inference unchanged.
 
-### Slice 4b — the concurrency runtime
+### Slice 4b — the escape primitive (DONE) + concurrency (deferred)
 
-- **Goal:** real concurrency on top of parameterized handlers.
-- **Delivers:** scheduler / `spawn` / `par` / a `Future` primitive (hides the
-  existential for heterogeneous parked continuations) / the concurrency half of
-  `Std.Control`. Needs existential support for parked continuations.
-- **Plan file(s):** _to be written, just-in-time, after 4a lands._
+- **Status: escape primitive SHIPPED** — `feat/one-shot-escape`, 681 tests green, pending
+  full-branch review.
+- **Delivers (shipped):** opaque second-class affine `Future a b r` (`TcFuture`); `Coro` effect +
+  `start`/`value`/`resume`/`cancel` as plain functions via trusted prims + `Std.Control`;
+  synchronous resumer (deep re-install); affine consumption check `checkFutureAffine`
+  (`FutureConsumedTwice`); trusted-once relaxation for `__coro_susp` in `Wok.IR.Multiplicity`;
+  carrier-escape + no-handler-anywhere negatives golden-tested.
+- **Design file:** `docs/superpowers/specs/2026-06-09-one-shot-escape-design.md`.
+- **Deferred follow-ups:**
+  - **4b′** — chaining / unbounded generators: a future whose resumption yields another future
+    (done-or-yield sum with second-class component); runtime over-delivers already, pure typing
+    increment.
+  - **4b″** — residual-row-carrying Future + bounded-handler-escaped unhandled-reperform:
+    needs a row-indexed `Future a b r eff`.
+  - **dot-accessor surface** (`s.resume` / `s.value`) — deferred ergonomic nicety.
+  - **scheduler / `spawn` / `par` / `select` / `ndet`** → layer 3 (runtime-provided
+    primitives; `effect-compilation-strategy`).
+  - **first-class Futures / `box`** → revisited at the scheduler.
+  - **cancellation runtime** (finalizer unwinding).
+- **Original scope** (real concurrency): scheduler / `spawn` / `par` / a `Future` primitive
+  (hides the existential for heterogeneous parked continuations) / the concurrency half of
+  `Std.Control`. Needs existential support for parked continuations. Remains deferred.
 
 ### Cross-cutting (slice X) — checked properties
 
