@@ -59,3 +59,22 @@ resume s v = __coro_unwrap (__coro_resume s v)
 -- applied to a Future-typed binding; `value` reads do NOT count).
 cancel : Future a b r -> ()
 cancel s = __coro_cancel s
+
+-- `step` resumes the parked continuation ONCE with `v`, then dispatches: the
+-- producer either completed (onDone r) or suspended again (onYield x s'), where
+-- s' is the tail future, SECOND-CLASS (a Future-typed lambda param: the carrier
+-- rule makes it second-class; the affine rule counts it as consumed when threaded
+-- on). The total, generator-safe counterpart of `resume` (which assumes a single
+-- suspension and crashes on re-suspend). `step` consumes its input future (passed
+-- as an argument) and produces a fresh tail s' the onYield branch consumes.
+--
+-- ARGUMENT ORDER IS LOAD-BEARING (sugar-readiness): the deferred named-arm sugar
+--   step e v of done r -> b1 ; yield x s' -> b2
+-- desugars positionally to
+--   step e v (\r -> b1) (\x s' -> b2)
+-- so `step` MUST stay (future, value, onDone, onYield) with onDone : r -> t and
+-- onYield : a -> Future a b r -> t. Do not reorder.
+extern __coro_step : Future a b r -> (r -> t) -> (a -> Future a b r -> t) -> t
+
+step : Future a b r -> b -> (r -> t) -> (a -> Future a b r -> t) -> t
+step f v onDone onYield = __coro_step (__coro_resume f v) onDone onYield

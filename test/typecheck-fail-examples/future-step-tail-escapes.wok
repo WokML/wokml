@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- The tail future `s'` escapes its scope (collected into a list). Confirms the
+-- carrier-escape walk descends into step's callback lambdas.
+producer : () -> () with Coro U64 ()
+producer u = let z = Coro.suspend 1 in ()
+grab : Future U64 () () -> [Future U64 () ()]
+grab s = step s () (\r -> []) (\x s' -> [s'])
+main : U64
+main = 0

@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Producer: suspends with lo, lo+1, ..., hi-1, driven by its own recursion.
+range : U64 -> U64 -> () with Coro U64 ()
+range lo hi = case eqU64 lo hi of
+  True  -> ()
+  False -> let u = Coro.suspend lo in range (lo + 1) hi
+
+-- Consumer: pulls one value per step, threading the FRESH tail s' through its
+-- own recursion. Each future is consumed exactly once, so the affine check
+-- accepts it (contrast future-recursive-consume.wok, which reuses one future).
+sumPulled : Future U64 () () -> U64
+sumPulled s = step s () (\r -> 0) (\x s' -> x + sumPulled s')
+
+main : U64
+main =
+  let s = start (\u -> range 0 5) in
+  value s + sumPulled s

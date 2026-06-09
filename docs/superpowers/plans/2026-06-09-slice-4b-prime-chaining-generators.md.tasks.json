@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-09-slice-4b-prime-chaining-generators.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: __coro_step dispatch prim",
+      "status": "pending",
+      "description": "**Goal:** Add the bodyless __coro_step prim that dispatches a resumed future onto two callbacks, register it, lock it in the prim-table test.\n\n**Files:**\n- Modify: src/Wok/Interp/Prim.hs (add coroStepP; add to prims list lines 30-35)\n- Modify: test/Spec.hs (prim-table name-set assertion lines 4051-4052; prim unit tests in interpPrimTests)\n\n**Steps:** create branch feat/slice-4b-prime; write failing prim unit tests + name-set update; run (fail); add coroStepP + register; run (pass); commit.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/Prim.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE \\\"InterpPrim|coro_step|FAIL\\\"\", \"acceptanceCriteria\": [\"__coro_step in primTable arity 3\", \"Completed dispatches onDone\", \"Suspended dispatches onYield with tail\", \"non-future -> PrimError\", \"prim-table name-set test updated\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: step prelude function + range pull-generator example",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Add extern __coro_step + the step wrapper to Std.Control (with sugar-readiness arg-order note), prove the whole stack works end-to-end on a repeatedly-suspending pull generator.\n\n**Files:**\n- Modify: prelude/Std/Control.wok (after cancel, ~line 61)\n- Create: test/run-examples/coro-step-range.wok\n- Create: test/run-golden/coro-step-range.expected (= 10)\n\n**Steps:** write failing run example + golden; run (fail, step undefined); add extern __coro_step + step wrapper (locked arg order: future,value,onDone,onYield); run (pass=10); accept golden; commit.\n\n```json:metadata\n{\"files\": [\"prelude/Std/Control.wok\", \"test/run-examples/coro-step-range.wok\", \"test/run-golden/coro-step-range.expected\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/coro-step-range.wok --run\", \"acceptanceCriteria\": [\"Std.Control type-checks with step\", \"range generator computes sum\", \"fresh-tail recursion accepted by affine\", \"prints 10\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: typecheck-fail negatives (lambda-descent confirmation)",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Lock the three step-specific rejections through the full pipeline — confirms carrier/affine descend into step's callback lambdas.\n\n**Files:**\n- Create: test/typecheck-fail-examples/future-step-input-twice.wok (+ .expected: FutureConsumedTwice Nothing \"s\")\n- Create: test/typecheck-fail-examples/future-step-tail-twice.wok (+ .expected: FutureConsumedTwice Nothing \"s'\")\n- Create: test/typecheck-fail-examples/future-step-tail-escapes.wok (+ .expected: CarrierEscape Nothing \"grab\")\n- Golden files in test/typecheck-fail-golden/\n\nSTOP CONDITION: if tail-twice does NOT fire FutureConsumedTwice \"s'\", the walk does not track lambda params -> halt, revisit spec 3.4.\n\n**Steps:** write 3 .wok negatives + goldens; run each via compiler, verify exact error matches BEFORE accept; accept goldens; confirm reperform still green; commit.\n\n```json:metadata\n{\"files\": [\"test/typecheck-fail-examples/future-step-input-twice.wok\", \"test/typecheck-fail-examples/future-step-tail-twice.wok\", \"test/typecheck-fail-examples/future-step-tail-escapes.wok\", \"test/typecheck-fail-golden/future-step-input-twice.expected\", \"test/typecheck-fail-golden/future-step-tail-twice.expected\", \"test/typecheck-fail-golden/future-step-tail-escapes.expected\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE \\\"future-step|FAIL\\\"\", \"acceptanceCriteria\": [\"input twice FutureConsumedTwice s\", \"tail twice FutureConsumedTwice s'\", \"tail escapes CarrierEscape grab\", \"reperform-unhandled still passes\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: two-producer zip example + back-compat",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Demonstrate the genuinely-pull capability (consumer holds two live futures, picks order) and confirm existing single-shot coro examples are unaffected.\n\n**Files:**\n- Create: test/run-examples/coro-step-zip.wok\n- Create: test/run-golden/coro-step-zip.expected (= 52)\n\n**Steps:** write zip example + golden; run (verify 52; if affine mis-counts two-future threading, halt); accept golden; confirm back-compat (coro-escape/coro-multi-driver); run whole suite green; commit.\n\n```json:metadata\n{\"files\": [\"test/run-examples/coro-step-zip.wok\", \"test/run-golden/coro-step-zip.expected\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/coro-step-zip.wok --run\", \"acceptanceCriteria\": [\"zip two producers prints 52\", \"each of a,b,a',b' consumed once\", \"coro-escape and coro-multi-driver back-compat\", \"whole suite green\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: spec + memory status update and review handoff",
+      "status": "pending",
+      "blockedBy": [3, 4],
+      "description": "**Goal:** Mark spec implemented (pending review), record outcome in memory, prepare full-branch review (required before merge per review-before-merge).\n\n**Files:**\n- Modify: docs/superpowers/specs/2026-06-09-slice-4b-prime-chaining-generators-design.md (status + 3.4 confirmation)\n- Modify: memory/effects-slice-4b-prime-chaining-generators.md\n\n**Steps:** update spec status + 3.4 confirmation; update memory note; commit spec; request full-branch review over git diff main...feat/slice-4b-prime; do NOT merge until review passes.\n\n```json:metadata\n{\"files\": [\"docs/superpowers/specs/2026-06-09-slice-4b-prime-chaining-generators-design.md\", \"memory/effects-slice-4b-prime-chaining-generators.md\"], \"verifyCommand\": \"git log --oneline main..feat/slice-4b-prime && cabal test 2>&1 | tail -2\", \"acceptanceCriteria\": [\"spec marked implemented pending review\", \"spec confirms lambda-descent + no multiplicity change\", \"memory updated to implemented\", \"full-branch review requested before merge\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-09T00:00:00Z"
+}

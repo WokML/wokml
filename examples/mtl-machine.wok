@@ -11,8 +11,8 @@ data Cmd = Inc U64 | Snapshot | Boom
 -- Run one command. `Inc n` adds `n * step` to the total, where `step` is read
 -- from the Reader config. `Snapshot` logs the current total. `Boom` aborts.
 -- Each step reports 1 so the caller can count how many ran.
-step : Cmd -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
-step cmd = case cmd of
+tick : Cmd -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+tick cmd = case cmd of
   Inc n    -> let mult = Reader.ask in
               let cur  = State.get in
               let u    = State.set (cur + mult * n) in
@@ -26,7 +26,7 @@ step cmd = case cmd of
 run : [Cmd] -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
 run cmds = case cmds of
   []           -> 0
-  cmd :: rest  -> step cmd + run rest
+  cmd :: rest  -> tick cmd + run rest
 
 -- The four handlers stack top-to-bottom = outer-to-inner, so `state` is nearest
 -- the computation and `except` is outermost (an abort discards state + log).

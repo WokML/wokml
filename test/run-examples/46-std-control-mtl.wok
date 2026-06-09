@@ -8,8 +8,8 @@ import Std.Control
 -- contribution, and Except is in the row (composing cleanly) even though this
 -- happy path never throws. Wok's Std.Base has no comparison operator, so the
 -- demo proves "runs without losing state/log", not a guarded throw.
-step : U64 -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
-step n =
+tick : U64 -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+tick n =
   let budget = Reader.ask in
   let cur    = State.get in
   let next   = cur + n in
@@ -18,7 +18,7 @@ step n =
   next + budget
 
 prog : () -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
-prog u = let a = step 10 in let b = step 20 in step 30
+prog u = let a = tick 10 in let b = tick 20 in tick 30
 
 main : Result ((U64, U64), [U64]) String
 main =

@@ -33,6 +33,7 @@ prims =
   , coroResumeP
   , coroDoneP
   , coroCancelP
+  , coroStepP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -98,6 +99,21 @@ coroCancelP :: Prim
 coroCancelP = mkPrim (Tx.pack "__coro_cancel") 1 $ \args -> case args of
   [_] -> Right (PRDone (VLit LUnit))
   _   -> Left (ArityError (Tx.pack "__coro_cancel"))
+
+-- | `__coro_step s onDone onYield` dispatches a RESUMED future (the result of
+-- `__coro_resume`, already either `Completed [r]` or `Suspended [x, k]`) onto two
+-- callbacks. `Completed [r]` applies `onDone r`; `Suspended [x, k]` applies
+-- `onYield x s'`, where s' is the SAME Suspended value re-handed as the tail
+-- future (no fresh allocation -- value/resume/step all keep working on it). The
+-- total, generator-safe counterpart of `__coro_unwrap` (which assumes Completed).
+coroStepP :: Prim
+coroStepP = mkPrim (Tx.pack "__coro_step") 3 $ \args -> case args of
+  [VCon t [r], onDone, _]
+    | t == Tx.pack "Completed"  -> Right (PRApply onDone [r])
+  [s@(VCon t [x, _]), _, onYield]
+    | t == Tx.pack "Suspended"  -> Right (PRApply onYield [x, s])
+  [s, _, _] -> Left (PrimError (Tx.pack "__coro_step: not a future: " <> renderValue s))
+  _         -> Left (ArityError (Tx.pack "__coro_step"))
 
 -- | (u32) : narrow a U64 to U32. v1 models integers as unbounded 'Integer' and
 -- does NOT model modular wrapping (consistent with the U64 arithmetic prims), so

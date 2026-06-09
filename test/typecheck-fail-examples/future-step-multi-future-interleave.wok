@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+import Std.Control
+-- KNOWN LIMITATION (slice 4b', deferred): multi-future interleaving (zip/merge)
+-- is currently REJECTED. To step two producers, `zipSum` must reference future
+-- `b` inside `a`'s onYield callback (the tail `a'` is only bound there), so the
+-- callback closure captures the second-class future `b`. The conservative carrier
+-- rule forbids a future-capturing closure in a non-handle continuation slot, so
+-- this is a CarrierEscape. Lifting it needs a carrier-rule relaxation (allow a
+-- non-escaping future-capturing closure in a continuation slot) -- a follow-up
+-- slice. This golden LOCKS the current boundary as a tripwire: when the
+-- relaxation lands, this program will type-check, this test will fail, and it
+-- must be promoted to a passing run-example.
+gen : U64 -> U64 -> () with Coro U64 ()
+gen lo hi = case eqU64 lo hi of
+  True  -> ()
+  False -> let u = Coro.suspend lo in gen (lo + 1) hi
+
+zipSum : Future U64 () () -> Future U64 () () -> U64
+zipSum a b =
+  step a () (\ra -> 0)
+    (\xa a' -> step b () (\rb -> 0)
+                 (\xb b' -> (xa + xb) + zipSum a' b'))
+
+main : U64
+main =
+  let a = start (\u -> gen 0 4) in
+  let b = start (\u -> gen 10 14) in
+  (value a + value b) + zipSum a b

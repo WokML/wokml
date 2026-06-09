@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Control
+-- The tail future `s'` (a lambda parameter introduced by the yield branch) is
+-- consumed twice. Confirms the affine walk descends into step's callback lambdas.
+producer : () -> () with Coro U64 ()
+producer u = let z = Coro.suspend 1 in ()
+badTail : Future U64 () () -> U64
+badTail s = step s () (\r -> 0)
+  (\x s' -> step s' () (\r -> 0) (\y t -> y)
+          + step s' () (\r -> 0) (\y t -> y))
+main : U64
+main = let s = start producer in badTail s
