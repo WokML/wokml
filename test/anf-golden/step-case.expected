@@ -1,0 +1,7 @@
+sumStep s =
+  case s of
+    Completed r -> r
+    Suspended x g -> x
+
+main =
+  0

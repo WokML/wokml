@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+import Std.Control
+leak : U64 -> [Step U64 () U64]
+leak n = [Completed n]
+main : U64
+main = 0

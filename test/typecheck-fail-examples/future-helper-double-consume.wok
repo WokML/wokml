@@ -1,15 +1,15 @@
 module Main
 import Std.Base
 import Std.Control
--- C1: a Future consumed through a HELPER call escapes the intra-procedural
--- affine check. `useit` resumes its Future parameter; calling it twice on the
--- same future double-resumes. The fix counts a Future passed to ANY function
--- (except the `value` reader) as a consumption, so `useit s + useit s` = Many.
-producer : () -> U64 with Coro U64 U64
-producer _ = (Coro.suspend 42) + 1
-useit : Future U64 U64 U64 -> U64
-useit f = resume f 1
+-- C1: a Suspension consumed through a HELPER call escapes the intra-procedural
+-- affine check. `useit` runs its Suspension parameter; calling it twice on the
+-- same suspension double-consumes. A Suspension passed to ANY function counts as
+-- a consumption, so `useit g + useit g` = Many. Expect FutureConsumedTwice.
+useit : Suspension U64 U64 U64 -> U64
+useit f = run f 1
+bad : Step U64 U64 U64 -> U64
+bad s = case s of
+  Completed r   -> r
+  Suspended x g -> useit g + useit g
 main : U64
-main =
-  let s = start producer in
-  useit s + useit s
+main = 0

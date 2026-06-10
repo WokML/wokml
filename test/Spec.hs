@@ -4049,31 +4049,7 @@ interpPrimTests :: TestTree
 interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
-        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","__coro_susp","__coro_unwrap","value","__coro_resume","__coro_done","__coro_cancel","__coro_step"])
-  , testCase "__coro_step on Completed applies onDone to r" $
-      case runPrim (T.pack "__coro_step")
-             [ IV.VCon (T.pack "Completed") [li 7]
-             , IV.VCon (T.pack "OnDone") []
-             , IV.VCon (T.pack "OnYield") [] ] of
-        Right (IV.PRApply (IV.VCon nm []) [arg]) -> do
-          nm @?= T.pack "OnDone"
-          IV.renderValue arg @?= T.pack "7"
-        other -> assertFailure (show2 other)
-  , testCase "__coro_step on Suspended applies onYield to x and the tail future" $
-      case runPrim (T.pack "__coro_step")
-             [ IV.VCon (T.pack "Suspended") [li 3, IV.VCon (T.pack "K") []]
-             , IV.VCon (T.pack "OnDone") []
-             , IV.VCon (T.pack "OnYield") [] ] of
-        Right (IV.PRApply (IV.VCon nm []) [xv, IV.VCon sc _]) -> do
-          nm @?= T.pack "OnYield"
-          IV.renderValue xv @?= T.pack "3"
-          sc @?= T.pack "Suspended"
-        other -> assertFailure (show2 other)
-  , testCase "__coro_step on a non-future errors" $
-      case runPrim (T.pack "__coro_step")
-             [ li 1, IV.VCon (T.pack "OnDone") [], IV.VCon (T.pack "OnYield") [] ] of
-        Left (IV.PrimError _) -> pure ()
-        other -> assertFailure (show2 other)
+        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","__coro_susp","__coro_unwrap","__coro_resume","__coro_done","__coro_cancel"])
   , testCase "addition" $
       case runPrim (T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"

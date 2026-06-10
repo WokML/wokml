@@ -29,11 +29,9 @@ prims =
   , dollarP
   , coroSuspP
   , coroUnwrapP
-  , coroValueP
   , coroResumeP
   , coroDoneP
   , coroCancelP
-  , coroStepP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -55,19 +53,13 @@ coroSuspP = mkPrim (Tx.pack "__coro_susp") 2 $ \args -> case args of
 coroUnwrapP :: Prim
 coroUnwrapP = mkPrim (Tx.pack "__coro_unwrap") 1 $ \args -> case args of
   [VCon t [r]] | t == Tx.pack "Completed" -> Right (PRDone r)
+  -- A `Suspended` shape means the producer re-suspended; `run` assumes completion,
+  -- so peeling it as `r` would smuggle a Step through where a result is expected.
+  -- Error instead of silently passing it through.
+  [VCon t _] | t == Tx.pack "Suspended" ->
+    Left (PrimError (Tx.pack "__coro_unwrap: producer re-suspended; use step, not run"))
   [v]                                     -> Right (PRDone v)
   _ -> Left (ArityError (Tx.pack "__coro_unwrap"))
-
--- | `value s` projects the yielded value out of a `Suspended` future (the `a`
--- the producer suspended with). Non-consuming: it does not touch the captured
--- continuation. This is the prelude's @extern value@ reader prim (bound by name);
--- the affine check trusts it by extern identity. Errors on any non-Suspended
--- shape (a Completed future has no yielded value to read).
-coroValueP :: Prim
-coroValueP = mkPrim (Tx.pack "value") 1 $ \args -> case args of
-  [VCon t [x, _]] | t == Tx.pack "Suspended" -> Right (PRDone x)
-  [v] -> Left (PrimError (Tx.pack "value: not a suspended future: " <> renderValue v))
-  _   -> Left (ArityError (Tx.pack "value"))
 
 -- | `__coro_resume s v` applies the captured continuation `k` (stored in the
 -- `Suspended` future) to the resume payload `v` under the current kont. This
@@ -76,8 +68,17 @@ coroValueP = mkPrim (Tx.pack "value") 1 $ \args -> case args of
 -- a `Completed` future. Errors on any non-Suspended shape.
 coroResumeP :: Prim
 coroResumeP = mkPrim (Tx.pack "__coro_resume") 2 $ \args -> case args of
+  -- New Step surface: a `Suspension` is the parked continuation itself (the slot-2
+  -- value bound by a `Suspended x g` arm of a `Step`). Apply it directly.
+  [k@VCont{},  v] -> Right (PRApply k [v])
+  -- Currently unreachable: a parameterized continuation (VContP) only arises from
+  -- parameterized handlers, which the non-parameterized `Coro` effect never builds.
+  -- Kept for forward-compatibility with a future parameterized producer surface.
+  [k@VContP{}, v] -> Right (PRApply k [v])
+  -- Legacy/defensive: a whole `Suspended [x, k]` VCon (the pre-Step rep) — extract
+  -- the continuation and apply it.
   [VCon t [_, k], v] | t == Tx.pack "Suspended" -> Right (PRApply k [v])
-  [s, _] -> Left (PrimError (Tx.pack "__coro_resume: not a suspended future: " <> renderValue s))
+  [s, _] -> Left (PrimError (Tx.pack "__coro_resume: not a suspension: " <> renderValue s))
   _      -> Left (ArityError (Tx.pack "__coro_resume"))
 
 -- | `__coro_done v` tags a normally-returned producer result as a `Completed`
@@ -99,21 +100,6 @@ coroCancelP :: Prim
 coroCancelP = mkPrim (Tx.pack "__coro_cancel") 1 $ \args -> case args of
   [_] -> Right (PRDone (VLit LUnit))
   _   -> Left (ArityError (Tx.pack "__coro_cancel"))
-
--- | `__coro_step s onDone onYield` dispatches a RESUMED future (the result of
--- `__coro_resume`, already either `Completed [r]` or `Suspended [x, k]`) onto two
--- callbacks. `Completed [r]` applies `onDone r`; `Suspended [x, k]` applies
--- `onYield x s'`, where s' is the SAME Suspended value re-handed as the tail
--- future (no fresh allocation -- value/resume/step all keep working on it). The
--- total, generator-safe counterpart of `__coro_unwrap` (which assumes Completed).
-coroStepP :: Prim
-coroStepP = mkPrim (Tx.pack "__coro_step") 3 $ \args -> case args of
-  [VCon t [r], onDone, _]
-    | t == Tx.pack "Completed"  -> Right (PRApply onDone [r])
-  [s@(VCon t [x, _]), _, onYield]
-    | t == Tx.pack "Suspended"  -> Right (PRApply onYield [x, s])
-  [s, _, _] -> Left (PrimError (Tx.pack "__coro_step: not a future: " <> renderValue s))
-  _         -> Left (ArityError (Tx.pack "__coro_step"))
 
 -- | (u32) : narrow a U64 to U32. v1 models integers as unbounded 'Integer' and
 -- does NOT model modular wrapping (consistent with the U64 arithmetic prims), so

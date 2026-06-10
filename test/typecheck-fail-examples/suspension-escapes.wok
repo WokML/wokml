@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+grab : Step U64 () () -> [Suspension U64 () ()]
+grab s = case s of
+  Completed _   -> []
+  Suspended x g -> [g]
+main : U64
+main = 0

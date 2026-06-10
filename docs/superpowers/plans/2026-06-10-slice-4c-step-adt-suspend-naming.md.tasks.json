@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-10-slice-4c-step-adt-suspend-naming.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Rename Future -> Suspension",
+      "status": "pending",
+      "description": "Rename the coroutine handle type Future->Suspension everywhere (TcFuture->TcSuspension, surface string, prelude sigs, goldens); behavior-preserving; suite green. Branch feat/slice-4c-step-adt.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Types.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"src/Wok/TypeChecking/Class.hs\",\"src/Wok/TypeChecking/Carrier.hs\",\"src/Wok/TypeChecking/Builtins.hs\",\"prelude/Std/Control.wok\"], \"verifyCommand\": \"grep -rn 'TcFuture' src/ ; cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"no TcFuture/Future remains for the handle\",\"cabal test fully green\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Built-in Step ADT, carrier+affine",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "Add built-in Step a b r = Completed r | Suspended a (Suspension a b r) (TcStep + hand-registered Completed/Suspended ConInfo schemes, tags coincide with runtime VCons); carrier (isHandleType TcStep) + affine (case-scrutiny of a Step = one consumption). Negatives: step-escapes (CarrierEscape), step-scrutinized-twice (FutureConsumedTwice).\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Types.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"src/Wok/TypeChecking/Class.hs\",\"src/Wok/TypeChecking/Builtins.hs\",\"src/Wok/TypeChecking/Carrier.hs\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE 'Step|carrier|affine|FAIL'\", \"acceptanceCriteria\": [\"Step resolves; Completed/Suspended typed\",\"case on Step type-checks + exhaustive\",\"Step/g' escape -> CarrierEscape\",\"double case-scrutiny -> FutureConsumedTwice\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Reshape prelude surface (step->ADT, start->Step, drop value, resume->run)",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "Retype prims + prelude: __coro_susp/resume/unwrap/done -> Step (impls unchanged); remove coroStepP + coroValueP; start:->Step; step s v = __coro_resume s v; run s v = __coro_unwrap(__coro_resume s v); cancel; delete old value/resume/CPS step + extern __coro_step; update prim-table name-set test.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/Prim.hs\",\"prelude/Std/Control.wok\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal build 2>&1 | tail -3; cabal test 2>&1 | grep -iE 'bodyless|FAIL'\", \"acceptanceCriteria\": [\"prims retyped to Step; __coro_step+value removed\",\"start/step/run/cancel typed per spec\",\"name-set test passes without __coro_step/value\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Migrate examples + goldens; promote multi-future tripwire",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "Rewrite coro-escape (421)/coro-multi-driver (64)/coro-step-range (10) to case/Step; create coro-step-zip (passing, golden = computed sum) and delete the future-step-multi-future-interleave tripwire; retarget the 3 future-step-* negatives to Step/case (verify errors by hand); whole suite green; manually sweep examples/.\n\n```json:metadata\n{\"files\": [\"test/run-examples/coro-escape.wok\",\"test/run-examples/coro-multi-driver.wok\",\"test/run-examples/coro-step-range.wok\",\"test/run-examples/coro-step-zip.wok\",\"test/typecheck-fail-examples/future-step-input-twice.wok\",\"test/typecheck-fail-examples/future-step-tail-twice.wok\",\"test/typecheck-fail-examples/future-step-tail-escapes.wok\"], \"verifyCommand\": \"cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"escape 421, multi-driver 64, step-range 10, step-zip sum\",\"3 negatives reject on Step surface\",\"no golden references value/resume/CPS step\",\"whole suite green\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Spec + memory status update and review handoff",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "Mark slice-4c spec implemented (note §5.1 invariant holds trivially since Step=runtime VCon, no lowering); update 4b' spec (CPS step superseded) + memory (multi-future works, Step/Suspension surface); commit docs; request full-branch review over git diff main...feat/slice-4c-step-adt; do NOT merge until it passes.\n\n```json:metadata\n{\"files\": [\"docs/superpowers/specs/2026-06-10-slice-4c-step-adt-suspend-naming-design.md\",\"docs/superpowers/specs/2026-06-09-slice-4b-prime-chaining-generators-design.md\",\"memory/effects-slice-4b-prime-chaining-generators.md\"], \"verifyCommand\": \"git log --oneline main..feat/slice-4c-step-adt && cabal test 2>&1 | tail -2\", \"acceptanceCriteria\": [\"spec marked implemented pending review\",\"memory updated; tripwire resolved (now passing)\",\"full-branch review requested before merge\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-10T00:00:00Z"
+}

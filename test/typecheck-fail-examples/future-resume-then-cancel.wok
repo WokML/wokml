@@ -1,11 +1,11 @@
 module Main
 import Std.Base
 import Std.Control
-producer : () -> U64 with Coro U64 U64
-producer _ = (Coro.suspend 42) + 1
+-- C1: a Suspension consumed by BOTH cancel and run => Many. Expect
+-- FutureConsumedTwice.
+bad : Step U64 U64 U64 -> U64
+bad s = case s of
+  Completed r   -> r
+  Suspended x g -> let u = cancel g in run g 1
 main : U64
-main =
-  let s = start producer in
-  let r = resume s 1 in
-  let u = cancel s in
-  r
+main = 0

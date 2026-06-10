@@ -752,7 +752,8 @@ resolveTyCon name
   | name == Tx.pack "Bool"   = TcBool
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
-  | name == Tx.pack "Future" = TcFuture
+  | name == Tx.pack "Suspension" = TcSuspension
+  | name == Tx.pack "Step"   = TcStep
   | otherwise                       = TcUser name
 
 -- | Bottom elimination: if an operation's result type is @Never@, replace it
@@ -3102,9 +3103,22 @@ inferProgramTC seedEnv origin decls = do
               Nothing -> case lookupCon n env2 of
                 Just ci -> Just (schemeParamTypes (conScheme ci))
                 Nothing -> Nothing
+    -- A carrier PRODUCER exemption (the tail of a clause body may be an
+    -- inline-produced 'Step'/'Suspension' matching the declared result type) is
+    -- granted ONLY to the standard prelude (Embedded origin): @Std.Control@'s
+    -- @start@/@step@ are the blessed constructors of a 'Step'. A UserFile that
+    -- declared a function returning a carrier (e.g. @leak n = Completed n@) must
+    -- still be rejected with 'CarrierEscape' — returning a carrier is an escape
+    -- in user code (same trust boundary the Part 1 `extern` gate uses).
+    let producerExempt = case origin of Embedded -> True; UserFile _ -> False
     forM_ tds $ \td ->
-      either throwError pure
-        (checkCarriers resolveParams Nothing (tdName td) (tdClauses td))
+      let arity = case tdClauses td of
+                    ((pats, _) : _) -> length pats
+                    []              -> 0
+      in either throwError pure
+           (checkCarriers resolveParams
+                          (producerExempt && resultIsAffineCarrier arity (tdScheme td))
+                          Nothing (tdName td) (tdClauses td))
     -- Affine consumption bound on Futures (slice 4b, Task 5): beside the carrier
     -- rule, a second LOCAL post-inference pass rejecting a coroutine Future
     -- consumed more than once (resume XOR cancel; value reads do not count).
@@ -3142,6 +3156,23 @@ schemeParamTypes = go . schemeBody
   where
     go (CTArr a _ b) = a : go b
     go _             = []
+
+-- | Is a binding's DECLARED result type (after applying its @arity@ value params)
+-- an AFFINE CARRIER — a coroutine 'Step' or 'Suspension'? Such a binding is a
+-- carrier PRODUCER (e.g. @start@/@step@ in @Std.Control@ return a 'Step'), so the
+-- carrier rule permits the tail of its body to be an inline-produced carrier of
+-- that type (see 'checkCarriers' @resultIsCarrier@). Peels exactly @arity@
+-- arrows, so a function that RETURNS a function (a partial-application producer)
+-- is judged on its true result, not an intermediate arrow.
+resultIsAffineCarrier :: Int -> Scheme -> Bool
+resultIsAffineCarrier arity = isCarrier . peel arity . schemeBody
+  where
+    peel 0 t              = t
+    peel n (CTArr _ _ b)  = peel (n - 1) b
+    peel _ t              = t
+    isCarrier (CTCon TcStep _)       = True
+    isCarrier (CTCon TcSuspension _) = True
+    isCarrier _                      = False
 
 -- | Convert a top-level Decl to zero or more LocalDecls so we can reuse
 -- the existing inferLetGroup machinery.
@@ -3477,8 +3508,10 @@ prettyCType (CTCon (TcUser n) xs) =
 prettyCType (CTCon (TcEffect n) []) = n
 prettyCType (CTCon (TcEffect n) xs) =
   Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
-prettyCType (CTCon TcFuture xs) =
-  Tx.concat [Tx.pack "Future", Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTCon TcSuspension xs) =
+  Tx.concat [Tx.pack "Suspension", Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTCon TcStep xs) =
+  Tx.concat [Tx.pack "Step", Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
@@ -3505,7 +3538,9 @@ prettyCTypeAtom t@(CTCon (TcUser _) (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t@(CTCon (TcEffect _) (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
-prettyCTypeAtom t@(CTCon TcFuture (_:_)) =
+prettyCTypeAtom t@(CTCon TcSuspension (_:_)) =
+  Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
+prettyCTypeAtom t@(CTCon TcStep (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t = prettyCType t
 

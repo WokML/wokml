@@ -1,6 +1,6 @@
 # wok examples
 
-Nine runnable programs, smallest to largest. Each is a complete module with a
+Thirteen runnable programs, smallest to largest. Each is a complete module with a
 `main`; run any of them with the `--run` flag:
 
 ```sh
@@ -19,7 +19,10 @@ to see the lowered intermediate representation.)
 | `as-patterns.wok` | `as`-patterns (`pat as name`) in a case arm, a single-clause head, and a multi-clause function | `[8, 5, 6, 7]` |
 | `named-instances.wok` | named effect instances — two independent `State U64` cells, handle-typed helper params | `(((), 105), 0)` |
 | `generators.wok` | a generator/stream as a **one-shot** handler (`yield x k -> [x] ++ k ()`) | `[1, 2, 3, 4, 5, 6]` |
-| `coroutine.wok` | one-shot escaping continuation: `start`/`value`/`resume` with an opaque second-class affine `Future` | `421` |
+| `coroutine.wok` | one-shot escaping continuation: `start` returns a `Step`, `case` on `Completed`/`Suspended`, `run`/`step`/`cancel` an opaque second-class affine `Suspension` | `421` |
+| `generators-pull.wok` | **pull**-model generator: the consumer drives, `step`ping a `Suspension` and `case`ing each `Step` (contrast the push `generators.wok`) | `15` |
+| `pull-take.wok` | consumer-driven early termination: take the first `n` values then `cancel` the parked remainder | `3` |
+| `pull-zip.wok` | zip two live producers in lockstep — holding two `Suspension`s at once, which the closed `Step` ADT (arm-bound tail, no closure capture) makes type-check | `52` |
 | `nondeterminism.wok` | backtracking search via explicit `List` (the list monad = reified multi-shot) | `[(1, 6), (2, 5), (3, 4), (4, 3), (5, 2), (6, 1)]` |
 | `probabilistic.wok` | probabilistic programming via a weighted-`List` distribution monad; `P(sum == 7)` for two dice | `(6, 36)` |
 
@@ -31,7 +34,7 @@ written up in [`../docs/expressing-multishot-under-one-shot.md`](../docs/express
 Run them all:
 
 ```sh
-for f in collatz state-accumulate expr-eval mtl-machine as-patterns named-instances generators nondeterminism probabilistic; do
+for f in collatz state-accumulate expr-eval mtl-machine as-patterns named-instances generators coroutine generators-pull pull-take pull-zip nondeterminism probabilistic; do
   printf '%-18s ' "$f"
   cabal run -v0 wok -- "examples/$f.wok" --run
 done
@@ -68,6 +71,14 @@ done
   `Yield.yield x k -> [x] ++ k ()` resumes once, and the producer's recursion
   (`count`) drives the "many." `--dump-multiplicity` reports `Yield.yield : 1`, so it
   is a legal handler under the one-shot law.
+- **`generators-pull.wok` / `pull-take.wok` / `pull-zip.wok`** — the **pull** model,
+  where the *consumer* drives instead of a handler reacting. `start` runs the producer
+  to its first suspension and returns the first `Step`; the consumer `case`s
+  `Suspended x g` / `Completed r` and calls `step g ()` to pull the next. `pull-take`
+  shows consumer-driven early termination (`cancel` the unused remainder); `pull-zip`
+  shows the payoff over a single push handler — driving two producers at once, holding
+  two `Suspension`s, which works because the tail binds in a `case` arm rather than a
+  closure.
 - **`nondeterminism.wok`** — the multi-shot handler `flip k -> k True ++ k False` is a
   compile error, so backtracking is written explicitly with `List`. `concatMapL`'s
   lambda is the continuation `k` made first-class; `[]` is the pruned (0-shot) branch,

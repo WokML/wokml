@@ -1,19 +1,21 @@
--- USE CASE: one-shot escaping coroutine (second-class affine Future).
+-- USE CASE: one-shot escaping coroutine (second-class affine Suspension).
 -- A producer runs to its first `Coro.suspend`, parking its continuation
--- below the effect boundary. The driver holds only an opaque Future handle
--- (second-class via the carrier rule: can't be returned, stored, or listed).
--- `resume` consumes the Future exactly once (affine: resume XOR cancel, at
--- most once total). `value` reads the yielded value without consuming the Future.
+-- below the effect boundary. `start` returns the FIRST outcome as a `Step`:
+-- either `Completed r` (the producer finished) or `Suspended x g`, where `x`
+-- is the yielded value and `g` is an opaque Suspension handle.
+-- The Suspension is second-class via the carrier rule (can't be returned,
+-- stored, or listed) and affine: `run`/`step`/`cancel` consume it exactly once.
 -- The parked continuation lives in the runtime; re-establishing the Coro handler
 -- on resume is done automatically by deep re-install.
 --
 -- Surface: plain functions, no `with coro in` needed.
---   `start producer` -- installs Coro, runs to first suspend, returns Future
---   `value s`        -- non-consuming read of the yielded value
---   `resume s v`     -- consuming: resumes the parked continuation with v
---   `cancel s`       -- the other consuming eliminator (resume XOR cancel)
+--   `start producer` -- installs Coro, runs to first suspend, returns a `Step`
+--   `case ... of`     -- dispatch on `Completed r` / `Suspended x g`
+--   `step g v`        -- advance one step, returns the next `Step`
+--   `run g v`         -- single-shot: resume once and assume completion
+--   `cancel g`        -- discard a Suspension without resuming it
 --
--- The Future is second-class and affine: a compile error if resumed twice,
+-- The Suspension is second-class and affine: a compile error if consumed twice,
 -- returned from a function, put in a list, or stored in a constructor.
 module Main
 import Std.Base
@@ -21,11 +23,11 @@ import Std.Control
 
 -- Producer: suspends with 42; when resumed with v, returns v + 1.
 producer : () -> U64 with Coro U64 U64
-producer _ = (Coro.suspend 42) + 1
+producer u = (Coro.suspend 42) + 1
 
 -- Driver: runs the producer to its first suspension, then resumes it with
--- value * 10 (= 420). The producer finishes as 420 + 1 = 421.
+-- x * 10 (= 420). The producer finishes as 420 + 1 = 421.
 main : U64
-main =
-  let s = start producer in
-  resume s (value s * 10)
+main = case start producer of
+  Completed r   -> r
+  Suspended x g -> run g (x * 10)

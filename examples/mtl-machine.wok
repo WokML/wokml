@@ -23,10 +23,12 @@ tick cmd = case cmd of
   Boom     -> Except.throw "machine hit a Boom"
 
 -- Walk the program recursively, summing the per-command counts.
-run : [Cmd] -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
-run cmds = case cmds of
+-- (Named `walk`, not `run`: `run` is now the Std.Control single-shot coroutine
+-- driver, and a same-named top-level binding would shadow it ambiguously.)
+walk : [Cmd] -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+walk cmds = case cmds of
   []           -> 0
-  cmd :: rest  -> tick cmd + run rest
+  cmd :: rest  -> tick cmd + walk rest
 
 -- The four handlers stack top-to-bottom = outer-to-inner, so `state` is nearest
 -- the computation and `except` is outermost (an abort discards state + log).
@@ -37,4 +39,4 @@ main =
   with reader 10 in
   with writer in
   with state 0 in
-  run [Inc 1, Snapshot, Inc 2, Snapshot]
+  walk [Inc 1, Snapshot, Inc 2, Snapshot]

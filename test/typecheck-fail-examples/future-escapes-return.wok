@@ -1,8 +1,8 @@
 module Main
 import Std.Base
--- Carrier rule: a Future-typed parameter is a second-class handle.
+-- Carrier rule: a Suspension-typed parameter is a second-class handle.
 -- Returning it bare from `leak` must be rejected with CarrierEscape.
-leak : Future U64 U64 U64 -> Future U64 U64 U64
+leak : Suspension U64 U64 U64 -> Suspension U64 U64 U64
 leak s = s
 main : U64
 main = 0

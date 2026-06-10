@@ -2,9 +2,12 @@ module Main
 import Std.Base
 import Std.Control
 worker : U64 -> () -> U64 with Coro U64 U64
-worker n _ = (Coro.suspend n) * 2
+worker n u = (Coro.suspend n) * 2
 main : U64
 main =
-  let a = start (worker 10) in
-  let b = start (worker 20) in
-  resume b (value b + 1) + resume a (value a + (value a - 9))
+  case start (worker 10) of
+    Completed _    -> 0
+    Suspended xa ga ->
+      case start (worker 20) of
+        Completed _    -> 0
+        Suspended xb gb -> run gb (xb + 1) + run ga (xa + (xa - 9))

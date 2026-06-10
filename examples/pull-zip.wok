@@ -1,0 +1,26 @@
+-- ZIP two generators -- holding TWO live producers at once and advancing them in
+-- lockstep. This is the capability the closed `Step` ADT unlocks over a single
+-- push handler: because the tail binds in a `case` ARM (not a callback closure),
+-- neither suspension is captured by a closure, so the second-class carrier rule
+-- is satisfied and the consumer can drive both at the same time.
+module Main
+import Std.Base
+import Std.Control
+
+gen : U64 -> U64 -> () with Coro U64 ()
+gen lo hi = case eqU64 lo hi of
+  True  -> ()
+  False -> let u = Coro.suspend lo in gen (lo + 1) hi
+
+-- Pull one from each, sum the pair, recurse on BOTH tails; stop when either
+-- producer completes.
+zipSum : Step U64 () () -> Step U64 () () -> U64
+zipSum sa sb = case sa of
+  Completed _    -> 0
+  Suspended xa ga -> case sb of
+    Completed _    -> 0
+    Suspended xb gb -> (xa + xb) + zipSum (step ga ()) (step gb ())
+
+main : U64
+main = zipSum (start (\u -> gen 0 4)) (start (\u -> gen 10 14))
+  -- (0+10)+(1+11)+(2+12)+(3+13) = 52

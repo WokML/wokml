@@ -17,64 +17,63 @@ effect Except e = { throw : e -> Never }
 except : (Except e -> a with Except e + eff r) -> Result a e with eff r
 except c = with self = Except { throw e k -> Err e ; v -> Ok v } in c self
 
--- Coro: the escaping one-shot coroutine. `suspend` yields an `a` and gets a `b`
--- back when the parked continuation is resumed. The continuation lives below the
--- effect boundary as an opaque `Future` handle (second-class via the carrier rule);
--- `Future a b r` has NO user-visible constructors.
+-- the producer effect is unchanged
 effect Coro a b = { suspend : a -> b }
 
--- Trusted bodyless builtin signatures (bind to prims by name at runtime).
--- __coro_susp decouples the continuation slot (b -> s) from the future's r so the
--- suspend arm's k : b -> <answer = Future a b r> unifies without an occurs-check.
-extern __coro_susp   : a -> (b -> s) -> Future a b r
-extern __coro_resume : Future a b r -> b -> Future a b r
-extern __coro_unwrap : Future a b r -> r
-extern __coro_done   : r -> Future a b r
-extern __coro_cancel : Future a b r -> ()
+-- COROUTINE TYPES (compiler built-ins).
+--
+-- `Suspension a b r` and `Step a b r` are built-in tycons: their second-class
+-- carrier + consume-once (affine) discipline is not expressible in surface wok
+-- (just as `Future` was built-in before, and `U64`/`[]`/tuples are). For
+-- reference, `Step` is EXACTLY the following two-constructor type, and you
+-- eliminate it with an ordinary `case`:
+--
+--   data Step a b r
+--     = Completed r                      -- the producer returned its final r
+--     | Suspended a (Suspension a b r)   -- it yielded an `a`; the tail is a Suspension
+--
+--   Suspension a b r                     -- opaque, second-class, affine handle
+--                                        -- (the parked producer; never constructed
+--                                        --  directly -- you get one from a Suspended arm)
+--
+-- Drive a coroutine by `case`-ing each Step (BOTH arms required):
+--
+--   case start producer of
+--     Completed r    -> ...                    -- finished without suspending
+--     Suspended x g  -> ... step g v ...       -- x = yielded value, g = tail; pull the next
+--
+--   case step g v of
+--     Completed r    -> ...
+--     Suspended x g' -> ...
+--
+-- A Suspension is consumed exactly once (by `step` XOR `run` XOR `cancel`); a Step
+-- is consumed by being `case`d once. Neither may escape its scope (return/store/list).
 
--- `start` installs the Coro handler and runs the producer to its first suspension,
--- returning the opaque Future. The suspend arm packs (yielded value, captured
--- continuation) into a Suspended future; the value arm tags a completed result.
-start : (() -> r with Coro a b) -> Future a b r
+-- Trusted builtins. Implementations are unchanged from 4b; only the wok-level
+-- types move to Step (a resumed coroutine IS a Suspended/Completed VCon = a Step).
+-- __coro_susp keeps the continuation slot decoupled (b -> s) from the future's r
+-- so the suspend arm's k : b -> <answer = Step a b r> unifies without an occurs-check.
+extern __coro_susp   : a -> (b -> s) -> Step a b r       -- builds a Suspended Step
+extern __coro_resume : Suspension a b r -> b -> Step a b r
+extern __coro_unwrap : Step a b r -> r                   -- peels a Completed Step (errors on Suspended)
+extern __coro_done   : r -> Step a b r                   -- builds a Completed Step
+extern __coro_cancel : Suspension a b r -> ()
+
+-- start: install Coro, run the producer to its first suspension, return the
+-- FIRST outcome as a Step (Suspended x g' or Completed r).
+start : (() -> r with Coro a b) -> Step a b r
 start c = with Coro { suspend x k -> __coro_susp x k ; v -> __coro_done v } (c ())
 
--- `value` reads the yielded value (non-consuming; may be read any number of
--- times). It is a direct `extern` bound to the value-projection prim, so the
--- affine check recognises it as the trusted non-consuming reader by EXTERN
--- IDENTITY (not by name): a user binding named `value` is a regular function, not
--- this extern, and is treated as a consumer.
-extern value : Future a b r -> a
+-- step: resume the parked continuation once, return the next outcome.
+step : Suspension a b r -> b -> Step a b r
+step s v = __coro_resume s v
 
--- `resume` runs the parked continuation once with `v`, delivering the producer's
--- result `r`. __coro_resume re-installs the Coro handler (deep re-install), the
--- producer's tail runs through the value arm to a Completed future, __coro_unwrap
--- peels it to r.
-resume : Future a b r -> b -> r
-resume s v = __coro_unwrap (__coro_resume s v)
+-- run: single-shot convenience. Resumes once and assumes completion; if the
+-- producer suspends again this errors at runtime (the documented partiality,
+-- same as 4b's resume; the residual-row guard is the deferred 4b" work).
+run : Suspension a b r -> b -> r
+run s v = __coro_unwrap (__coro_resume s v)
 
--- `cancel` consumes the future WITHOUT resuming it, dropping the parked
--- continuation and returning unit. It is a consuming use, mutually exclusive
--- with `resume`: a future may be `resume`d XOR `cancel`led, at most once total
--- (enforced by the affine consumption check, which counts `resume`/`cancel`
--- applied to a Future-typed binding; `value` reads do NOT count).
-cancel : Future a b r -> ()
+-- cancel: discard a suspension without resuming it.
+cancel : Suspension a b r -> ()
 cancel s = __coro_cancel s
-
--- `step` resumes the parked continuation ONCE with `v`, then dispatches: the
--- producer either completed (onDone r) or suspended again (onYield x s'), where
--- s' is the tail future, SECOND-CLASS (a Future-typed lambda param: the carrier
--- rule makes it second-class; the affine rule counts it as consumed when threaded
--- on). The total, generator-safe counterpart of `resume` (which assumes a single
--- suspension and crashes on re-suspend). `step` consumes its input future (passed
--- as an argument) and produces a fresh tail s' the onYield branch consumes.
---
--- ARGUMENT ORDER IS LOAD-BEARING (sugar-readiness): the deferred named-arm sugar
---   step e v of done r -> b1 ; yield x s' -> b2
--- desugars positionally to
---   step e v (\r -> b1) (\x s' -> b2)
--- so `step` MUST stay (future, value, onDone, onYield) with onDone : r -> t and
--- onYield : a -> Future a b r -> t. Do not reorder.
-extern __coro_step : Future a b r -> (r -> t) -> (a -> Future a b r -> t) -> t
-
-step : Future a b r -> b -> (r -> t) -> (a -> Future a b r -> t) -> t
-step f v onDone onYield = __coro_step (__coro_resume f v) onDone onYield

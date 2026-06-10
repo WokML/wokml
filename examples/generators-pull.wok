@@ -1,0 +1,32 @@
+-- PULL-model generators (contrast with examples/generators.wok, the PUSH model).
+--
+-- In the push model the consumer IS the handler: it reacts as the producer
+-- drives. Here the CONSUMER drives. `start` runs the producer to its first
+-- suspension and hands back the first `Step`; the consumer pattern-matches
+-- `Suspended x g` to read the yielded value `x` and the tail handle `g`, does
+-- its own work, then calls `step g ()` to pull the next outcome. The producer
+-- is parked between pulls.
+--
+--   Step a b r = Completed r | Suspended a (Suspension a b r)
+--   start : (() -> r with Coro a b) -> Step a b r
+--   step  : Suspension a b r -> b -> Step a b r
+module Main
+import Std.Base
+import Std.Control
+
+-- Producer: yields lo, lo+1, ..., hi-1, suspending once per value.
+range : U64 -> U64 -> () with Coro U64 ()
+range lo hi = case eqU64 lo hi of
+  True  -> ()
+  False -> let u = Coro.suspend lo in range (lo + 1) hi
+
+-- Consumer: drive the generator to exhaustion, summing every value it yields.
+-- Each `Suspended x g` gives the value and the rest of the producer; recurse on
+-- the fresh tail `g` (consumed exactly once -- the affine rule is satisfied).
+sumAll : Step U64 () () -> U64
+sumAll s = case s of
+  Completed _   -> 0
+  Suspended x g -> x + sumAll (step g ())
+
+main : U64
+main = sumAll (start (\u -> range 0 6))   -- yields 0..5; 0+1+2+3+4+5 = 15

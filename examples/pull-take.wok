@@ -1,0 +1,28 @@
+-- Consumer-driven EARLY TERMINATION -- the thing the pull model expresses that a
+-- fold-style push handler does not: the consumer decides to stop before the
+-- producer is exhausted, and `cancel`s the parked remainder.
+--
+--   cancel : Suspension a b r -> ()   -- discard a suspension without resuming it
+module Main
+import Std.Base
+import Std.Control
+
+-- A long counter (bounded by hi only to stay total): yields 0,1,2,...
+count : U64 -> U64 -> () with Coro U64 ()
+count lo hi = case eqU64 lo hi of
+  True  -> ()
+  False -> let u = Coro.suspend lo in count (lo + 1) hi
+
+-- Sum the FIRST `n` yielded values, then stop and cancel the rest. The producer
+-- never runs past what the consumer asked for.
+takeSum : U64 -> Step U64 () () -> U64
+takeSum n s = case eqU64 n 0 of
+  True  -> case s of                       -- got enough; cancel the parked tail
+    Completed _   -> 0
+    Suspended x g -> let u = cancel g in 0
+  False -> case s of                       -- pull one more
+    Completed _   -> 0                      -- producer ended early
+    Suspended x g -> x + takeSum (n - 1) (step g ())
+
+main : U64
+main = takeSum 3 (start (\u -> count 0 100))   -- first 3 of 0..99: 0+1+2 = 3

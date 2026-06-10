@@ -1,7 +1,7 @@
-useIt s : TcFuture U64 U64 U64 =
+useIt s : TcSuspension U64 U64 U64 =
   ()
 
-passes s : TcFuture U64 U64 U64 =
+passes s : TcSuspension U64 U64 U64 =
   let t : () = useIt(s)
   t
 

@@ -8,6 +8,12 @@ a **library function**, no surface-language change. Named-arm syntax sugar is ex
 (zip/merge) is currently REJECTED by the conservative carrier rule — see §2 and §13. Single-future
 consumer-driven pull works and is validated.
 
+> **SUPERSEDED (2026-06-10) by slice 4c** (`2026-06-10-slice-4c-step-adt-suspend-naming-design.md`):
+> the CPS `step` was replaced by a closed `Step` ADT eliminated by `case`, which **resolves the
+> multi-future limitation** (the tail binds in a `case` arm, not a closure — zip type-checks and
+> `coro-step-zip` runs → 52). `Future`→`Suspension`, `value` dropped, `resume`→`run`. The
+> `future-step-multi-future-interleave` tripwire was promoted to the passing `coro-step-zip`.
+
 Reads with: `2026-06-09-one-shot-escape-design.md` (slice 4b — the single-shot escape this
 extends; esp. the Task 0 decision note in §5.2 and §9's deferred-list entry for 4b′), memory
 `effects-slice-4b-one-shot-escape` (the shipped mechanism + the load-bearing findings),

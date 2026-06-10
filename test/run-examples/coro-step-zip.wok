@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+import Std.Control
+gen : U64 -> U64 -> () with Coro U64 ()
+gen lo hi = case eqU64 lo hi of
+  True  -> ()
+  False -> let u = Coro.suspend lo in gen (lo + 1) hi
+zipSum : Step U64 () () -> Step U64 () () -> U64
+zipSum sa sb = case sa of
+  Completed _    -> 0
+  Suspended xa ga -> case sb of
+    Completed _    -> 0
+    Suspended xb gb -> (xa + xb) + zipSum (step ga ()) (step gb ())
+main : U64
+main = zipSum (start (\u -> gen 0 4)) (start (\u -> gen 10 14))

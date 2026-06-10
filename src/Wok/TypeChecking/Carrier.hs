@@ -33,7 +33,6 @@ module Wok.TypeChecking.Carrier
   ) where
 
 import Data.Text (Text)
-import qualified Data.Text as Tx
 import qualified Data.Set as Set
 import Data.Set (Set)
 
@@ -66,15 +65,18 @@ data Ctx = Ctx
   , ctxSpan       :: SourceSpan
   , ctxName       :: Text
   , ctxHandlerArm :: Bool
-    -- ^ True ONLY for the IMMEDIATE top-level check of a handler arm body (the
-    -- arm's answer expression). Reset to False when 'check' recurses into children
-    -- via 'recurse', so nested sub-expressions of an arm body receive the normal
-    -- check. This single-level flag exempts the DIRECT arm body of a Coro handler
-    -- (e.g. @__coro_done v@ or @__coro_susp x k@) from the inline-Future escape
-    -- rule: those saturated calls are the structural Future constructors for the
-    -- handler's answer type, not propagations of an existing Future. Any deeper
-    -- escapes inside the arm body (e.g. storing a Future in a list) are still
-    -- caught because the flag is False by the time 'recurse' reaches them.
+    -- ^ True ONLY for the IMMEDIATE top-level check of (a) a handler arm body (the
+    -- arm's answer expression), or (b) the tail of a clause body whose binding is
+    -- a carrier PRODUCER (its declared result type is a 'Step'/'Suspension'; see
+    -- 'checkCarriers' @resultIsCarrier@). Reset to False when 'check' recurses
+    -- into children via 'recurse', so nested sub-expressions receive the normal
+    -- check. This single-level flag exempts the DIRECT producer expression
+    -- (e.g. @__coro_done v@ / @__coro_susp x k@ inside a Coro handler arm, or
+    -- @__coro_resume s v@ as the body of @step@) from the inline-carrier escape
+    -- rule: those saturated calls are the structural carrier constructors for the
+    -- answer type, not propagations of an existing handle. Any deeper escapes
+    -- (e.g. storing a carrier in a list) are still caught because the flag is
+    -- False by the time 'recurse' reaches them.
   }
 
 -- | The per-position mutable state threaded through the walk.
@@ -91,15 +93,25 @@ err c = Left (CarrierEscape (ctxSpan c) (ctxName c))
 -- walked. The 'SourceSpan' (the binding's position) and name carry the
 -- diagnostic, since the typed AST has no per-node spans. Returns the first
 -- violation, if any.
+--
+-- @resultIsCarrier@ is True when the binding's DECLARED result type is itself an
+-- affine carrier (a 'Step' or 'Suspension'): such a binding is a carrier
+-- PRODUCER (e.g. @start@/@step@ return a 'Step'), so the TAIL of its clause body
+-- is permitted to be an inline-produced carrier of that type. This is the
+-- producer analogue of the handler-arm exemption ('ctxHandlerArm'): the carrier
+-- is the function's structural answer, not a propagation of a captured handle.
+-- The exemption is single-level — it is reset before descending into children
+-- (via 'recurse'), so a carrier escaping into a list/tuple inside the body is
+-- still caught.
 checkCarriers
-  :: ParamResolver -> SourceSpan -> Text -> [([TPat], TExpr)] -> Either TypeError ()
-checkCarriers resolve sp name clauses = mapM_ checkClause clauses
+  :: ParamResolver -> Bool -> SourceSpan -> Text -> [([TPat], TExpr)] -> Either TypeError ()
+checkCarriers resolve resultIsCarrier sp name clauses = mapM_ checkClause clauses
   where
     ctx = Ctx resolve sp name False
     checkClause (pats, body) =
       let env0 = Env (Set.unions (map handleBindersOfPat pats))
                      (Set.unions (map patVars pats))
-      in check ctx env0 False body
+      in check (ctx { ctxHandlerArm = resultIsCarrier }) env0 False body
 
 -- | Walk an expression. @allowed@ says whether THIS position may host an escaping
 -- carrier (a perform receiver, a handle-typed argument slot, an application head,
@@ -176,7 +188,7 @@ capturesHandleClosure carriers ty e = case ty of
 -- already caught by 'directlyEscapes' via the carrier set. Only a saturated
 -- call (a non-arrow @TApp@) needs this additional check.
 isInlineFutureApp :: TExpr -> Bool
-isInlineFutureApp (Texp ty (TApp _ _)) = isFutureType ty
+isInlineFutureApp (Texp ty (TApp _ _)) = isAffineCarrierType ty
 isInlineFutureApp _ = False
 
 -- | Recurse into a node's children, setting each child's @allowed@ flag and
@@ -230,8 +242,14 @@ recurse ctx env node = case node of
     in do mapM_ (checkDecl ctx env') decls
           check ctx env' False body
 
+  -- The scrutinee is an ALLOWED position: scrutinizing is how a transparent
+  -- affine carrier (a 'Step') is ELIMINATED. The carrier is consumed here, not
+  -- carried outward; the alts are checked non-allowed, so nothing escapes
+  -- through the arm bodies. (A bare 'Suspension' is never cased, so this does
+  -- not loosen the suspension rule.) The affine consume-once accounting for the
+  -- scrutiny lives in 'consumeCard' (the @TCase@ One rule).
   TCase scrut alts -> do
-    go False scrut
+    go True scrut
     mapM_ (checkAlt ctx env) alts
 
   -- A handler installation: the body and arms are non-allowed positions.
@@ -341,12 +359,13 @@ bindDecls env decls = env
       ]
     typeOf (Texp t _) = t
 
--- | Is this an effect-instance handle type, or a Future handle?
+-- | Is this an effect-instance handle type, or a Suspension handle?
 -- Both @CTCon (TcEffect _) _@ (named effect-instance handles) and
--- @CTCon TcFuture _@ (coroutine futures) are second-class and must not escape.
+-- @CTCon TcSuspension _@ (coroutine suspensions) are second-class and must not escape.
 isHandleType :: CType -> Bool
 isHandleType (CTCon (TcEffect _) _) = True
-isHandleType (CTCon TcFuture _)     = True
+isHandleType (CTCon TcSuspension _) = True
+isHandleType (CTCon TcStep _)       = True
 isHandleType _                       = False
 
 -- | A parameter slot into which a carrier may be passed (condition 2, extended):
@@ -481,8 +500,8 @@ freeVarsArm arm = case arm of
 -- It is a SIBLING pass to the carrier walk rather than an extension of it: the
 -- carrier walk's job (and its @allowed@/positional plumbing) is escape, an
 -- orthogonal concern; counting consuming uses with the {0,1,ω} cardinality
--- lattice reads far more clearly on its own, and reuses only the Future-binder
--- identification ('handleBindersOfPat' already classifies a @TcFuture@ binder).
+-- lattice reads far more clearly on its own, and reuses only the Suspension-binder
+-- identification ('handleBindersOfPat' already classifies a @TcSuspension@ binder).
 -- We reuse the 'Card' lattice from "Wok.IR.Multiplicity" (@joinC@ for branch =
 -- max, @addC@ for sequence = saturating sum) rather than reinventing it; that
 -- pass is over ANF 'Expr', so we replicate ONLY the sequence/branch combination
@@ -522,12 +541,12 @@ data ReaderTrust = ReaderTrust
   , rtShadows    :: Set Text   -- ^ reader names this module redefines at top level
   }
 
--- | The prelude extern reader names. This IS the @extern@ reader prim declared in
--- @Std.Control@ (@value@); the Part 1 gate guarantees no UserFile can forge an
--- @extern@ by this name, so recognising it (combined with the not-redefined /
--- not-locally-shadowed checks below) keys trust on the prelude extern's identity.
+-- | The prelude extern reader names. The Step surface removed the @value@ reader
+-- (you obtain a Suspension only by matching @Suspended x g@), so there are no
+-- trusted prelude readers. The ReaderTrust machinery is retained (it is cheap and
+-- the row plumbing still flows through it) but the trusted set is now empty.
 preludeReaderNames :: Set Text
-preludeReaderNames = Set.singleton (Tx.pack "value")
+preludeReaderNames = Set.empty
 
 -- | Check the affine consumption bound for one binding's clauses. Mirrors
 -- 'checkCarriers': the clause params may themselves bind futures (a parameter of
@@ -698,8 +717,17 @@ consumeCard trust s = go (Set.singleton s) Set.empty
             rhss = foldr (addC . declCard aliases' locals') Zero decls
         in addC rhss (go aliases' locals' body)
 
+      -- A @case@ CONSUMES its scrutinee when the scrutinee is a bare alias of
+      -- the tracked affine carrier. This is how a 'Step' is eliminated:
+      -- scrutinizing it once is fine (One); scrutinizing the same binder in two
+      -- @case@s is a double-consume (Many, via addC across the two cases at
+      -- their common parent). A non-bare scrutinee recurses ordinarily (its
+      -- uses are counted as before).
       TCase scrut alts ->
-        addC (go aliases locals scrut) (foldr (joinC . altCard aliases locals) Zero alts)
+        let scrutCard
+              | bareAlias aliases scrut = One
+              | otherwise               = go aliases locals scrut
+        in addC scrutCard (foldr (joinC . altCard aliases locals) Zero alts)
 
       THandle e arms ->
         addC (go aliases locals e) (foldr (addC . armCard aliases locals) Zero arms)
@@ -772,12 +800,13 @@ consumeCard trust s = go (Set.singleton s) Set.empty
         | otherwise -> go aliases (Set.union locals (Set.unions (map patVars pats))) body
       TParamArm _ initE -> go aliases locals initE
 
--- | The Future-typed binders introduced by a pattern (a @TcFuture@ binder), reusing
--- the same type predicate the carrier rule uses, restricted to futures.
+-- | The affine-carrier-typed binders introduced by a pattern (a @TcSuspension@ or
+-- @TcStep@ binder), reusing the same type predicate ('isAffineCarrierType') the
+-- carrier rule uses. Covers both affine carriers: Suspension and Step.
 futureBindersOfPat :: TPat -> Set Text
 futureBindersOfPat (Tpat ty p) = case p of
   TPVar n
-    | isFutureType ty -> Set.singleton n
+    | isAffineCarrierType ty -> Set.singleton n
     | otherwise       -> Set.empty
   TPWild      -> Set.empty
   TPLitI _    -> Set.empty
@@ -790,24 +819,36 @@ futureBindersOfPat (Tpat ty p) = case p of
   TPCons h t  -> Set.union (futureBindersOfPat h) (futureBindersOfPat t)
   TPAs n inner ->
     let rest = futureBindersOfPat inner
-    in if isFutureType ty then Set.insert n rest else rest
+    in if isAffineCarrierType ty then Set.insert n rest else rest
 
--- | The Future-typed binders introduced by a let/where group: a binding whose
--- (peeled) result type is a Future, or whose pattern binds a future.
+-- | The affine-carrier-typed binders introduced by a let/where group: a binding
+-- whose (peeled) result type is an affine carrier (Suspension or Step), or whose
+-- pattern binds an affine carrier.
 futureBindersOfDecls :: [TLocalDecl CType] -> Set Text
 futureBindersOfDecls decls = Set.unions
   [ binders
   | TLocalDecl n pats rhs <- decls
-  , let resultIsFuture = null pats && isFutureType (typeOf rhs)
+  , let resultIsFuture = null pats && isAffineCarrierType (typeOf rhs)
         patFuts = Set.unions (map futureBindersOfPat pats)
         binders = (if resultIsFuture then Set.singleton n else Set.empty)
                     `Set.union` patFuts
   ]
   where typeOf (Texp t _) = t
 
--- | Is this specifically a coroutine 'Future' handle type? (A subset of
+-- | Is this specifically a coroutine 'Suspension' handle type? (A subset of
 -- 'isHandleType' — effect-instance handles are NOT subject to the consumption
--- bound, only futures are.)
-isFutureType :: CType -> Bool
-isFutureType (CTCon TcFuture _) = True
-isFutureType _                  = False
+-- bound, only suspensions are.)
+isSuspensionType :: CType -> Bool
+isSuspensionType (CTCon TcSuspension _) = True
+isSuspensionType _                      = False
+
+-- | Is this an AFFINE carrier type — a coroutine 'Suspension' OR the built-in
+-- transparent 'Step' ADT? Both are consume-once: a 'Suspension' is consumed
+-- when passed as an argument (e.g. to @resume@); a 'Step' is consumed when it
+-- is the SCRUTINEE of a @case@. Both kinds of binder are tracked by the affine
+-- analysis ('consumeCard'); the scrutiny rule there distinguishes how each is
+-- consumed. (A superset of 'isSuspensionType'; effect-instance handles are NOT
+-- subject to the consumption bound.)
+isAffineCarrierType :: CType -> Bool
+isAffineCarrierType (CTCon TcStep _) = True
+isAffineCarrierType ty               = isSuspensionType ty

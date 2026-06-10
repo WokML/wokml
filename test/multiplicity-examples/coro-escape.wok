@@ -8,9 +8,9 @@ import Std.Control
 -- This is the golden that would have surfaced C2 (a spoofed `__coro_susp` would
 -- NOT be certified, since the relaxation now keys on the prim's identity).
 producer : () -> U64 with Coro U64 U64
-producer _ = (Coro.suspend 42) + 1
+producer u = (Coro.suspend 42) + 1
 
 main : U64
-main =
-  let s = start producer in
-  resume s (value s * 10)
+main = case start producer of
+  Completed r   -> r
+  Suspended x g -> run g (x * 10)
