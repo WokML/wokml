@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-10-slice-b-row-kinded-params.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Branch and baseline (slice B)",
+      "status": "pending",
+      "description": "**Goal:** Branch feat/slice-b-row-kinded-params from main; record 701-green + coro 421/10/52/64 + Happy conflict count (31).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git branch --show-current\", \"acceptanceCriteria\": [\"on branch feat/slice-b-row-kinded-params from main\", \"cabal test green (701); coro 421/10/52/64\", \"conflict count recorded (31)\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Grammar - (row e) param + type-arg forms",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Add TyParam (TPPlain/TPRow `(row VarId)`) on the 3 data decls ([VarId]->[TyParam]) + TRowArg Type2; BNFC regen + 3 patches + conflict unchanged (31); reorderDecl exhaustive; minimal Infer compile fix; parse round-trip golden.\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok/\", \"src/Wok/Reordering.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/examples/41-row-kinded-params.wok\"], \"verifyCommand\": \"cabal test 2>&1 | grep -i 41-row-kinded-params\", \"acceptanceCriteria\": [\"TyParam TPPlain/TPRow + TRowArg Type2; 3 decls use [TyParam]\", \"BNFC regen + 3 patches; conflict count 31\", \"build clean; existing decls parse unchanged\", \"round-trip parse golden added\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Elaboration - per-param kinds + (row e) arg (positive proof)",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** TyConInfo per-param kinds (tcParamKinds); registerTyCons tcKind + registerCon constructor quantifiers from per-param kinds (fix all-KStar 874/908); (row e) arg -> KEffect var resolving to bound row param in goT (sigs) and walkArg (fields); positive fixture type-checks + runs to 5.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Env.hs\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/Spec.hs\", \"test/typecheck-examples/row-param-box.wok\", \"test/run-examples/row-param-box.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/row-param-box.wok --run\", \"acceptanceCriteria\": [\"TyConInfo per-param kinds; (row e)->KEffect, bare->KStar\", \"registerCon quantifiers use per-param kinds\", \"(row e) arg elaborates to KEffect var (sigs+fields), resolves to bound param\", \"positive fixture type-checks; --run prints 5\", \"full suite green; no pre-existing golden changed\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Kind-check applications + contextual error + prettyCType (negatives)",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** TyConArgKind error; kind-check the 4 application sites (goT 542/559, walkArg 947/958) tcParamKinds vs syntax-directed argKind; negatives (Box U64, Option (row e)) rejected with contextual message; gate fixture; harden prettyCType row arms; kind-check unit anchor.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Error.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/Spec.hs\", \"test/typecheck-fail-examples/star-arg-in-row-slot.wok\", \"test/typecheck-fail-examples/row-arg-in-star-slot.wok\", \"test/typecheck-fail-examples/extern-row-param-user-forbidden.wok\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE 'star-arg-in-row-slot|row-arg-in-star-slot|All [0-9]+ tests'\", \"acceptanceCriteria\": [\"TyConArgKind contextual error (tycon+param#+kinds)\", \"row-in-* and *-in-row mismatches rejected; Box U64 message names the row param\", \"UserFile extern type (row e) -> ExternNotAllowed\", \"prettyCType row arms hardened\", \"full suite green; no pre-existing golden changed; coro 421/10/52/64\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Full-branch review and finish (slice B)",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Standing-rule full-branch review main..HEAD; triage; integrate per user preference (confirm in prose).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"full-branch review main..HEAD completed + triaged\", \"build+test green; no pre-existing golden changed; coro 421/10/52/64\", \"decidability contract held\", \"integration decision made with user\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-10"
+}

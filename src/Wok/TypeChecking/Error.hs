@@ -7,7 +7,7 @@ module Wok.TypeChecking.Error
 
 import Data.Text (Text)
 import GeneratedParser.Wok.Abs (BNFC'Position)
-import Wok.TypeChecking.Types (CRow, CType)
+import Wok.TypeChecking.Types (CRow, CType, Kind)
 
 -- | A source location. Currently the start position of the offending
 -- token (BNFC only records token starts, not full spans).
@@ -19,6 +19,14 @@ data TypeError
     -- ^ Two types of different KINDS were unified (e.g. a row where a `*`-kinded
     -- type was expected). Cannot arise from surface programs in Slice A (every
     -- type is well-kinded); guards the kinded representation for later slices.
+  | TyConArgKind SourceSpan Text Int Kind Kind
+    -- ^ Tycon application kind error: <tycon> parameter #<i> (0-based) expects
+    -- kind <expected>, but the argument has kind <actual>. The application-site
+    -- analogue of the unification-level KindMismatch (slice B).
+  | FieldKindError SourceSpan Kind
+    -- ^ A constructor field's type must have kind `*`, but it has kind <actual>
+    -- (a row-typed field, e.g. `Box e` with `e:KEffect`). Caught at field
+    -- translation, preempting a cryptic downstream KindMismatch (slice B).
   | OccursCheck SourceSpan Int CType
   | UnknownVar SourceSpan Text
   | UnknownCon SourceSpan Text

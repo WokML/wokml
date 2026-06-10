@@ -1,0 +1,13 @@
+unwrap p : Box a4 =
+  join j30(n : U64) =
+    n
+  case p of
+    Box f : U64 -> jump j30(f)
+
+main =
+  let t.1 : Box a13 = Box(7)
+  let t.2 : Carry a13 = Carry(t.1)
+  case t.2 of
+    Carry b : Box a13 ->
+      let t.3 : U64 = unwrap(b)
+      t.3

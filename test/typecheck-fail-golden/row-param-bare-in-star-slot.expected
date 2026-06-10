@@ -1,0 +1,1 @@
+typecheck: typecheck in Main: TyConArgKind (Just (5,25)) "Option" 0 KStar KEffect

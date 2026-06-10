@@ -49,6 +49,9 @@ data TyConInfo = TyConInfo
     -- ^ True iff declared by an @extern data@/@extern type@ (Embedded-only). A
     -- carrier tycon is second-class (no escape) and affine (consume-once); the
     -- Carrier analyses consult this flag, not a TyCon tag.
+  , tcParamKinds :: [Kind]
+    -- ^ Kind of each parameter, in order (KStar for bare, KEffect for @(row e)@);
+    -- slice B. Length matches 'tcArity'.
   }
   deriving (Eq, Show)
 

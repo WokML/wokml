@@ -871,8 +871,8 @@ envOverlayTests = testGroup "envOverlay"
   , testCase "tycon collision returns Left with NsTyCon" $
       -- A genuine collision requires DIFFERING entries under the same name
       -- (byte-identical re-exports merge silently to support diamond imports).
-      let tciA = TE.TyConInfo Ty.KStar 0 [] False
-          tciB = TE.TyConInfo Ty.KStar 1 [] False
+      let tciA = TE.TyConInfo Ty.KStar 0 [] False []
+          tciB = TE.TyConInfo Ty.KStar 1 [] False [Ty.KStar]
           a = TE.extendTyCon (T.pack "Foo") tciA TE.emptyEnv
           b = TE.extendTyCon (T.pack "Foo") tciB TE.emptyEnv
       in case TE.overlayEnvs a b of
@@ -907,8 +907,8 @@ envOverlayTests = testGroup "envOverlay"
   , testCase "collisions across multiple namespaces are all reported" $
       let sA  = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           sB  = Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])
-          tciA = TE.TyConInfo Ty.KStar 0 [] False
-          tciB = TE.TyConInfo Ty.KStar 1 [] False
+          tciA = TE.TyConInfo Ty.KStar 0 [] False []
+          tciB = TE.TyConInfo Ty.KStar 1 [] False [Ty.KStar]
           a = TE.extendTyCon (T.pack "X") tciA (TE.extendVar (T.pack "y") sA TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tciB (TE.extendVar (T.pack "y") sB TE.emptyEnv)
       in case TE.overlayEnvs a b of
@@ -923,7 +923,7 @@ envOverlayTests = testGroup "envOverlay"
       -- module that re-exports `Std.Base` without every shared name
       -- clashing.
       let s   = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
-          tci = TE.TyConInfo Ty.KStar 0 [] False
+          tci = TE.TyConInfo Ty.KStar 0 [] False []
           a = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
       in case TE.overlayEnvs a b of
@@ -2380,7 +2380,8 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
       let pos = (0,0)
           vc s = Abs.ConId (pos, T.pack s)
           vv s = Abs.VarId (pos, T.pack s)
-          decl = Abs.DData (vc "Maybe") [vv "a"]
+          tp s = Abs.TPPlain (vv s)
+          decl = Abs.DData (vc "Maybe") [tp "a"]
                    [ Abs.ConDef (vc "Nothing") []
                    , Abs.ConDef (vc "Just") [Abs.TVar (vv "a")]
                    ]
@@ -2422,10 +2423,11 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
       let pos = (0,0)
           vc s = Abs.ConId (pos, T.pack s)
           vv s = Abs.VarId (pos, T.pack s)
+          tp s = Abs.TPPlain (vv s)
           -- extern type Susp a b r
-          suspDecl = Abs.DExternType (vc "Susp") [vv "a", vv "b", vv "r"]
+          suspDecl = Abs.DExternType (vc "Susp") [tp "a", tp "b", tp "r"]
           -- extern data St a b r = Done r | More a (Susp a b r)
-          stDecl = Abs.DExternData (vc "St") [vv "a", vv "b", vv "r"]
+          stDecl = Abs.DExternData (vc "St") [tp "a", tp "b", tp "r"]
                      [ Abs.ConDef (vc "Done") [Abs.TVar (vv "r")]
                      , Abs.ConDef (vc "More")
                          [ Abs.TVar (vv "a")
@@ -2439,7 +2441,7 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
                          ]
                      ]
           -- data Plain a = MkPlain a
-          plainDecl = Abs.DData (vc "Plain") [vv "a"]
+          plainDecl = Abs.DData (vc "Plain") [tp "a"]
                         [ Abs.ConDef (vc "MkPlain") [Abs.TVar (vv "a")] ]
           result = TM.runTC_ B.initialEnv $
                      I.processDataDecls B.initialEnv [suspDecl, stDecl, plainDecl]
@@ -2455,6 +2457,28 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
                Nothing -> assertFailure "St missing"
              case TE.lookupTyCon (T.pack "Plain") env of
                Just info -> TE.tcCarrier info @?= False
+               Nothing   -> assertFailure "Plain missing"
+           Left e -> assertFailure (show e)
+  , testCase "tcParamKinds: (row e) is KEffect, bare is KStar" $
+      let pos = (0,0)
+          vc s = Abs.ConId (pos, T.pack s)
+          vv s = Abs.VarId (pos, T.pack s)
+          -- data Box (row e) = Box U64
+          boxDecl = Abs.DData (vc "Box") [Abs.TPRow (vv "e")]
+                      [ Abs.ConDef (vc "Box")
+                          [Abs.TCon (Abs.MPName (vc "U64"))] ]
+          -- data Plain a = Plain a
+          plainDecl = Abs.DData (vc "Plain") [Abs.TPPlain (vv "a")]
+                        [ Abs.ConDef (vc "Plain") [Abs.TVar (vv "a")] ]
+          result = TM.runTC_ B.initialEnv $
+                     I.processDataDecls B.initialEnv [boxDecl, plainDecl]
+      in case result of
+           Right env -> do
+             case TE.lookupTyCon (T.pack "Box") env of
+               Just info -> TE.tcParamKinds info @?= [Ty.KEffect]
+               Nothing   -> assertFailure "Box missing"
+             case TE.lookupTyCon (T.pack "Plain") env of
+               Just info -> TE.tcParamKinds info @?= [Ty.KStar]
                Nothing   -> assertFailure "Plain missing"
            Left e -> assertFailure (show e)
   ]

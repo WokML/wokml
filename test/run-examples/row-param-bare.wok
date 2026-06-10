@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+data Box (row e) = Box U64
+data Carry (row e) = Carry (Box e)   -- bare `e` (a KEffect param) in Box's row slot -- must be ACCEPTED
+
+unwrap : Box (row e) -> U64
+unwrap (Box n) = n
+
+main : U64
+main = case Carry (Box 7) of Carry b -> unwrap b

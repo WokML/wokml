@@ -77,6 +77,12 @@ entrypoints Module ;
 -- beyond the three above (`extern`/`data`/`type` are all already keywords, so
 -- one-token lookahead after `extern` disambiguates cleanly). The patch list is
 -- unchanged: keep applying exactly the three patches documented here.
+--
+-- POST-REGEN NOTE: slice B added the `TyParam` category (`TPPlain` bare VarId /
+-- `TPRow` `(row e)`) for `data`/`extern data`/`extern type` type-constructor
+-- parameters, plus the `TRowArg` Type2 (`(row e)` as a type argument). No new
+-- manual patch is required (`row` is already a keyword; the `(` ... `)` framing
+-- disambiguates cleanly). The patch list stays at exactly the three above.
 layout toplevel ;
 layout "let", "where", "of" ;
 layout stop "in" ;
@@ -86,9 +92,9 @@ Module.   Module ::= [Decl] ;
 DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
 DSig.     Decl ::= SigName [SigNameComma] ":" Type ;   -- multi-name sig; name may be VarId or (VarSym)
 DExtern.  Decl ::= "extern" SigName [SigNameComma] ":" Type ; -- explicit compiler-hole primitive; same shape as a bodyless DSig but intentional (no lint)
-DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
-DExternData. Decl ::= "extern" "data" ConId [VarId] "=" [ConDef] ; -- marked carrier ADT (Embedded-only; gate in Infer)
-DExternType. Decl ::= "extern" "type" ConId [VarId] ;              -- marked opaque carrier (Embedded-only)
+DData.    Decl ::= "data" ConId [TyParam] "=" [ConDef] ;
+DExternData. Decl ::= "extern" "data" ConId [TyParam] "=" [ConDef] ; -- marked carrier ADT (Embedded-only; gate in Infer)
+DExternType. Decl ::= "extern" "type" ConId [TyParam] ;              -- marked opaque carrier (Embedded-only)
 DEffect.  Decl ::= "effect" ConId [VarId] "=" "{" [RecordFieldType] "}" ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 
@@ -152,6 +158,11 @@ separator SigNameComma "" ;
 
 -- For `data T a b c = ...`, type params are bare VarIds (whitespace-separated list)
 separator VarId "" ;
+
+-- Type-constructor parameters: a bare VarId (kind *) or `(row VarId)` (kind Row/KEffect, slice B).
+TPPlain.  TyParam ::= VarId ;
+TPRow.    TyParam ::= "(" "row" VarId ")" ;
+separator TyParam "" ;
 
 -- Function LHS — four equivalent forms for defining operators:
 --   add x y    = ...   (LHSPre, FNBare VarId)
@@ -286,6 +297,7 @@ TList.    Type2 ::= "[" Type "]" ;
 TTuple.   Type2 ::= "(" Type "," [Type] ")" ;
 TParen.   Type2 ::= "(" Type ")" ;
 TUnit.    Type2 ::= "(" ")" ;            -- unit type; whitespace permitted
+TRowArg.  Type2 ::= "(" "row" VarId ")" ;   -- a row variable as a type argument (slice B)
 
 -- Type-level extension `Point + ext` (left-assoc; tighter than `->`).
 -- The `+` token is captured via `VarSym`; the elaborator restricts to literal "+"

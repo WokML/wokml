@@ -1,0 +1,10 @@
+peek p : Box a4 =
+  join j30(n : U64) =
+    n
+  case p of
+    Box f : U64 -> jump j30(f)
+
+main =
+  let t.1 : Box a7 = Box(5)
+  let t.2 : U64 = peek(t.1)
+  t.2

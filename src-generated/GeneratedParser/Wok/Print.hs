@@ -152,9 +152,9 @@ instance Print GeneratedParser.Wok.Abs.Decl where
     GeneratedParser.Wok.Abs.DEqn funlhs exp maybewhere -> prPrec i 0 (concatD [prt 0 funlhs, doc (showString "="), prt 0 exp, prt 0 maybewhere])
     GeneratedParser.Wok.Abs.DSig signame signamecommas type_ -> prPrec i 0 (concatD [prt 0 signame, prt 0 signamecommas, doc (showString ":"), prt 0 type_])
     GeneratedParser.Wok.Abs.DExtern signame signamecommas type_ -> prPrec i 0 (concatD [doc (showString "extern"), prt 0 signame, prt 0 signamecommas, doc (showString ":"), prt 0 type_])
-    GeneratedParser.Wok.Abs.DData conid varids condefs -> prPrec i 0 (concatD [doc (showString "data"), prt 0 conid, prt 0 varids, doc (showString "="), prt 0 condefs])
-    GeneratedParser.Wok.Abs.DExternData conid varids condefs -> prPrec i 0 (concatD [doc (showString "extern"), doc (showString "data"), prt 0 conid, prt 0 varids, doc (showString "="), prt 0 condefs])
-    GeneratedParser.Wok.Abs.DExternType conid varids -> prPrec i 0 (concatD [doc (showString "extern"), doc (showString "type"), prt 0 conid, prt 0 varids])
+    GeneratedParser.Wok.Abs.DData conid typarams condefs -> prPrec i 0 (concatD [doc (showString "data"), prt 0 conid, prt 0 typarams, doc (showString "="), prt 0 condefs])
+    GeneratedParser.Wok.Abs.DExternData conid typarams condefs -> prPrec i 0 (concatD [doc (showString "extern"), doc (showString "data"), prt 0 conid, prt 0 typarams, doc (showString "="), prt 0 condefs])
+    GeneratedParser.Wok.Abs.DExternType conid typarams -> prPrec i 0 (concatD [doc (showString "extern"), doc (showString "type"), prt 0 conid, prt 0 typarams])
     GeneratedParser.Wok.Abs.DEffect conid varids recordfieldtypes -> prPrec i 0 (concatD [doc (showString "effect"), prt 0 conid, prt 0 varids, doc (showString "="), doc (showString "{"), prt 0 recordfieldtypes, doc (showString "}")])
     GeneratedParser.Wok.Abs.DFixity fixname fixassoc fixrels -> prPrec i 0 (concatD [doc (showString "fixity"), prt 0 fixname, prt 0 fixassoc, prt 0 fixrels])
     GeneratedParser.Wok.Abs.DClass conid varids classentrys -> prPrec i 0 (concatD [doc (showString "class"), prt 0 conid, prt 0 varids, doc (showString "where"), doc (showString "{"), prt 0 classentrys, doc (showString "}")])
@@ -242,6 +242,15 @@ instance Print [GeneratedParser.Wok.Abs.VarId] where
   prt _ [] = concatD []
   prt _ (x:xs) = concatD [prt 0 x, prt 0 xs]
 
+instance Print GeneratedParser.Wok.Abs.TyParam where
+  prt i = \case
+    GeneratedParser.Wok.Abs.TPPlain varid -> prPrec i 0 (concatD [prt 0 varid])
+    GeneratedParser.Wok.Abs.TPRow varid -> prPrec i 0 (concatD [doc (showString "("), doc (showString "row"), prt 0 varid, doc (showString ")")])
+
+instance Print [GeneratedParser.Wok.Abs.TyParam] where
+  prt _ [] = concatD []
+  prt _ (x:xs) = concatD [prt 0 x, prt 0 xs]
+
 instance Print GeneratedParser.Wok.Abs.FunLHS where
   prt i = \case
     GeneratedParser.Wok.Abs.LHSPre funname atompats -> prPrec i 0 (concatD [prt 0 funname, prt 0 atompats])
@@ -312,6 +321,7 @@ instance Print GeneratedParser.Wok.Abs.Type where
     GeneratedParser.Wok.Abs.TTuple type_ types -> prPrec i 2 (concatD [doc (showString "("), prt 0 type_, doc (showString ","), prt 0 types, doc (showString ")")])
     GeneratedParser.Wok.Abs.TParen type_ -> prPrec i 2 (concatD [doc (showString "("), prt 0 type_, doc (showString ")")])
     GeneratedParser.Wok.Abs.TUnit -> prPrec i 2 (concatD [doc (showString "("), doc (showString ")")])
+    GeneratedParser.Wok.Abs.TRowArg varid -> prPrec i 2 (concatD [doc (showString "("), doc (showString "row"), prt 0 varid, doc (showString ")")])
     GeneratedParser.Wok.Abs.TExtend type_ varsym rowcontrib -> prPrec i 1 (concatD [prt 1 type_, prt 0 varsym, prt 0 rowcontrib])
 
 instance Print GeneratedParser.Wok.Abs.EffectAtom where

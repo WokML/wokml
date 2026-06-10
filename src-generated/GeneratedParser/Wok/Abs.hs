@@ -21,9 +21,9 @@ data Decl
     = DEqn FunLHS Exp MaybeWhere
     | DSig SigName [SigNameComma] Type
     | DExtern SigName [SigNameComma] Type
-    | DData ConId [VarId] [ConDef]
-    | DExternData ConId [VarId] [ConDef]
-    | DExternType ConId [VarId]
+    | DData ConId [TyParam] [ConDef]
+    | DExternData ConId [TyParam] [ConDef]
+    | DExternType ConId [TyParam]
     | DEffect ConId [VarId] [RecordFieldType]
     | DFixity FixName FixAssoc [FixRel]
     | DClass ConId [VarId] [ClassEntry]
@@ -70,6 +70,9 @@ data SigName = SNBare VarId | SNParen VarSym
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data SigNameComma = SNCons SigName
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data TyParam = TPPlain VarId | TPRow VarId
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data FunLHS
@@ -121,6 +124,7 @@ data Type
     | TTuple Type [Type]
     | TParen Type
     | TUnit
+    | TRowArg VarId
     | TExtend Type VarSym RowContrib
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 

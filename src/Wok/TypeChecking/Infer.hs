@@ -407,6 +407,7 @@ checkAnonTailPolarity sp = goT True
       Abs.TParen t'         -> goT pos t'
       Abs.TCon _            -> pure ()
       Abs.TVar _            -> pure ()
+      Abs.TRowArg _         -> pure ()   -- row var arg: leaf, no anon `..` tail
       Abs.TUnit             -> pure ()
 
     goRow :: Bool -> Abs.EffectRow -> TC s ()
@@ -556,14 +557,16 @@ translateSig env ty = do
                   pos  = modPathPos modPath
               case lookupTyCon name env' of
                 Just info
-                  | tcArity info == length args ->
+                  | tcArity info == length args -> do
+                      checkArgKinds pos name args (tcParamKinds info)
                       CTCon (resolveTyCon name) <$> mapM goT args
                   | otherwise -> throwError
                       (ArityMismatch (Just pos) name (tcArity info) (length args))
                 Nothing -> case lookupEffect name env' of
                   -- Saturated effect application `State U64` -> a handle type.
                   Just eInfo
-                    | length (eiParams eInfo) == length args ->
+                    | length (eiParams eInfo) == length args -> do
+                        checkArgKinds pos name args (map snd (eiParams eInfo))
                         CTCon (TcEffect name) <$> mapM goT args
                     | otherwise -> throwError
                         (ArityMismatch (Just pos) name (length (eiParams eInfo)) (length args))
@@ -579,6 +582,17 @@ translateSig env ty = do
           pure (CTCon (TcTuple (1 + length others)) ts)
         goT (Abs.TParen t') = goT t'
         goT Abs.TUnit = pure (CTCon TcUnit [])
+        -- `(row e)` as a type argument (slice B). Elaborates to a KEffect-kinded
+        -- row variable, allocated in `rowSeenRef` (so the scheme records it with
+        -- kind KEffect). Shares its slot with an effect-row variable `eff e` of
+        -- the same name (keyed under "eff:") so `(row e)` and `eff e` in one
+        -- scheme refer to the same row.
+        goT (Abs.TRowArg (Abs.VarId (_, name))) = do
+          let key = Tx.pack "eff:" <> name
+          rowSeen <- liftST (readSTRef rowSeenRef)
+          case Map.lookup key rowSeen of
+            Just i  -> pure (CTGen i)
+            Nothing -> CTGen <$> allocSlot rowSeenRef key
         -- `a -> b with E`: the effect row E rides the arrow's row slot.
         -- `with` binds looser than `->`, so for a chain `A -> B -> C with E`
         -- the parse is `TFun A (TWith B C E)` -- E attaches to the INNERMOST
@@ -632,8 +646,10 @@ translateSig env ty = do
           restRow <- goEffectRow rest
           pure (CRExtend lbl fieldCT restRow)
         -- Named open effect tail `eff e`: a shared KEffect row variable. Keyed
-        -- under an "eff:"-prefixed name so it can never collide with a record
-        -- `row e` of the same spelling (which uses the bare name).
+        -- under an "eff:"-prefixed name so that `eff e` and a signature-position
+        -- `(row e)` of the same spelling SHARE one slot (both use this prefix; see
+        -- `goT (Abs.TRowArg …)`), while the record `+`-tail row var `row e`
+        -- (`goRC RCVar`, bare name) stays separate.
         goEffectRow (Abs.ERVarOnly (Abs.VarId (_, name))) = do
           let key = Tx.pack "eff:" <> name
           rowSeen <- liftST (readSTRef rowSeenRef)
@@ -649,7 +665,8 @@ translateSig env ty = do
         goEffectAtom (Abs.ERAtom (Abs.ConId (pos, name)) typeArgs) =
           case lookupEffect name env' of
             Nothing -> throwError (MissingEffectDecl (Just pos) name)
-            Just _  -> do
+            Just eInfo  -> do
+              checkArgKinds pos name typeArgs (map snd (eiParams eInfo))
               argCTs <- mapM goT typeArgs
               let fieldCT = case argCTs of
                     []  -> CTCon TcUnit []
@@ -722,6 +739,32 @@ translateSig env ty = do
 collectApp :: Abs.Type -> Abs.Type -> (Abs.Type, [Abs.Type])
 collectApp (Abs.TApp f x) y = let (h, xs) = collectApp f x in (h, xs ++ [y])
 collectApp other y = (other, [y])
+
+-- | The KIND of a surface type argument, syntax-directed (slice B). A `(row e)`
+-- argument is KEffect; every other type is KStar. Used to kind-check tycon
+-- applications against 'tcParamKinds' at translation time, so an ill-kinded
+-- application (a row in a `*` slot, or a `*` type in a row slot) is rejected at
+-- the application site with a clear 'TyConArgKind' error -- preempting the
+-- cryptic downstream unification 'KindMismatch'.
+argKind :: Abs.Type -> Kind
+argKind (Abs.TRowArg _) = KEffect
+argKind _               = KStar
+
+-- | Kind-check a SATURATED tycon application's arguments against the tycon's
+-- declared per-parameter kinds ('tcParamKinds'). The caller must have already
+-- verified @length args == tcArity info@; since @tcArity info == length
+-- (tcParamKinds info)@ holds by construction ('registerTyCons'), the 'zip3'
+-- pairs every argument with its parameter's kind (the @[0..]@ index list is
+-- infinite, so it truncates to that equal-length pair). A mismatch -- a row in a
+-- `*` slot, or a `*` type in a row slot -- is a 'TyConArgKind' at the
+-- application site (slice B), preempting the cryptic downstream unification
+-- 'KindMismatch'. Shared by the signature ('goT') and constructor-field
+-- ('walkArg') translators.
+checkArgKinds :: (Int, Int) -> Text -> [Abs.Type] -> [Kind] -> TC s ()
+checkArgKinds pos name args paramKinds =
+  sequence_ [ when (argKind a /= pk) $
+                throwError (TyConArgKind (Just pos) name i pk (argKind a))
+            | (i, a, pk) <- zip3 [0 ..] args paramKinds ]
 
 -- | Flatten a dotted ModPath into its text key, e.g. Std.Base -> "Std.Base".
 -- Used by the module loader for module-name keys and by the typechecker
@@ -831,6 +874,19 @@ processDataDecls env0 decls = do
   envWithTyCons <- registerTyCons env0 dataDecls
   registerCons envWithTyCons dataDecls
   where
+    -- MINIMAL slice-B fix: extract the bound name from a tycon parameter.
+    -- The `(row e)` kind annotation (TPRow) is IGNORED here; per-param kinds
+    -- are Task 2. Both forms bind a single VarId name.
+    tyParamName :: Abs.TyParam -> Tx.Text
+    tyParamName (Abs.TPPlain (Abs.VarId (_, n))) = n
+    tyParamName (Abs.TPRow   (Abs.VarId (_, n))) = n
+
+    -- The kind a tycon parameter binds at: a bare `a` is KStar, a `(row e)`
+    -- annotation binds a row variable at KEffect (slice B).
+    paramKind :: Abs.TyParam -> Kind
+    paramKind (Abs.TPPlain _) = KStar
+    paramKind (Abs.TPRow   _) = KEffect
+
     dataDecls = filter isDataLike decls
 
     isDataLike Abs.DData{}       = True
@@ -856,22 +912,24 @@ processDataDecls env0 decls = do
       in case lookupTyCon name env of
         Just _  -> throwError (DuplicateTyCon (Just pos) name)
         Nothing -> do
-          let k    = foldr KArrow KStar (replicate (length params) KStar)
-              info = TyConInfo k (length params) [] carrier
+          let pks  = map paramKind params
+              k    = foldr KArrow KStar pks
+              info = TyConInfo k (length params) [] carrier pks
           registerTyCons (extendTyCon name info env) ds
 
     registerCons env [] = pure env
     registerCons env (d : ds) = case conDefsOf d of
       Nothing -> registerCons env ds   -- extern type: opaque, no constructors
       Just (pos, tcName, params, conDefs) -> do
-        let paramNames = [ n | Abs.VarId (_, n) <- params ]
+        let paramNames = map tyParamName params
             paramMap = Map.fromList (zip paramNames [0 ..])
+            pks      = map paramKind params
         -- Normalize elision (ConDefRecElide -> ConDefRec) and reject
         -- elision in multi-constructor decls.
         conDefs' <- normalizeElision (Just pos) tcName conDefs
         -- Reject same field name across constructors of this decl.
         checkFieldNameUniqueness (Just pos) conDefs'
-        env' <- foldM (registerCon tcName paramMap) env conDefs'
+        env' <- foldM (registerCon tcName paramMap pks) env conDefs'
         -- Collect positional constructor names for tcCons (record constructors
         -- are NOT included in tcCons because they don't appear in pattern
         -- applications via the positional namespace).
@@ -882,30 +940,30 @@ processDataDecls env0 decls = do
             env'' = extendTyCon tcName tcInfo env'
         registerCons env'' ds
 
-    registerCon tcName paramMap env (Abs.ConDef (Abs.ConId (pos, cname)) argTys) =
+    registerCon tcName paramMap pks env (Abs.ConDef (Abs.ConId (pos, cname)) argTys) =
       case lookupCon cname env of
         Just _ -> throwError (DuplicateCon (Just pos) cname)
         Nothing -> do
-          argCTypes <- mapM (translateConArg env paramMap) argTys
+          argCTypes <- mapM (translateConArg env paramMap pks) argTys
           let arity = length argTys
               paramCount = Map.size paramMap
               resultTy = CTCon (resolveTyCon tcName)
                            [ CTGen i | i <- [0 .. paramCount - 1] ]
               body = foldr (\arg acc -> CTArr arg CREmpty acc) resultTy argCTypes
-              quantifiers = [ (i, KStar) | i <- [0 .. paramCount - 1] ]
+              -- Per-param kinds (slice B): a `(row e)` param quantifies at KEffect.
+              quantifiers = zip [0 ..] pks
               scheme = mkScheme quantifiers body
               info = ConInfo scheme arity tcName
           pure (extendCon cname info env)
 
-    registerCon _tcName paramMap env (Abs.ConDefRec (Abs.ConId (pos, cname)) fields) =
+    registerCon _tcName paramMap pks env (Abs.ConDefRec (Abs.ConId (pos, cname)) fields) =
       case lookupRecordCon cname env of
         Just _ -> throwError (DuplicateCon (Just pos) cname)
         Nothing -> do
           fieldsCT <- forM fields $ \(Abs.RFType (Abs.VarId (_, fname)) ty) -> do
-            ct <- translateConArg env paramMap ty
+            ct <- translateConArg env paramMap pks ty
             pure (fname, ct)
-          let paramCount = Map.size paramMap
-              quantifiers = [ (i, KStar) | i <- [0 .. paramCount - 1] ]
+          let quantifiers = zip [0 ..] pks
               info = RecordConInfo
                 { rcTag    = cname
                 , rcFields = fieldsCT
@@ -913,7 +971,7 @@ processDataDecls env0 decls = do
                 }
           pure (extendRecordCon cname info env)
 
-    registerCon _ _ _ (Abs.ConDefRecElide _) =
+    registerCon _ _ _ _ (Abs.ConDefRecElide _) =
       error "registerCon: ConDefRecElide should have been normalized away by normalizeElision"
 
 -- | Translate a constructor-argument, record-field, or effect-operation type
@@ -923,17 +981,45 @@ processDataDecls env0 decls = do
 --
 -- A @with@ clause on the type (effect-carrying field/op types) is NOT handled
 -- here; such types are a later feature and reach the non-exhaustive fall through.
-translateConArg :: Env -> Map.Map Text Int -> Abs.Type -> TC s CType
-translateConArg env paramMap ty = do
+translateConArg :: Env -> Map.Map Text Int -> [Kind] -> Abs.Type -> TC s CType
+translateConArg env paramMap pks ty = do
   -- Apply the same `..`-polarity rule signatures get (spec 145/142), so an
   -- anonymous tail can never reach a parameter position via a data-field or
   -- operation type either. Today 'walkArg' rejects `with`/`+` wholesale, but
   -- routing through this check keeps the rule enforced uniformly and closes the
   -- loophole that would open if 'walkArg' later supported those forms.
   checkAnonTailPolarity Nothing ty
+  -- B4: a constructor field's OWN type must have kind `*`. A bare row-param
+  -- field (`Box e` with `e:KEffect`) or a `(row e)` field has kind KEffect and
+  -- is rejected here, before it can leak a cryptic downstream KindMismatch.
+  when (fieldArgKind ty /= KStar) $
+    throwError (FieldKindError (fieldKindPos ty) (fieldArgKind ty))
   walkArg ty
   where
+    -- Binding-aware kind of a field-position type (slice B). A bare variable
+    -- resolves to its enclosing declaration's declared param kind (`(row e)`
+    -- params are KEffect); anything else -- a concrete type, tycon application,
+    -- or arrow -- is KStar. This differs from the syntactic `argKind`, which
+    -- cannot see param bindings and is correct only in signature context.
+    fieldArgKind :: Abs.Type -> Kind
+    fieldArgKind (Abs.TVar (Abs.VarId (_, n)))    = maybe KStar (pks !!) (Map.lookup n paramMap)
+    fieldArgKind (Abs.TRowArg (Abs.VarId (_, n))) = maybe KStar (pks !!) (Map.lookup n paramMap)
+    fieldArgKind _                                = KStar
+
+    -- Position of a field type, for the B4 error (when available).
+    fieldKindPos :: Abs.Type -> BNFC'Position
+    fieldKindPos (Abs.TVar (Abs.VarId (p, _)))    = Just p
+    fieldKindPos (Abs.TRowArg (Abs.VarId (p, _))) = Just p
+    fieldKindPos _                                = Nothing
     walkArg (Abs.TVar (Abs.VarId (pos, name))) =
+      case Map.lookup name paramMap of
+        Just i -> pure (CTGen i)
+        Nothing -> throwError (UnknownTyCon (Just pos) name)
+    -- `(row e)` as a field-type argument (slice B): resolves to the decl's own
+    -- row-kinded param slot. The slot's KEffect kind comes from the tycon's
+    -- per-param kinds (registerTyCons/registerCon). A field may only reference a
+    -- row variable bound by the enclosing declaration's parameters.
+    walkArg (Abs.TRowArg (Abs.VarId (pos, name))) =
       case Map.lookup name paramMap of
         Just i -> pure (CTGen i)
         Nothing -> throwError (UnknownTyCon (Just pos) name)
@@ -955,7 +1041,16 @@ translateConArg env paramMap ty = do
               p = modPathPos mp
           case lookupTyCon n env of
             Just info
-              | tcArity info == length args ->
+              | tcArity info == length args -> do
+                  -- B1: kind-check field tycon-args by their BINDING-AWARE kind
+                  -- (`fieldArgKind`), not the syntactic `argKind`. A bare param
+                  -- variable contributes its declared param kind, so a KEffect
+                  -- param in a `*` slot (`Option e`) is rejected and a KEffect
+                  -- param in a row slot (`Box e`) is accepted -- consistently
+                  -- with the explicit `(row e)` form.
+                  sequence_ [ when (fieldArgKind a /= pk) $
+                                throwError (TyConArgKind (Just p) n i pk (fieldArgKind a))
+                            | (i, a, pk) <- zip3 [0 ..] args (tcParamKinds info) ]
                   CTCon (resolveTyCon n) <$> mapM walkArg args
               | otherwise -> throwError
                   (ArityMismatch (Just p) n (tcArity info) (length args))
@@ -1008,7 +1103,7 @@ processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
       case Map.lookup opName acc of
         Just _  -> throwError (DuplicateOperation pos ename opName)
         Nothing -> do
-          ct <- translateConArg env paramMap ty
+          ct <- translateConArg env paramMap (map snd quantifiers) ty
           pure (Map.insert opName (mkScheme quantifiers ct) acc)
 
 -- ---------------------------------------------------------------------------
@@ -3556,8 +3651,14 @@ prettyCType (CTArr a r b) =
     ]
 -- Row nodes (kind KEffect) are normally rendered via 'prettyCRow' (record rows)
 -- or 'prettyEffectRow' (arrow rows); these arms only keep 'prettyCType' total.
-prettyCType r@CREmpty       = prettyCRow r
-prettyCType r@(CRExtend{})  = prettyCRow r
+-- Defensive: a row node reaching 'prettyCType' as a standalone type. In slice B
+-- row arguments are row VARIABLES ('CTGen'), which print as a var name, so a
+-- concrete row node should not surface here -- these arms render it readably
+-- (deliberately the nested `{l | rest}` form, distinct from 'prettyCRow's flat
+-- comma list used for the arrow `with`-clause path) rather than the old
+-- empty-string delegation.
+prettyCType CREmpty             = Tx.pack "{}"
+prettyCType (CRExtend l _ rest) = Tx.concat [Tx.pack "{", l, Tx.pack " | ", prettyCType rest, Tx.pack "}"]
 
 prettyCTypeArg :: CType -> Text
 prettyCTypeArg t@CTArr{} = Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]

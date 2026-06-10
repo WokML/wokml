@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+data Box (row e) = Box U64
+data Pair (row e) = Pair (Box (row e))
+
+peek : Box (row e) -> U64
+peek (Box n) = n
+
+main : U64
+main = peek (Box 5)

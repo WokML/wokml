@@ -113,9 +113,9 @@ Decl
   : FunLHS '=' Exp MaybeWhere { GeneratedParser.Wok.Abs.DEqn $1 $3 $4 }
   | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
   | 'extern' SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DExtern $2 $3 $5 }
-  | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
-  | 'extern' 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DExternData $3 $4 $6 }
-  | 'extern' 'type' ConId ListVarId { GeneratedParser.Wok.Abs.DExternType $3 $4 }
+  | 'data' ConId ListTyParam '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
+  | 'extern' 'data' ConId ListTyParam '=' ListConDef { GeneratedParser.Wok.Abs.DExternData $3 $4 $6 }
+  | 'extern' 'type' ConId ListTyParam { GeneratedParser.Wok.Abs.DExternType $3 $4 }
   | 'effect' ConId ListVarId '=' '{' ListRecordFieldType '}' { GeneratedParser.Wok.Abs.DEffect $2 $3 $6 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
   | 'class' ConId ListVarId 'where' '{' ListClassEntry '}' { GeneratedParser.Wok.Abs.DClass $2 $3 $6 }
@@ -203,6 +203,15 @@ ListSigNameComma
 
 ListVarId :: { [GeneratedParser.Wok.Abs.VarId] }
 ListVarId : {- empty -} { [] } | VarId ListVarId { (:) $1 $2 }
+
+TyParam :: { GeneratedParser.Wok.Abs.TyParam }
+TyParam
+  : VarId { GeneratedParser.Wok.Abs.TPPlain $1 }
+  | '(' 'row' VarId ')' { GeneratedParser.Wok.Abs.TPRow $3 }
+
+ListTyParam :: { [GeneratedParser.Wok.Abs.TyParam] }
+ListTyParam
+  : {- empty -} { [] } | TyParam ListTyParam { (:) $1 $2 }
 
 FunLHS :: { GeneratedParser.Wok.Abs.FunLHS }
 FunLHS
@@ -304,6 +313,7 @@ Type2
   | '(' Type ',' ListType ')' { GeneratedParser.Wok.Abs.TTuple $2 $4 }
   | '(' Type ')' { GeneratedParser.Wok.Abs.TParen $2 }
   | '(' ')' { GeneratedParser.Wok.Abs.TUnit }
+  | '(' 'row' VarId ')' { GeneratedParser.Wok.Abs.TRowArg $3 }
 
 RowContrib :: { GeneratedParser.Wok.Abs.RowContrib }
 RowContrib

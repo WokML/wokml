@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+
+bad : Option (row e)   -- a row argument in Option's `*` parameter slot
+
+main : U64
+main = 0

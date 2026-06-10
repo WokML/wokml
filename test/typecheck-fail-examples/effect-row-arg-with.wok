@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+
+bad : U64 -> U64 with State (row e)   -- a row argument in State's `*` parameter slot
+bad x = x
+
+main : U64
+main = 0

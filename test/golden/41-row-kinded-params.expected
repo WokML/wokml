@@ -1,0 +1,3 @@
+data Box (row e) = Box U64;
+data Pair (row e) = Pair (Box (row e));
+peek : Box (row e) -> U64

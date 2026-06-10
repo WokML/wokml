@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+
+data Box (row e) = Box U64
+data Bad (row e) = Bad (Option e)   -- bare `e` (a KEffect param) in Option's `*` slot -- must be REJECTED
+
+main : U64
+main = 0
