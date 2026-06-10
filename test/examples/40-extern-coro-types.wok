@@ -1,0 +1,2 @@
+extern type Suspension a b r
+extern data Step a b r = Completed r | Suspended a (Suspension a b r)

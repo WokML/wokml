@@ -23,6 +23,7 @@ import qualified Wok.TypeChecking.Unify as U
 import qualified Wok.TypeChecking.Infer as I
 import qualified Wok.TypeChecking.Class as Class
 import qualified Wok.TypeChecking.Builtins as B
+import qualified Wok.TypeChecking.Carrier as Carrier
 import qualified Wok.TypeChecking.Solve as Solve
 import qualified Data.Set as Set
 import qualified Wok.TypeChecking.Typed as Typed
@@ -870,8 +871,8 @@ envOverlayTests = testGroup "envOverlay"
   , testCase "tycon collision returns Left with NsTyCon" $
       -- A genuine collision requires DIFFERING entries under the same name
       -- (byte-identical re-exports merge silently to support diamond imports).
-      let tciA = TE.TyConInfo Ty.KStar 0 []
-          tciB = TE.TyConInfo Ty.KStar 1 []
+      let tciA = TE.TyConInfo Ty.KStar 0 [] False
+          tciB = TE.TyConInfo Ty.KStar 1 [] False
           a = TE.extendTyCon (T.pack "Foo") tciA TE.emptyEnv
           b = TE.extendTyCon (T.pack "Foo") tciB TE.emptyEnv
       in case TE.overlayEnvs a b of
@@ -906,8 +907,8 @@ envOverlayTests = testGroup "envOverlay"
   , testCase "collisions across multiple namespaces are all reported" $
       let sA  = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           sB  = Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])
-          tciA = TE.TyConInfo Ty.KStar 0 []
-          tciB = TE.TyConInfo Ty.KStar 1 []
+          tciA = TE.TyConInfo Ty.KStar 0 [] False
+          tciB = TE.TyConInfo Ty.KStar 1 [] False
           a = TE.extendTyCon (T.pack "X") tciA (TE.extendVar (T.pack "y") sA TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tciB (TE.extendVar (T.pack "y") sB TE.emptyEnv)
       in case TE.overlayEnvs a b of
@@ -922,7 +923,7 @@ envOverlayTests = testGroup "envOverlay"
       -- module that re-exports `Std.Base` without every shared name
       -- clashing.
       let s   = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
-          tci = TE.TyConInfo Ty.KStar 0 []
+          tci = TE.TyConInfo Ty.KStar 0 [] False
           a = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
       in case TE.overlayEnvs a b of
@@ -1786,6 +1787,18 @@ carrierRuleTests = testGroup "Wok.TypeChecking.CarrierRule"
             ]
             (T.pack "prog")
             @?= Right (T.pack "State U64 -> U64")
+
+      , testCase "carrier predicates consult the tcCarrier marker set" $ do
+          let carrierTys = Set.fromList [T.pack "H"]
+              hApplied   = Ty.CTCon (Ty.TcUser (T.pack "H")) [Ty.CTCon Ty.TcU64 []]
+              other      = Ty.CTCon (Ty.TcUser (T.pack "Other")) []
+              effHandle  = Ty.CTCon (Ty.TcEffect (T.pack "State")) [Ty.CTCon Ty.TcU64 []]
+          Carrier.isHandleType        carrierTys hApplied @?= True
+          Carrier.isAffineCarrierType carrierTys hApplied @?= True
+          Carrier.isHandleType        carrierTys other    @?= False
+          Carrier.isAffineCarrierType carrierTys other    @?= False
+          Carrier.isHandleType        Set.empty  effHandle @?= True
+          Carrier.isAffineCarrierType Set.empty  effHandle @?= False
       ]
 
   , testGroup "REJECT (carrier escapes its scope)"
@@ -2405,6 +2418,45 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
         _ -> assertFailure
                 ("expected DuplicateTyCon, got "
                 ++ either show (const "Right") result)
+  , testCase "extern data/type elaborate to carrier-marked tycons" $
+      let pos = (0,0)
+          vc s = Abs.ConId (pos, T.pack s)
+          vv s = Abs.VarId (pos, T.pack s)
+          -- extern type Susp a b r
+          suspDecl = Abs.DExternType (vc "Susp") [vv "a", vv "b", vv "r"]
+          -- extern data St a b r = Done r | More a (Susp a b r)
+          stDecl = Abs.DExternData (vc "St") [vv "a", vv "b", vv "r"]
+                     [ Abs.ConDef (vc "Done") [Abs.TVar (vv "r")]
+                     , Abs.ConDef (vc "More")
+                         [ Abs.TVar (vv "a")
+                         , Abs.TApp
+                             (Abs.TApp
+                               (Abs.TApp
+                                 (Abs.TCon (Abs.MPName (vc "Susp")))
+                                 (Abs.TVar (vv "a")))
+                               (Abs.TVar (vv "b")))
+                             (Abs.TVar (vv "r"))
+                         ]
+                     ]
+          -- data Plain a = MkPlain a
+          plainDecl = Abs.DData (vc "Plain") [vv "a"]
+                        [ Abs.ConDef (vc "MkPlain") [Abs.TVar (vv "a")] ]
+          result = TM.runTC_ B.initialEnv $
+                     I.processDataDecls B.initialEnv [suspDecl, stDecl, plainDecl]
+      in case result of
+           Right env -> do
+             case TE.lookupTyCon (T.pack "Susp") env of
+               Just info -> TE.tcCarrier info @?= True
+               Nothing   -> assertFailure "Susp missing"
+             case TE.lookupTyCon (T.pack "St") env of
+               Just info -> do
+                 TE.tcCarrier info @?= True
+                 TE.tcCons info @?= [T.pack "Done", T.pack "More"]
+               Nothing -> assertFailure "St missing"
+             case TE.lookupTyCon (T.pack "Plain") env of
+               Just info -> TE.tcCarrier info @?= False
+               Nothing   -> assertFailure "Plain missing"
+           Left e -> assertFailure (show e)
   ]
 
 patternTests :: TestTree

@@ -99,12 +99,8 @@ resolveLayout topLayout =
     -- put an explicit layout block on the stack.
     -- This is done even if there was no layout word,
     -- to keep opening and closing braces.
-    -- PATCH: split isLayoutOpen / isParenOpen so the paren branch can call
-    -- maybeInsertSeparator (insert decl separator before paren-opening top-level
-    -- decls). Do NOT add the separator on the layout-open branch.
     | isLayoutOpen t0
       = t0 : res (Just t0) (Explicit : st) ts
-
     | isParenOpen t0
       = maybeInsertSeparator pt t0 st $
         t0 : res (Just t0) (Explicit : st) ts

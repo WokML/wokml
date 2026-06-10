@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+
+-- Robustness (slice 4d): this declares its OWN `Step` reusing the prelude's
+-- exact names, and deliberately does NOT `import Std.Control`. Because the
+-- carrier discipline rides the `extern` marker (tcCarrier) and not the name,
+-- this unmarked user `Step` is an ordinary type: it may be returned (`returnIt`)
+-- and stored in a list (`storeIt`) freely -- both forbidden for the marked
+-- prelude `Step` (see test/typecheck-fail-examples/step-inline-escape-*.wok).
+data Step a b r = Completed r | Suspended a r
+
+mkStep : U64 -> Step U64 U64 U64
+mkStep n = Completed n
+
+returnIt : Step U64 U64 U64
+returnIt = mkStep 7
+
+storeIt : [Step U64 U64 U64]
+storeIt = [mkStep 1, mkStep 2]
+
+main : U64
+main = case returnIt of
+  Completed r -> r
+  Suspended x y -> x

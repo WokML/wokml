@@ -50,12 +50,6 @@ data TyCon
   | TcUnit
   | TcTuple Int
   | TcList
-  | TcSuspension
-  -- | The built-in transparent coroutine-step ADT
-  -- @Step a b r = Completed r | Suspended a (Suspension a b r)@. Carrier
-  -- (cannot escape) and affine (consumed by @case@-scrutiny). Its
-  -- constructors' runtime tags coincide with the prims' VCon tags.
-  | TcStep
   | TcUser Text
   -- | An effect-instance HANDLE type. @TcEffect "State"@ applied to args
   -- (e.g. @TCon (TcEffect "State") [U64]@) is the type of a named effect

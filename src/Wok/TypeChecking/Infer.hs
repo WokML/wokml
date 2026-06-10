@@ -37,6 +37,7 @@ import Wok.SourceOrigin (Origin (..))
 import qualified Wok.TypeChecking.Builtins as Builtins
 import Wok.TypeChecking.Env
   ( ConInfo (..), Env, EffectInfo (..), RecordConInfo (..), TyConInfo (..)
+  , envTyCons
   , extendCon, extendEffect, extendRecordCon, extendTyCon, extendVar
   , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
 import Wok.TypeChecking.Error (TypeError (..), Warning (..))
@@ -752,8 +753,6 @@ resolveTyCon name
   | name == Tx.pack "Bool"   = TcBool
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
-  | name == Tx.pack "Suspension" = TcSuspension
-  | name == Tx.pack "Step"   = TcStep
   | otherwise                       = TcUser name
 
 -- | Bottom elimination: if an operation's result type is @Never@, replace it
@@ -827,39 +826,56 @@ processDataDecls env0 decls = do
   envWithTyCons <- registerTyCons env0 dataDecls
   registerCons envWithTyCons dataDecls
   where
-    dataDecls = [ d | d@(Abs.DData{}) <- decls ]
+    dataDecls = filter isDataLike decls
+
+    isDataLike Abs.DData{}       = True
+    isDataLike Abs.DExternData{} = True
+    isDataLike Abs.DExternType{} = True
+    isDataLike _                 = False
+
+    -- (pos, name, params, isCarrier) for the tycon-registration pass.
+    dataLikeHead (Abs.DData (Abs.ConId (pos, n)) ps _)       = (pos, n, ps, False)
+    dataLikeHead (Abs.DExternData (Abs.ConId (pos, n)) ps _) = (pos, n, ps, True)
+    dataLikeHead (Abs.DExternType (Abs.ConId (pos, n)) ps)   = (pos, n, ps, True)
+    dataLikeHead _ = error "processDataDecls.dataLikeHead: non-data-like (input pre-filtered)"
+
+    -- The constructor defs to register, if any. extern type has none.
+    conDefsOf (Abs.DData (Abs.ConId (pos, n)) ps cs)       = Just (pos, n, ps, cs)
+    conDefsOf (Abs.DExternData (Abs.ConId (pos, n)) ps cs) = Just (pos, n, ps, cs)
+    conDefsOf Abs.DExternType{}                            = Nothing
+    conDefsOf _ = error "processDataDecls.conDefsOf: non-data-like (input pre-filtered)"
 
     registerTyCons env [] = pure env
-    registerTyCons env (Abs.DData (Abs.ConId (pos, name)) params _ : ds) =
-      case lookupTyCon name env of
-        Just _ -> throwError (DuplicateTyCon (Just pos) name)
+    registerTyCons env (d : ds) =
+      let (pos, name, params, carrier) = dataLikeHead d
+      in case lookupTyCon name env of
+        Just _  -> throwError (DuplicateTyCon (Just pos) name)
         Nothing -> do
-          let k = foldr KArrow KStar (replicate (length params) KStar)
-              info = TyConInfo k (length params) []
-              env' = extendTyCon name info env
-          registerTyCons env' ds
-    registerTyCons _ (_ : _) = error "registerTyCons: non-DData reached (input should be pre-filtered)"
+          let k    = foldr KArrow KStar (replicate (length params) KStar)
+              info = TyConInfo k (length params) [] carrier
+          registerTyCons (extendTyCon name info env) ds
 
     registerCons env [] = pure env
-    registerCons env (Abs.DData (Abs.ConId (pos, tcName)) params conDefs : ds) = do
-      let paramNames = [ n | Abs.VarId (_, n) <- params ]
-          paramMap = Map.fromList (zip paramNames [0 ..])
-      -- Normalize elision (ConDefRecElide -> ConDefRec) and reject
-      -- elision in multi-constructor decls.
-      conDefs' <- normalizeElision (Just pos) tcName conDefs
-      -- Reject same field name across constructors of this decl.
-      checkFieldNameUniqueness (Just pos) conDefs'
-      env' <- foldM (registerCon tcName paramMap) env conDefs'
-      -- Collect positional constructor names for tcCons (record constructors
-      -- are NOT included in tcCons because they don't appear in pattern
-      -- applications via the positional namespace).
-      let cons = [ cn | Abs.ConDef (Abs.ConId (_, cn)) _ <- conDefs' ]
-          tcInfo = case lookupTyCon tcName env' of
-            Just t  -> t { tcCons = cons }
-            Nothing -> error "registerCons: tycon vanished"
-          env'' = extendTyCon tcName tcInfo env'
-      registerCons env'' ds
-    registerCons _ (_ : _) = error "registerCons: non-DData reached (input should be pre-filtered)"
+    registerCons env (d : ds) = case conDefsOf d of
+      Nothing -> registerCons env ds   -- extern type: opaque, no constructors
+      Just (pos, tcName, params, conDefs) -> do
+        let paramNames = [ n | Abs.VarId (_, n) <- params ]
+            paramMap = Map.fromList (zip paramNames [0 ..])
+        -- Normalize elision (ConDefRecElide -> ConDefRec) and reject
+        -- elision in multi-constructor decls.
+        conDefs' <- normalizeElision (Just pos) tcName conDefs
+        -- Reject same field name across constructors of this decl.
+        checkFieldNameUniqueness (Just pos) conDefs'
+        env' <- foldM (registerCon tcName paramMap) env conDefs'
+        -- Collect positional constructor names for tcCons (record constructors
+        -- are NOT included in tcCons because they don't appear in pattern
+        -- applications via the positional namespace).
+        let cons = [ cn | Abs.ConDef (Abs.ConId (_, cn)) _ <- conDefs' ]
+            tcInfo = case lookupTyCon tcName env' of
+              Just t  -> t { tcCons = cons }
+              Nothing -> error "registerCons: tycon vanished"
+            env'' = extendTyCon tcName tcInfo env'
+        registerCons env'' ds
 
     registerCon tcName paramMap env (Abs.ConDef (Abs.ConId (pos, cname)) argTys) =
       case lookupCon cname env of
@@ -3078,6 +3094,11 @@ inferProgramTC seedEnv origin decls = do
   withEnv (const env1i) $ do
     tds <- inferTopLetGroup origin externs localDecls
     env2 <- currentEnv
+    -- Names of marked carrier tycons (extern data/type), read off the env's
+    -- tcCarrier flags. Threaded into both post-inference soundness passes so
+    -- carrier-ness rides the marker, not a TyCon tag (slice 4d).
+    let carrierTys = Set.fromList
+          [ n | (n, info) <- Map.toList (envTyCons env2), tcCarrier info ]
     -- Part 1 gate: `extern` is the trust anchor for the soundness analyses (the
     -- one-shot relaxation's escape sink and the affine check's non-consuming
     -- reader are recognised by EXTERN IDENTITY — see C2/C3). Only the standard
@@ -3085,8 +3106,11 @@ inferProgramTC seedEnv origin decls = do
     -- one could forge that trusted identity. Reject any `extern` in a UserFile.
     case origin of
       Embedded   -> pure ()
-      UserFile _ -> forM_ (externDecls decls) $ \(n, pos) ->
-        throwError (ExternNotAllowed (Just pos) n)
+      UserFile _ -> do
+        forM_ (externDecls decls) $ \(n, pos) ->
+          throwError (ExternNotAllowed (Just pos) n)
+        forM_ (externTypeDecls decls) $ \(n, pos) ->
+          throwError (ExternNotAllowed (Just pos) n)
     -- Carrier rule (named effect instances, §4.3): a second-class escape check
     -- over the frozen typed AST. A handle (or a closure capturing one) may not
     -- escape its scope. Runs after inference because handle-ness is read off
@@ -3116,8 +3140,8 @@ inferProgramTC seedEnv origin decls = do
                     ((pats, _) : _) -> length pats
                     []              -> 0
       in either throwError pure
-           (checkCarriers resolveParams
-                          (producerExempt && resultIsAffineCarrier arity (tdScheme td))
+           (checkCarriers carrierTys resolveParams
+                          (producerExempt && resultIsAffineCarrier carrierTys arity (tdScheme td))
                           Nothing (tdName td) (tdClauses td))
     -- Affine consumption bound on Futures (slice 4b, Task 5): beside the carrier
     -- rule, a second LOCAL post-inference pass rejecting a coroutine Future
@@ -3131,7 +3155,7 @@ inferProgramTC seedEnv origin decls = do
                                     , not (Set.member (tdName td) externs) ]
     forM_ tds $ \td ->
       either throwError pure
-        (checkFutureAffine ownNonExtern Nothing (tdName td) (tdClauses td))
+        (checkFutureAffine carrierTys ownNonExtern Nothing (tdName td) (tdClauses td))
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
 
@@ -3146,6 +3170,17 @@ externDecls = concatMap go
         : [ (sigNameText x, sigNamePos x) | Abs.SNCons x <- extras ]
     go (Abs.DLocal d) = go d
     go _              = []
+
+-- | The @extern data@/@extern type@ declarations, as (tycon-name, position)
+-- pairs. Used by the Part-1 gate to reject either in a UserFile: a marked
+-- carrier tycon is a trust anchor, mintable only by the standard prelude.
+externTypeDecls :: [Abs.Decl] -> [(Text, (Int, Int))]
+externTypeDecls = concatMap go
+  where
+    go (Abs.DExternData (Abs.ConId (pos, n)) _ _) = [(n, pos)]
+    go (Abs.DExternType (Abs.ConId (pos, n)) _)   = [(n, pos)]
+    go (Abs.DLocal d)                             = go d
+    go _                                          = []
 
 -- | The declared parameter types of a scheme, in order, by peeling its body's
 -- arrows. Polymorphic positions remain 'CTGen' — this is exactly the property
@@ -3164,15 +3199,14 @@ schemeParamTypes = go . schemeBody
 -- that type (see 'checkCarriers' @resultIsCarrier@). Peels exactly @arity@
 -- arrows, so a function that RETURNS a function (a partial-application producer)
 -- is judged on its true result, not an intermediate arrow.
-resultIsAffineCarrier :: Int -> Scheme -> Bool
-resultIsAffineCarrier arity = isCarrier . peel arity . schemeBody
+resultIsAffineCarrier :: Set.Set Text -> Int -> Scheme -> Bool
+resultIsAffineCarrier carrierTys arity = isCarrier . peel arity . schemeBody
   where
     peel 0 t              = t
     peel n (CTArr _ _ b)  = peel (n - 1) b
     peel _ t              = t
-    isCarrier (CTCon TcStep _)       = True
-    isCarrier (CTCon TcSuspension _) = True
-    isCarrier _                      = False
+    isCarrier (CTCon (TcUser n) _) = Set.member n carrierTys
+    isCarrier _                    = False
 
 -- | Convert a top-level Decl to zero or more LocalDecls so we can reuse
 -- the existing inferLetGroup machinery.
@@ -3508,10 +3542,6 @@ prettyCType (CTCon (TcUser n) xs) =
 prettyCType (CTCon (TcEffect n) []) = n
 prettyCType (CTCon (TcEffect n) xs) =
   Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
-prettyCType (CTCon TcSuspension xs) =
-  Tx.concat [Tx.pack "Suspension", Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
-prettyCType (CTCon TcStep xs) =
-  Tx.concat [Tx.pack "Step", Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
@@ -3537,10 +3567,6 @@ prettyCTypeAtom t@CTArr{} = Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t@(CTCon (TcUser _) (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t@(CTCon (TcEffect _) (_:_)) =
-  Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
-prettyCTypeAtom t@(CTCon TcSuspension (_:_)) =
-  Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
-prettyCTypeAtom t@(CTCon TcStep (_:_)) =
   Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
 prettyCTypeAtom t = prettyCType t
 

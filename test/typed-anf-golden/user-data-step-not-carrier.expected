@@ -1,0 +1,20 @@
+mkStep n : U64 =
+  let t : Step U64 U64 U64 = Completed(n)
+  t
+
+returnIt =
+  let t : Step U64 U64 U64 = mkStep(7)
+  t
+
+storeIt =
+  let t.1 : Step U64 U64 U64 = mkStep(1)
+  let t.2 : Step U64 U64 U64 = mkStep(2)
+  let t.4 : [Step U64 U64 U64] = Nil
+  let t.3 : [Step U64 U64 U64] = Cons(t.2, t.4)
+  let t.5 : [Step U64 U64 U64] = Cons(t.1, t.3)
+  t.5
+
+main =
+  case returnIt of
+    Completed r : U64 -> r
+    Suspended x : U64 y : U64 -> x

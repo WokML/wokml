@@ -1,0 +1,20 @@
+mkStep n =
+  let t = Completed(n)
+  t
+
+returnIt =
+  let t = mkStep(7)
+  t
+
+storeIt =
+  let t.1 = mkStep(1)
+  let t.2 = mkStep(2)
+  let t.4 = Nil
+  let t.3 = Cons(t.2, t.4)
+  let t.5 = Cons(t.1, t.3)
+  t.5
+
+main =
+  case returnIt of
+    Completed r -> r
+    Suspended x y -> x

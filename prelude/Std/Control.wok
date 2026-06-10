@@ -20,34 +20,16 @@ except c = with self = Except { throw e k -> Err e ; v -> Ok v } in c self
 -- the producer effect is unchanged
 effect Coro a b = { suspend : a -> b }
 
--- COROUTINE TYPES (compiler built-ins).
+-- COROUTINE TYPES (prelude-declared `extern`; slice 4d).
 --
--- `Suspension a b r` and `Step a b r` are built-in tycons: their second-class
--- carrier + consume-once (affine) discipline is not expressible in surface wok
--- (just as `Future` was built-in before, and `U64`/`[]`/tuples are). For
--- reference, `Step` is EXACTLY the following two-constructor type, and you
--- eliminate it with an ordinary `case`:
---
---   data Step a b r
---     = Completed r                      -- the producer returned its final r
---     | Suspended a (Suspension a b r)   -- it yielded an `a`; the tail is a Suspension
---
---   Suspension a b r                     -- opaque, second-class, affine handle
---                                        -- (the parked producer; never constructed
---                                        --  directly -- you get one from a Suspended arm)
---
--- Drive a coroutine by `case`-ing each Step (BOTH arms required):
---
---   case start producer of
---     Completed r    -> ...                    -- finished without suspending
---     Suspended x g  -> ... step g v ...       -- x = yielded value, g = tail; pull the next
---
---   case step g v of
---     Completed r    -> ...
---     Suspended x g' -> ...
---
--- A Suspension is consumed exactly once (by `step` XOR `run` XOR `cancel`); a Step
--- is consumed by being `case`d once. Neither may escape its scope (return/store/list).
+-- `Suspension` is the opaque, second-class, affine parked producer: you never
+-- construct one; you obtain it from a `Suspended` arm and feed it to
+-- `step`/`run`/`cancel`. `Step` is the closed outcome of one step; eliminate it
+-- with an ordinary `case` (both arms). Their carrier + consume-once discipline
+-- rides the `extern` marker (Embedded-only), not the names.
+extern type Suspension a b r
+
+extern data Step a b r = Completed r | Suspended a (Suspension a b r)
 
 -- Trusted builtins. Implementations are unchanged from 4b; only the wok-level
 -- types move to Step (a resumed coroutine IS a Suspended/Completed VCon = a Step).

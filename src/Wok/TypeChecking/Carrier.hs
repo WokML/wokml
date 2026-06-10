@@ -30,6 +30,8 @@
 module Wok.TypeChecking.Carrier
   ( checkCarriers
   , checkFutureAffine
+  , isHandleType         -- exported for the slice-4d marker anchor test
+  , isAffineCarrierType  -- exported for the slice-4d marker anchor test
   ) where
 
 import Data.Text (Text)
@@ -77,6 +79,9 @@ data Ctx = Ctx
     -- answer type, not propagations of an existing handle. Any deeper escapes
     -- (e.g. storing a carrier in a list) are still caught because the flag is
     -- False by the time 'recurse' reaches them.
+  , ctxCarrierTys :: Set Text
+    -- ^ Names of marked carrier tycons (@extern data@/@extern type@); the marker
+    -- set consulted by 'isHandleType'/'isAffineCarrierType' (slice 4d).
   }
 
 -- | The per-position mutable state threaded through the walk.
@@ -104,12 +109,15 @@ err c = Left (CarrierEscape (ctxSpan c) (ctxName c))
 -- (via 'recurse'), so a carrier escaping into a list/tuple inside the body is
 -- still caught.
 checkCarriers
-  :: ParamResolver -> Bool -> SourceSpan -> Text -> [([TPat], TExpr)] -> Either TypeError ()
-checkCarriers resolve resultIsCarrier sp name clauses = mapM_ checkClause clauses
+  :: Set Text -> ParamResolver -> Bool -> SourceSpan -> Text
+  -> [([TPat], TExpr)] -> Either TypeError ()
+checkCarriers carrierTys resolve resultIsCarrier sp name clauses =
+  mapM_ checkClause clauses
   where
-    ctx = Ctx resolve sp name False
+    ctx = Ctx { ctxResolve = resolve, ctxSpan = sp, ctxName = name
+              , ctxHandlerArm = False, ctxCarrierTys = carrierTys }
     checkClause (pats, body) =
-      let env0 = Env (Set.unions (map handleBindersOfPat pats))
+      let env0 = Env (Set.unions (map (handleBindersOfPat carrierTys) pats))
                      (Set.unions (map patVars pats))
       in check (ctx { ctxHandlerArm = resultIsCarrier }) env0 False body
 
@@ -135,7 +143,7 @@ check ctx env allowed e@(Texp _ node)
   -- flag is set to True only for that single level and is reset to False
   -- (via 'recurse') before any child expressions are checked, so nested
   -- escapes (e.g. @[start producer]@ inside an arm) are still caught.
-  | isInlineFutureApp e, not allowed, not (ctxHandlerArm ctx) = err ctx
+  | isInlineFutureApp (ctxCarrierTys ctx) e, not allowed, not (ctxHandlerArm ctx) = err ctx
   | otherwise = recurse (ctx { ctxHandlerArm = False }) env node
 
 -- | The value forms that carry a handle out of their position: a bare carrier
@@ -187,9 +195,9 @@ capturesHandleClosure carriers ty e = case ty of
 -- 'directlyEscapes'. A @TVar@ / @TQVar@ bare reference to a Future variable is
 -- already caught by 'directlyEscapes' via the carrier set. Only a saturated
 -- call (a non-arrow @TApp@) needs this additional check.
-isInlineFutureApp :: TExpr -> Bool
-isInlineFutureApp (Texp ty (TApp _ _)) = isAffineCarrierType ty
-isInlineFutureApp _ = False
+isInlineFutureApp :: Set Text -> TExpr -> Bool
+isInlineFutureApp carrierTys (Texp ty (TApp _ _)) = isAffineCarrierType carrierTys ty
+isInlineFutureApp _          _                    = False
 
 -- | Recurse into a node's children, setting each child's @allowed@ flag and
 -- extending the environment where a binder is introduced.
@@ -216,7 +224,7 @@ recurse ctx env node = case node of
   TApp h args ->
     let paramTys = headParamTypes ctx env h
         argAllowed i = case drop i paramTys of
-          (pt : _) -> isHandleSlot pt
+          (pt : _) -> isHandleSlot (ctxCarrierTys ctx) pt
           []       -> False
     in do go True h
           sequence_ [ go (argAllowed i) a | (i, a) <- zip [0 ..] args ]
@@ -224,7 +232,7 @@ recurse ctx env node = case node of
   -- A lambda: its params become local binders (handle-typed ones also carriers);
   -- the body is a non-allowed position. (A lambda VALUE that captures a handle
   -- and escapes is caught at the lambda's own position by its parent.)
-  TLam pats body -> check ctx (bindPats env pats) False body
+  TLam pats body -> check ctx (bindPats (ctxCarrierTys ctx) env pats) False body
 
   TIf c a b -> mapM_ (go False) [c, a, b]
   TTuple xs -> mapM_ (go False) xs
@@ -238,7 +246,7 @@ recurse ctx env node = case node of
   -- name does not let it escape; instead the name joins the carrier set, so any
   -- later escape THROUGH the name is caught. Then the body is checked.
   TLet decls body ->
-    let env' = bindDecls env decls
+    let env' = bindDecls (ctxCarrierTys ctx) env decls
     in do mapM_ (checkDecl ctx env') decls
           check ctx env' False body
 
@@ -294,14 +302,14 @@ headParamTypes ctx env (Texp hTy hf) = case hf of
 -- tracked (allowed) position.
 checkDecl :: Ctx -> Env -> TLocalDecl CType -> Either TypeError ()
 checkDecl ctx env (TLocalDecl _ pats rhs) =
-  check ctx (bindPats env pats) True rhs
+  check ctx (bindPats (ctxCarrierTys ctx) env pats) True rhs
 
 -- | Check a case alternative: the pattern's binders and any where-decl carriers
 -- extend the environment; the body is non-allowed.
 checkAlt :: Ctx -> Env -> TAlt CType -> Either TypeError ()
 checkAlt ctx env (TAlt pat decls body) =
-  let env0 = bindPats env [pat]
-      env' = bindDecls env0 decls
+  let env0 = bindPats (ctxCarrierTys ctx) env [pat]
+      env' = bindDecls (ctxCarrierTys ctx) env0 decls
   in do mapM_ (checkDecl ctx env') decls
         check ctx env' False body
 
@@ -317,15 +325,15 @@ checkAlt ctx env (TAlt pat decls body) =
 -- an arm) still fire the inline-Future error.
 checkArm :: Ctx -> Env -> THandlerArm CType -> Either TypeError ()
 checkArm ctx env arm = case arm of
-  TReturnArm pat body    -> check (ctx { ctxHandlerArm = True }) (bindPats env [pat]) False body
-  TOpArm _ _ pats _ body -> check (ctx { ctxHandlerArm = True }) (bindPats env pats) False body
+  TReturnArm pat body    -> check (ctx { ctxHandlerArm = True }) (bindPats (ctxCarrierTys ctx) env [pat]) False body
+  TOpArm _ _ pats _ body -> check (ctx { ctxHandlerArm = True }) (bindPats (ctxCarrierTys ctx) env pats) False body
   TParamArm _ initE      -> check ctx env False initE
 
 -- | Extend the environment with a pattern's binders: all names join @locals@;
 -- handle-typed names also join @carriers@.
-bindPats :: Env -> [TPat] -> Env
-bindPats env pats = env
-  { envCarriers = Set.union (envCarriers env) (Set.unions (map handleBindersOfPat pats))
+bindPats :: Set Text -> Env -> [TPat] -> Env
+bindPats carrierTys env pats = env
+  { envCarriers = Set.union (envCarriers env) (Set.unions (map (handleBindersOfPat carrierTys) pats))
   , envLocals   = Set.union (envLocals env)   (Set.unions (map patVars pats))
   }
 
@@ -342,8 +350,8 @@ bindPats env pats = env
 -- a plain @U64@ (a perform CONSUMES the handle and returns a value), and @old@
 -- references @cell@ in its RHS, so a free-var test would wrongly mark @old@ a
 -- carrier and reject a later innocent use of @old@ in a non-handle slot.
-bindDecls :: Env -> [TLocalDecl CType] -> Env
-bindDecls env decls = env
+bindDecls :: Set Text -> Env -> [TLocalDecl CType] -> Env
+bindDecls carrierTys env decls = env
   { envCarriers = Set.union (envCarriers env) (Set.fromList carrierNames)
   , envLocals   = Set.union (envLocals env)   (Set.fromList allNames)
   }
@@ -353,20 +361,19 @@ bindDecls env decls = env
       [ n
       | TLocalDecl n pats rhs <- decls
       , let inner = Set.union (envCarriers env)
-                              (Set.unions (map handleBindersOfPat pats))
+                              (Set.unions (map (handleBindersOfPat carrierTys) pats))
       , directlyEscapes inner rhs
-          || isHandleType (peelArrowResults (length pats) (typeOf rhs))
+          || isHandleType carrierTys (peelArrowResults (length pats) (typeOf rhs))
       ]
     typeOf (Texp t _) = t
 
--- | Is this an effect-instance handle type, or a Suspension handle?
--- Both @CTCon (TcEffect _) _@ (named effect-instance handles) and
--- @CTCon TcSuspension _@ (coroutine suspensions) are second-class and must not escape.
-isHandleType :: CType -> Bool
-isHandleType (CTCon (TcEffect _) _) = True
-isHandleType (CTCon TcSuspension _) = True
-isHandleType (CTCon TcStep _)       = True
-isHandleType _                       = False
+-- | Is this a second-class HANDLE type — an effect-instance handle
+-- @CTCon (TcEffect _) _@, or a MARKED carrier tycon (an @extern data@/@extern
+-- type@, whose name is in @carrierTys@)? Both must not escape their scope.
+isHandleType :: Set Text -> CType -> Bool
+isHandleType _          (CTCon (TcEffect _) _) = True
+isHandleType carrierTys (CTCon (TcUser n)   _) = Set.member n carrierTys
+isHandleType _          _                       = False
 
 -- | A parameter slot into which a carrier may be passed (condition 2, extended):
 --
@@ -382,10 +389,10 @@ isHandleType _                       = False
 --     documented allowance for the runner-continuation shape (slightly
 --     permissive: a contrived callee of type @(Handle -> a) -> (Handle -> a)@
 --     that returned its argument is not separately re-checked here).
-isHandleSlot :: CType -> Bool
-isHandleSlot pt = isHandleType pt || isHandleContinuation pt
+isHandleSlot :: Set Text -> CType -> Bool
+isHandleSlot carrierTys pt = isHandleType carrierTys pt || isHandleContinuation pt
   where
-    isHandleContinuation (CTArr dom _ _) = isHandleType dom
+    isHandleContinuation (CTArr dom _ _) = isHandleType carrierTys dom
     isHandleContinuation _               = False
 
 -- | The parameter types of a (curried) arrow type, in order. A non-arrow is [].
@@ -401,23 +408,23 @@ peelArrowResults _ t = t
 
 -- | The handle binders introduced by a pattern: any binder (a @TPVar@ or the
 -- whole-value name of a @TPAs@) whose annotated type is a handle type.
-handleBindersOfPat :: TPat -> Set Text
-handleBindersOfPat (Tpat ty p) = case p of
+handleBindersOfPat :: Set Text -> TPat -> Set Text
+handleBindersOfPat carrierTys (Tpat ty p) = case p of
   TPVar n
-    | isHandleType ty -> Set.singleton n
+    | isHandleType carrierTys ty -> Set.singleton n
     | otherwise       -> Set.empty
   TPWild      -> Set.empty
   TPLitI _    -> Set.empty
   TPLitS _    -> Set.empty
   TPLitC _    -> Set.empty
   TPUnit      -> Set.empty
-  TPTuple ps  -> Set.unions (map handleBindersOfPat ps)
-  TPList ps   -> Set.unions (map handleBindersOfPat ps)
-  TPCon _ ps  -> Set.unions (map handleBindersOfPat ps)
-  TPCons h t  -> Set.union (handleBindersOfPat h) (handleBindersOfPat t)
+  TPTuple ps  -> Set.unions (map (handleBindersOfPat carrierTys) ps)
+  TPList ps   -> Set.unions (map (handleBindersOfPat carrierTys) ps)
+  TPCon _ ps  -> Set.unions (map (handleBindersOfPat carrierTys) ps)
+  TPCons h t  -> Set.union (handleBindersOfPat carrierTys h) (handleBindersOfPat carrierTys t)
   TPAs n inner ->
-    let rest = handleBindersOfPat inner
-    in if isHandleType ty then Set.insert n rest else rest
+    let rest = handleBindersOfPat carrierTys inner
+    in if isHandleType carrierTys ty then Set.insert n rest else rest
 
 -- | The names bound by a pattern (all of them, regardless of type), for the
 -- free-variable computation's binder removal.
@@ -501,7 +508,7 @@ freeVarsArm arm = case arm of
 -- carrier walk's job (and its @allowed@/positional plumbing) is escape, an
 -- orthogonal concern; counting consuming uses with the {0,1,ω} cardinality
 -- lattice reads far more clearly on its own, and reuses only the Suspension-binder
--- identification ('handleBindersOfPat' already classifies a @TcSuspension@ binder).
+-- identification ('handleBindersOfPat' already classifies a marked-carrier binder).
 -- We reuse the 'Card' lattice from "Wok.IR.Multiplicity" (@joinC@ for branch =
 -- max, @addC@ for sequence = saturating sum) rather than reinventing it; that
 -- pass is over ANF 'Expr', so we replicate ONLY the sequence/branch combination
@@ -556,17 +563,19 @@ preludeReaderNames = Set.empty
 -- @ownTopLevel@ is the set of names this module DEFINES at the top level; any
 -- reader name in it is a user redefinition (not the prelude extern) and is NOT
 -- trusted (it is treated as a consumer).
-checkFutureAffine :: Set Text -> SourceSpan -> Text -> [([TPat], TExpr)] -> Either TypeError ()
-checkFutureAffine ownTopLevel sp name clauses = mapM_ checkClause clauses
+checkFutureAffine
+  :: Set Text -> Set Text -> SourceSpan -> Text
+  -> [([TPat], TExpr)] -> Either TypeError ()
+checkFutureAffine carrierTys ownTopLevel sp name clauses = mapM_ checkClause clauses
   where
     trust = ReaderTrust preludeReaderNames
                         (Set.intersection preludeReaderNames ownTopLevel)
     checkClause (pats, body) =
-      let seeded = Set.unions (map futureBindersOfPat pats)
+      let seeded = Set.unions (map (futureBindersOfPat carrierTys) pats)
       in do
         -- Param-bound futures: their scope is the whole body.
         mapM_ (checkBinder body) (Set.toList seeded)
-        walk trust sp name body
+        walk carrierTys trust sp name body
 
     checkBinder scope fut
       | consumeCard trust fut scope == Many = Left (FutureConsumedTwice sp fut)
@@ -577,8 +586,8 @@ checkFutureAffine ownTopLevel sp name clauses = mapM_ checkClause clauses
 -- then descends into all sub-expressions so nested introductions are reached.
 -- (The per-binder card is computed independently over its scope, so this walk
 -- only needs to FIND introductions, not thread any count.)
-walk :: ReaderTrust -> SourceSpan -> Text -> TExpr -> Either TypeError ()
-walk trust sp name (Texp _ node) = case node of
+walk :: Set Text -> ReaderTrust -> SourceSpan -> Text -> TExpr -> Either TypeError ()
+walk carrierTys trust sp name (Texp _ node) = case node of
   TLitI _      -> ok
   TLitS _      -> ok
   TLitC _      -> ok
@@ -589,34 +598,34 @@ walk trust sp name (Texp _ node) = case node of
   TQVar _ _    -> ok
   TProjCon _ _ -> ok
 
-  TApp h args         -> walk trust sp name h >> mapM_ (walk trust sp name) args
-  TLam pats body      -> introducedBy (Set.unions (map futureBindersOfPat pats)) body
-                           >> walk trust sp name body
-  TIf c a b           -> mapM_ (walk trust sp name) [c, a, b]
-  TTuple xs           -> mapM_ (walk trust sp name) xs
-  TList xs            -> mapM_ (walk trust sp name) xs
-  TProj e _           -> walk trust sp name e
-  TPerformOn recv _ _ -> walk trust sp name recv
-  TRecord _ fs        -> mapM_ (walk trust sp name . snd) fs
-  TRecordExt _ e fs   -> walk trust sp name e >> mapM_ (walk trust sp name . snd) fs
+  TApp h args         -> walk carrierTys trust sp name h >> mapM_ (walk carrierTys trust sp name) args
+  TLam pats body      -> introducedBy (Set.unions (map (futureBindersOfPat carrierTys) pats)) body
+                           >> walk carrierTys trust sp name body
+  TIf c a b           -> mapM_ (walk carrierTys trust sp name) [c, a, b]
+  TTuple xs           -> mapM_ (walk carrierTys trust sp name) xs
+  TList xs            -> mapM_ (walk carrierTys trust sp name) xs
+  TProj e _           -> walk carrierTys trust sp name e
+  TPerformOn recv _ _ -> walk carrierTys trust sp name recv
+  TRecord _ fs        -> mapM_ (walk carrierTys trust sp name . snd) fs
+  TRecordExt _ e fs   -> walk carrierTys trust sp name e >> mapM_ (walk carrierTys trust sp name . snd) fs
 
   -- A let group introduces futures: each Future-typed binding's scope is the
   -- (potentially mutually recursive) group body plus the RHSs of the group. We
   -- check consumption over the group body (where the binder is used downstream);
   -- then descend into RHSs and the body for nested introductions.
   TLet decls body ->
-    let futs = futureBindersOfDecls decls
+    let futs = futureBindersOfDecls carrierTys decls
     in do mapM_ (checkBinder body) (Set.toList futs)
-          mapM_ (\(TLocalDecl _ _ rhs) -> walk trust sp name rhs) decls
-          walk trust sp name body
+          mapM_ (\(TLocalDecl _ _ rhs) -> walk carrierTys trust sp name rhs) decls
+          walk carrierTys trust sp name body
 
-  TCase scrut alts -> walk trust sp name scrut >> mapM_ walkAlt alts
+  TCase scrut alts -> walk carrierTys trust sp name scrut >> mapM_ walkAlt alts
 
   THandle e arms ->
-    walk trust sp name e >> mapM_ walkArm arms
+    walk carrierTys trust sp name e >> mapM_ walkArm arms
 
   TWithNamedH _ arms body ->
-    mapM_ walkArm arms >> walk trust sp name body
+    mapM_ walkArm arms >> walk carrierTys trust sp name body
   where
     ok = Right ()
     checkBinder scope fut
@@ -625,15 +634,15 @@ walk trust sp name (Texp _ node) = case node of
     introducedBy futs scope =
       mapM_ (checkBinder scope) (Set.toList futs)
     walkAlt (TAlt pat decls altBody) =
-      let futs = Set.union (futureBindersOfPat pat) (futureBindersOfDecls decls)
+      let futs = Set.union (futureBindersOfPat carrierTys pat) (futureBindersOfDecls carrierTys decls)
       in do mapM_ (checkBinder altBody) (Set.toList futs)
-            mapM_ (\(TLocalDecl _ _ rhs) -> walk trust sp name rhs) decls
-            walk trust sp name altBody
+            mapM_ (\(TLocalDecl _ _ rhs) -> walk carrierTys trust sp name rhs) decls
+            walk carrierTys trust sp name altBody
     walkArm arm = case arm of
-      TReturnArm pat body    -> introducedBy (futureBindersOfPat pat) body >> walk trust sp name body
-      TOpArm _ _ pats _ body -> introducedBy (Set.unions (map futureBindersOfPat pats)) body
-                                  >> walk trust sp name body
-      TParamArm _ initE      -> walk trust sp name initE
+      TReturnArm pat body    -> introducedBy (futureBindersOfPat carrierTys pat) body >> walk carrierTys trust sp name body
+      TOpArm _ _ pats _ body -> introducedBy (Set.unions (map (futureBindersOfPat carrierTys) pats)) body
+                                  >> walk carrierTys trust sp name body
+      TParamArm _ initE      -> walk carrierTys trust sp name initE
 
 -- | Consuming-use cardinality of the Future binding @s@ in an expression. Reuses
 -- the {0,1,ω} lattice: 'addC' for sequence (both run), 'joinC' for branch (one
@@ -800,55 +809,46 @@ consumeCard trust s = go (Set.singleton s) Set.empty
         | otherwise -> go aliases (Set.union locals (Set.unions (map patVars pats))) body
       TParamArm _ initE -> go aliases locals initE
 
--- | The affine-carrier-typed binders introduced by a pattern (a @TcSuspension@ or
--- @TcStep@ binder), reusing the same type predicate ('isAffineCarrierType') the
--- carrier rule uses. Covers both affine carriers: Suspension and Step.
-futureBindersOfPat :: TPat -> Set Text
-futureBindersOfPat (Tpat ty p) = case p of
+-- | The affine-carrier-typed binders introduced by a pattern (a marked carrier
+-- tycon binder), reusing the same type predicate ('isAffineCarrierType') the
+-- carrier rule uses. Any marked carrier tycon qualifies (the prelude's
+-- 'Suspension'/'Step' are the canonical instances).
+futureBindersOfPat :: Set Text -> TPat -> Set Text
+futureBindersOfPat carrierTys (Tpat ty p) = case p of
   TPVar n
-    | isAffineCarrierType ty -> Set.singleton n
+    | isAffineCarrierType carrierTys ty -> Set.singleton n
     | otherwise       -> Set.empty
   TPWild      -> Set.empty
   TPLitI _    -> Set.empty
   TPLitS _    -> Set.empty
   TPLitC _    -> Set.empty
   TPUnit      -> Set.empty
-  TPTuple ps  -> Set.unions (map futureBindersOfPat ps)
-  TPList ps   -> Set.unions (map futureBindersOfPat ps)
-  TPCon _ ps  -> Set.unions (map futureBindersOfPat ps)
-  TPCons h t  -> Set.union (futureBindersOfPat h) (futureBindersOfPat t)
+  TPTuple ps  -> Set.unions (map (futureBindersOfPat carrierTys) ps)
+  TPList ps   -> Set.unions (map (futureBindersOfPat carrierTys) ps)
+  TPCon _ ps  -> Set.unions (map (futureBindersOfPat carrierTys) ps)
+  TPCons h t  -> Set.union (futureBindersOfPat carrierTys h) (futureBindersOfPat carrierTys t)
   TPAs n inner ->
-    let rest = futureBindersOfPat inner
-    in if isAffineCarrierType ty then Set.insert n rest else rest
+    let rest = futureBindersOfPat carrierTys inner
+    in if isAffineCarrierType carrierTys ty then Set.insert n rest else rest
 
 -- | The affine-carrier-typed binders introduced by a let/where group: a binding
--- whose (peeled) result type is an affine carrier (Suspension or Step), or whose
--- pattern binds an affine carrier.
-futureBindersOfDecls :: [TLocalDecl CType] -> Set Text
-futureBindersOfDecls decls = Set.unions
+-- whose (peeled) result type is a marked carrier tycon, or whose pattern binds
+-- one.
+futureBindersOfDecls :: Set Text -> [TLocalDecl CType] -> Set Text
+futureBindersOfDecls carrierTys decls = Set.unions
   [ binders
   | TLocalDecl n pats rhs <- decls
-  , let resultIsFuture = null pats && isAffineCarrierType (typeOf rhs)
-        patFuts = Set.unions (map futureBindersOfPat pats)
+  , let resultIsFuture = null pats && isAffineCarrierType carrierTys (typeOf rhs)
+        patFuts = Set.unions (map (futureBindersOfPat carrierTys) pats)
         binders = (if resultIsFuture then Set.singleton n else Set.empty)
                     `Set.union` patFuts
   ]
   where typeOf (Texp t _) = t
 
--- | Is this specifically a coroutine 'Suspension' handle type? (A subset of
--- 'isHandleType' — effect-instance handles are NOT subject to the consumption
--- bound, only suspensions are.)
-isSuspensionType :: CType -> Bool
-isSuspensionType (CTCon TcSuspension _) = True
-isSuspensionType _                      = False
-
--- | Is this an AFFINE carrier type — a coroutine 'Suspension' OR the built-in
--- transparent 'Step' ADT? Both are consume-once: a 'Suspension' is consumed
--- when passed as an argument (e.g. to @resume@); a 'Step' is consumed when it
--- is the SCRUTINEE of a @case@. Both kinds of binder are tracked by the affine
--- analysis ('consumeCard'); the scrutiny rule there distinguishes how each is
--- consumed. (A superset of 'isSuspensionType'; effect-instance handles are NOT
--- subject to the consumption bound.)
-isAffineCarrierType :: CType -> Bool
-isAffineCarrierType (CTCon TcStep _) = True
-isAffineCarrierType ty               = isSuspensionType ty
+-- | Is this an AFFINE carrier type — a MARKED carrier tycon (consume-once)?
+-- A 'Suspension' is consumed when passed as an argument; a 'Step' is consumed
+-- when it is the SCRUTINEE of a @case@. Effect-instance handles are carriers but
+-- are NOT subject to the consumption bound, so they are excluded here.
+isAffineCarrierType :: Set Text -> CType -> Bool
+isAffineCarrierType carrierTys (CTCon (TcUser n) _) = Set.member n carrierTys
+isAffineCarrierType _          _                     = False

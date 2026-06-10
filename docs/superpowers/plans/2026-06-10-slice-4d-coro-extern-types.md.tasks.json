@@ -1,0 +1,66 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-10-slice-4d-coro-extern-types.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Branch and capture baseline",
+      "status": "completed",
+      "description": "**Goal:** Create feat/slice-4d-coro-extern-types from main; record green test count + Happy shift/reduce conflict baseline.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git branch --show-current\", \"acceptanceCriteria\": [\"on branch feat/slice-4d-coro-extern-types from main\", \"cabal build/test green; baseline count recorded\", \"Happy conflict count recorded\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Grammar - extern data/extern type productions",
+      "status": "completed",
+      "blockedBy": [
+        0
+      ],
+      "description": "**Goal:** Add DExternData/DExternType productions; BNFC regen; reapply 3 manual patches; keep reorderDecl exhaustive; prove parse round-trip; conflict count unchanged.\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok/\", \"src/Wok/Reordering.hs\", \"test/examples/40-extern-coro-types.wok\"], \"verifyCommand\": \"cabal test 2>&1 | grep -i 40-extern-coro-types\", \"acceptanceCriteria\": [\"DExternData/DExternType productions added\", \"BNFC regen + 3 manual patches reapplied\", \"conflict count unchanged vs baseline\", \"reorderDecl handles both new ctors\", \"round-trip example parses and prints stably\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Elaborate extern data/type to carrier-marked tycons",
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
+      "description": "**Goal:** Add tcCarrier::Bool to TyConInfo; processDataDecls registers DExternData (with cons) / DExternType (opaque) with tcCarrier=True; UserFile extern data/type -> ExternNotAllowed.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Env.hs\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/Spec.hs\", \"test/typecheck-fail-examples/extern-data-user-forbidden.wok\", \"test/typecheck-fail-examples/extern-type-user-forbidden.wok\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE 'extern-(data|type)-user-forbidden'\", \"acceptanceCriteria\": [\"tcCarrier field added; all TyConInfo ctors updated; build green\", \"extern data/type register tcCarrier=True; data stays False\", \"extern data cons/arity identical to data decl\", \"UserFile extern data/type -> ExternNotAllowed\", \"full suite green\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Thread carrier-tycon marker set through analyses",
+      "status": "completed",
+      "blockedBy": [
+        2
+      ],
+      "description": "**Goal:** Carrier.hs predicates consult Set Text carrier-tycon names (from env tcCarrier flags); TcStep/TcSuspension kept as temporary fallback so behavior is identical. Pure plumbing refactor.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Carrier.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"predicates+binders+walk+checkCarriers+checkFutureAffine thread Set Text\", \"Infer passes carrierTys from env2\", \"behavior unchanged: 4c examples+negatives identical\", \"anchor unit test confirms marked TcUser seen as carrier\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Cutover - prelude extern decls; remove built-ins",
+      "status": "completed",
+      "blockedBy": [
+        3
+      ],
+      "description": "**Goal:** Flip Std.Control to extern type Suspension / extern data Step; delete TcStep/TcSuspension everywhere; drop Carrier fallback; retarget resultIsAffineCarrier to marker set; regen 3 typed-anf goldens.\n\n```json:metadata\n{\"files\": [\"prelude/Std/Control.wok\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Types.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Class.hs\", \"src/Wok/TypeChecking/Carrier.hs\", \"test/typed-anf-golden/\"], \"verifyCommand\": \"grep -rn 'TcStep\\\\|TcSuspension' src/ ; cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"Std.Control declares extern type/data; 4c comment gone\", \"TcStep/TcSuspension removed everywhere\", \"resultIsAffineCarrier consults carrierTys\", \"4c run-examples 421/10/52/64 + negatives identical\", \"3 typed-anf goldens now read Suspension/Step\", \"full suite green\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Robustness - user data Step type-checks; sweep examples",
+      "status": "completed",
+      "blockedBy": [
+        4
+      ],
+      "description": "**Goal:** Prove the marker (not the name) confers discipline: a UserFile's own unmarked data Step that returns AND stores values type-checks. Manually sweep non-CI examples/ coroutine programs.\n\n```json:metadata\n{\"files\": [\"test/typecheck-examples/user-data-step-not-carrier.wok\", \"examples/coroutine.wok\", \"examples/generators-pull.wok\", \"examples/pull-take.wok\", \"examples/pull-zip.wok\"], \"verifyCommand\": \"cabal test 2>&1 | grep -i user-data-step-not-carrier\", \"acceptanceCriteria\": [\"unmarked user data Step returns+stores freely; type-checks\", \"all examples/ coroutine programs still run\", \"full suite green\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Full-branch review and finish",
+      "status": "in_progress",
+      "blockedBy": [
+        5
+      ],
+      "description": "**Goal:** Full-branch code review before merge to main (standing rule); triage findings; integrate per user's preference (confirm in prose first).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"full-branch review main..HEAD completed and triaged\", \"build+test green on final tree\", \"no TcStep/TcSuspension in src/\", \"integration decision made with user\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-10"
+}

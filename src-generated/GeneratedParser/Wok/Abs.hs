@@ -22,6 +22,8 @@ data Decl
     | DSig SigName [SigNameComma] Type
     | DExtern SigName [SigNameComma] Type
     | DData ConId [VarId] [ConDef]
+    | DExternData ConId [VarId] [ConDef]
+    | DExternType ConId [VarId]
     | DEffect ConId [VarId] [RecordFieldType]
     | DFixity FixName FixAssoc [FixRel]
     | DClass ConId [VarId] [ClassEntry]

@@ -1,7 +1,7 @@
-sumStep s : TcStep U64 () U64 =
+sumStep s : Step U64 () U64 =
   case s of
     Completed r : U64 -> r
-    Suspended x : U64 g : TcSuspension U64 () U64 -> x
+    Suspended x : U64 g : Suspension U64 () U64 -> x
 
 main =
   0

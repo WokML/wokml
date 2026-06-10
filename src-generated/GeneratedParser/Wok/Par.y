@@ -114,6 +114,8 @@ Decl
   | SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DSig $1 $2 $4 }
   | 'extern' SigName ListSigNameComma ':' Type { GeneratedParser.Wok.Abs.DExtern $2 $3 $5 }
   | 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DData $2 $3 $5 }
+  | 'extern' 'data' ConId ListVarId '=' ListConDef { GeneratedParser.Wok.Abs.DExternData $3 $4 $6 }
+  | 'extern' 'type' ConId ListVarId { GeneratedParser.Wok.Abs.DExternType $3 $4 }
   | 'effect' ConId ListVarId '=' '{' ListRecordFieldType '}' { GeneratedParser.Wok.Abs.DEffect $2 $3 $6 }
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
   | 'class' ConId ListVarId 'where' '{' ListClassEntry '}' { GeneratedParser.Wok.Abs.DClass $2 $3 $6 }
@@ -242,20 +244,18 @@ RecordFieldPat :: { GeneratedParser.Wok.Abs.RecordFieldPat }
 RecordFieldPat
   : VarId '=' Pat { GeneratedParser.Wok.Abs.RFPat $1 $3 }
 
--- PATCH: left-recursive NEListRecordFieldPat to avoid the shift/reduce conflict
---        with the trailing comma before `..` in PRecordOpen. The list is built
---        in reversed order and reversed in the PRecord/PRecordOpen actions.
---        See grammar/Wok.cf POST-REGEN NOTE.
-NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
-NEListRecordFieldPat
-  : RecordFieldPat { [$1] }
-  | NEListRecordFieldPat ',' RecordFieldPat { $3 : $1 }
-
 ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
 ListRecordFieldPat
   : {- empty -} { [] }
   | RecordFieldPat { (:[]) $1 }
   | RecordFieldPat ',' ListRecordFieldPat { (:) $1 $3 }
+
+-- PATCH: left-recursive NEListRecordFieldPat to avoid shift/reduce conflict
+--        with the trailing comma before `..` in PRecordOpen. Built reversed.
+NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
+NEListRecordFieldPat
+  : RecordFieldPat { [$1] }
+  | NEListRecordFieldPat ',' RecordFieldPat { $3 : $1 }
 
 PatRowTail :: { GeneratedParser.Wok.Abs.PatRowTail }
 PatRowTail

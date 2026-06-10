@@ -45,6 +45,10 @@ data TyConInfo = TyConInfo
   { tcKind :: Kind
   , tcArity :: Int
   , tcCons :: [Text]
+  , tcCarrier :: Bool
+    -- ^ True iff declared by an @extern data@/@extern type@ (Embedded-only). A
+    -- carrier tycon is second-class (no escape) and affine (consume-once); the
+    -- Carrier analyses consult this flag, not a TyCon tag.
   }
   deriving (Eq, Show)
 

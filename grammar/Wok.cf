@@ -34,10 +34,11 @@ entrypoints Module ;
 -- the `PRecordOpen` production, making the open-record-pattern syntax
 -- `Point { x = a, .. }` unparseable.
 --
--- Fix: replace the auto-generated `ListRecordFieldPat` with a left-recursive
--- `NEListRecordFieldPat`. Build the list in reversed order inside the Happy
--- semantic actions and call `reverse` at the production root. The affected
--- Happy production is `PRecordOpen`:
+-- Fix: add a left-recursive `NEListRecordFieldPat` and route BOTH the plain
+-- `PRecord` and the open `PRecordOpen` AtomPat rules through it (the
+-- right-recursive auto-generated `ListRecordFieldPat` must NOT feed `PRecord`,
+-- or it reintroduces the conflict). Build the list reversed in the Happy
+-- semantic actions and `reverse` at each production root:
 --
 --   -- PATCH: left-recursive NEListRecordFieldPat to avoid shift/reduce conflict
 --   --        with the trailing comma before `..` in PRecordOpen.
@@ -47,12 +48,15 @@ entrypoints Module ;
 --     | NEListRecordFieldPat ',' RecordFieldPat
 --         { $3 : $1 }
 --
---   -- Updated PRecordOpen to use reverse(NEListRecordFieldPat)
---   -- (PRecord keeps [RecordFieldPat] via the standard BNFC separator rule)
+--   -- Both PRecord and PRecordOpen use reverse(NEListRecordFieldPat):
 --   AtomPat
---     : ConId '{' reverse_NEListRecordFieldPat ',' PatRowTail '}'
+--     : ConId '{' NEListRecordFieldPat '}'
+--         { PRecord $1 (reverse $3) }
+--     | ConId '{' NEListRecordFieldPat ',' PatRowTail '}'
 --         { PRecordOpen $1 (reverse $3) $5 }
 --
+-- (The auto-generated `ListRecordFieldPat` rule may be left in place unused;
+-- Happy only warns about the unused nonterminal.)
 -- See commit e06ba60 `feat(tc): record patterns (Task 7)` for the applied patch.
 --
 -- POST-REGEN NOTE: src-generated/GeneratedParser/Wok/Par.y needs a third manual
@@ -67,6 +71,12 @@ entrypoints Module ;
 --
 -- It produces the same `PRecord` node as the populated rule, with an empty
 -- field list. Keep it as the first of the `ConId '{' ... '}'` alternatives.
+--
+-- POST-REGEN NOTE: slice 4d added the `DExternData` (`extern data ...`) and
+-- `DExternType` (`extern type ...`) productions. They require NO manual patch
+-- beyond the three above (`extern`/`data`/`type` are all already keywords, so
+-- one-token lookahead after `extern` disambiguates cleanly). The patch list is
+-- unchanged: keep applying exactly the three patches documented here.
 layout toplevel ;
 layout "let", "where", "of" ;
 layout stop "in" ;
@@ -77,6 +87,8 @@ DEqn.     Decl ::= FunLHS "=" Exp MaybeWhere ;
 DSig.     Decl ::= SigName [SigNameComma] ":" Type ;   -- multi-name sig; name may be VarId or (VarSym)
 DExtern.  Decl ::= "extern" SigName [SigNameComma] ":" Type ; -- explicit compiler-hole primitive; same shape as a bodyless DSig but intentional (no lint)
 DData.    Decl ::= "data" ConId [VarId] "=" [ConDef] ;
+DExternData. Decl ::= "extern" "data" ConId [VarId] "=" [ConDef] ; -- marked carrier ADT (Embedded-only; gate in Infer)
+DExternType. Decl ::= "extern" "type" ConId [VarId] ;              -- marked opaque carrier (Embedded-only)
 DEffect.  Decl ::= "effect" ConId [VarId] "=" "{" [RecordFieldType] "}" ;
 DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 

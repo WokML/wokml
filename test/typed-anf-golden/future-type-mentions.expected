@@ -1,4 +1,4 @@
-ignore _ : TcSuspension U64 U64 U64 =
+ignore _ : Suspension U64 U64 U64 =
   ()
 
 main =
