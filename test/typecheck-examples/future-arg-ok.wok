@@ -3,9 +3,9 @@ import Std.Base
 import Std.Control
 -- Carrier rule: a Suspension passed as a handle-typed argument is allowed.
 -- This must NOT produce a CarrierEscape.
-useIt : Suspension U64 U64 U64 -> ()
+useIt : Suspension U64 U64 U64 (row e) -> ()
 useIt s = ()
-passes : Suspension U64 U64 U64 -> ()
+passes : Suspension U64 U64 U64 (row e) -> ()
 passes s = useIt s
 main : U64
 main = 0

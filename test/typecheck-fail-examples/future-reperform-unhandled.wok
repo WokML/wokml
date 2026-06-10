@@ -1,10 +1,11 @@
 module Main
 import Std.Base
 import Std.Control
--- The producer performs an unhandled effect (Log) alongside Coro. `start` only
--- installs the Coro handler, so the residual Log row is unhandled => RowMismatch.
-effect Log = { emit : U64 -> () }
-producer : () -> U64 with Coro U64 U64 + Log
-producer u = let x = Coro.suspend 42 in let v = Log.emit x in x
-main : Step U64 U64 U64
+-- A live Step (the producer suspended, so its carrier is still resumable) is
+-- returned from `main`, escaping the producer scope => CarrierEscape. The carrier
+-- rule fires before any resume-site row obligation can apply. (The residual-effect
+-- obligation at a resume site is exercised directly by coro-residual-escapes.wok.)
+producer : () -> U64 with Coro U64 U64
+producer u = let x = Coro.suspend 42 in x
+main : Step U64 U64 U64 (row e)
 main = start producer

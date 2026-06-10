@@ -3,7 +3,7 @@ import Std.Base
 import Std.Control
 -- C1: a Suspension extracted from a Suspended arm is consumed twice (two `run`
 -- calls on the same `g`) => Many. Expect FutureConsumedTwice.
-bad : Step U64 U64 U64 -> U64
+bad : Step U64 U64 U64 (row e) -> U64
 bad s = case s of
   Completed r   -> r
   Suspended x g -> run g 1 + run g 2

@@ -583,14 +583,29 @@ renderCType = go
   where
     go (CTCon c [])   = tyConKey c
     go (CTCon TcList [a]) = Tx.pack "[" <> go a <> Tx.pack "]"
-    go (CTCon c args) = tyConKey c <> Tx.pack " "
-                        <> Tx.intercalate (Tx.pack " ") (map atom args)
+    -- Drop empty-row arguments (an empty residual prints as nothing), matching
+    -- 'Infer.prettyCType' / 'Anf.prettyCTypeLocal'.
+    go (CTCon c args0) = case filter (/= CREmpty) args0 of
+      []   -> tyConKey c
+      args -> tyConKey c <> Tx.pack " "
+              <> Tx.intercalate (Tx.pack " ") (map atom args)
     go (CTArr a _ b)  = atom a <> Tx.pack " -> " <> go b
     go (CTRecord t _) = t
     go (CTGen i)      = Tx.pack "t" <> Tx.pack (show i)
-    -- Row nodes (kind KEffect) are not rendered as type heads here.
+    -- A row (kind KEffect) reaching here is a type argument; enumerate ALL
+    -- labels rather than only the head (the earlier form dropped the rest).
     go CREmpty        = Tx.pack "{}"
-    go (CRExtend l _ _) = Tx.pack "{" <> l <> Tx.pack "}"
+    go r@CRExtend{}   = renderRow r
+
+    renderRow row =
+      Tx.pack "{" <> Tx.intercalate (Tx.pack ", ") labels <> tailTx <> Tx.pack "}"
+      where
+        (labels, restTail) = collect row
+        collect (CRExtend l _ rest) = let (ls, t) = collect rest in (l : ls, t)
+        collect other               = ([], other)
+        tailTx = case restTail of
+          CREmpty -> Tx.empty
+          t       -> Tx.pack " | " <> go t
 
     atom t@(CTCon _ (_:_)) = Tx.pack "(" <> go t <> Tx.pack ")"
     atom t@(CTArr{})       = Tx.pack "(" <> go t <> Tx.pack ")"

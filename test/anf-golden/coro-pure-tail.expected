@@ -1,0 +1,12 @@
+counter u =
+  let t = Coro.suspend(10)
+  let v = t
+  99
+
+main =
+  let t.1 = start(counter)
+  case t.1 of
+    Completed r -> r
+    Suspended x g ->
+      let t.2 = run(g, 0)
+      t.2

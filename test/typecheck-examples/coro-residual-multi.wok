@@ -1,0 +1,27 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Log = { emit : U64 -> () }
+effect Tick = { tick : U64 }
+
+-- A producer whose tail performs TWO residual effects (Log then Tick). Its
+-- residual row carries both labels; this guards the row pretty-printer against
+-- the head-only truncation bug (a {Log, Tick} residual must not print as {Log}).
+producer : () -> U64 with Coro U64 U64 + Log + Tick
+producer u =
+  let x = Coro.suspend 7 in
+  let v = Log.emit x in
+  let t = Tick.tick in
+  x + t
+
+drive : () -> U64
+drive u =
+  with Tick { tick k -> k 1 }
+    (with Log { emit n k -> k () }
+      (case start producer of
+         Completed r   -> r
+         Suspended _ g -> run g 5))
+
+main : U64
+main = drive ()

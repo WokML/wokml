@@ -27,35 +27,42 @@ effect Coro a b = { suspend : a -> b }
 -- `step`/`run`/`cancel`. `Step` is the closed outcome of one step; eliminate it
 -- with an ordinary `case` (both arms). Their carrier + consume-once discipline
 -- rides the `extern` marker (Embedded-only), not the names.
-extern type Suspension a b r
+extern type Suspension a b r (row e)
 
-extern data Step a b r = Completed r | Suspended a (Suspension a b r)
+extern data Step a b r (row e) = Completed r | Suspended a (Suspension a b r (row e))
 
--- Trusted builtins. Implementations are unchanged from 4b; only the wok-level
--- types move to Step (a resumed coroutine IS a Suspended/Completed VCon = a Step).
--- __coro_susp keeps the continuation slot decoupled (b -> s) from the future's r
--- so the suspend arm's k : b -> <answer = Step a b r> unifies without an occurs-check.
-extern __coro_susp   : a -> (b -> s) -> Step a b r       -- builds a Suspended Step
-extern __coro_resume : Suspension a b r -> b -> Step a b r
-extern __coro_unwrap : Step a b r -> r                   -- peels a Completed Step (errors on Suspended)
-extern __coro_done   : r -> Step a b r                   -- builds a Completed Step
-extern __coro_cancel : Suspension a b r -> ()
+-- Trusted builtins. Implementations are UNCHANGED (e is phantom at runtime); only the
+-- wok-level signatures gain the residual row e. __coro_susp keeps the continuation slot
+-- decoupled (b -> s) so the suspend arm unifies without an occurs-check; the continuation
+-- performs e on resume.
+extern __coro_susp   : a -> (b -> s with eff e) -> Step a b r (row e)
+extern __coro_resume : Suspension a b r (row e) -> b -> Step a b r (row e) with eff e
+extern __coro_unwrap : Step a b r (row e) -> r                   -- pure projection; partial on Suspended (run's fail state, deferred)
+extern __coro_done   : r -> Step a b r (row e)
+extern __coro_cancel : Suspension a b r (row e) -> ()
 
--- start: install Coro, run the producer to its first suspension, return the
--- FIRST outcome as a Step (Suspended x g' or Completed r).
-start : (() -> r with Coro a b) -> Step a b r
+-- start: install Coro, run the producer to its first suspension, return the FIRST
+-- outcome as a Step. e = the producer's NON-Coro residual: emitted at the start site
+-- (before-suspend effects) AND captured into the Step (performed on resume).
+start : (() -> r with Coro a b + eff e) -> Step a b r (row e) with eff e
 start c = with Coro { suspend x k -> __coro_susp x k ; v -> __coro_done v } (c ())
 
--- step: resume the parked continuation once, return the next outcome.
-step : Suspension a b r -> b -> Step a b r
+-- step: resume once; the tail performs e, so the resume site must handle e.
+step : Suspension a b r (row e) -> b -> Step a b r (row e) with eff e
 step s v = __coro_resume s v
 
--- run: single-shot convenience. Resumes once and assumes completion; if the
--- producer suspends again this errors at runtime (the documented partiality,
--- same as 4b's resume; the residual-row guard is the deferred 4b" work).
-run : Suspension a b r -> b -> r
+-- run: single-shot convenience. Resumes once (performing e) and assumes completion;
+-- if the producer RE-SUSPENDS this still errors at runtime (documented partiality -- the
+-- residual row tracks effects, not completion; run's totality is the deferred
+-- failure-model slice). run reveals the tail's effects via `with eff e`.
+run : Suspension a b r (row e) -> b -> r with eff e
 run s v = __coro_unwrap (__coro_resume s v)
 
--- cancel: discard a suspension without resuming it.
-cancel : Suspension a b r -> ()
+-- cancel: discard a suspension without resuming it. The tail never runs, so cancel
+-- performs nothing and carries NO residual row. Note this is NOT an escape from the
+-- residual obligation: `start` already demands `e` at the start site (its input and
+-- output share the same `e`), so an unhandleable tail is rejected before any
+-- suspension exists to cancel. cancel's purpose is to skip the tail's work/effects,
+-- not to launder its type.
+cancel : Suspension a b r (row e) -> ()
 cancel s = __coro_cancel s

@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Log = { emit : U64 -> () }
+
+-- The producer performs Log in its tail (after the suspend). `start` runs the
+-- producer to its first suspension, so the Log residual is captured into the Step
+-- and is performed on resume. `drive` resumes via `run g 0`, whose residual is
+-- `with Log`; but `drive` is annotated PURE (`-> U64`, no `with`), so the captured
+-- Log is unhandled at the resume site => TYPE ERROR (residual obligation), NOT a
+-- runtime NoMatchingHandler. This is the soundness win of the residual row.
+producer : () -> U64 with Coro U64 U64 + Log
+producer u =
+  let x = Coro.suspend 1 in
+  let v = Log.emit x in
+  x
+
+drive : () -> U64
+drive u =
+  case start producer of
+    Completed r   -> r
+    Suspended _ g -> run g 0
+
+main : U64
+main = drive ()

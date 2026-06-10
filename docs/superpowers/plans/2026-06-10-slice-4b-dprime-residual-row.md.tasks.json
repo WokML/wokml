@@ -1,0 +1,33 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-10-slice-4b-dprime-residual-row.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Branch and baseline (4b-dprime)",
+      "status": "completed",
+      "description": "**Goal:** Branch feat/slice-4b-dprime from main; record 718-green + coro 421/10/52/64.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git branch --show-current\", \"acceptanceCriteria\": [\"on branch feat/slice-4b-dprime from main\", \"cabal test green (718); coro 421/10/52/64\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Residual-row core + spike (thread e; prove gap closes)",
+      "status": "completed",
+      "blockedBy": [0],
+      "description": "**Goal:** Suspension/Step gain (row e); start/step/run carry `with eff e`, cancel no row; __coro_* sigs thread e (Prim.hs UNCHANGED); suppress-empty in prettyCType + prettyCTypeLocal; migrate explicit Suspension/Step annotations; headline negative (bounded-handler-escaped -> type error) + pure-tailed positive. SPIKE: verify e threads through the Coro handler (prelude type-checks); if not, surface the compiler gap.\n\n```json:metadata\n{\"files\": [\"prelude/Std/Control.wok\", \"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/IR/Anf.hs\", \"test/typecheck-fail-examples/coro-residual-escapes.wok\", \"test/typecheck-examples/coro-pure-tail.wok\", \"test/run-examples/coro-pure-tail.wok\", \"test/typecheck-examples/future-arg-ok.wok\", \"test/typecheck-examples/future-type-mentions.wok\", \"test/typecheck-examples/step-case.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/typecheck-fail-examples/coro-residual-escapes.wok 2>&1 | tail -1 ; cabal test 2>&1 | grep -iE 'All [0-9]+ tests'\", \"acceptanceCriteria\": [\"Suspension/Step (row e); start/step/run with eff e; cancel no row; prim sigs thread e; Prim.hs unchanged\", \"headline negative is a type error (RowMismatch/unhandled-effect), not a crash\", \"pure-tailed coroutine type-checks+runs; empty residual prints without {}\", \"coro 421/10/52/64; suite green; golden churn limited to e-additions on explicit annotations\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Coverage + document run's deferred fail state",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Residual-HANDLED positive (Log-tailed producer resumed where Log IS handled -> type-checks+runs); confirm existing coro negatives still reject; verify run comment notes deferred re-suspend partiality. Full regression.\n\n```json:metadata\n{\"files\": [\"test/typecheck-examples/coro-residual-handled.wok\", \"test/run-examples/coro-residual-handled.wok\", \"prelude/Std/Control.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/coro-residual-handled.wok --run ; cabal test 2>&1 | grep -iE 'All [0-9]+ tests'\", \"acceptanceCriteria\": [\"Log-tailed coroutine resumed under a live Log handler type-checks + runs\", \"existing coro negatives still reject identically\", \"run comment notes deferred re-suspend partiality\", \"suite green; coro 421/10/52/64; churn limited to slice fixtures\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Full-branch review and finish (4b-dprime)",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Standing-rule full-branch review main..HEAD; triage; integrate per user (confirm in prose).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"full-branch review main..HEAD completed + triaged\", \"build+test green; coro 421/10/52/64; churn limited to slice fixtures\", \"Prim.hs/runtime + carrier/affine/producer-exemption unchanged; run partiality documented not fixed\", \"integration decision made with user\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-11"
+}

@@ -3629,11 +3629,15 @@ prettyCType (CTCon (TcTuple _) xs) =
     , Tx.pack ")"
     ]
 prettyCType (CTCon (TcUser n) []) = n
-prettyCType (CTCon (TcUser n) xs) =
-  Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTCon (TcUser n) xs0) =
+  case filter (/= CREmpty) xs0 of
+    []  -> n
+    xs  -> Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
 prettyCType (CTCon (TcEffect n) []) = n
-prettyCType (CTCon (TcEffect n) xs) =
-  Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+prettyCType (CTCon (TcEffect n) xs0) =
+  case filter (/= CREmpty) xs0 of
+    []  -> n
+    xs  -> Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]

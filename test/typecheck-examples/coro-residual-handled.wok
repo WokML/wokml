@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Log = { emit : U64 -> () }
+
+-- producer suspends with 7, then performs Log in the tail, returns x + 100
+-- where x is the resume value (so the result is sensitive to resumption, not a
+-- constant). The Log residual is captured into the Step and performed on resume.
+producer : () -> U64 with Coro U64 U64 + Log
+producer u =
+  let x = Coro.suspend 7 in
+  let v = Log.emit x in
+  x + 100
+
+-- drive: resume UNDER a live Log handler, so the residual Log is discharged here.
+-- The whole `case start … of … run g 5` sits inside `with Log`, because `start`
+-- itself carries `with Log` and `run g 5` performs the parked tail's Log.
+-- The suspension `g` is CONSUMED inside the handler scope (exercises the residual
+-- gate, not the carrier-escape rule). Explicitly-typed helper, not main, because
+-- main does not obligate effect rows.
+drive : () -> U64
+drive u =
+  with Log { emit n k -> k () }
+    (case start producer of
+       Completed r   -> r
+       Suspended _ g -> run g 5)
+
+main : U64
+main = drive ()

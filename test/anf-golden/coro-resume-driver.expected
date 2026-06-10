@@ -1,0 +1,6 @@
+replay g =
+  let t = run(g, 0)
+  t
+
+main =
+  0

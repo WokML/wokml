@@ -1,0 +1,2 @@
+counter : () -> U64 with Coro
+main : U64

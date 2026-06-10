@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+
+counter : () -> U64 with Coro U64 U64
+counter u =
+  let v = Coro.suspend 10 in
+  99
+
+main : U64
+main =
+  case start counter of
+    Completed r   -> r
+    Suspended x g -> run g 0

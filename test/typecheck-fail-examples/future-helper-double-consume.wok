@@ -5,9 +5,9 @@ import Std.Control
 -- affine check. `useit` runs its Suspension parameter; calling it twice on the
 -- same suspension double-consumes. A Suspension passed to ANY function counts as
 -- a consumption, so `useit g + useit g` = Many. Expect FutureConsumedTwice.
-useit : Suspension U64 U64 U64 -> U64
+useit : Suspension U64 U64 U64 (row e) -> U64
 useit f = run f 1
-bad : Step U64 U64 U64 -> U64
+bad : Step U64 U64 U64 (row e) -> U64
 bad s = case s of
   Completed r   -> r
   Suspended x g -> useit g + useit g

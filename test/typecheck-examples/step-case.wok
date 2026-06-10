@@ -1,7 +1,7 @@
 module Main
 import Std.Base
 import Std.Control
-sumStep : Step U64 () U64 -> U64
+sumStep : Step U64 () U64 (row e) -> U64
 sumStep s = case s of
   Completed r -> r
   Suspended x g -> x

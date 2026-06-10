@@ -1,2 +1,2 @@
 main : U64
-sumStep : Step U64 () U64 -> U64
+sumStep : forall a. Step U64 () U64 a -> U64

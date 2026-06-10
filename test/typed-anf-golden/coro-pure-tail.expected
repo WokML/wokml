@@ -1,0 +1,12 @@
+counter u : () =
+  let t : U64 = Coro.suspend(10)
+  let v : U64 = t
+  99
+
+main =
+  let t.1 : Step U64 U64 U64 = start(counter)
+  case t.1 of
+    Completed r : U64 -> r
+    Suspended x : U64 g : Suspension U64 U64 U64 ->
+      let t.2 : U64 = run(g, 0)
+      t.2

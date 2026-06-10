@@ -1,7 +1,7 @@
 module Main
 import Std.Base
 import Std.Control
-grab : Step U64 () () -> [Suspension U64 () ()]
+grab : Step U64 () () (row e) -> [Suspension U64 () () (row e)]
 grab s = case s of
   Completed _   -> []
   Suspended x g -> [g]

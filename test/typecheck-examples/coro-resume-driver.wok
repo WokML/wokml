@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- CHARACTERIZATION of the resume-site obligation (slice 4b-dprime).
+--
+-- `replay` RECEIVES an already-suspended coroutine with an arbitrary residual
+-- row e and resumes it with `run`. One might expect this to be REJECTED unless
+-- `replay` handles e (it performs the parked tail's effects). It is NOT: a
+-- polymorphic residual contributes no concrete obligation, so `replay` type-
+-- checks as effect-polymorphic and the residual is ABSORBED into its scheme.
+--
+-- This is sound -- `start` eagerly demands the full residual at the lifecycle
+-- root, and second-class carriers keep every resume dynamically inside that
+-- scope, so the handler is always present. But it means a generic resume driver
+-- hides the tail's effects from its own signature. If we later make control
+-- explicit (force resume drivers to declare `with eff e`), this golden flips
+-- from an effect-polymorphic scheme to one carrying the residual -- a conscious
+-- gate on that decision.
+replay : Suspension U64 U64 U64 (row e) -> U64
+replay g = run g 0
+
+main : U64
+main = 0

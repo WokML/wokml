@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: RowMismatch Nothing CREmpty (CRExtend "Log" (CTCon TcUnit []) CREmpty)
+typecheck: typecheck in Main: CarrierEscape Nothing "main"

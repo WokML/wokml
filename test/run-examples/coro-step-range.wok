@@ -5,7 +5,7 @@ range : U64 -> U64 -> () with Coro U64 ()
 range lo hi = case eqU64 lo hi of
   True  -> ()
   False -> let u = Coro.suspend lo in range (lo + 1) hi
-sumGen : Step U64 () () -> U64
+sumGen : Step U64 () () (row e) -> U64
 sumGen s = case s of
   Completed _   -> 0
   Suspended x g -> x + sumGen (step g ())

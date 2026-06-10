@@ -1,0 +1,6 @@
+replay g : Suspension U64 U64 U64 =
+  let t : U64 = run(g, 0)
+  t
+
+main =
+  0

@@ -372,17 +372,34 @@ prettyCTypeLocal (CTCon (TcTuple _) xs) =
     <> Tx.intercalate (Tx.pack ", ") (map prettyCTypeLocal xs)
     <> Tx.pack ")"
 prettyCTypeLocal (CTCon (TcUser n) []) = n
-prettyCTypeLocal (CTCon (TcUser n) xs) =
-  n <> Tx.pack " " <> Tx.intercalate (Tx.pack " ") (map prettyCTypeLocal xs)
+prettyCTypeLocal (CTCon (TcUser n) xs0) =
+  case filter (/= CREmpty) xs0 of
+    []  -> n
+    xs  -> n <> Tx.pack " " <> Tx.intercalate (Tx.pack " ") (map prettyCTypeLocal xs)
 prettyCTypeLocal (CTCon tc xs) =
   Tx.pack (show tc)
     <> (if null xs then Tx.pack "" else Tx.pack " " <> Tx.intercalate (Tx.pack " ") (map prettyCTypeLocal xs))
 prettyCTypeLocal (CTArr a _ b) =
   prettyCTypeLocal a <> Tx.pack " -> " <> prettyCTypeLocal b
 prettyCTypeLocal (CTRecord t _) = t
--- Row nodes (kind KEffect) are not rendered as standalone types here.
+-- Row nodes (kind KEffect) reach here when a row appears as a type argument,
+-- e.g. the residual (row e) of Step/Suspension. Enumerate ALL labels (the
+-- earlier head-only form silently dropped every label past the first).
 prettyCTypeLocal CREmpty            = Tx.pack "{}"
-prettyCTypeLocal (CRExtend l _ _)   = Tx.pack "{" <> l <> Tx.pack "}"
+prettyCTypeLocal r@CRExtend{}       = prettyRowLocal r
+
+-- | Render a row as a flat brace list: @{Log, Tick}@ for a closed row, or
+-- @{Log, Tick | e}@ when it ends in a row variable.
+prettyRowLocal :: CType -> Text
+prettyRowLocal row =
+  Tx.pack "{" <> Tx.intercalate (Tx.pack ", ") labels <> tailTx <> Tx.pack "}"
+  where
+    (labels, restTail) = collect row
+    collect (CRExtend l _ rest) = let (ls, t) = collect rest in (l : ls, t)
+    collect other               = ([], other)
+    tailTx = case restTail of
+      CREmpty -> Tx.empty
+      t       -> Tx.pack " | " <> prettyCTypeLocal t
 
 -- ---------------------------------------------------------------------------
 -- Public API

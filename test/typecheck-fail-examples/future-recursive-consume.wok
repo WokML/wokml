@@ -5,12 +5,12 @@ import Std.Control
 -- runs its Suspension parameter on every iteration; the suspension passed to the
 -- recursive `loop` call also counts as a consumption, so the False arm's
 -- `run f 1 + loop (n - 1) f` = Many. Expect FutureConsumedTwice.
-loop : U64 -> Suspension U64 U64 U64 -> U64
+loop : U64 -> Suspension U64 U64 U64 (row e) -> U64
 loop n f =
   case eqU64 n 0 of
     True -> 0
     False -> run f 1 + loop (n - 1) f
-bad : Step U64 U64 U64 -> U64
+bad : Step U64 U64 U64 (row e) -> U64
 bad s = case s of
   Completed r   -> r
   Suspended x g -> loop 3 g

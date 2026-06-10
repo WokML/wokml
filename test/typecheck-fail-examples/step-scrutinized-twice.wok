@@ -1,7 +1,7 @@
 module Main
 import Std.Base
 import Std.Control
-dbl : Step U64 () U64 -> U64
+dbl : Step U64 () U64 (row e) -> U64
 dbl s = (case s of Completed r -> r ; Suspended x g -> x)
       + (case s of Completed r -> r ; Suspended x g -> x)
 main : U64

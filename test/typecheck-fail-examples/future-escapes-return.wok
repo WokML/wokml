@@ -3,7 +3,7 @@ import Std.Base
 import Std.Control
 -- Carrier rule: a Suspension-typed parameter is a second-class handle.
 -- Returning it bare from `leak` must be rejected with CarrierEscape.
-leak : Suspension U64 U64 U64 -> Suspension U64 U64 U64
+leak : Suspension U64 U64 U64 (row e) -> Suspension U64 U64 U64 (row e)
 leak s = s
 main : U64
 main = 0
