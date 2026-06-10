@@ -18,7 +18,7 @@ module Wok.TypeChecking
     -- Types
   , Scheme (..)
   , CType (..)
-  , CRow (..)
+  , CRow
   , Kind (..)
   , TyCon (..)
     -- Origin
@@ -37,4 +37,4 @@ import Wok.TypeChecking.Infer
   , prettyScheme
   )
 import Wok.TypeChecking.Types
-  ( CRow (..), CType (..), Kind (..), Scheme (..), TyCon (..) )
+  ( CRow, CType (..), Kind (..), Scheme (..), TyCon (..) )

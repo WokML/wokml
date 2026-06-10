@@ -380,6 +380,9 @@ prettyCTypeLocal (CTCon tc xs) =
 prettyCTypeLocal (CTArr a _ b) =
   prettyCTypeLocal a <> Tx.pack " -> " <> prettyCTypeLocal b
 prettyCTypeLocal (CTRecord t _) = t
+-- Row nodes (kind KEffect) are not rendered as standalone types here.
+prettyCTypeLocal CREmpty            = Tx.pack "{}"
+prettyCTypeLocal (CRExtend l _ _)   = Tx.pack "{" <> l <> Tx.pack "}"
 
 -- ---------------------------------------------------------------------------
 -- Public API

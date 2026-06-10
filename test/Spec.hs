@@ -2964,8 +2964,8 @@ rowUnifyTests = testGroup "RowUnify"
             let row = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) Ty.RowEmpty
             U.unifyRow Nothing rVar row
             -- Force rVar to check it was bound
-            forced <- U.forceRow rVar
-            U.freezeRow forced
+            forced <- U.force rVar
+            U.freeze forced
       in case result of
            Right cr -> assertBool "expected CRExtend x ..." $
              case cr of
@@ -2977,8 +2977,8 @@ rowUnifyTests = testGroup "RowUnify"
       let result = runUnify $ do
             rVar <- TM.freshRVar
             U.unifyRow Nothing rVar Ty.RowEmpty
-            forced <- U.forceRow rVar
-            U.freezeRow forced
+            forced <- U.force rVar
+            U.freeze forced
       in case result of
            Right Ty.CREmpty -> pure ()
            Right cr -> assertFailure ("expected CREmpty, got: " ++ show cr)
@@ -2991,7 +2991,7 @@ rowUnifyTests = testGroup "RowUnify"
             rVar <- TM.freshRVar
             (ty, rest) <- U.rewriteRowStrict Nothing (T.pack "x") rVar
             ct <- U.freeze ty
-            cr <- U.freezeRow rest
+            cr <- U.freeze rest
             pure (ct, cr)
       in case result of
            Left (TErr.UnknownField _ _ lbl) -> lbl @?= T.pack "x"
@@ -3026,7 +3026,7 @@ rowUnifyTests = testGroup "RowUnify"
                         (Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcBool []) Ty.RowEmpty)
             (ty, rest) <- U.rewriteRow Nothing (T.pack "x") row
             ct  <- U.freeze ty
-            cr  <- U.freezeRow rest
+            cr  <- U.freeze rest
             pure (ct, cr)
       in case result of
            Right (Ty.CTCon Ty.TcU64 [], Ty.CRExtend lbl (Ty.CTCon Ty.TcBool []) Ty.CREmpty)
@@ -3036,15 +3036,17 @@ rowUnifyTests = testGroup "RowUnify"
            Left e -> assertFailure ("expected Right, got: " ++ show e)
 
   , testCase "occurs check: r := {x : r} is rejected" $
-      -- Setup: fresh RowVar r. Attempt to bind r to RowExtend "x" someType (RowVar r).
-      -- Expected: throws RowOccursCheck (dedicated cycle error).
+      -- Setup: fresh row var r (a TVar of kind KEffect). Attempt to bind r to
+      -- RowExtend "x" someType r. After the kinded-Ty merge rows are ordinary
+      -- TVars, but a self-cycle on a KEffect var still reports RowOccursCheck
+      -- (distinct from OccursCheck for KStar type-var cycles).
       let result = runUnify $ do
             rVar <- TM.freshRVar
             case rVar of
-              Ty.RowVar ref -> do
+              Ty.TVar ref -> do
                 let cyclicRow = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) rVar
-                U.bindRowVar Nothing ref cyclicRow
-              _ -> error "expected RowVar from freshRVar"
+                U.unifyVar Nothing ref cyclicRow
+              _ -> error "expected TVar from freshRVar"
       in case result of
            Left (TErr.RowOccursCheck _ _ _) -> pure ()
            _ -> assertFailure ("expected RowOccursCheck (cycle), got: " ++ show result)
@@ -3083,12 +3085,52 @@ rowUnifyTests = testGroup "RowUnify"
             r1 <- TM.freshRVar
             r2 <- TM.freshRVar
             U.unifyRow Nothing r1 r2
-            -- Both should now freeze to the same CRow (CRGen)
-            cr1 <- U.freezeRow r1
-            cr2 <- U.freezeRow r2
+            -- Both should now freeze to the same row gen (CTGen, KEffect)
+            cr1 <- U.freeze r1
+            cr2 <- U.freeze r2
             pure (cr1, cr2)
       in case result of
            Right (cr1, cr2) -> cr1 @?= cr2
+           Left e -> assertFailure ("expected Right, got: " ++ show e)
+
+  -- Kinded representation (Slice A): behaviours the surface language can't yet
+  -- exercise. Pure unit tests against the merged kinded `Type s`.
+
+  , testCase "kinded representation: shared-structure rows unify via merged unify" $
+      -- Post-merge, rows are ordinary KEffect Types and unifyRow is an alias of
+      -- unify. {x:U64 | r1} ~ {x:U64 | r2} (fresh row tails) must still unify
+      -- via the inlined Leijen algorithm.
+      let result = runUnify $ do
+            r1 <- TM.freshRVar
+            r2 <- TM.freshRVar
+            let row1 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) r1
+                row2 = Ty.RowExtend (T.pack "x") (Ty.TCon Ty.TcU64 []) r2
+            U.unify Nothing row1 row2
+      in case result of
+           Right () -> pure ()
+           Left e -> assertFailure ("expected Right (), got: " ++ show e)
+
+  , testCase "kinded representation: KStar var vs KEffect row is KindMismatch" $
+      -- Unifying a KStar meta var with a row (kind KEffect) must throw.
+      let result = runUnify $ do
+            a <- TM.freshTVar Ty.KStar
+            U.unify Nothing a Ty.RowEmpty
+      in case result of
+           Left (TErr.KindMismatch _ _ _) -> pure ()
+           _ -> assertFailure ("expected KindMismatch, got: " ++ show result)
+
+  , testCase "kinded representation: freeze round-trips a row-bearing arrow" $
+      -- freeze must handle a row in the arrow's effect slot, producing the
+      -- closed row constructors CRExtend/CREmpty.
+      let result = runUnify $
+            U.freeze
+              (Ty.TArr (Ty.TCon Ty.TcUnit [])
+                 (Ty.RowExtend (T.pack "Log") (Ty.TCon Ty.TcUnit []) Ty.RowEmpty)
+                 (Ty.TCon Ty.TcUnit []))
+      in case result of
+           Right (Ty.CTArr _ (Ty.CRExtend lbl _ Ty.CREmpty) _)
+             | lbl == T.pack "Log" -> pure ()
+           Right ct -> assertFailure ("expected CTArr _ (CRExtend Log _ CREmpty) _, got: " ++ show ct)
            Left e -> assertFailure ("expected Right, got: " ++ show e)
   ]
 
@@ -3215,7 +3257,8 @@ mkRCVar s = Abs.RCVar (Abs.VarId ((0,0), T.pack s))
 cRowLabels :: Ty.CRow -> [T.Text]
 cRowLabels Ty.CREmpty = []
 cRowLabels (Ty.CRExtend l _ rest) = l : cRowLabels rest
-cRowLabels (Ty.CRGen _) = []
+cRowLabels (Ty.CTGen _) = []
+cRowLabels _ = []  -- non-row CType: no labels (cannot occur in a row position)
 
 typeLevelExtTests :: TestTree
 typeLevelExtTests = testGroup "TypeLevelExtension"
@@ -3237,24 +3280,25 @@ typeLevelExtTests = testGroup "TypeLevelExtension"
           T.pack "y" `elem` labels @? "expected y in row"
         Right other -> assertFailure ("expected CTRecord scheme, got: " ++ show other)
 
-  , testCase "row variable extension translates to CTRecord with CRGen tail" $ do
+  , testCase "row variable extension translates to CTRecord with row-gen (CTGen) tail" $ do
       -- Point + row r should yield CTRecord "Point" (x, y, r)
       let ty = Abs.TExtend mkPointTy (mkVarSym "+") (mkRCVar "r")
       case translateSigInPointEnv ty of
         Left e -> assertFailure ("unexpected error: " ++ show e)
         Right (Ty.Scheme qs _ (Ty.CTRecord tag row)) -> do
           tag @?= T.pack "Point"
-          -- The row should end with a CRGen for the row variable
-          let hasRowVar (Ty.CRGen _) = True
+          -- The row should end with a row-gen (CTGen, KEffect) for the row variable
+          let hasRowVar (Ty.CTGen _) = True
               hasRowVar Ty.CREmpty   = False
               hasRowVar (Ty.CRExtend _ _ rest) = hasRowVar rest
-          hasRowVar row @? "expected row variable (CRGen) in row"
+              hasRowVar _            = False
+          hasRowVar row @? "expected row variable (CTGen) in row"
           -- There should be exactly one KEffect quantifier for the row var
           let rowQs = [ i | (i, Ty.KEffect) <- qs ]
           length rowQs @?= 1
         Right other -> assertFailure ("expected CTRecord scheme, got: " ++ show other)
 
-  , testCase "two uses of same row var share one CRGen slot" $ do
+  , testCase "two uses of same row var share one row-gen (CTGen) slot" $ do
       -- (Point + row r) -> (Point + row r): both `r` should map to same index
       let extTy = Abs.TExtend mkPointTy (mkVarSym "+") (mkRCVar "r")
           ty    = Abs.TFun extTy extTy

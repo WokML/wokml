@@ -1,0 +1,8 @@
+applyThunk f =
+  let t = f(())
+  t
+
+main =
+  let t.1 = \_ -> 7
+  let t.2 = applyThunk(t.1)
+  t.2

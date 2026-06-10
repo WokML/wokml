@@ -1,0 +1,2 @@
+applyThunk : forall b a. (() -> b with eff a) -> b with eff a
+main : U64

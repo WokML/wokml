@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-10-kinded-ty-representation-slice-a.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Branch and capture preservation baseline",
+      "status": "pending",
+      "description": "**Goal:** Branch feat/kinded-ty-representation from main; record 695-green baseline + coro regression anchors (421/10/52/64).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git branch --show-current\", \"acceptanceCriteria\": [\"on branch feat/kinded-ty-representation from main\", \"cabal build/test green; count recorded (695)\", \"coro run-example values recorded\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Prep - KindMismatch error + row-skolemization guard test",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Add KindMismatch constructor to TypeError; add effect-poly-roundtrip regression (row var in two sig positions type-checks) golden-pinned. Green, behaviour-identical.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Error.hs\", \"test/typecheck-examples/effect-poly-roundtrip.wok\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE 'effect-poly-roundtrip|All [0-9]+ tests'\", \"acceptanceCriteria\": [\"KindMismatch in TypeError, renders via existing pipeline\", \"effect-poly row-var roundtrip type-checks, golden-pinned, runs to 7\", \"full suite green; build clean\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Atomic merge - fold CRow/Row/RVar into CType/Type/TVar",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Fold rows into the type datatype KEEPING constructor names (CREmpty/CRExtend/RowEmpty/RowExtend) + add CRow/Row aliases; CTGen subsumes CRGen; delete RVar/CRGen/RowVar/forceRow/freezeRow; collapse force/freeze/occurs/unify halves; add unifyVar kind check (KindMismatch); keep freezeSig row-non-skolemization. Keeping ctor names gives TRUE zero golden churn (error goldens render ctors via Show). One large task, ends GREEN.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Types.hs\", \"src/Wok/TypeChecking/Unify.hs\", \"src/Wok/TypeChecking/Monad.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Carrier.hs\", \"src/Wok/TypeChecking/Class.hs\", \"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Env.hs\", \"src/Wok/IR/Anf.hs\", \"src/Wok/IR/Elaborate.hs\", \"src/Wok/TypeChecking/Typed.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"grep -rnE 'CRGen|RowVar|RUnbound|RLink|forceRow|freezeRow|data CRow|data Row |data RVar' src/ ; cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"deleted names gone from src/ (CRGen/RowVar/RUnbound/RLink/forceRow/freezeRow/data RVar/CRow/Row); CRow/Row aliases + CREmpty/CRExtend/RowEmpty/RowExtend kept\", \"unifyVar rejects kind-mismatched link with KindMismatch\", \"freezeSig: KStar->Rigid, KEffect->fresh Unbound (preserved)\", \"cabal build clean -Wall -Werror\", \"cabal test green AND zero golden churn (incl. future-reperform-unhandled, 13-polymorphic-records); coro 421/10/52/64\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Post-merge unit tests for kinded representation",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Direct unit tests: kind-dispatched row unify; KStar-vs-KEffect → KindMismatch; freeze round-trips a row-bearing arrow. Reuse existing unifyTests/rowUnifyTests harness.\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE 'kinded representation|All [0-9]+ tests'\", \"acceptanceCriteria\": [\"row unify still scoped-label via merged unify\", \"KStar vs KEffect yields KindMismatch\", \"freeze round-trips row-bearing arrow\", \"full suite green; still zero golden churn\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Full-branch review and finish",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Standing-rule full-branch review main..HEAD; triage; integrate per user preference (confirm in prose).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"full-branch review main..HEAD completed + triaged\", \"build+test green; zero golden churn vs main\", \"no CRow/RVar in src/\", \"integration decision made with user\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-10"
+}

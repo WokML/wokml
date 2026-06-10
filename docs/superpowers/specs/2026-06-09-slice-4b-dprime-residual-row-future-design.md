@@ -4,7 +4,13 @@ Date: 2026-06-09
 Status: Design sketch for a DEFERRED follow-on to slice 4b (merged: `2026-06-09-one-shot-escape-design.md`).
 Closes the soundness gap 4b documented (re-suspension / bounded-handler-escaped resume crashes a
 well-typed program). The load-bearing PREREQUISITE/RISK is a kind-system extension (row-kinded
-type parameters) — front-loaded in §2. Planning artifact: the implementing session MUST start with
+type parameters) — front-loaded in §2.
+
+**SUPERSEDED PREREQUISITE (2026-06-10):** the kind-system extension this slice's §2 calls for is now
+its own foundational design — `2026-06-10-kinded-type-representation-design.md` (unify `CType`/`CRow`
+into one kinded `Ty`, enabling rows as type-constructor parameters generally, for the whole layer-3
+cluster). 4b″ becomes a *consumer* of that foundation (a row-indexed `Suspension a b r e`) rather than
+carrying its own kind extension. Sequence: land the kinded-`Ty` representation first, then 4b″. Planning artifact: the implementing session MUST start with
 brainstorming (Kickoff prompt at the end), then writing-plans, then subagent-driven-development.
 
 Reads with: `2026-06-09-one-shot-escape-design.md` (slice 4b — esp. §5.2 the "capability

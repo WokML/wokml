@@ -31,7 +31,7 @@ import           Wok.TypeChecking.Env
   , extendClass, extendInstance, extendVar, lookupClass )
 import           Wok.TypeChecking.Error (TypeError (..))
 import           Wok.TypeChecking.Types
-  ( CRow (..), CType (..), Constraint (..), Kind (..), Scheme (..), TyCon (..) )
+  ( CType (..), Constraint (..), Kind (..), Scheme (..), TyCon (..) )
 
 -- ---------------------------------------------------------------------------
 -- Class declarations
@@ -152,6 +152,9 @@ smaller x parent = x /= parent && elemSub x parent
                               || elemSub t a || elemSub t b || elemSubR t r
     elemSub t (CTRecord _ r) = elemSubR t r
     elemSub _ (CTGen _)     = False
+    -- Row nodes (kind KEffect) are reached via elemSubR, not as type heads.
+    elemSub t r@(CRExtend{}) = elemSubR t r
+    elemSub _ CREmpty        = False
     elemSubR t (CRExtend _ ty rest) = t == ty || elemSub t ty || elemSubR t rest
     elemSubR _ _ = False
 
@@ -580,6 +583,9 @@ renderCType = go
     go (CTArr a _ b)  = atom a <> Tx.pack " -> " <> go b
     go (CTRecord t _) = t
     go (CTGen i)      = Tx.pack "t" <> Tx.pack (show i)
+    -- Row nodes (kind KEffect) are not rendered as type heads here.
+    go CREmpty        = Tx.pack "{}"
+    go (CRExtend l _ _) = Tx.pack "{" <> l <> Tx.pack "}"
 
     atom t@(CTCon _ (_:_)) = Tx.pack "(" <> go t <> Tx.pack ")"
     atom t@(CTArr{})       = Tx.pack "(" <> go t <> Tx.pack ")"

@@ -89,3 +89,6 @@ applySub m = go
     go (CTCon c ts)  = CTCon c (map go ts)
     go (CTArr a r b) = CTArr (go a) r (go b)
     go (CTRecord t r) = CTRecord t r
+    -- Rows (kind KEffect) are not substituted (see haddock above).
+    go CREmpty        = CREmpty
+    go r@(CRExtend{}) = r

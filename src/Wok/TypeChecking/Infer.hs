@@ -42,9 +42,9 @@ import Wok.TypeChecking.Env
   , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
 import Wok.TypeChecking.Error (TypeError (..), Warning (..))
 import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
-import Wok.TypeChecking.Unify (force, forceRow, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
+import Wok.TypeChecking.Unify (force, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
 import Wok.TypeChecking.Types
-  ( CRow (..), CType (..), Constraint (..), Kind (..), Level (..), RVar (..), Row (..)
+  ( CRow, CType (..), Constraint (..), Kind (..), Level (..), Row
   , Scheme (..), mkScheme, TyCon (..), TVar (..), Type (..) )
 import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
 import qualified Wok.TypeChecking.Typed as Ty
@@ -168,12 +168,17 @@ freezeQuantifyG tolerateRigid recordQuant outer nextRef seenRef kindsRef = goT
       ty' <- forceST ty
       case ty' of
         TCon c ts -> CTCon c <$> mapM goT ts
-        TArr a r b -> CTArr <$> goT a <*> goR r <*> goT b
-        TRecord tag row -> CTRecord tag <$> goR row
+        TArr a r b -> CTArr <$> goT a <*> goT r <*> goT b
+        TRecord tag row -> CTRecord tag <$> goT row
+        RowEmpty -> pure CREmpty
+        RowExtend l ty2 rest -> CRExtend l <$> goT ty2 <*> goT rest
         TVar ref -> do
           tv <- readSTRef ref
           case tv of
             Link _ -> error "freezeQuantify: TVar was Link after forceST (caller invariant violation)"
+            -- A row variable (kind KEffect) freezes to its uniq directly,
+            -- WITHOUT interning as a quantifier (preserving the old goR path).
+            Unbound u _ KEffect -> pure (CTGen u)
             Rigid u _
               | tolerateRigid -> intern u Nothing
               | otherwise -> error
@@ -186,17 +191,6 @@ freezeQuantifyG tolerateRigid recordQuant outer nextRef seenRef kindsRef = goT
                   ++ " var (uniq " ++ show u
                   ++ "); finalizeGroup should have routed this as a mono binding")
 
-    goR row = do
-      row' <- forceRowST row
-      case row' of
-        RowEmpty -> pure CREmpty
-        RowExtend l ty rest -> CRExtend l <$> goT ty <*> goR rest
-        RowVar ref -> do
-          rv <- readSTRef ref
-          case rv of
-            RLink _ -> error "freezeQuantify (goR): RowVar was RLink after forceRowST (caller invariant violation)"
-            RUnbound u _ -> pure (CRGen u)
-
     forceST tt = case tt of
       TVar ref -> do
         tv <- readSTRef ref
@@ -207,17 +201,6 @@ freezeQuantifyG tolerateRigid recordQuant outer nextRef seenRef kindsRef = goT
             pure t''
           _ -> pure tt
       _ -> pure tt
-
-    forceRowST rr = case rr of
-      RowVar ref -> do
-        rv <- readSTRef ref
-        case rv of
-          RLink r' -> do
-            r'' <- forceRowST r'
-            writeSTRef ref (RLink r'')
-            pure r''
-          _ -> pure rr
-      _ -> pure rr
 
 -- | Freeze a typed-AST tree for a SIGNED binding. Unlike 'generalizeTyped',
 -- this produces no scheme (the binding's scheme is its DECLARED signature) and
@@ -268,20 +251,22 @@ instantiateQ (Scheme vars constraints body) = do
               | c <- constraints ]
   pure (body', cs')
   where
+    -- One walk over the folded CType. Row nodes (CREmpty/CRExtend) and the
+    -- type nodes share the case split; a gen index is looked up in the type
+    -- subst first, then the row subst (the two index sets are disjoint).
     substInCType :: Map.Map Int (Type s) -> Map.Map Int (Row s) -> CType -> Type s
     substInCType m rm = goT
       where
         goT (CTCon c ts) = TCon c (map goT ts)
-        goT (CTArr a r b) = TArr (goT a) (goR r) (goT b)
-        goT (CTRecord tag row) = TRecord tag (goR row)
+        goT (CTArr a r b) = TArr (goT a) (goT r) (goT b)
+        goT (CTRecord tag row) = TRecord tag (goT row)
+        goT CREmpty = RowEmpty
+        goT (CRExtend l ty rest) = RowExtend l (goT ty) (goT rest)
         goT (CTGen i) = case Map.lookup i m of
           Just t -> t
-          Nothing -> error ("instantiate: dangling CTGen " ++ show i)
-        goR CREmpty = RowEmpty
-        goR (CRExtend l ty rest) = RowExtend l (goT ty) (goR rest)
-        goR (CRGen i) = case Map.lookup i rm of
-          Just r -> r
-          Nothing -> error ("instantiate: dangling CRGen " ++ show i)
+          Nothing -> case Map.lookup i rm of
+            Just r -> r
+            Nothing -> error ("instantiate: dangling CTGen " ++ show i)
 
 -- | Allocate a fresh TVar (or RowVar for KEffect) for each param slot in
 -- @rcParams@. Returns a map from CTGen index to fresh Type.
@@ -299,15 +284,25 @@ substCTypeWith :: Map.Map Int (Type s) -> CType -> Type s
 substCTypeWith m = goT
   where
     goT (CTCon c ts)       = TCon c (map goT ts)
-    goT (CTArr a r b)      = TArr (goT a) (goR r) (goT b)
-    goT (CTRecord tag row) = TRecord tag (goR row)
+    goT (CTArr a r b)      = TArr (goT a) (goT r) (goT b)
+    goT (CTRecord tag row) = TRecord tag (goT row)
+    goT CREmpty            = RowEmpty
+    goT (CRExtend l t rst) = RowExtend l (goT t) (goT rst)
     goT (CTGen i)          = case Map.lookup i m of
       Just t  -> t
-      Nothing -> error ("substCTypeWith: dangling CTGen " ++ show i)
-
-    goR CREmpty            = RowEmpty
-    goR (CRExtend l t rst) = RowExtend l (goT t) (goR rst)
-    goR (CRGen _)          = RowEmpty  -- row params not supported in v1
+      -- Not-in-subst fallback. Pre-merge this was two arms:
+      --   * a row-kinded gen (former CRGen) -> RowEmpty, because row
+      --     params are not supported in this record-field context (v1);
+      --   * a type-kinded gen -> error "substCTypeWith: dangling CTGen",
+      --     an internal invariant violation.
+      -- The kinded-Ty merge collapsed CRGen/CTGen into a single CTGen, so
+      -- the two cases are no longer distinguishable here without threading
+      -- param kinds through every caller. We keep the RowEmpty fallback: it
+      -- is correct for the row-param case, and a dangling *type* gen is
+      -- unreachable for valid programs (callers build paramSubst from the
+      -- complete rcParams / scheme quantifier list, so every type-kinded
+      -- gen is present in the map).
+      Nothing -> RowEmpty
 
 -- | Replace each forall-bound type variable in a user's signature with
 -- a fresh Rigid type — one the unifier treats as an opaque constant.
@@ -323,7 +318,7 @@ substCTypeWith m = goT
 -- with (u64 -> u64) fails, and the over-promise surfaces as a type
 -- error rather than disappearing.
 --
--- Row variables (KEffect slots, CRGen) become fresh RowVars rather than
+-- Row variables (KEffect slots, CTGen) become fresh RowVars rather than
 -- being dropped as RowEmpty. This ensures two uses of the same row variable
 -- in a sig (e.g. `Point + row r -> Point + row r`) share the same RowVar.
 freezeSig :: Scheme -> TC s (Type s)
@@ -352,25 +347,32 @@ freezeSigSkolems (Scheme vars _ body) = do
       uniqOfVar = Map.fromList [ (i, u) | (i, (u, _)) <- skolems ]
   pure (substInCType tySubst rowSubst body, uniqOfVar)
   where
+    -- One walk over the folded CType. A gen index is a type skolem (looked up
+    -- in m) or a row var (looked up in rm); a row index missing from rm maps to
+    -- RowEmpty (preserving the old goR fallback).
     substInCType :: Map.Map Int (Type s) -> Map.Map Int (Row s) -> CType -> Type s
     substInCType m rm = goT
       where
         goT (CTCon c ts) = TCon c (map goT ts)
-        goT (CTArr a r b) = TArr (goT a) (goR r) (goT b)
-        goT (CTRecord tag row) = TRecord tag (goR row)
+        goT (CTArr a r b) = TArr (goT a) (goT r) (goT b)
+        goT (CTRecord tag row) = TRecord tag (goT row)
+        goT CREmpty = RowEmpty
+        goT (CRExtend l ty rest) = RowExtend l (goT ty) (goT rest)
+        -- A type gen resolves in the skolem map `m`; a row gen in the row-var
+        -- map `rm`. The merge kept both maps, so we preserve the pre-merge
+        -- safety net: a gen in NEITHER is a genuine dangling-CTGen invariant
+        -- violation (unreachable for valid schemes — every body gen comes from
+        -- the quantifier list these maps are built from).
         goT (CTGen i) = case Map.lookup i m of
           Just t -> t
-          Nothing -> error ("freezeSig: dangling CTGen " ++ show i)
-        goR CREmpty = RowEmpty
-        goR (CRExtend l ty rest) = RowExtend l (goT ty) (goR rest)
-        goR (CRGen i) = case Map.lookup i rm of
-          Just r -> r
-          Nothing -> RowEmpty  -- row var not in subst: treat as empty (shouldn't happen)
+          Nothing -> case Map.lookup i rm of
+            Just r  -> r
+            Nothing -> error ("freezeSig: dangling CTGen " ++ show i)
 
 -- | Translate a parsed Abs.Type into a Scheme. Free VarIds in the
 -- type become universally quantified CTGen slots (in first-occurrence
 -- order). Row variables (introduced via @row r@ in RowContrib) become
--- universally quantified CRGen slots with KEffect kind. Validates tycon
+-- universally quantified CTGen slots with KEffect kind. Validates tycon
 -- arity. Built-in tycon names (U64, Char, String, Bool, Unit, list) map
 -- to specialised TyCon tags; user names become TcUser.
 -- Record-form TyCons (registered in envRecordCons with matching name)
@@ -608,10 +610,10 @@ translateSig env ty = do
         goRC (Abs.RCVar (Abs.VarId (_, rname))) = do
           rowSeen <- liftST (readSTRef rowSeenRef)
           case Map.lookup rname rowSeen of
-            Just i  -> pure (CRGen i)
-            Nothing -> CRGen <$> allocSlot rowSeenRef rname
+            Just i  -> pure (CTGen i)
+            Nothing -> CTGen <$> allocSlot rowSeenRef rname
         -- Anonymous record tail `Point + ..`: a fresh, single-use row var.
-        goRC Abs.RCWild = CRGen <$> freshAnonRowSlot
+        goRC Abs.RCWild = CTGen <$> freshAnonRowSlot
 
         -- Translate a `with` clause's effect row into a CRow. An effect label
         -- is the effect's nominal name; the label's field type carries the
@@ -636,10 +638,10 @@ translateSig env ty = do
           let key = Tx.pack "eff:" <> name
           rowSeen <- liftST (readSTRef rowSeenRef)
           case Map.lookup key rowSeen of
-            Just i  -> pure (CRGen i)
-            Nothing -> CRGen <$> allocSlot rowSeenRef key
+            Just i  -> pure (CTGen i)
+            Nothing -> CTGen <$> allocSlot rowSeenRef key
         -- Anonymous open effect tail `..`: a fresh, single-use row var.
-        goEffectRow Abs.ERWildOnly = CRGen <$> freshAnonRowSlot
+        goEffectRow Abs.ERWildOnly = CTGen <$> freshAnonRowSlot
 
         -- An effect atom `E t1..tn` -> (label "E", field type). The field type
         -- is unit for a no-arg effect, the single arg for one, a tuple for
@@ -673,7 +675,7 @@ translateSig env ty = do
 
         -- Merge two CRows for type-level extension.
         -- Labels from `ext` are prepended before `base`'s labels.
-        -- The terminal element of `ext` (CREmpty or CRGen) replaces the
+        -- The terminal element of `ext` (CREmpty or CTGen) replaces the
         -- terminal CREmpty of `base`, making row variables in `ext` the
         -- open tail of the merged row.
         --
@@ -681,34 +683,37 @@ translateSig env ty = do
         --                       base = CRExtend "x" t (CRExtend "y" t CREmpty)
         --                       result = CRExtend "score" t (CRExtend "x" t (CRExtend "y" t CREmpty))
         --
-        -- `Point + row r`:     ext = CRGen i
+        -- `Point + row r`:     ext = CTGen i
         --                      base = CRExtend "x" t (CRExtend "y" t CREmpty)
-        --                      result = CRExtend "x" t (CRExtend "y" t (CRGen i))
+        --                      result = CRExtend "x" t (CRExtend "y" t (CTGen i))
         appendCRow :: CRow -> CRow -> CRow
         appendCRow ext base =
           let newTail = cRowTail ext
               base'   = replaceCREmpty newTail base
           in  prependLabels ext base'
 
-        -- Extract the terminal (CREmpty or CRGen) of a CRow.
+        -- Extract the terminal (CREmpty or CTGen) of a CRow.
         cRowTail :: CRow -> CRow
         cRowTail CREmpty = CREmpty
-        cRowTail (CRGen i) = CRGen i
+        cRowTail (CTGen i) = CTGen i
         cRowTail (CRExtend _ _ rest) = cRowTail rest
+        cRowTail _ = error "cRowTail: expected a row"
 
         -- Replace the terminal CREmpty of a CRow with a new tail.
         replaceCREmpty :: CRow -> CRow -> CRow
         replaceCREmpty newTail CREmpty = newTail
-        replaceCREmpty _ (CRGen i) = CRGen i  -- already open; preserve it
+        replaceCREmpty _ (CTGen i) = CTGen i  -- already open; preserve it
         replaceCREmpty newTail (CRExtend l t rest) =
           CRExtend l t (replaceCREmpty newTail rest)
+        replaceCREmpty _ _ = error "replaceCREmpty: expected a row"
 
         -- Prepend the labels from `ext` before `base`, stopping at ext's terminal.
         prependLabels :: CRow -> CRow -> CRow
         prependLabels CREmpty base = base
-        prependLabels (CRGen _) base = base  -- terminal: labels exhausted
+        prependLabels (CTGen _) base = base  -- terminal: labels exhausted
         prependLabels (CRExtend l t rest) base =
           CRExtend l t (prependLabels rest base)
+        prependLabels _ _ = error "prependLabels: expected a row"
 
 -- ---------------------------------------------------------------------------
 -- Module-level helpers shared by translateSig and processDataDecls
@@ -1371,24 +1376,22 @@ inferExprWChecked mono (Just _) e = inferExprW mono e
 -- or RowVar. Used for extension-field detection.
 collectRowLabels :: Row s -> TC s [Text]
 collectRowLabels row = do
-  row' <- forceRow row
+  row' <- force row
   case row' of
-    RowEmpty        -> pure []
-    RowVar _        -> pure []  -- open row: no labels to inspect
     RowExtend l _ r -> do
       rest <- collectRowLabels r
       pure (l : rest)
+    _               -> pure []  -- RowEmpty or open tail (row var): no more labels
 
 -- | Look up a single label in a row, returning its type if found.
 lookupRowLabel :: Text -> Row s -> TC s (Maybe (Type s))
 lookupRowLabel label row = do
-  row' <- forceRow row
+  row' <- force row
   case row' of
-    RowEmpty        -> pure Nothing
-    RowVar _        -> pure Nothing
     RowExtend l t r
       | l == label -> pure (Just t)
       | otherwise  -> lookupRowLabel label r
+    _               -> pure Nothing  -- RowEmpty or open tail (row var)
 
 -- | Split trailing fields into overrides (present in spread) and additions
 -- (in extension set). Fields in neither produce UnknownField.
@@ -2182,15 +2185,14 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
 -- of effects that were not handled.
 dischargeEffects :: Row s -> [Text] -> TC s (Row s)
 dischargeEffects row handled = do
-  row' <- forceRow row
+  row' <- force row
   case row' of
-    RowEmpty            -> pure RowEmpty
-    RowVar _            -> pure row'  -- open tail: nothing concrete to drop
     RowExtend l t rest  -> do
       rest' <- dischargeEffects rest handled
       if l `elem` handled
         then pure rest'
         else pure (RowExtend l t rest')
+    _                   -> pure row'  -- RowEmpty or open tail: nothing concrete to drop
 
 -- | Ordinary record field projection `e.label`: the original (pre-effects)
 -- 'EProj' behaviour, factored out so the operation-call case can fall back to
@@ -2271,13 +2273,13 @@ emitEffect sp label argTy = do
 -- (terminating in 'RowEmpty') that lacks the label is NOT reachable.
 effectReachable :: Text -> Row s -> TC s Bool
 effectReachable label row = do
-  row' <- forceRow row
+  row' <- force row
   case row' of
     RowEmpty            -> pure False
-    RowVar _            -> pure True  -- open tail: can grow to include label
     RowExtend l _ rest
       | l == label      -> pure True
       | otherwise       -> effectReachable label rest
+    _                   -> pure True  -- open tail (row var): can grow to include label
 
 -- | Add a whole (concrete) effect row into the ambient row -- used when an
 -- application calls a function whose own effect row carries labels. Open tails
@@ -2285,13 +2287,12 @@ effectReachable label row = do
 -- label is emitted via 'emitEffect'.
 emitRow :: BNFC'Position -> Row s -> TC s ()
 emitRow sp row = do
-  row' <- forceRow row
+  row' <- force row
   case row' of
-    RowEmpty           -> pure ()
-    RowVar _           -> pure ()  -- open tail: no concrete effects to add
     RowExtend l t rest -> do
       emitEffect sp l t
       emitRow sp rest
+    _                  -> pure ()  -- RowEmpty or open tail: no concrete effects to add
 
 -- | Look up an infix operator; monomorphic bindings are checked first.
 -- Returns the operator's type and its name (for building the typed node).
@@ -2344,9 +2345,9 @@ checkRecordPatternCoverage sp scrutT alts = do
     hasRowVarTail :: Row s -> TC s Bool
     hasRowVarTail RowEmpty = pure False
     hasRowVarTail (RowExtend _ _ rest) = do
-      rest' <- forceRow rest
+      rest' <- force rest
       hasRowVarTail rest'
-    hasRowVarTail (RowVar _) = pure True
+    hasRowVarTail _ = pure True  -- open tail (row var)
 
     -- Return True iff the arm's outermost pattern is a strict record pattern.
     -- Open arms (PRecordOpen with '..'), wild arms (PRecordWild), and any
@@ -2597,9 +2598,13 @@ hasOuterScopeVar outer = go
         TArr a r b -> do
           a' <- go a
           if a' then pure True else do
-            r' <- goR r
+            r' <- go r
             if r' then pure True else go b
-        TRecord _ row -> goR row
+        TRecord _ row -> go row
+        RowEmpty -> pure False
+        RowExtend _ ty2 rest -> do
+          a <- go ty2
+          if a then pure True else go rest
         TVar ref -> do
           tv <- liftST $ readSTRef ref
           case tv of
@@ -2609,18 +2614,6 @@ hasOuterScopeVar outer = go
               -- from an enclosing sig), so any binding that references one
               -- must stay monomorphic.
             Link _ -> error "hasOuterScopeVar: TVar was Link after force (caller invariant violation)"
-    goR row = do
-      row' <- forceRow row
-      case row' of
-        RowEmpty -> pure False
-        RowExtend _ ty rest -> do
-          a <- go ty
-          if a then pure True else goR rest
-        RowVar ref -> do
-          rv <- liftST $ readSTRef ref
-          case rv of
-            RUnbound _ (Level l) -> pure (l <= outer)
-            RLink _ -> error "hasOuterScopeVar: RowVar was RLink after forceRow (caller invariant violation)"
     orM = foldM (\acc m -> if acc then pure True else m) False
 
 -- | Back at outer level: generalize an inferred type or verify a sig.
@@ -2792,6 +2785,9 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
     ctGenVars (CTCon _ ts)    = Set.unions (map ctGenVars ts)
     ctGenVars (CTArr a _ b)   = ctGenVars a `Set.union` ctGenVars b
     ctGenVars (CTRecord _ _)  = Set.empty
+    -- Row nodes (kind KEffect): constraints never range over row vars.
+    ctGenVars CREmpty         = Set.empty
+    ctGenVars (CRExtend{})    = Set.empty
 
 -- | Recover the per-clause @(params, body)@ list from the synthetic wrapper that
 -- 'finalizeGroupTyped' froze: a 'TLam' over all clauses' params concatenated,
@@ -2936,11 +2932,12 @@ effRowAtDepth n ty
 -- bind that tail to 'RowEmpty'. Concrete labels are preserved.
 closeRow :: Row s -> TC s ()
 closeRow row = do
-  row' <- forceRow row
+  row' <- force row
   case row' of
     RowEmpty            -> pure ()
     RowExtend _ _ rest  -> closeRow rest
-    RowVar ref          -> liftST $ writeSTRef ref (RLink RowEmpty)
+    TVar ref            -> liftST $ writeSTRef ref (Link RowEmpty)  -- open tail (row var)
+    _                   -> pure ()  -- non-row (cannot occur)
 
 -- | Build the curried function type for an equation, placing the equation's
 -- ambient effect row on the INNERMOST arrow -- the one crossed when the
@@ -3557,6 +3554,10 @@ prettyCType (CTArr a r b) =
     , Tx.pack " with "
     , prettyEffectRow r
     ]
+-- Row nodes (kind KEffect) are normally rendered via 'prettyCRow' (record rows)
+-- or 'prettyEffectRow' (arrow rows); these arms only keep 'prettyCType' total.
+prettyCType r@CREmpty       = prettyCRow r
+prettyCType r@(CRExtend{})  = prettyCRow r
 
 prettyCTypeArg :: CType -> Text
 prettyCTypeArg t@CTArr{} = Tx.concat [Tx.pack "(", prettyCType t, Tx.pack ")"]
@@ -3573,7 +3574,8 @@ prettyCTypeAtom t = prettyCType t
 prettyCRow :: CRow -> Text
 prettyCRow CREmpty = Tx.empty
 prettyCRow (CRExtend l _ rest) = Tx.concat [l, Tx.pack ",", prettyCRow rest]
-prettyCRow (CRGen i) = Tx.concat [Tx.pack "r", Tx.pack (show i)]
+prettyCRow (CTGen i) = Tx.concat [Tx.pack "r", Tx.pack (show i)]
+prettyCRow _ = error "prettyCRow: expected a row"
 
 -- | Render an arrow's effect row in surface @with@ form: effect labels joined
 -- by @ + @, with an open tail printed as @eff <var>@. The arrow's row slot only
@@ -3585,6 +3587,7 @@ prettyEffectRow = go True
   where
     go _ CREmpty = Tx.empty
     go first (CRExtend l _ rest) = Tx.concat [lead first, l, go False rest]
-    go first (CRGen i) = Tx.concat [lead first, Tx.pack "eff ", varName i]
+    go first (CTGen i) = Tx.concat [lead first, Tx.pack "eff ", varName i]
+    go _ _ = error "prettyEffectRow: expected a row"
     lead first = if first then Tx.empty else Tx.pack " + "
 

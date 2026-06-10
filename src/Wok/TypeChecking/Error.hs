@@ -15,6 +15,10 @@ type SourceSpan = BNFC'Position
 
 data TypeError
   = Mismatch SourceSpan CType CType
+  | KindMismatch SourceSpan CType CType
+    -- ^ Two types of different KINDS were unified (e.g. a row where a `*`-kinded
+    -- type was expected). Cannot arise from surface programs in Slice A (every
+    -- type is well-kinded); guards the kinded representation for later slices.
   | OccursCheck SourceSpan Int CType
   | UnknownVar SourceSpan Text
   | UnknownCon SourceSpan Text

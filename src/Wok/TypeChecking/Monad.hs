@@ -35,7 +35,7 @@ import Data.Text (Text)
 import Wok.TypeChecking.Env (Env, extendVar)
 import Wok.TypeChecking.Error (TypeError, Warning)
 import Wok.TypeChecking.Types
-  ( Kind, Level (..), RVar (..), Row (..), Scheme, TVar (..), Type (..) )
+  ( Kind (..), Level (..), Row, Scheme, TVar (..), Type (..) )
 
 -- | A constraint collected during inference; its argument is still a mutable
 -- 'Type s' and is frozen to 'CType' at the binding's generalization.
@@ -126,8 +126,8 @@ freshRVar :: TC s (Row s)
 freshRVar = do
   lvl <- currentLevel
   u <- freshUniq
-  ref <- liftST $ newSTRef (RUnbound u lvl)
-  pure (RowVar ref)
+  ref <- liftST $ newSTRef (Unbound u lvl KEffect)
+  pure (TVar ref)
 
 enterLevel :: TC s a -> TC s a
 enterLevel = local

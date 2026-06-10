@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+-- Regression: row var `e` is shared across two effect-row positions (argument +
+-- result). Pins freezeSigSkolems' non-skolemization of row sig-vars, which the
+-- kinded-Ty merge (slice A) must preserve.
+applyThunk : (() -> a with eff e) -> a with eff e
+applyThunk f = f ()
+
+main : U64
+main = applyThunk (\_ -> 7)
