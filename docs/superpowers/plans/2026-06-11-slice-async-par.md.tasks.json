@@ -31,7 +31,7 @@
     {
       "id": 4,
       "subject": "Task 4: Full-branch review and finish (async-par)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [3],
       "description": "**Goal:** Standing-rule full-branch review main..HEAD; triage; integrate per user (confirm in prose). Prim.hs/interpreter unchanged (no new prims) unless the Task 1 fallback was escalated.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"full-branch review main..HEAD completed + triaged\", \"build+test green; coro values unchanged; churn limited to slice\", \"Prim.hs/interpreter unchanged (no new prims) unless fallback escalated\", \"integration decision made with user\"]}\n```"
     }

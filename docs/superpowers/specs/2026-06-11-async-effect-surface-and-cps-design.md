@@ -15,7 +15,7 @@ Builds on:
   `start`/`step`/`run`/`cancel`, `__coro_*` trusted prims, the existing
   `coro-multi-driver` example (drives several coroutines at once).
 - Invariants: effect handlers are the one control mechanism; handlers are
-  second-class; one-shot is the law; nondeterminism is reflected in the row (`Nondet`).
+  second-class; one-shot is the law; nondeterminism enters only via foreign effects in the row (no synthetic marker -- see �7).
 
 ---
 
@@ -23,7 +23,7 @@ Builds on:
 
 **DETERMINED here (surface + interface — specified even if not all built):**
 - The `Async` effect and its operation set.
-- Structured combinators `par` (deterministic) and `race` (nondeterministic).
+- Structured combinators `par` (wait-both) and `race` (first-wins) -- both neutral; no determinism marker (�7).
 - The cancellation model (cooperative, transparent / `finally`-based).
 - The pluggable-runtime **interface** (opaque-token / waker contract) that a
   future `foreign` executor implements.
@@ -114,16 +114,16 @@ par : (() -> a with Async + e)
 - Runs both children, interleaving them at their `yield` points under a **fixed**
   schedule (left-biased round-robin — see §10), and returns both results.
 - **Discharges `Async`** (par is its driver) → `Async` is not in par's result row.
-- **Deterministic**: fixed schedule + fixed effect order ⇒ **no `Nondet`**.
+- **Deterministic**: fixed schedule + fixed effect order, fully reproducible (no determinism marker needed -- �7).
 - Residual `e` (children's other effects) propagates to the par call site
   (resume-site: those effects resolve where par is invoked).
 
-### `race` — nondeterministic, SHIPPED (slice async-race)
+### `race` — neutral combinator, SHIPPED (slice async-race)
 
 ```
 race : (() -> r with Async + eff e)
     -> (() -> r with Async + eff e)
-    -> r with Nondet + eff e
+    -> r with eff e
 ```
 
 - First child to complete wins; the loser is **dropped** — its carrier simply goes
@@ -131,14 +131,15 @@ race : (() -> r with Async + eff e)
   Slice-2 **spike confirmed the affine analysis accepts the drop (0 uses)**, so this
   is pure control-flow — **no keyword, no explicit `cancel` call** needed. (`finally`
   on drop arrives with resources/Perceus; nothing to clean up yet.)
-- **Discharges `Async`** (race is the driver) and **adds `Nondet`** to the result row.
-- **`Nondet` representation:** `effect Nondet = { decide : Bool }`. `race` performs
-  `Nondet.decide` only on a *tie* (both children complete the same round) to pick the
-  winner — that single use puts `Nondet` in the type, statically, even when no tie
-  occurs at runtime. A deterministic resolver `runDet c = with Nondet { decide -> True }
-  (c ())` discharges it left-biased, so races are reproducible for golden tests; a real
-  runtime resolves `decide` by timing. `Nondet` is the cross-runtime *contract*, not a
-  claim about the reference resolver. (See §7.)
+- **Discharges `Async`** (and `Coro`); propagates the children's residual `e`. A
+  plain combinator, exactly like `par` — **no extra marker in the row**.
+- **On a tie** (both children complete the same lockstep round) the **left** child
+  wins — a fixed, deterministic rule. Correctness comes from `runRace` handling
+  every `Step` combination (`Completed`/`Suspended` × both sides) exhaustively; no
+  tagging or choice effect is needed.
+- **No `Nondet` / determinism marker** — see §7 for why. Earlier drafts added a
+  `Nondet` effect + a `runDet` resolver; both were removed as scaffolding for an
+  enforceable-determinism story that cannot exist.
 
 ### `scope` / `spawn` — dynamic nursery, DEFERRED
 
@@ -328,30 +329,44 @@ implemented this slice (no FFI yet).
 
 ---
 
-## 7. Determinism and `Nondet`
+## 7. Determinism is NOT a tracked property (and why)
 
-The nondeterminism marker is named **`Nondet`** (de-abbreviated from the early
-`ndet`; chosen as the precise, source-neutral term over `Chance`/`Race`/`Flux`,
-which each narrow or vague-ify — `race` minus `par` is nondeterminism *itself*, a
-property not a capability). It is `effect Nondet = { decide : Bool }` (§3).
+There is **no `Nondet` marker** and no determinism guarantee in the type system.
+This is deliberate. The reasoning (the design converged here after trying a
+`Nondet` effect, then a per-source `nondet` tag, and rejecting both):
 
-- `par`: deterministic — fixed schedule, fixed effect order, no `Nondet`.
-- `race`: `Nondet` in the **type** (winner varies across real runtimes), even though
-  the deterministic resolver `runDet` gives a reproducible answer for tests.
-  `Nondet` describes the cross-runtime contract; a deterministic resolver is one
-  lawful resolution of it.
-- Consequence (the payoff): "is this program deterministic?" is a type check — a
-  function whose row lacks `Nondet` cannot call `race` until something discharges it.
-- Future refinement (spec §11 / not yet built): concrete sources `Clock`/`Random`
-  become their own effects that *also* carry `Nondet`; `race` adds `Nondet` directly.
+- **Determinism cannot be enforced.** The only source of nondeterminism is the
+  **foreign boundary** (a real clock, a real scheduler, a real RNG). Foreign code
+  is *trusted, not verified* — you declare its effects and hope. So any
+  "row lacks the marker ⇒ deterministic" promise rests on unverifiable honesty.
+  Claiming a guarantee you can't keep is itself a leaky abstraction.
+- **It taxes users for nothing.** A `Nondet` marker forces extra row entries,
+  handling obligations, and a `runDet` to thread — all to back a hollow promise.
+- **Nondeterminism is a property of the *handler*, not the effect interface.** The
+  same effect (`Clock`, a scheduler) is deterministic under a mock/pure handler and
+  nondeterministic under a foreign one. Tagging the *interface* bakes an
+  implementation assumption into the declaration.
+- **Pure wok is deterministic by construction** — deterministic interpreter,
+  one-shot law (no `amb`/backtracking), pure handlers are just functions. So in pure
+  wok there is no nondeterminism to mark; `race` (lockstep, left-biased) is fully
+  reproducible.
+
+What we keep: the roadmap invariant "nondeterminism is visible in the row" still
+holds — but realized by the thing that's actually honest and unavoidable, the
+**foreign effect itself**. When a real scheduler/clock/RNG arrives (slice 4), it
+appears in the row as its declared foreign effect (e.g. `IO`). The user reads the
+row, sees the foreign/world-touching capability, and *infers* "this can vary"; the
+compiler never over-promises. Effects (`Async`, a future `Clock`/`Random`/scheduler
+capability) are **neutral capabilities**; determinism follows from *who resolves
+them* — pure handler (reproducible) vs foreign handler (its nondeterminism is in
+the row). No synthetic marker, no tag.
 
 ---
 
 ## 8. Testing (verifiable now)
 
 - **typecheck-examples**: `par`/`yield` signatures; par discharges `Async` and
-  carries no `Nondet`; residual `e` propagates; (deferred-fixture sketches for
-  `race` carrying `Nondet`).
+  no determinism marker; residual `e` propagates.
 - **run-examples**: `par` of two `yield`-ing children → deterministic interleave
   → golden output; par returns both results.
 - **typecheck-fail-examples**: `Async.yield` performed in an explicitly-typed pure
@@ -371,7 +386,7 @@ property not a capability). It is `effect Nondet = { decide : Bool }` (§3).
   fails the affine analysis, fall back to a trusted `__par` prim; (2) the `Async`
   effect + `par` signature + the Async→Coro adapter; (3) deterministic interleave
   schedule + golden examples; (4) full-branch review + finish.
-- **Slice 2 (DONE):** `race` + cooperative cancellation (pure-drop, transparent) + `Nondet` resolver `runDet`.
+- **Slice 2 (DONE):** `race` (neutral first-wins combinator) + cooperative cancellation (pure-drop, transparent). No Nondet marker (determinism not tracked, �7).
 - **Slice 3:** dynamic `scope`/`spawn`/`await`/`Promise` (N-child driver).
 - **Slice 4:** real runtime via a `foreign` executor over the §6 token interface
   (needs FFI).

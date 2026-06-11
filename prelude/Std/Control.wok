@@ -121,35 +121,25 @@ par a b = parBoth (start (asCoro a)) (start (asCoro b))
 
 -- ---------------------------------------------------------------------------
 -- race (slice async-race): run two Async children, first to COMPLETE wins; the
--- loser is dropped (its carrier goes unused -> its remaining tail never runs =
--- cooperative cancellation, no keyword). `Nondet` is the nondeterminism marker:
--- race performs `Nondet.decide` only on a TIE (both complete the same round).
+-- loser is dropped (its carrier goes unused -> remaining tail never runs =
+-- cooperative cancellation, pure control-flow, no keyword). A neutral combinator
+-- like `par` -- determinism is not a tracked property here; nondeterminism (a
+-- real scheduler) would enter later as a foreign effect in the row, not a marker.
+-- On a tie (both complete the same lockstep round) the LEFT child wins.
 
--- Nondet: the nondeterminism marker. `decide` is the environment's choice;
--- a real runtime resolves it by timing, `runDet` resolves it deterministically.
-effect Nondet = { decide : Bool }
-
--- runDet: deterministic resolver -- `decide` is always True (left-biased), so a
--- race under runDet is reproducible. Discharges Nondet.
-runDet : (() -> a with Nondet + eff e) -> a with eff e
-runDet c = with Nondet { decide -> True } (c ())
-
--- runRace: lockstep-drive two coroutines; return the first to Complete, dropping
--- the other. On a simultaneous completion (tie) ask `Nondet.decide`.
-runRace : Step () () r (row e) -> Step () () r (row e) -> r with Nondet + eff e
+-- runRace: lockstep-drive two coroutines; return the first to Complete (left-
+-- biased on a tie), dropping the other.
+runRace : Step () () r (row e) -> Step () () r (row e) -> r with eff e
 runRace sa sb = case sa of
   Completed ra -> case sb of
-    Completed rb -> case Nondet.decide of
-                      True  -> ra
-                      False -> rb
+    Completed rb   -> ra
     Suspended _ gb -> ra
   Suspended _ ga -> case sb of
-    Completed rb -> rb
+    Completed rb   -> rb
     Suspended _ gb ->
       let sa2 = step ga () in
       let sb2 = step gb () in
       runRace sa2 sb2
 
--- race: adapt each child, start both, drive to the first completion.
-race : (() -> r with Async + eff e) -> (() -> r with Async + eff e) -> r with Nondet + eff e
+race : (() -> r with Async + eff e) -> (() -> r with Async + eff e) -> r with eff e
 race a b = runRace (start (asCoro a)) (start (asCoro b))

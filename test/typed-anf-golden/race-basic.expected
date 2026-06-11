@@ -11,7 +11,5 @@ slow u : () =
   9
 
 main =
-  let t.2 : () -> U64 = \u : () -> let t.1 : U64 = race(fast, slow)
-  t.1
-  let t.3 : U64 = runDet(t.2)
-  t.3
+  let t : U64 = race(fast, slow)
+  t

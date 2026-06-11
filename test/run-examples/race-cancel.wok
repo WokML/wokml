@@ -27,7 +27,7 @@ loser : () -> U64 with Async + Writer [U64]
 loser u = let p = Writer.tell [3] in let q = Async.yield () in let r = Async.yield () in let s = Writer.tell [9] in 8
 
 -- Route race through an intermediate function with an explicit Writer residual.
-runRaced : () -> U64 with Nondet + Writer [U64]
+runRaced : () -> U64 with Writer [U64]
 runRaced u = race winner loser
 
 -- Fold the recorded order into a base-10 number: [1,3,2] => 132.
@@ -37,5 +37,5 @@ toNum acc xs = case xs of
   n :: rest -> toNum (acc * 10 + n) rest
 
 main : U64
-main = case writer (\u -> runDet runRaced) of
+main = case writer (\u -> runRaced ()) of
   (_, log) -> toNum 0 log
