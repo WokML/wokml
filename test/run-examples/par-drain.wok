@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Control
+
+genC : () -> U64 with Async
+genC u = let p = Async.yield () in let q = Async.yield () in 100
+
+genD : () -> U64 with Async
+genD u = 200
+
+main : U64
+main = let (x, y) = par genC genD in x * 10 + y

@@ -1,0 +1,17 @@
+genA u =
+  let t = Async.yield(())
+  let p = t
+  10
+
+genB u =
+  let t = Async.yield(())
+  let p = t
+  20
+
+main =
+  let t.1 = par(genA, genB)
+  case t.1 of
+    Tuple2 x y ->
+      let t.2 = *(x, 10)
+      let t.3 = +(t.2, y)
+      t.3

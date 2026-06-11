@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Control
+
+wa : () -> U64 with Coro () ()
+wa u = let s = Coro.suspend () in 10
+
+wb : () -> U64 with Coro () ()
+wb u = let s = Coro.suspend () in 20
+
+main : U64
+main = let (x, y) = parBoth (start wa) (start wb) in x * 10 + y

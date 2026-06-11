@@ -1,0 +1,23 @@
+genE u : () =
+  let t.2 : () = Log.emit(1)
+  let p : () = t.2
+  let t.1 : () = Async.yield(())
+  let q : () = t.1
+  5
+
+useE u : () =
+  let t.1 : (U64, U64) = par(genE, genE)
+  case t.1 of
+    Tuple2 x : U64 y : U64 ->
+      let t.2 : U64 = +(x, y)
+      t.2
+
+main =
+  let t.1 : U64 = useE(())
+  t.1
+  with {
+    return v : U64 -> v
+    Log.emit(n : U64, resume : U64) ->
+      let t.2 : U64 = resume(())
+      t.2
+  }

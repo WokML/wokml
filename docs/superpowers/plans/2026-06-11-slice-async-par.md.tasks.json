@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-11-slice-async-par.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Branch and baseline (async-par)",
+      "status": "completed",
+      "description": "**Goal:** Branch feat/slice-async-par from main; confirm green baseline.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git branch --show-current; cabal test 2>&1 | grep -iE 'All [0-9]+ tests'\", \"acceptanceCriteria\": [\"on branch feat/slice-async-par from main\", \"cabal test green (734)\", \"coro values 421/10/52/64/99/105/6\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Two-carrier driver over raw Coro (spike)",
+      "status": "completed",
+      "blockedBy": [0],
+      "description": "**Goal:** Add parBoth/drainA/drainB to prelude/Std/Control.wok; prove the result-combining draining two-carrier lockstep driver type-checks under the affine analysis and runs over raw Coro. Front-loads the only risk (zipSum proves the shape). If affine REJECTS: STOP + report (fallback = trusted __par prim, escalate first).\n\n```json:metadata\n{\"files\": [\"prelude/Std/Control.wok\", \"test/run-examples/par-driver-raw.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/par-driver-raw.wok --run ; cabal test 2>&1 | grep -iE 'All [0-9]+ tests'\", \"acceptanceCriteria\": [\"parBoth/drainA/drainB in prelude; prelude type-checks\", \"par-driver-raw.wok --run = 30\", \"full suite green; coro values unchanged\", \"if affine rejects: STOP and report (do not hack)\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Async effect + asCoro adapter + par",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Add effect Async = { yield : () -> () }, the asCoro adapter (Async.yield -> Coro.suspend), and par (adapt each child, start, drive with parBoth). par type-checks + runs; discharges Async, no ndet.\n\n```json:metadata\n{\"files\": [\"prelude/Std/Control.wok\", \"test/run-examples/par-basic.wok\", \"test/typecheck-examples/par-basic.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/par-basic.wok --run ; cabal test 2>&1 | grep -iE 'All [0-9]+ tests'\", \"acceptanceCriteria\": [\"Async + asCoro + par in prelude; prelude type-checks\", \"par discharges Async, no ndet\", \"par-basic.wok --run = 30\", \"full suite green; coro values unchanged\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Coverage -- drain, residual, unhandled-Async",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Remaining slice-1 fixtures: asymmetric-completion drain path (par-drain -> 300), residual-effect propagation (par-residual-log: useE : () -> U64 with Log, --run 10), unhandled-Async rejection (async-unhandled).\n\n```json:metadata\n{\"files\": [\"test/run-examples/par-drain.wok\", \"test/run-examples/par-residual-log.wok\", \"test/typecheck-examples/par-residual-log.wok\", \"test/typecheck-fail-examples/async-unhandled.wok\"], \"verifyCommand\": \"cabal run -v0 wok -- test/run-examples/par-drain.wok --run ; cabal run -v0 wok -- test/typecheck-fail-examples/async-unhandled.wok 2>&1 | tail -1 ; cabal test 2>&1 | grep -iE 'All [0-9]+ tests'\", \"acceptanceCriteria\": [\"par-drain --run = 300\", \"par-residual-log type-checks (useE with Log) + --run = 10\", \"async-unhandled rejected (unhandled Async)\", \"suite green; coro values unchanged; churn limited to new fixtures\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Full-branch review and finish (async-par)",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Standing-rule full-branch review main..HEAD; triage; integrate per user (confirm in prose). Prim.hs/interpreter unchanged (no new prims) unless the Task 1 fallback was escalated.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test 2>&1 | tail -3\", \"acceptanceCriteria\": [\"full-branch review main..HEAD completed + triaged\", \"build+test green; coro values unchanged; churn limited to slice\", \"Prim.hs/interpreter unchanged (no new prims) unless fallback escalated\", \"integration decision made with user\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-11"
+}

@@ -66,3 +66,55 @@ run s v = __coro_unwrap (__coro_resume s v)
 -- not to launder its type.
 cancel : Suspension a b r (row e) -> ()
 cancel s = __coro_cancel s
+
+-- ---------------------------------------------------------------------------
+-- Two-coroutine lockstep driver (slice async-par).
+--
+-- Runs two coroutines (each `Coro () ()`, i.e. yields/resumes with unit) to
+-- completion and returns both results. Carriers are held only as recursive
+-- ARGUMENTS (second-class, never stored/returned); each is `step`-ped at most
+-- once per round, so one-shot holds. Lockstep (advance both per round) is the
+-- deterministic interleave schedule. This is `coro-step-zip`'s `zipSum` shape
+-- plus result-combination and per-side drain.
+-- drainOne: drive a single Step (Coro () ()) to completion, returning its result.
+-- Used when the other side has already finished; the carrier is `step`-ped once
+-- per round (second-class, recursive arg) so one-shot holds.
+drainOne : Step () () r (row e) -> r with eff e
+drainOne s = case s of
+  Completed r   -> r
+  Suspended _ g -> drainOne (step g ())
+
+parBoth : Step () () ra (row e) -> Step () () rb (row e) -> (ra, rb) with eff e
+parBoth sa sb = case sa of
+  Completed ra -> case sb of
+    Completed rb   -> (ra, rb)
+    Suspended _ gb -> (ra, drainOne (step gb ()))
+  Suspended _ ga -> case sb of
+    Completed rb   -> (drainOne (step ga ()), rb)
+    -- Sequence the two resumptions explicitly (A's round before B's) so the
+    -- cross-side order of residual effects is fixed by the driver, not by the
+    -- interpreter's argument-evaluation order.
+    Suspended _ gb ->
+      let sa2 = step ga () in
+      let sb2 = step gb () in
+      parBoth sa2 sb2
+
+-- ---------------------------------------------------------------------------
+-- Async surface (slice async-par). `par` is a built-in DRIVER over `Async`,
+-- expressed over the coroutine machinery -- not a runtime (no IO/scheduler).
+
+-- Async: the cooperative-scheduling effect. `yield` is a breakpoint: the task
+-- parks and hands control to its driver.
+effect Async = { yield : () -> () }
+
+-- asCoro: adapt an `Async` child to a coroutine by mapping `Async.yield` to
+-- `Coro.suspend` (yield/resume carry unit). Discharges Async, introduces Coro;
+-- the child's non-Async residual e flows through.
+asCoro : (() -> r with Async + eff e) -> () -> r with Coro () () + eff e
+asCoro c _ = with Async { yield _ k -> k (Coro.suspend ()) } (c ())
+
+-- par: run two Async children concurrently (deterministic lockstep) and return
+-- both results. Discharges Async (and Coro); the children's residual e is
+-- demanded here, at the call site (resume-site). Deterministic => no ndet.
+par : (() -> ra with Async + eff e) -> (() -> rb with Async + eff e) -> (ra, rb) with eff e
+par a b = parBoth (start (asCoro a)) (start (asCoro b))

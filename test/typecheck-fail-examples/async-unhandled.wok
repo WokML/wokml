@@ -1,0 +1,6 @@
+module Main
+import Std.Base
+import Std.Control
+
+solo : () -> U64
+solo u = let p = Async.yield () in 7

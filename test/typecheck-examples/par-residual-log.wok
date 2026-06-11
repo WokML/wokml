@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Log = { emit : U64 -> () }
+
+genE : () -> U64 with Async + Log
+genE u = let p = Log.emit 1 in let q = Async.yield () in 5
+
+useE : () -> U64 with Log
+useE u = let (x, y) = par genE genE in x + y
+
+main : U64
+main = with Log { emit n k -> k () } (useE ())
