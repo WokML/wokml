@@ -24,7 +24,7 @@ module Wok.TypeChecking.Unify
   ) where
 
 import Control.Monad (when, zipWithM_)
-import Control.Monad.Except (throwError)
+import Control.Monad.Except (catchError, throwError)
 import Data.STRef (STRef, readSTRef, writeSTRef)
 import Data.Text (Text)
 import qualified Data.Map.Strict as Map
@@ -202,7 +202,18 @@ unify sp a b = do
       warnOnShadow sp row1
     (RowEmpty, RowEmpty) -> pure ()
     (RowExtend l1 t1 rest1, _) -> do
-      (t2, rest2') <- rewriteRow sp l1 b'
+      -- Bubble label @l1@ through @b'@. A label-not-found failure surfaces as an
+      -- 'UnknownField sp "<row>" l1' placeholder from 'rewriteRow'; rewrite it
+      -- into a positioned 'RowMismatch' showing BOTH full rows (the same shape as
+      -- the 'RowEmpty'/'RowExtend' arm below). Any other error (KindMismatch,
+      -- OccursCheck, NominalMismatch from the recursive unifies, ...) is rethrown
+      -- unchanged so we do not mask genuine failures.
+      (t2, rest2') <- rewriteRow sp l1 b' `catchError` \case
+        UnknownField{} -> do
+          ca <- freeze a'
+          cb <- freeze b'
+          throwError (RowMismatch sp ca cb)
+        e -> throwError e
       unify sp t1 t2
       unify sp rest1 rest2'
     (RowEmpty, RowExtend{}) -> do

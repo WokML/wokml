@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Foo = { foo : U64 -> () }
+effect Bar = { bar : U64 -> () }
+
+childFoo : () -> U64 with Async + Foo
+childFoo u = let p = Foo.foo 1 in let q = Async.yield () in 1
+
+childBar : () -> U64 with Async + Bar
+childBar u = let p = Bar.bar 2 in let q = Async.yield () in 2
+
+-- par forces both children's residual rows to unify; Foo /= Bar => row mismatch.
+bad : () -> U64 with Foo + Bar
+bad u = let (x, y) = par childFoo childBar in x + y

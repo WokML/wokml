@@ -1,0 +1,1 @@
+typecheck: typecheck in Main: RowMismatch Nothing (CRExtend "Foo" (CTCon TcUnit []) CREmpty) (CRExtend "Bar" (CTCon TcUnit []) CREmpty)

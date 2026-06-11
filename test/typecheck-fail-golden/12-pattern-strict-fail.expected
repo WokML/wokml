@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: UnknownField Nothing "<row>" "z"
+typecheck: typecheck in Main: RowMismatch Nothing (CRExtend "z" (CTCon TcU64 []) (CRExtend "x" (CTCon TcU64 []) (CRExtend "y" (CTCon TcU64 []) CREmpty))) (CRExtend "x" (CTCon TcU64 []) (CRExtend "y" (CTCon TcU64 []) CREmpty))
