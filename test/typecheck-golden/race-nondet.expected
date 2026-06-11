@@ -1,0 +1,3 @@
+g : () -> U64 with Async
+main : U64
+useRace : () -> U64 with Nondet

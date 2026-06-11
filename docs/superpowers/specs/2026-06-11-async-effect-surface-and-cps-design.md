@@ -15,8 +15,7 @@ Builds on:
   `start`/`step`/`run`/`cancel`, `__coro_*` trusted prims, the existing
   `coro-multi-driver` example (drives several coroutines at once).
 - Invariants: effect handlers are the one control mechanism; handlers are
-  second-class; one-shot is the law; nondeterminism is reflected in the row
-  (`ndet`).
+  second-class; one-shot is the law; nondeterminism is reflected in the row (`Nondet`).
 
 ---
 
@@ -36,7 +35,9 @@ Builds on:
 - Deterministic golden tests: typecheck + run.
 
 **DEFERRED (named, not built):**
-- `race` + cancellation (`finally`, `ndet`) — next slice.
+- `finally` / cleanup-on-cancel — deferred until resources exist. (`race`'s
+  cooperative cancellation ships now as pure-drop, no keyword — slice async-race;
+  there is simply nothing to clean up yet.)
 - Dynamic `scope`/`spawn`/`await`/`Promise` — needs an N-child driver.
 - Real runtime (IO, timers, parallelism) via a `foreign` executor — needs FFI;
   its interface is specified here so it slots in without surface changes.
@@ -113,25 +114,31 @@ par : (() -> a with Async + e)
 - Runs both children, interleaving them at their `yield` points under a **fixed**
   schedule (left-biased round-robin — see §10), and returns both results.
 - **Discharges `Async`** (par is its driver) → `Async` is not in par's result row.
-- **Deterministic**: fixed schedule + fixed effect order ⇒ **no `ndet`**.
+- **Deterministic**: fixed schedule + fixed effect order ⇒ **no `Nondet`**.
 - Residual `e` (children's other effects) propagates to the par call site
   (resume-site: those effects resolve where par is invoked).
 
-### `race` — nondeterministic, DEFERRED to the next slice
+### `race` — nondeterministic, SHIPPED (slice async-race)
 
 ```
-race : (() -> a with Async + e)
-    -> (() -> a with Async + e)
-    -> a with ndet + e
+race : (() -> r with Async + eff e)
+    -> (() -> r with Async + eff e)
+    -> r with Nondet + eff e
 ```
 
-- First child to complete wins; the loser is **dropped** (§4.3; its `finally` runs
-  on drop under a future runtime). No explicit cancel call.
-- **Discharges `Async`** (race is the driver) and **adds `ndet`** to the result row.
-- The `ndet` reflects the *contract* — the winner depends on scheduling/timing under
-  a real runtime. The deterministic reference driver resolves it reproducibly
-  (left-biased) for golden tests; `ndet` is the cross-runtime contract, not a claim
-  about the reference driver. (See §7.)
+- First child to complete wins; the loser is **dropped** — its carrier simply goes
+  unused, so its remaining tail never runs (cooperative cancellation, §4.3). The
+  Slice-2 **spike confirmed the affine analysis accepts the drop (0 uses)**, so this
+  is pure control-flow — **no keyword, no explicit `cancel` call** needed. (`finally`
+  on drop arrives with resources/Perceus; nothing to clean up yet.)
+- **Discharges `Async`** (race is the driver) and **adds `Nondet`** to the result row.
+- **`Nondet` representation:** `effect Nondet = { decide : Bool }`. `race` performs
+  `Nondet.decide` only on a *tie* (both children complete the same round) to pick the
+  winner — that single use puts `Nondet` in the type, statically, even when no tie
+  occurs at runtime. A deterministic resolver `runDet c = with Nondet { decide -> True }
+  (c ())` discharges it left-biased, so races are reproducible for golden tests; a real
+  runtime resolves `decide` by timing. `Nondet` is the cross-runtime *contract*, not a
+  claim about the reference resolver. (See §7.)
 
 ### `scope` / `spawn` — dynamic nursery, DEFERRED
 
@@ -321,23 +328,30 @@ implemented this slice (no FFI yet).
 
 ---
 
-## 7. Determinism and `ndet`
+## 7. Determinism and `Nondet`
 
-- `par`: deterministic — fixed schedule, fixed effect order, no `ndet`.
-- `race`: `ndet` in the **type** (winner varies across real runtimes), even though
-  the deterministic reference driver gives a reproducible answer for tests.
-  `ndet` describes the cross-runtime contract; a deterministic driver is one
+The nondeterminism marker is named **`Nondet`** (de-abbreviated from the early
+`ndet`; chosen as the precise, source-neutral term over `Chance`/`Race`/`Flux`,
+which each narrow or vague-ify — `race` minus `par` is nondeterminism *itself*, a
+property not a capability). It is `effect Nondet = { decide : Bool }` (§3).
+
+- `par`: deterministic — fixed schedule, fixed effect order, no `Nondet`.
+- `race`: `Nondet` in the **type** (winner varies across real runtimes), even though
+  the deterministic resolver `runDet` gives a reproducible answer for tests.
+  `Nondet` describes the cross-runtime contract; a deterministic resolver is one
   lawful resolution of it.
 - Consequence (the payoff): "is this program deterministic?" is a type check — a
-  function whose row lacks `ndet` cannot call `race` until something discharges it.
+  function whose row lacks `Nondet` cannot call `race` until something discharges it.
+- Future refinement (spec §11 / not yet built): concrete sources `Clock`/`Random`
+  become their own effects that *also* carry `Nondet`; `race` adds `Nondet` directly.
 
 ---
 
 ## 8. Testing (verifiable now)
 
 - **typecheck-examples**: `par`/`yield` signatures; par discharges `Async` and
-  carries no `ndet`; residual `e` propagates; (deferred-fixture sketches for
-  `race` carrying `ndet`).
+  carries no `Nondet`; residual `e` propagates; (deferred-fixture sketches for
+  `race` carrying `Nondet`).
 - **run-examples**: `par` of two `yield`-ing children → deterministic interleave
   → golden output; par returns both results.
 - **typecheck-fail-examples**: `Async.yield` performed in an explicitly-typed pure
@@ -357,8 +371,7 @@ implemented this slice (no FFI yet).
   fails the affine analysis, fall back to a trusted `__par` prim; (2) the `Async`
   effect + `par` signature + the Async→Coro adapter; (3) deterministic interleave
   schedule + golden examples; (4) full-branch review + finish.
-- **Slice 2:** `race` + cooperative cancellation (`finally`, transparent) +
-  `ndet`.
+- **Slice 2 (DONE):** `race` + cooperative cancellation (pure-drop, transparent) + `Nondet` resolver `runDet`.
 - **Slice 3:** dynamic `scope`/`spawn`/`await`/`Promise` (N-child driver).
 - **Slice 4:** real runtime via a `foreign` executor over the §6 token interface
   (needs FFI).

@@ -1,0 +1,17 @@
+fast u =
+  let t = Async.yield(())
+  let p = t
+  7
+
+slow u =
+  let t.2 = Async.yield(())
+  let p = t.2
+  let t.1 = Async.yield(())
+  let q = t.1
+  9
+
+main =
+  let t.2 = \u -> let t.1 = race(fast, slow)
+  t.1
+  let t.3 = runDet(t.2)
+  t.3

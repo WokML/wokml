@@ -1,0 +1,12 @@
+g u : () =
+  let t : () = Async.yield(())
+  let p : () = t
+  1
+
+useRace u : () =
+  let t : U64 = race(g, g)
+  t
+
+main =
+  let t : U64 = runDet(useRace)
+  t

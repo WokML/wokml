@@ -6,3 +6,4 @@ Writer.tell : 1
 Except.throw : 0
 Coro.suspend : 1
 Async.yield : 1
+Nondet.decide : 1

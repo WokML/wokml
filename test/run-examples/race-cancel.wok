@@ -1,0 +1,41 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Cooperative-cancellation observability fixture (slice async-race).
+--
+-- race drives two Async children in lockstep; the first to COMPLETE wins and the
+-- loser is DROPPED (its remaining tail never runs). We observe that with a Writer
+-- log: each child `tell`s markers around its yields, and we fold the recorded log
+-- into a base-10 number so the `--run` value IS the firing order.
+--
+-- winner completes after 1 yield (marks 1 then 2); loser marks 3 before its first
+-- yield, yields TWICE, then marks 9 in its TAIL. Lockstep schedule:
+--   round 0 (starts): winner tell[1] -> yield (Suspended); loser tell[3] -> yield
+--                     (Suspended).  log = [1,3]
+--   round 1 (step both): winner tell[2] -> return (Completed); loser -> 2nd yield
+--                        (Suspended, no mark).  log = [1,3,2]
+--   winner Completed + loser Suspended => winner wins, loser dropped BEFORE tell[9].
+-- Observed log = [1,3,2] -> 132.  The loser's EARLY mark (3) is PRESENT (it ran
+-- partway), its TAIL mark (9) is ABSENT (it was cancelled).  A non-dropping race
+-- that ran the loser to completion would log [1,3,2,9] -> 1329 (the 9 would appear).
+
+winner : () -> U64 with Async + Writer [U64]
+winner u = let p = Writer.tell [1] in let q = Async.yield () in let r = Writer.tell [2] in 7
+
+loser : () -> U64 with Async + Writer [U64]
+loser u = let p = Writer.tell [3] in let q = Async.yield () in let r = Async.yield () in let s = Writer.tell [9] in 8
+
+-- Route race through an intermediate function with an explicit Writer residual.
+runRaced : () -> U64 with Nondet + Writer [U64]
+runRaced u = race winner loser
+
+-- Fold the recorded order into a base-10 number: [1,3,2] => 132.
+toNum : U64 -> [U64] -> U64
+toNum acc xs = case xs of
+  []        -> acc
+  n :: rest -> toNum (acc * 10 + n) rest
+
+main : U64
+main = case writer (\u -> runDet runRaced) of
+  (_, log) -> toNum 0 log

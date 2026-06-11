@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Control
+
+fast : () -> U64 with Async
+fast u = let p = Async.yield () in 7
+
+slow : () -> U64 with Async
+slow u = let p = Async.yield () in let q = Async.yield () in 9
+
+main : U64
+main = runDet (\u -> race fast slow)

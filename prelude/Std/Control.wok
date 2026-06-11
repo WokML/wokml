@@ -118,3 +118,38 @@ asCoro c _ = with Async { yield _ k -> k (Coro.suspend ()) } (c ())
 -- demanded here, at the call site (resume-site). Deterministic => no ndet.
 par : (() -> ra with Async + eff e) -> (() -> rb with Async + eff e) -> (ra, rb) with eff e
 par a b = parBoth (start (asCoro a)) (start (asCoro b))
+
+-- ---------------------------------------------------------------------------
+-- race (slice async-race): run two Async children, first to COMPLETE wins; the
+-- loser is dropped (its carrier goes unused -> its remaining tail never runs =
+-- cooperative cancellation, no keyword). `Nondet` is the nondeterminism marker:
+-- race performs `Nondet.decide` only on a TIE (both complete the same round).
+
+-- Nondet: the nondeterminism marker. `decide` is the environment's choice;
+-- a real runtime resolves it by timing, `runDet` resolves it deterministically.
+effect Nondet = { decide : Bool }
+
+-- runDet: deterministic resolver -- `decide` is always True (left-biased), so a
+-- race under runDet is reproducible. Discharges Nondet.
+runDet : (() -> a with Nondet + eff e) -> a with eff e
+runDet c = with Nondet { decide -> True } (c ())
+
+-- runRace: lockstep-drive two coroutines; return the first to Complete, dropping
+-- the other. On a simultaneous completion (tie) ask `Nondet.decide`.
+runRace : Step () () r (row e) -> Step () () r (row e) -> r with Nondet + eff e
+runRace sa sb = case sa of
+  Completed ra -> case sb of
+    Completed rb -> case Nondet.decide of
+                      True  -> ra
+                      False -> rb
+    Suspended _ gb -> ra
+  Suspended _ ga -> case sb of
+    Completed rb -> rb
+    Suspended _ gb ->
+      let sa2 = step ga () in
+      let sb2 = step gb () in
+      runRace sa2 sb2
+
+-- race: adapt each child, start both, drive to the first completion.
+race : (() -> r with Async + eff e) -> (() -> r with Async + eff e) -> r with Nondet + eff e
+race a b = runRace (start (asCoro a)) (start (asCoro b))
