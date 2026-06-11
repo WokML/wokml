@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+effect Tick = { tick : U64 -> U64 }
+
+-- loopK passes its continuation k to its OWN recursive call. The trust map is
+-- computed by a fixpoint from empty: loopK's continuation slot can only be proven
+-- <= 1 if loopK itself is already proven <= 1, which never happens, so the slot
+-- stays Many. The handler arm delegating to loopK must therefore be conservatively
+-- rejected as multishot, even though a precise analysis might show it resumes once.
+loopK : (U64 -> U64) -> U64 -> U64
+loopK k n = case n of
+  0 -> k 0
+  _ -> loopK k (n - 1)
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  with { Tick.tick n k -> loopK k n }
+  useTick ()

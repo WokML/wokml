@@ -3,6 +3,8 @@ module Wok.IR.Multiplicity
   , joinC
   , addC
   , cardOf
+  , cardOfWithTrust
+  , computeTrustMap
   , MultiplicityError (..)
   , analyzeModule
   , renderMultiplicityError
@@ -57,8 +59,31 @@ mentionsAny r = any (mentionsAtom r)
 -- set; a USER binding merely HINTED @__coro_susp@ has a different 'Unique' and is
 -- NOT in the set, so it is NOT trusted. An empty set (Std.Control not loaded, so
 -- no genuine escape exists) means the relaxation never fires.
+--
+-- Back-compat shim: 'cardOf' is 'cardOfWithTrust' with an EMPTY trust map, i.e.
+-- the inter-procedural relaxation (clause B below) never fires. This preserves
+-- the original conservative, purely-intra-procedural behaviour for every caller
+-- (and unit test) that does not supply a trust map.
 cardOf :: Set Unique -> Name -> Expr -> Card
-cardOf onceSinks r = go Map.empty
+cardOf onceSinks = cardOfWithTrust onceSinks Map.empty
+
+-- | The same affine analysis as 'cardOf', closed over a @trustMap@ that records,
+-- for each top-level function (keyed by its 'Unique'), the per-parameter
+-- cardinality of that parameter in the function body. This enables ONE extra
+-- relaxation (clause B in 'cardRhs'): when the resume binder @r@ is passed
+-- DIRECTLY (as a bare @AVar r@ argument) to a known function @f@, we may charge
+-- only @f@'s trusted card for that slot instead of the blanket @Many@.
+--
+-- SOUNDNESS. The relaxation lowers a card below @Many@ ONLY when (a) @f@ has a
+-- trust-map entry whose slot for that argument position is provably @<= 1@, AND
+-- (b) the continuation is handed over directly. A continuation buried in a
+-- lambda/constructor/record still hits the unchanged 'RLam'/'RCon'/'RRecord'
+-- rules and yields @Many@. The trust map itself is computed by a fixpoint that
+-- STARTS FROM EMPTY (see 'computeTrustMap'), so a callee absent from the map is
+-- treated as @Many@ for that slot; trust only ever grows monotonically as cards
+-- DECREASE, hence the relaxation can never wrongly trust a multishot callee.
+cardOfWithTrust :: Set Unique -> Map Unique [Card] -> Name -> Expr -> Card
+cardOfWithTrust onceSinks trustMap r = go Map.empty
   where
     go :: Map JoinId Card -> Expr -> Card
     go env e = case e of
@@ -105,6 +130,35 @@ cardOf onceSinks r = go Map.empty
             addC One (if mentionsAny r as then Many else Zero)
       RApp (AVar f) as
         | isCoroSusp f && mentionsAny r as -> One
+      -- B. Inter-procedural relaxation. If @f@ is a known top-level function and
+      -- the resume binder @r@ is among its arguments, charge, for each argument
+      -- position that is EXACTLY @AVar r@ (the continuation passed directly), the
+      -- callee's trusted card for that parameter; sum (addC) over those positions
+      -- (so passing @k@ to two One-slots is One + One = Many). A position that is
+      -- out of range, or whose trusted card is @Many@, contributes @Many@. Args
+      -- are atoms, so @mentionsAtom r a@ is exactly "@a@ is @AVar r@"; there is no
+      -- continuation buried inside an arg at this level (those hit RLam/RCon).
+      -- SOUNDNESS: @cs@ comes from the fixpoint-from-empty trust map, an UPPER
+      -- bound on the callee's uses; a recursive/mutual callee never gets proven
+      -- (stays absent => looked up as Nothing => this clause does not fire =>
+      -- catch-all Many), so cycles stay conservative.
+      --
+      -- SATURATION GUARD: @cs@ has exactly one entry per parameter, so
+      -- @length cs@ IS the callee's arity. The trusted per-param card is only a
+      -- valid charge for a SATURATED application that actually CONSUMES the
+      -- parameters. An under-saturated (partial) application does not invoke the
+      -- callee at all: it CAPTURES the continuation into a returned closure (an
+      -- escape), and the later calls of that closure re-invoke @r@ an unbounded
+      -- number of times. Requiring @length as == length cs@ confines this clause
+      -- to saturated calls; partial (and over-applied) calls fall through to the
+      -- catch-all @RApp _ as -> Many@, which is correct (the continuation escapes).
+      RApp (AVar f) as
+        | Just cs <- Map.lookup (nameUniq f) trustMap
+        , length as == length cs        -- saturated call only (see SATURATION GUARD)
+        , mentionsAny r as ->
+            foldr addC Zero
+              [ cs !! i
+              | (i, a) <- zip [0 :: Int ..] as, mentionsAtom r a ]
       RApp _ as        -> if mentionsAny r as then Many else Zero
       RAtom a          -> if mentionsAtom r a then Many else Zero
       RCon _ as        -> if mentionsAny r as then Many else Zero
@@ -181,17 +235,51 @@ opArmsInHandler :: Handler -> [OpArm]
 opArmsInHandler (Handler (_, re) ops _ _ _) =
   opArmsInExpr re ++ concatMap (\oa -> oa : opArmsInExpr (oaBody oa)) ops
 
--- | The card of an arm's continuation: walk the body, keyed on the resume binder.
-armCard :: Set Unique -> OpArm -> Card
-armCard onceSinks oa = cardOf onceSinks (bndName (oaResume oa)) (oaBody oa)
+-- | The card of an arm's continuation under a trust map: walk the body, keyed on
+-- the resume binder.
+armCard :: Set Unique -> Map Unique [Card] -> OpArm -> Card
+armCard onceSinks tm oa =
+  cardOfWithTrust onceSinks tm (bndName (oaResume oa)) (oaBody oa)
+
+-- | The per-function, per-parameter trust map: for each top-level binding, the
+-- cardinality of each of its parameters in its own body, computed under the
+-- trust map itself by a fixpoint.
+--
+-- SOUNDNESS (the fixpoint MUST start from EMPTY). With the empty map, a callee
+-- looked up by clause B of 'cardRhs' is absent, so the relaxation does not fire
+-- and the catch-all charges @Many@: every param's card in the first iterate is a
+-- sound UPPER BOUND on its uses. Each subsequent iterate can only LOWER a card
+-- (Many -> One/Zero) as more callees become trusted, never raise one, so the
+-- sequence is monotonically decreasing in the @Many >= One >= Zero@ order and
+-- converges. Because trust only grows from a sound start, the map can NEVER
+-- wrongly trust a multishot function. A recursive (or mutually-recursive)
+-- function that passes its parameter to a self/mutual call: on every iterate the
+-- callee's relevant slot is still @Many@ (it never gets proven @<= 1@ because the
+-- proof would require itself), so the param stays @Many@ — conservative and
+-- correct. Do NOT seed this from an optimistic (Zero/One) map; that would assume
+-- the very property under proof and could trust a genuine multishot.
+computeTrustMap :: Set Unique -> CoreModule -> Map Unique [Card]
+computeTrustMap onceSinks cm = fixpoint Map.empty
+  where
+    step tm = Map.fromList
+      [ ( nameUniq (tbName tb)
+        , [ cardOfWithTrust onceSinks tm (bndName p) (tbBody tb)
+          | p <- tbParams tb ] )
+      | tb <- cmBinds cm ]
+    fixpoint tm =
+      let tm' = step tm
+      in if tm' == tm then tm else fixpoint tm'
 
 -- | The consumer: every multi-shot arm is an error. @onceSinks@ is the set of
 -- canonical 'Unique's of the genuine once-sink @extern@ prims (see 'cardOf').
+-- The inter-procedural trust map is computed INTERNALLY (fixpoint from empty),
+-- so the external signature is unchanged.
 analyzeModule :: Set Unique -> CoreModule -> [MultiplicityError]
 analyzeModule onceSinks cm =
-  [ MultishotResume (oaLabel oa) (oaOp oa)
-  | oa <- opArmsInModule cm
-  , armCard onceSinks oa == Many ]
+  let tm = computeTrustMap onceSinks cm
+  in [ MultishotResume (oaLabel oa) (oaOp oa)
+     | oa <- opArmsInModule cm
+     , armCard onceSinks tm oa == Many ]
 
 renderMultiplicityError :: MultiplicityError -> Text
 renderMultiplicityError (MultishotResume lbl op) =
@@ -206,9 +294,10 @@ renderMultiplicityError (MultishotResume lbl op) =
 -- (resolved in the pipeline), so the dump agrees with what the law accepts.
 prettyMultiplicity :: Set Unique -> CoreModule -> Text
 prettyMultiplicity onceSinks cm =
-  Tx.intercalate (Tx.pack "\n")
-    [ Tx.concat [ oaLabel oa, Tx.pack ".", oaOp oa, Tx.pack " : ", renderCard (armCard onceSinks oa) ]
-    | oa <- opArmsInModule cm ]
+  let tm = computeTrustMap onceSinks cm
+  in Tx.intercalate (Tx.pack "\n")
+       [ Tx.concat [ oaLabel oa, Tx.pack ".", oaOp oa, Tx.pack " : ", renderCard (armCard onceSinks tm oa) ]
+       | oa <- opArmsInModule cm ]
 
 renderCard :: Card -> Text
 renderCard Zero = Tx.pack "0"

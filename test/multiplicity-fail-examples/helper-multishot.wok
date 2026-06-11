@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+
+effect Tick = { tick : U64 -> U64 }
+
+-- twice invokes its continuation argument TWICE, so its first param is Many.
+-- A handler arm delegating resume to twice must still be rejected as multishot.
+twice : (U64 -> U64) -> U64 -> U64
+twice k n = let a = k n in k n
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  with { Tick.tick n k -> twice k n }
+  useTick ()

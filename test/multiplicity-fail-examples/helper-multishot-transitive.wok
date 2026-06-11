@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+effect Tick = { tick : U64 -> U64 }
+
+-- twice is Many in its continuation param; viaTwice delegates to twice, so it is
+-- transitively Many too. The handler arm delegates to viaTwice and must still be
+-- rejected: transitive multishot must propagate through the trust map.
+twice : (U64 -> U64) -> U64 -> U64
+twice k n = let a = k n in k n
+
+viaTwice : (U64 -> U64) -> U64 -> U64
+viaTwice k n = twice k n
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  with { Tick.tick n k -> viaTwice k n }
+  useTick ()

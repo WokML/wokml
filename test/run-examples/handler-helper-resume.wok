@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+effect Tick = { tick : U64 -> U64 }
+
+-- A one-shot top-level helper: it invokes its first argument (the continuation)
+-- exactly once. Previously the handler arm below was REJECTED as multishot
+-- because k is passed to apply1; with inter-procedural inference apply1's first
+-- param is provably One, so the arm is One and this type-checks.
+apply1 : (U64 -> U64) -> U64 -> U64
+apply1 k n = k n
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  with { Tick.tick n k -> apply1 k (n + 1) }
+  useTick ()

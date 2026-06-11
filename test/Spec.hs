@@ -5903,6 +5903,26 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
       , testCase "non-coro_susp call with resume binder = Many (control)" $
           Mult.cardOf trustedSusp kName fooCallResume @?= Many
       ]
+  , testGroup "cardOfWithTrust (inter-procedural)"
+      [ testCase "helper trusted One in slot 0 -> direct k pass = One" $
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One])])
+            kName callHelperWithK @?= One
+      , testCase "helper trusted Many in slot 0 -> Many (relaxation no-op)" $
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [Many])])
+            kName callHelperWithK @?= Many
+      , testCase "helper absent from trust map -> Many (catch-all)" $
+          Mult.cardOfWithTrust trustedSusp Map.empty kName callHelperWithK @?= Many
+      , testCase "k passed to two One-slots in one call = Many (addC)" $
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One, One])])
+            kName callHelperWithKK @?= Many
+      , testCase "partial application of trusted helper to k = Many (escape, saturation guard)" $
+          -- helper has arity 2 (trust [One, One]) but is applied to ONLY k: that
+          -- partial app CAPTURES k into the closure f rather than consuming it.
+          -- The two later f n calls re-invoke the captured continuation. Clause B
+          -- must NOT fire (length as 1 != length cs 2) -> falls through to Many.
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One, One])])
+            kName partialHelperEscape @?= Many
+      ]
   , testGroup "analyzeModule"
       [ testCase "clean module = no errors" $
           Mult.analyzeModule Set.empty (modWith resumeOnceArm) @?= []
@@ -5990,6 +6010,31 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
       Let (bnd (Name (T.pack "s2") (Unique 74)))
           (RApp (AVar fooName) [AVar xName, AVar kName])
           (Ret unit)
+    -- Inter-procedural relaxation fixtures: a top-level helper to whose param the
+    -- resume binder k is handed directly. Its trusted card is supplied via the
+    -- trust map in each test.
+    helperUniq = Unique 75
+    helperName = Name (T.pack "helper") helperUniq
+    tName      = Name (T.pack "t")      (Unique 76)
+    -- let t = helper k in Ret t   (k handed directly to helper's slot 0)
+    callHelperWithK =
+      Let (bnd tName) (RApp (AVar helperName) [AVar kName]) (Ret (AVar tName))
+    -- let t = helper k k in Ret t (k in two slots -> One + One = Many)
+    callHelperWithKK =
+      Let (bnd tName) (RApp (AVar helperName) [AVar kName, AVar kName]) (Ret (AVar tName))
+    -- Partial application capture (arity 2, applied to 1 arg = k):
+    --   let f = helper k        -- partial: captures k into the closure f
+    --   let a = f n             -- re-invokes captured k
+    --   let b = f n             -- re-invokes captured k again
+    --   Ret b
+    -- The saturation guard must keep clause B from firing on `helper k`.
+    fName2 = Name (T.pack "f") (Unique 77)
+    nName  = Name (T.pack "n") (Unique 78)
+    partialHelperEscape =
+      Let (bnd fName2) (RApp (AVar helperName) [AVar kName])
+        (Let (bnd (Name (T.pack "a") (Unique 79))) (RApp (AVar fName2) [AVar nName])
+          (Let (bnd (Name (T.pack "b") (Unique 82))) (RApp (AVar fName2) [AVar nName])
+            (Ret (AVar (Name (T.pack "b") (Unique 82))))))
     resumeOnceArm =
       OpArm (T.pack "Tick") (T.pack "tick") [] (bnd kName) resumeOnce
     multishotArm =
