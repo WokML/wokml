@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: NominalMismatch Nothing "OrderId" "UserId"
+typecheck: typecheck in Main: NominalMismatch (Just (11,12)) "OrderId" "UserId"

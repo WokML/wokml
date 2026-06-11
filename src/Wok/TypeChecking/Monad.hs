@@ -29,11 +29,11 @@ import Control.Monad.Except (ExceptT, MonadError, runExceptT)
 import Control.Monad.Reader (MonadReader, ReaderT, asks, local, runReaderT)
 import Control.Monad.Trans (lift)
 import Control.Monad.ST (ST, runST)
-import Data.List (nub)
+import Data.List (nubBy)
 import Data.STRef (STRef, modifySTRef', newSTRef, readSTRef, writeSTRef)
 import Data.Text (Text)
 import Wok.TypeChecking.Env (Env, extendVar)
-import Wok.TypeChecking.Error (TypeError, Warning)
+import Wok.TypeChecking.Error (TypeError, Warning (RowShadow))
 import Wok.TypeChecking.Types
   ( Kind (..), Level (..), Row, Scheme, TVar (..), Type (..) )
 
@@ -88,9 +88,21 @@ runTC env action = runST $ do
       -- Dedup structurally-identical warnings: the same shadow can be reached
       -- through more than one unification (e.g. a record value unified against
       -- a placeholder and again against its declared sig), and each path may
-      -- re-emit the identical 'RowShadow'. 'nub' keeps one per (pos,label,...),
-      -- preserving source order; distinct warnings differ in their fields.
-      pure (Right (a, nub (reverse ws)))
+      -- re-emit the identical 'RowShadow'. For 'RowShadow' we dedup on
+      -- (label, outer type, inner type) only, IGNORING the 'SourceSpan': the
+      -- same shadow can now arrive with different positions (one path carries a
+      -- 'Just p' application span, another 'Nothing'), and we must not splinter
+      -- it into two warnings. All other warning constructors keep full
+      -- structural equality. Keeps the first occurrence, preserving source order.
+      pure (Right (a, nubBy warnEqIgnoringShadowPos (reverse ws)))
+
+-- | Warning equality for deduplication that ignores the 'SourceSpan' of
+-- 'RowShadow' (comparing only label + the two types); every other constructor
+-- compares by full structural equality.
+warnEqIgnoringShadowPos :: Warning -> Warning -> Bool
+warnEqIgnoringShadowPos (RowShadow _ l1 a1 b1) (RowShadow _ l2 a2 b2) =
+  l1 == l2 && a1 == a2 && b1 == b2
+warnEqIgnoringShadowPos w1 w2 = w1 == w2
 
 currentLevel :: TC s Level
 currentLevel = asks ctxLevel

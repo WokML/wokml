@@ -1589,7 +1589,7 @@ inferExprW mono (Abs.EApp f x) = do
   -- commits to the effects observed here, so the row variable does not escape
   -- into the inferred type (an inferred higher-order function stays pure unless
   -- its sig says `with eff e`).
-  unify Nothing fT (TArr xT effRow rT)
+  unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
   emitRow Nothing effRow
   closeRow effRow
   -- Flatten the curried application spine: nested EApp on the left becomes a
