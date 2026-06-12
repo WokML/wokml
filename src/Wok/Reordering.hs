@@ -42,7 +42,7 @@ data OpInfo = OpInfo
   , opLooser  :: [Text]
   , opPos     :: BNFC'Position
   }
-  deriving (Show)
+  deriving (Eq, Show)
 
 newtype FixityTable = FixityTable { entriesOf :: Map.Map Text OpInfo }
   deriving (Show)
@@ -94,17 +94,23 @@ buildFixityTable (Module decls) =
       in (m', errs ++ selfErrs ++ redeclErrs)
     collect acc _ = acc
 
--- | Left-biased union of two fixity tables. On any operator name that
--- appears in BOTH, returns 'RedeclaredOp name posA posB' (one entry per
--- offending operator), with @posA@ taken from the first table and
--- @posB@ from the second. Used by the module loader to detect cross-
--- module fixity conflicts when merging imports' tables.
+-- | Left-biased union of two fixity tables. An operator appearing in BOTH is a
+-- genuine 'RedeclaredOp' (one entry per offending operator, @posA@ from the
+-- first table, @posB@ from the second) ONLY when the two entries DIFFER. Two
+-- structurally identical entries are the SAME declaration re-imported through a
+-- diamond (Main imports Std.Base directly AND via Std.Control, both re-exporting
+-- Std.Base's @+@): same origin => identical 'OpInfo' (including 'opPos'), so it
+-- is merged silently, mirroring how 'overlayEnvs' lets diamond re-exports merge
+-- on binding provenance. A real redeclaration sits at a DIFFERENT source
+-- position, so its 'OpInfo' differs and it still errors.
 overlayFixities
   :: FixityTable -> FixityTable -> Either [FixityError] FixityTable
 overlayFixities (FixityTable a) (FixityTable b) =
-  let clashes = Map.intersectionWithKey
-                  (\k ai bi -> RedeclaredOp k (opPos ai) (opPos bi))
-                  a b
+  let clashes = Map.mapMaybeWithKey
+                  (\k ai -> case Map.lookup k b of
+                              Just bi | ai /= bi -> Just (RedeclaredOp k (opPos ai) (opPos bi))
+                              _                  -> Nothing)
+                  a
   in case Map.elems clashes of
        [] -> Right (FixityTable (Map.union a b))
        es -> Left es

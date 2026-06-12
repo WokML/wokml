@@ -70,6 +70,15 @@ runPipelineFold _entryName = go Map.empty Map.empty Map.empty []
                       (foldM overlayEnvs envSeed importedEnvs)
       ast        <- first ((ctx "reorder" ++) . show)
                       (reorderModuleWith importsFix (lmAst m))
+      -- The fixity table this module EXPORTS is the transitive closure: the
+      -- fixities it imported (importsFix) overlaid with the ones it declares
+      -- itself (lmFixities m). Storing this -- rather than lmFixities m alone --
+      -- threads operators defined 2+ levels down the import chain through every
+      -- importer, mirroring how envOut (a transitive env) is stored below. The
+      -- overlay also re-detects any redeclaration the importer makes of an
+      -- imported operator (the same check reorderModuleWith already performs).
+      exportFix  <- first ((ctx "fixity merge" ++) . show)
+                      (overlayFixities importsFix (lmFixities m))
       (envOut0, decls, ws) <- first ((ctx "typecheck" ++) . show)
                       (TC.inferProgramWith mergedEnv (lmOrigin m) ast)
       -- Tag binding provenance for the var namespace: every var introduced
@@ -84,7 +93,7 @@ runPipelineFold _entryName = go Map.empty Map.empty Map.empty []
           mr = ModResult decls envOut
       go (Map.insert (lmName m) mr         resultMap)
          (Map.insert (lmName m) envOut     envsByMod)
-         (Map.insert (lmName m) (lmFixities m) fixByMod)
+         (Map.insert (lmName m) exportFix  fixByMod)
          (reverse ws ++ warns)
          rest
 

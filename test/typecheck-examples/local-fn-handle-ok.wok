@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Positive companion to handle-escape-eqn.wok (Bug #2).
+--
+-- (a) A non-capturing equation-form local helper must still typecheck: `dbl`
+--     closes over nothing in the carrier set, so it is a plain function.
+pure_local : U64
+pure_local = let dbl x = x + x in dbl 3
+
+-- (b) An equation-form local helper that DOES capture the handle `c` is fine as
+--     long as it is CALLED inside the `with` scope (not returned/stored): the
+--     handle does not escape, the perform happens under its live handler.
+-- `with c = state 0 in BODY` wraps BODY's result with the final state via the
+-- return arm `v -> (v, s)`; BODY here is `bump 7` = `c.set 7` = `()`, so the
+-- whole expression has type `((), U64)`.
+inscope : ((), U64)
+inscope = with c = state 0 in let bump x = c.set x in bump 7
+
+main : ((), U64)
+main = inscope

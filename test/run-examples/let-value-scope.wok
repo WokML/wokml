@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+x = 10
+
+second : U64 -> U64 -> U64
+second a b = b
+
+main = second (let x = 1 in x) x

@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: CarrierEscape Nothing "escape"
+typecheck: typecheck in Main: CarrierEscape (Just (16,1)) "escape"

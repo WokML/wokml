@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+-- Bug #13: an operand mismatch at an infix operator must be reported AT the
+-- operator (`+` here), not as a positionless `Mismatch Nothing ...`. The infix
+-- inference now threads the operator token's own source position into the unify.
+flag : Bool
+flag = True
+
+bad : U64
+bad = 1 + flag

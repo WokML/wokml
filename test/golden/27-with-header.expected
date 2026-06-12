@@ -1,4 +1,4 @@
-ROUND-TRIP PARSE ERROR: syntax error at line 12, column 13 before `,'
+ROUND-TRIP PARSE ERROR: syntax error at line 14, column 3 before `;'
 ---first print---
 module Main;
 import Std . Base;

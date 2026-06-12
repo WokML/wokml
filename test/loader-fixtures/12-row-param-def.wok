@@ -1,0 +1,14 @@
+module RowParamDef
+import Std.Base
+
+-- Bug #5: an UNSIGNED row-polymorphic binding whose inferred scheme is EXPORTED.
+-- `mkbox` infers `forall (e : row). Box e`. Before the fix, freezeQuantify froze
+-- the generalizable row var to its raw global uniq as an UNRECORDED CTGen, so the
+-- stored scheme carried a CTGen absent from its quantifier list -- and a use in
+-- ANOTHER module (below) instantiated it and panicked `dangling CTGen`.
+data Box (row e) = Box U64
+
+unwrap : Box (row e) -> U64
+unwrap (Box n) = n
+
+mkbox = Box 5

@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+import RowParamDef
+
+-- Instantiating RowParamDef.mkbox's cross-module scheme must NOT panic.
+main : U64
+main = unwrap mkbox

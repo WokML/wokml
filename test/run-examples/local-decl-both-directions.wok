@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- Bug #6 (both directions). Local bindings are emitted in dependency order, so a
+-- function referencing a sibling VALUE and a value referencing a sibling
+-- FUNCTION both resolve. A fixed value-outside/functions-inside order regressed
+-- the value->function case (`v = f 3` crashed UnboundVar).
+fnUsesValue : U64        -- function -> value
+fnUsesValue = let base = 5 ; f y = y + base in f 1
+
+valueUsesFn : U64        -- value -> function
+valueUsesFn = let g y = y + 1 ; v = g 3 in v
+
+deepChain : U64          -- function -> value -> function
+deepChain = let f y = y + v ; v = h 3 ; h y = y + 1 in f 10
+
+main : U64
+main = fnUsesValue + valueUsesFn + deepChain

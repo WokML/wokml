@@ -13,12 +13,14 @@ module Wok.Interp.Value
   , PrimResult (..)
   , PrimTable
   , RuntimeError (..)
+  , CafFailure (..)
   , resolveAtom
   , bindBinder
   , bindBinders
   , renderValue
   ) where
 
+import Control.Exception (Exception)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -134,6 +136,19 @@ data RuntimeError
   | ArityError Text
   | UnsupportedCaf Text
   deriving (Eq, Show)
+
+-- | A user-written 0-arity binding (CAF) whose body raised a 'RuntimeError'
+-- when forced. Because a CAF lives in the lazy 'gEnv' 'Map' as a pure 'Value'
+-- thunk, an evaluation error cannot be returned as a 'Left' from the point of
+-- the force; it is thrown as this imprecise exception and re-caught at the
+-- 'runModule' boundary, where it is turned back into the ORIGINAL 'RuntimeError'
+-- (no information lost, no internal-invariant relabelling). Compiler-generated
+-- CAFs (dictionaries) never fail, so this only ever carries a genuine user
+-- runtime error.
+newtype CafFailure = CafFailure RuntimeError
+  deriving (Show)
+
+instance Exception CafFailure
 
 -- ---------------------------------------------------------------------------
 -- Atom resolution and binder helpers

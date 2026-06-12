@@ -3,11 +3,17 @@ import Std.Base
 import Std.Control
 
 -- Soundness regression: a coro carrier (Step/Suspension, affine one-shot) must
--- NOT cross the Conc transport. The promise cell caches the completed value and
--- hands the SAME Suspension to every awaiter, so without the runtime guard the
--- suspended tail runs TWICE with two different resume values (printed 112).
--- The scheduler now walks every value entering a promise cell / channel and
--- rejects captured continuations at the transport boundary.
+-- NOT cross the Conc transport. The promise cell would otherwise cache the
+-- completed value and hand the SAME Suspension to every awaiter, so the
+-- suspended tail would run TWICE with two different resume values (printed 112).
+--
+-- This carrier-smuggling exploit is now caught STATICALLY: `async (\ () -> start
+-- prod)` is a user-file producer THUNK whose body manufactures a Step carrier,
+-- and the producer-thunk exemption is origin-gated to the prelude (bug #14), so
+-- in a user file it is rejected as a CarrierEscape at typecheck time -- strictly
+-- earlier and stronger than the runtime guard. The scheduler's continuation-walk
+-- at the cell/channel boundary remains in place as defense-in-depth for any
+-- inference-only payload bypass that slips the static check (spec section 11).
 
 prod : () -> U64 with Coro () U64 + Conc
 prod u = let x = Coro.suspend () in x + 1

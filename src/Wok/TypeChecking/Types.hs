@@ -81,11 +81,15 @@ type Row s = Type s
 
 data TVar s
   = Unbound { uniq :: Int, level :: Level, kind :: Kind }
-  | Rigid   { uniq :: Int, kind :: Kind }
+  | Rigid   { uniq :: Int, rigidLevel :: Level, kind :: Kind }
     -- ^ Rigid (frozen) type introduced by freezeSig. Represents a rigid
     -- type — an opaque constant the unifier can only equate with itself.
     -- See freezeSig in Wok.TypeChecking.Infer for the over-promising
-    -- motivation.
+    -- motivation. The 'Level' records the scope at which the skolem was
+    -- minted (the level current when 'freezeSigSkolems' created it). Pinning a
+    -- metavar from a SHALLOWER (outer) level to this skolem would let the rigid
+    -- escape its binding's scope, so 'rigidUnify' rejects it as a 'RigidEscape'
+    -- -- the same level discipline 'occursAdjust' applies to ordinary vars.
   | Link (Type s)
 -- A row variable is a 'TVar' whose cell has @kind = KEffect@.
 

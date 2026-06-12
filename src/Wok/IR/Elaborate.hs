@@ -7,6 +7,9 @@ module Wok.IR.Elaborate
 
 import Control.Monad.Reader
 import Control.Monad.State.Strict (State)
+import Data.Foldable (foldrM)
+import qualified Data.Graph as Graph
+import Data.Graph (SCC (..))
 import Data.List (elemIndex)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -19,6 +22,7 @@ import Wok.TypeChecking.Env
   ( Env, envVars, envVarOrigin, lookupCon, conArity, conTyCon, lookupRecordCon, rcFields
   , lookupTyCon, TyConInfo (..)
   , classOfMethod, lookupClass, ClassInfo (..) )
+import Wok.TypeChecking.Carrier (freeVars)
 import Wok.TypeChecking.Infer (TypedDecl (..))
 import Wok.TypeChecking.Typed
   ( Texp (..), TexpF (..), Tpat (..), TpatF (..)
@@ -121,9 +125,17 @@ isCompound _           = False
 -- For compound expressions (TIf / TCase / THandle) in value position, introduce
 -- a join so that all branches jump to a single merge point.
 normName :: TExpr -> (Atom -> Elab Expr) -> Elab Expr
-normName (Texp _ (TLet decls body)) k =
-  -- TLet in value position: emit the bindings, then normalize the body.
-  elabLocalDecls decls (normName body k)
+normName (Texp ty (TLet decls body)) k = do
+  -- TLet in value position: the let's local bindings must scope ONLY over the
+  -- let's own body, NOT over the continuation `k` that consumes the let result
+  -- (which also normalizes later sibling arguments). Route the body through a
+  -- join: `k` runs in the OUTER scope (as the join body), while the bindings +
+  -- body deliver the result to the join from INSIDE the local scope.
+  j     <- lift freshJoin
+  r     <- bindFresh (Tx.pack "r")
+  jbody <- k (AVar r)
+  comp  <- elabLocalDecls decls (elabK (TJump j) body)
+  pure (LetJoin j [Binder r Unrestricted ty] jbody comp)
 normName e@(Texp ty node) k
   | isCompound node = do
       j <- lift freshJoin
@@ -461,7 +473,11 @@ elabRhsF ty node@(TCase{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(THandle{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(TWithNamedH{}) k = elabCompoundRhs ty node k
 
-elabRhsF _ (TLet decls body) k = elabLocalDecls decls (elabRhs body k)
+-- TLet where a single Rhs is expected: scope the local bindings ONLY over the
+-- let body (see normName's TLet note). Route through normName so the body's
+-- result atom is handed to `k` in the OUTER scope.
+elabRhsF ty (TLet decls body) k =
+  normName (Texp ty (TLet decls body)) (k . RAtom)
 
 -- | A compound expression appearing where a single Rhs is expected: route it
 -- through normName (which introduces the join) and hand the resulting atom to k.
@@ -488,8 +504,23 @@ elabKF tk _ (TIf c a b) =
                   , AltCon (Tx.pack "False") [] tb ])
 
 -- case scrutinee of alts
+--
+-- The flat one-'Alt'-per-clause path ('elabCaseAlt') commits to the first
+-- alternative whose TOP constructor matches and cannot backtrack to a later
+-- alternative with the SAME head -- so overlapping heads with refutable
+-- sub-patterns mis-dispatch (e.g. `Some 1 -> ..; Some n -> ..` on `Some 2`
+-- wrongly hits NonExhaustiveCase, bug #7). When two alternatives share a
+-- constructor head, route through the 'Wok.IR.Match' decision-tree compiler
+-- (the same one top-level multi-clause functions use), which backtracks
+-- correctly. The flat path is kept for the non-overlapping case so its ANF stays
+-- byte-identical, and as the fallback for patterns the match compiler does not
+-- accept (record-constructor heads, non-empty list literals).
 elabKF tk _ (TCase scrut alts) =
-  normName scrut $ \sa -> Case sa <$> mapM (elabCaseAlt tk sa) alts
+  normName scrut $ \sa -> do
+    env <- asks ecEnv
+    if caseNeedsMatch env alts
+      then elabCaseAltsMatch tk sa alts
+      else Case sa <$> mapM (elabCaseAlt tk sa) alts
 
 -- let ... in body: emit bindings then elaborate body in same tail position
 elabKF tk _ (TLet decls body) =
@@ -607,29 +638,66 @@ elabTail = elabK TRet
 
 -- | Elaborate a group of local declarations, wrapping the given continuation.
 --
--- Layout: a single LetRec for all function bindings (those with params), then
--- value Let-bindings (in source order), then the continuation body. Functions
--- see each other and all value bindings are in scope everywhere in the group.
+-- Bindings are emitted in DEPENDENCY (topological) order: a binding's
+-- strongly-connected component is bound OUTSIDE every component that references
+-- it. FUNCTION bindings (those with params) go in a 'LetRec' -- lazy closures
+-- over the recursive env, so they see anything bound in an enclosing component;
+-- VALUE bindings (no params) are strict 'Let's evaluated in that same enclosing
+-- env. Because order follows the dependency graph, BOTH reference directions
+-- work: a function referencing a sibling value AND a value referencing a sibling
+-- function (bug #6 -- a fixed value-outside/functions-inside order regressed the
+-- latter). The only shape that cannot be expressed is a genuine value<->function
+-- CYCLE (a value and a function mutually recursive): such a component emits the
+-- functions in a LetRec wrapping the values, so the values see the functions but
+-- a function forcing the cyclic value at evaluation time would observe it unbound
+-- (ill-defined in a strict language, like @x = x@).
 elabLocalDecls :: [TLocalDecl CType] -> Elab Expr -> Elab Expr
 elabLocalDecls decls cont = do
-  -- Partition into value bindings (no params) and function bindings (params).
-  let (valueBnds, funcBnds) = foldr classify ([], []) decls
-        where
-          classify (TLocalDecl fn [] body) (vs, fs) = ((fn, body) : vs, fs)
-          classify (TLocalDecl fn ps body) (vs, fs) = (vs, (fn, ps, body) : fs)
-
   -- Mint a fresh Name for every bound name up front, extending ecScope with ALL
-  -- of them so mutual/forward references resolve.
-  let allNames = map fst valueBnds ++ map (\(fn, _, _) -> fn) funcBnds
+  -- of them so mutual/forward references resolve during elaboration.
+  let allNames = [ fn | TLocalDecl fn _ _ <- decls ]
+      binderSet = Set.fromList allNames
   freshPairs <- mapM (\t -> (,) t <$> bindFresh t) allNames
   withLocals freshPairs $ do
-    funcDefs <- mapM (elabFuncBnd freshPairs) funcBnds
-    inner <- buildValueLets freshPairs valueBnds cont
-    case funcDefs of
-      [] -> pure inner
-      _  -> pure (LetRec funcDefs inner)
+    -- Intra-group dependency edges: a binding -> the sibling binders its RHS
+    -- references (free vars minus its own params, restricted to the group).
+    let depsOf (TLocalDecl _ params body) =
+          let pvs = Set.fromList (map fst (clauseVars params))
+              fvs = freeVars body `Set.difference` pvs
+          in Set.toList (fvs `Set.intersection` binderSet)
+        nodes = [ (d, declNameOf d, depsOf d) | d <- decls ]
+        -- 'stronglyConnComp' yields SCCs with dependencies FIRST, so a left
+        -- 'foldr' makes the first (dependency) component the OUTERMOST binder.
+        sccs = Graph.stronglyConnComp nodes
+    body <- cont
+    foldrM (emitSCC freshPairs) body sccs
 
   where
+    declNameOf (TLocalDecl fn _ _) = fn
+
+    emitSCC :: [(Text, Name)] -> SCC (TLocalDecl CType) -> Expr -> Elab Expr
+    emitSCC freshPairs (AcyclicSCC d) rest = case d of
+      TLocalDecl fn [] body -> emitValue freshPairs fn body rest
+      TLocalDecl fn ps body -> do
+        def <- elabFuncBnd freshPairs (fn, ps, body)
+        pure (LetRec [def] rest)
+    emitSCC freshPairs (CyclicSCC ds) rest = do
+      -- Mutually-recursive component: every function in ONE LetRec (so they may
+      -- recurse), wrapping any values as inner Lets (so the values see the
+      -- functions). A pure-function cycle is the common mutual-recursion case.
+      let isValue (TLocalDecl _ ps _) = null ps
+          (valueDs, funcDs) = (filter isValue ds, filter (not . isValue) ds)
+      funcDefs <- mapM (\(TLocalDecl fn ps body) -> elabFuncBnd freshPairs (fn, ps, body)) funcDs
+      inner <- foldrM (\(TLocalDecl fn _ body) acc -> emitValue freshPairs fn body acc) rest valueDs
+      pure (if null funcDefs then inner else LetRec funcDefs inner)
+
+    emitValue :: [(Text, Name)] -> Text -> TExpr -> Expr -> Elab Expr
+    emitValue freshPairs fn body rest =
+      case lookup fn freshPairs of
+        Nothing -> error ("elabLocalDecls: internal: name not found: " <> Tx.unpack fn)
+        Just n  -> normName body $ \atom ->
+          pure (Let (Binder n Unrestricted (teType body)) (RAtom atom) rest)
+
     elabFuncBnd :: [(Text, Name)] -> (Text, [TPat], TExpr)
                 -> Elab (Binder, [Binder], Expr)
     elabFuncBnd freshPairs (fn, params, body) =
@@ -641,16 +709,6 @@ elabLocalDecls decls cont = do
           -- The function binder's type is the overall binding type; use the
           -- body type as a stand-in (erased printer/runtime ignore it).
           pure (Binder n Unrestricted (teType body), paramBinders, bodyExpr)
-
-    buildValueLets :: [(Text, Name)] -> [(Text, TExpr)] -> Elab Expr -> Elab Expr
-    buildValueLets _ [] cont0 = cont0
-    buildValueLets freshPairs ((fn, body) : rest) cont0 =
-      case lookup fn freshPairs of
-        Nothing -> error ("elabLocalDecls: internal: name not found: " <> Tx.unpack fn)
-        Just n  -> do
-          inner <- buildValueLets freshPairs rest cont0
-          normName body $ \atom ->
-            pure (Let (Binder n Unrestricted (teType body)) (RAtom atom) inner)
 
 -- ---------------------------------------------------------------------------
 -- Pattern compilation
@@ -807,21 +865,31 @@ isBodylessSig td = case tdClauses td of
 buildOracle :: Env -> ConOracle
 buildOracle env = ConOracle
   { coArity = \c ->
-      case tupleArity c of
-        Just n  -> n
-        Nothing
-          | c == Tx.pack "Nil"  -> 0
-          | c == Tx.pack "Cons" -> 2
-          | Just ci <- lookupCon c env -> conArity ci
-          | otherwise -> 0
+      -- USER constructors are authoritative: consult the env FIRST so a user
+      -- data type declaring a con named `Nil`/`Cons`/`TupleN` gets its own
+      -- arity, not the built-in structural one (bug #8). Built-in tags answer
+      -- only when the name is NOT a user constructor.
+      case lookupCon c env of
+        Just ci -> conArity ci
+        Nothing -> case tupleArity c of
+          Just n -> n
+          Nothing
+            | c == Tx.pack "Nil"  -> 0
+            | c == Tx.pack "Cons" -> 2
+            | otherwise -> 0
   , coSiblings = \c ->
-      case tupleArity c of
-        Just n  -> Just [tupleTag n]
-        Nothing
-          | c `elem` [Tx.pack "Nil", Tx.pack "Cons"] -> Just [Tx.pack "Nil", Tx.pack "Cons"]
-          | Just ci <- lookupCon c env
-          , Just ti <- lookupTyCon (conTyCon ci) env -> Just (tcCons ti)
+      -- Same precedence: a user constructor's sibling set is its data type's
+      -- full constructor list; only fall back to the built-in list/tuple
+      -- signature for genuinely built-in literals.
+      case lookupCon c env of
+        Just ci
+          | Just ti <- lookupTyCon (conTyCon ci) env -> Just (tcCons ti)
           | otherwise -> Nothing
+        Nothing -> case tupleArity c of
+          Just n -> Just [tupleTag n]
+          Nothing
+            | c `elem` [Tx.pack "Nil", Tx.pack "Cons"] -> Just [Tx.pack "Nil", Tx.pack "Cons"]
+            | otherwise -> Nothing
   }
   where
     tupleArity t
@@ -864,6 +932,88 @@ clauseVars = concatMap patVars
     patVars (Tpat _  (TPCon _ ps)) = concatMap patVars ps
     patVars (Tpat ty (TPAs name inner)) = (name, ty) : patVars inner
     patVars _                      = []   -- wildcard / unit / literal bind nothing
+
+-- | Does this body-position @case@ need the decision-tree compiler? True when
+-- some alternative has a REFUTABLE sub-pattern nested under a constructor/cons/
+-- tuple head -- the configuration the flat one-'Alt'-per-clause path
+-- mis-dispatches: it commits to the top tag, then a failing inner match (a
+-- literal like @Some 0@, or a nested constructor) cannot backtrack to a later
+-- alternative (a same-head sibling OR a wildcard catch-all). Bug #7. This
+-- subsumes the duplicate-head case (@Some 1 -> ..; Some n -> ..@) and the
+-- catch-all case (@Some 0 -> ..; _ -> ..@) alike. Distinct constructor heads with
+-- only irrefutable (var/wildcard) sub-patterns stay on the flat path (its ANF is
+-- byte-identical there). Kept off the match path when an alternative uses a
+-- pattern 'toMPat' cannot lower (a record-constructor head or a non-empty list
+-- literal); the flat path handles record heads via field projection.
+caseNeedsMatch :: Env -> [TAlt CType] -> Bool
+caseNeedsMatch env alts =
+  not (any altHasUnsupported alts) && any armNeedsBacktrack alts
+  where
+    -- An arm whose top head (constructor / cons / tuple / list), once committed
+    -- to by the flat path, leaves a REFUTABLE sub-obligation that could fail with
+    -- a later alternative able to match -- i.e. it has a refutable sub-pattern.
+    armNeedsBacktrack (TAlt pat _ _) = headHasRefutableSub pat
+    headHasRefutableSub (Tpat _ p) = case p of
+      TPCon _ ps   -> any isRefutable ps
+      TPCons h t   -> isRefutable h || isRefutable t
+      TPTuple ps   -> any isRefutable ps
+      TPList ps    -> any isRefutable ps
+      TPAs _ inner -> headHasRefutableSub inner
+      _            -> False
+    -- A pattern that can fail to match some value of its type.
+    isRefutable (Tpat _ p) = case p of
+      TPVar _      -> False
+      TPWild       -> False
+      TPUnit       -> False
+      TPTuple ps   -> any isRefutable ps   -- single-con; refutable iff a field is
+      TPAs _ inner -> isRefutable inner
+      _            -> True                  -- literal / constructor / cons / list
+    -- A pattern the match compiler cannot lower: a record-constructor head, or a
+    -- non-empty list literal (both error in 'toMPat'). Checked recursively.
+    altHasUnsupported (TAlt pat _ _) = patUnsupported pat
+    patUnsupported (Tpat _ p) = case p of
+      TPCon c ps  -> isRecordConName env c || any patUnsupported ps
+      TPList []   -> False
+      TPList _    -> True
+      TPCons h t  -> patUnsupported h || patUnsupported t
+      TPTuple ps  -> any patUnsupported ps
+      TPAs _ inner -> patUnsupported inner
+      _           -> False
+
+-- | Is @c@ a record constructor in scope? (The match compiler's 'toMPat' has no
+-- way to project record fields, so such heads stay on the flat path.)
+isRecordConName :: Env -> Text -> Bool
+isRecordConName env c = case lookupRecordCon c env of
+  Just _  -> True
+  Nothing -> False
+
+-- | Compile a body-position @case@ whose alternatives share a constructor head
+-- through the decision-tree compiler, matching directly on the existing
+-- scrutinee atom (no fresh parameter). Each alternative becomes a join point
+-- whose parameters are its bound variables (left-to-right); its @where@ decls and
+-- body are elaborated under the SAME tail continuation @tk@ as the flat path.
+elabCaseAltsMatch :: TailK -> Atom -> [TAlt CType] -> Elab Expr
+elabCaseAltsMatch tk scrut alts = do
+  env <- asks ecEnv
+  built <- mapM buildAltJoin alts   -- [(JoinId, [(Text,CType,Name)], Expr)]
+  let rows = [ Row { rowPats  = [toMPat env pat]
+                   , rowSubst = []
+                   , rowJoin  = jid
+                   , rowOrder = [ v | (v, _, _) <- vars ]
+                   , rowIndex = ix }
+             | (ix, TAlt pat _ _, (jid, vars, _)) <- zip3 [0 ..] alts built ]
+  tree <- lift (compileMatch (buildOracle env) [scrut] rows)
+  pure $ foldr
+    (\(jid, vars, jbody) acc ->
+        LetJoin jid [ Binder n Unrestricted t | (_, t, n) <- vars ] jbody acc)
+    tree built
+  where
+    buildAltJoin (TAlt pat wh body) = do
+      jid <- lift freshJoin
+      triples <- mapM (\(v, t) -> do n <- bindFresh v; pure (v, t, n)) (clauseVars [pat])
+      jbody <- withLocals [ (v, n) | (v, _, n) <- triples ]
+                          (elabLocalDecls wh (elabK tk body))
+      pure (jid, triples, jbody)
 
 -- | Compile a clause group into fresh argument binders plus a decision-tree body
 -- wrapped in one 'LetJoin' per clause. Each clause's body becomes a join point

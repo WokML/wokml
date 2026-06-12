@@ -5,6 +5,6 @@ peek p : Box a4 =
     Box f : U64 -> jump j30(f)
 
 main =
-  let t.1 : Box a7 = Box(5)
+  let t.1 : Box a0 = Box(5)
   let t.2 : U64 = peek(t.1)
   t.2

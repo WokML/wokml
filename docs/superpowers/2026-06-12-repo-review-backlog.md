@@ -7,6 +7,101 @@ with an actual repro (program + observed output) unless marked otherwise. Ordere
 by severity within each section. Each is its own fix slice; none blocks the Conc
 merge.
 
+## RESOLUTION (branch `fix/repo-review-backlog`, 801 green)
+
+All 14 findings are now fixed on `fix/repo-review-backlog`. A three-reviewer
+full-branch adversarial pass confirmed #1,#2,#3,#5,#6,#7,#8,#12,#14 sound and
+caught two defects in the first cut (#11's CafFailure catch never fired due to a
+strictness hoist; #4's panic survived on the multi-line layout) — both repaired
+and locked with run-the-exploit fixtures. Commit map:
+- `e223398` batches 1-5: #1 (scope-leak join), #2 (functionCapturesHandle),
+  #3 (row shared-tail guard), #4 (rigidUnify level guard — signed case),
+  #6 (LetRec ordering), #8 (buildOracle env-first), #9 (handler `;` layout),
+  #10 (transitive fixities + diamond-merge), #11 (first cut), #12 (Jump arity),
+  #14 (producer-thunk origin gate).
+- `941cdfe` #5 dangling CTGen (intern generalizable row vars; cross-module fixture).
+- `fad9709` #7 body-case via Match (duplicate-head trigger; byte-identical flat path else).
+- `767bd80` #13 carrier/future + infix-operand positions (EIf/list generic-expr
+  positions DEFERRED — needs a BNFC `Exp` position functor).
+- `d96982e` review fixes: #11 (thunk + deep-force, now actually catches),
+  #4 (EscapedTyVar backstop for the unsigned-enclosing layout).
+
+Notes on residual scope, all documented in-commit:
+- #9: the newline-as-separator works per ARM; a single arm whose BODY spans lines
+  still needs explicit grouping (same constraint records have).
+- #10: same-name + same-fixity + same-(line,col) in two modules merges silently
+  (legitimate diamond; harmful redeclarations differ in OpInfo or are caught by
+  the value-namespace overlayEnvs).
+- #12: resolveAtom's prim-name fallback is load-bearing (builtin resolution); the
+  Jump arity check fixes the concrete missed-binder repro at its source.
+- #13: infix-operand and carrier/future decl errors are now positioned; generic
+  EIf/condition/list-element unifies still pass `Nothing` (Exp AST has no
+  per-node position — only embedded tokens do).
+
+## DEFERRED FULL FIXES (the residuals above, proper form)
+
+These are the COMPLETE fixes for the two diagnostics residuals (#12, #13), kept
+out of this branch because each is a cross-cutting structural change
+disproportionate to a diagnostics-only payoff (neither produces a wrong value or
+a crash on valid input). Recorded here so a future slice can pick them up.
+
+### #12 — distinguish prim references from missing binders
+
+Problem. `resolveAtom` (`src/Wok/Interp/Value.hs:160`) resolves an `AVar n` by
+unique id in the env, then FALLS BACK to the prim table by `nameHint`. That
+fallback IS how builtins (`+`, `mod`, `div`, …) resolve — they are not bound in
+the env, only looked up by name. So it cannot be removed. But it also means a
+binder that goes MISSING due to a compiler bug, whose hint collides with a prim
+name, silently resolves to the builtin (wrong value) instead of erroring
+`UnboundVar`. The Jump arity check (Machine.hs) closed the one known path to a
+missing binder; the masking itself is latent (needs another bug to bite).
+
+Full fix. Mark prim references distinctly at elaboration so the by-name fallback
+is unreachable for ordinary binders:
+  1. Add an atom form for builtins, e.g. `APrim Text` to `data Atom`
+     (`src/Wok/IR/Anf.hs:39`), OR a sentinel/global flag on the `Name`.
+  2. In the elaborator, emit `APrim name` (not `AVar`) for a resolved builtin —
+     `resolveVar`/the globals path in `src/Wok/IR/Elaborate.hs` is where a name
+     resolves to a builtin; route builtins to the new form there.
+  3. In `resolveAtom`: `APrim name -> Map.lookup name prims` (hard error if
+     absent); `AVar n -> Map.lookup (nameUniq n) env` and on a miss return
+     `Left (UnboundVar …)` with NO prim fallback.
+  4. Update the other `Atom` consumers in `Anf.hs` (collectAtom ~112,
+     renderAtom ~190) and any pattern matches on `Atom`.
+Cost: small but cross-cutting (Atom type + elaborator + machine + a couple of
+walkers). Effect: a missing binder is always a loud `UnboundVar`, never a
+silently-substituted builtin.
+
+### #13 — position EIf / list / tuple (and any generic-expression) unifies
+
+Problem. A mismatch at an `if`/list/tuple surfaces as `Mismatch Nothing …`
+(`src/Wok/TypeChecking/Infer.hs`: EIf ~1711-1712, list ~1726, and similar). Root
+cause is structural: the BNFC `Exp` AST carries NO per-node position
+(`data Exp = … | EIf Exp Exp Exp | …` in `src-generated/GeneratedParser/Wok/Abs.hs`);
+positions live only on leaf TOKENS (VarId / WokInt / operator symbols). That is
+why the infix-operand and decl-name cases COULD be fixed (a token to hang the
+span on) and these cannot.
+
+Full fix (option 1, complete). Regenerate the parser with a POSITION FUNCTOR on
+`Exp` (BNFC `--functor`, or the project's regen path), so every `Exp` node carries
+`BNFC'Position`. Then thread that position into the `unify` calls in
+`inferExprW` (EIf condition/branches, EList/ETuple element unifies, EApp, …).
+Correct and complete, but touches the generated parser, the `Exp` type, and every
+`inferExprW` arm — a large, mechanical, repo-wide change.
+
+Full fix (option 2, cheap heuristic — RECOMMENDED first step). Add
+`exprPos :: Abs.Exp -> SourceSpan` that walks to the LEFTMOST leaf token of a
+subexpression (`EVar`→its VarId pos, `ELitI`→its pos, `EApp f _`→`exprPos f`,
+`EIf c _ _`→`exprPos c`, `EList (x:_)`→`exprPos x`, …) and use it at the
+positionless `unify` sites. Imprecise (points at the start of the offending
+branch, not the exact clash) but strictly better than `Nothing`; ~30 lines, NO
+parser regen. Mirrors how `infixOpPos` already recovers the operator token's
+position for the infix case.
+
+---
+
+## Original findings (as filed)
+
 ## A. Soundness / wrong-values (highest priority)
 
 1. **Elaboration scope leak — silent wrong values.** `src/Wok/IR/Elaborate.hs:124`

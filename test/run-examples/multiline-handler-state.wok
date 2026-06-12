@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+effect State s = { get : s, set : s -> () }
+
+runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
+runState i c = with State {
+    s = i
+    get -> s
+    set x k -> k x ()
+    v -> (v, s)
+  } c ()
+
+prog : () -> U64 with State U64
+prog u =
+  let a = State.get in
+  let b = State.set (a + 5) in
+  let c = State.get in
+  a + c
+
+main : (U64, U64)
+main = runState 100 prog

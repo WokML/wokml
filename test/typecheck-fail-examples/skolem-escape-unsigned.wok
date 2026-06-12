@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+-- Bug #4: a nested signed helper's skolem must not escape into an UNSIGNED
+-- enclosing binding via a compiler PANIC. Here `helper : a -> a` forces its
+-- skolem `a` equal to `outer`'s parameter `u` (`else u`), so `a` escapes
+-- `outer`. This must surface as a clean EscapedTyVar type error, not the
+-- `finalizeGroupTyped: unexpected escape` internal panic. (The multi-line layout
+-- is load-bearing: it routes through finalizeGroupTyped rather than the signed
+-- helper's own generality check.)
+outer u = let helper : a -> a
+              helper y = if True then y else u
+          in helper 1

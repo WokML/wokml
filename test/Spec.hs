@@ -113,6 +113,7 @@ main = do
     , loaderTests
     , crossModuleFixityTests
     , crossModuleNameConflictTests
+    , crossModuleRowParamTests
     , bodylessUserWarningTests
     , rowUnifyTests
     , recordDeclTests
@@ -2900,6 +2901,27 @@ crossModuleNameConflictTests = testGroup "crossModuleNameConflict"
         Left lerr -> assertFailure ("loader unexpectedly failed: " ++ show lerr)
   ]
 
+-- A cross-module instantiation of an inferred row-polymorphic scheme must not
+-- panic. RowParamDef exports `mkbox : forall (e : row). Box e` (unsigned, so its
+-- scheme is built by freezeQuantify). Bug #5 was that freezeQuantify froze the
+-- generalizable row var to its raw global uniq as an UNRECORDED CTGen, leaving it
+-- out of the stored scheme's quantifier list; the importing module then
+-- instantiated it and crashed `instantiate: dangling CTGen`. Whole-program
+-- elaboration succeeding (a Right) is the load-bearing assertion.
+crossModuleRowParamTests :: TestTree
+crossModuleRowParamTests = testGroup "crossModuleRowParam"
+  [ testCase "cross-module use of an inferred row-poly scheme does not dangle" $ do
+      res <- Loader.loadProgram
+               "test/loader-fixtures/12-row-param-use.wok"
+               [ "test/loader-fixtures/12-row-param-def.wok" ]
+      case res of
+        Right (entryName, ms) ->
+          case Pipeline.elaborateProgram entryName ms of
+            Right _  -> pure ()
+            Left s   -> assertFailure ("expected pipeline success, got: " ++ s)
+        Left lerr -> assertFailure ("loader unexpectedly failed: " ++ show lerr)
+  ]
+
 bodylessUserWarningTests :: TestTree
 bodylessUserWarningTests = testGroup "bodylessUser"
   [ testCase "user-file bodyless sig produces BodylessBinding warning at pipeline level" $ do
@@ -4903,7 +4925,13 @@ elaborateControlTests = testGroup "ElaborateControl"
   , -- PCons with a non-trivial (literal) head: case xs of { 0 : rest -> rest ; _ -> [] }
     -- The head 0 is an APLitI, which is refutable; elabPat must emit a nested
     -- Case on the head binder with an AltLit 0 arm (not silently wildcard it).
-    testCase "cons pattern with literal head: nested Case on head binder is produced" $
+    testCase "cons pattern with literal head: literal is compiled to a real test (not wildcarded)" $
+      -- `case xs of (0 :: rest) -> rest; _ -> []`. The head literal `0` is a
+      -- REFUTABLE sub-pattern under Cons, so this routes through the decision-tree
+      -- compiler (bug #7: the old flat one-Alt path committed to Cons and could
+      -- not backtrack from a failed `0` test to the `_` arm). The literal must
+      -- still appear as an AltLit (LInt 0) somewhere in the tree -- proving it was
+      -- compiled to an actual test rather than silently wildcarded.
       let expr = Abs.ECase (Abs.EVar (Abs.VarId ((0,0), T.pack "xs")))
                    [ Abs.AltC
                        (Abs.PCons (Abs.APLitI (Abs.WokInt ((0,0), T.pack "0")))
@@ -4913,18 +4941,20 @@ elaborateControlTests = testGroup "ElaborateControl"
                    , Abs.AltC (Abs.PAtom Abs.APWild) (Abs.EList []) Abs.NoWhere
                    ]
           result = elaborateExprForTest TE.emptyEnv expr
-          -- The first alt of the outer Case must be AltCon "Cons" [_, _] whose
-          -- body is a Case _ [AltLit (LInt 0) _], proving the literal head test
-          -- was compiled to a nested case rather than silently wildcarded.
-          hasNestedLitHead e = case e of
-            Anf.Case _ (Anf.AltCon c (_:_:_) innerBody : _)
-              | c == T.pack "Cons" -> case innerBody of
-                  Anf.Case _ (Anf.AltLit (Anf.LInt 0) _ : _) -> True
-                  _                                            -> False
-            _ -> False
+          altHasLit0 a = case a of
+            Anf.AltLit (Anf.LInt 0) _ -> True
+            Anf.AltLit _ b            -> exprHasLit0 b
+            Anf.AltCon _ _ b          -> exprHasLit0 b
+            Anf.AltDefault b          -> exprHasLit0 b
+          exprHasLit0 e = case e of
+            Anf.Case _ alts        -> any altHasLit0 alts
+            Anf.Let _ _ b          -> exprHasLit0 b
+            Anf.LetRec _ b         -> exprHasLit0 b
+            Anf.LetJoin _ _ jb b   -> exprHasLit0 jb || exprHasLit0 b
+            _                      -> False
       in assertBool
-           ("expected outer Case with AltCon Cons whose body has nested AltLit 0, got: " <> show result)
-           (hasNestedLitHead result)
+           ("expected an AltLit (LInt 0) somewhere in the tree, got: " <> show result)
+           (exprHasLit0 result)
 
   , -- where clause: equation body using where-bound name
     -- let x = (let-with-where body) where w = 5

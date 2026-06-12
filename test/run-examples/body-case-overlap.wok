@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+
+-- Bug #7: a body-position `case` with OVERLAPPING constructor heads and a
+-- refutable sub-pattern. The flat one-Alt-per-clause path commits to the first
+-- `Some` arm, runs `case 2 of 1 -> 100`, fails, and cannot backtrack to the
+-- second `Some` arm -- wrongly raising NonExhaustiveCase. Routing through the
+-- decision-tree compiler dispatches `Some 2` to `Some n -> n`, yielding 2.
+
+classify : Option U64 -> U64
+classify m = case m of
+  Some 1 -> 100
+  Some n -> n
+  None   -> 0
+
+main : U64
+main = classify (Some 2) + classify (Some 1) + classify None

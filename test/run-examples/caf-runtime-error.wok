@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+-- Bug #11: a runtime error raised while forcing a 0-arity binding (a CAF) must
+-- surface as a clean `runtime error: ...`, NOT an internal panic / uncaught
+-- exception. The CAF lives as a lazy thunk in the global env; its failure is
+-- thrown as CafFailure and re-caught at the runModule boundary (with the result
+-- forced deeply so an embedded failing CAF is caught too).
+bad : U64
+bad = div 1 0
+
+main : U64
+main = bad

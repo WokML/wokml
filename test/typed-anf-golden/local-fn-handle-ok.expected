@@ -1,0 +1,21 @@
+pure_local =
+  letrec
+    dbl : U64 x : U64 =
+      let t.2 : U64 = +(x, x)
+      t.2
+  let t.1 : U64 = dbl(3)
+  t.1
+
+inscope =
+  let t.3 : TcEffect "State" U64 -> () = \c : TcEffect "State" U64 -> letrec
+    bump : () x : U64 =
+      let t.2 : () = c.State.set(x)
+      t.2
+  let t.1 : () = bump(7)
+  t.1
+  let t.4 : TcEffect "State" U64 -> () -> ((), U64) = state(0)
+  let t.5 : ((), U64) = t.4(t.3)
+  t.5
+
+main =
+  inscope

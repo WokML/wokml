@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: FutureConsumedTwice Nothing "g"
+typecheck: typecheck in Main: FutureConsumedTwice (Just (7,1)) "g"

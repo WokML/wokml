@@ -32,6 +32,7 @@ module Wok.TypeChecking.Carrier
   , checkFutureAffine
   , isHandleType         -- exported for the slice-4d marker anchor test
   , isAffineCarrierType  -- exported for the slice-4d marker anchor test
+  , freeVars             -- exported for IR.Elaborate's local-decl dependency sort
   ) where
 
 import Data.Text (Text)
@@ -82,6 +83,14 @@ data Ctx = Ctx
   , ctxCarrierTys :: Set Text
     -- ^ Names of marked carrier tycons (@extern data@/@extern type@); the marker
     -- set consulted by 'isHandleType'/'isAffineCarrierType' (slice 4d).
+  , ctxProducerExempt :: Bool
+    -- ^ Whether the PRODUCER-THUNK exemption ('isProducerThunk' in 'check') is in
+    -- effect. Origin-gated by the caller exactly like the clause-tail producer
+    -- exemption ('resultIsCarrier'/@producerExempt@ in 'Infer.hs'): True only for
+    -- Embedded (prelude) code, False for a UserFile. A user file therefore cannot
+    -- write a bare @\\() -> Completed n@ fresh-carrier factory (rejected as a
+    -- carrier escape, consistent with the direct @Completed n@ form); the
+    -- prelude's @runConc@/@spawn@/@async@ producer thunks remain exempt.
   }
 
 -- | The per-position mutable state threaded through the walk.
@@ -109,13 +118,14 @@ err c = Left (CarrierEscape (ctxSpan c) (ctxName c))
 -- (via 'recurse'), so a carrier escaping into a list/tuple inside the body is
 -- still caught.
 checkCarriers
-  :: Set Text -> ParamResolver -> Bool -> SourceSpan -> Text
+  :: Set Text -> ParamResolver -> Bool -> Bool -> SourceSpan -> Text
   -> [([TPat], TExpr)] -> Either TypeError ()
-checkCarriers carrierTys resolve resultIsCarrier sp name clauses =
+checkCarriers carrierTys resolve producerThunkExempt resultIsCarrier sp name clauses =
   mapM_ checkClause clauses
   where
     ctx = Ctx { ctxResolve = resolve, ctxSpan = sp, ctxName = name
-              , ctxHandlerArm = False, ctxCarrierTys = carrierTys }
+              , ctxHandlerArm = False, ctxCarrierTys = carrierTys
+              , ctxProducerExempt = producerThunkExempt }
     checkClause (pats, body) =
       let env0 = Env (Set.unions (map (handleBindersOfPat carrierTys) pats))
                      (Set.unions (map patVars pats))
@@ -154,7 +164,7 @@ check ctx env allowed e@(Texp _ node)
   -- is single-level: 'recurse' (via the TLam case) checks the body with
   -- 'ctxHandlerArm' set so only the flat top of the body is exempt; nested
   -- escapes (a carrier stored in a list inside the body) still fire.
-  | isProducerThunk (ctxCarrierTys ctx) e =
+  | ctxProducerExempt ctx, isProducerThunk (ctxCarrierTys ctx) e =
       recurse (ctx { ctxHandlerArm = True }) env node
   | otherwise = recurse (ctx { ctxHandlerArm = False }) env node
 
@@ -219,6 +229,13 @@ isInlineFutureApp _          _                    = False
 -- Step-result-clause exemptions. (A lambda that CAPTURES an in-scope handle is
 -- still flagged separately by 'directlyEscapes' at its own position, so this
 -- exemption does not loosen the handle-escape rule.)
+--
+-- ORIGIN-GATED. The 'check' caller consults this exemption ONLY when
+-- 'ctxProducerExempt' is set, which the inference driver gates on Embedded
+-- (prelude) origin — the same trust boundary as the clause-tail producer
+-- exemption. A UserFile @\\() -> Completed n@ is therefore rejected as a carrier
+-- escape (consistent with the direct @Completed n@ form), while the prelude's
+-- @runConc@/@spawn@/@async@ starter thunks stay exempt.
 isProducerThunk :: Set Text -> TExpr -> Bool
 isProducerThunk carrierTys (Texp ty (TLam pats _)) =
   isAffineCarrierType carrierTys (peelArrowResults (length pats) ty)
@@ -369,12 +386,20 @@ bindPats carrierTys env pats = env
 --   * its (peeled) RESULT TYPE is a handle (@let c2 = cell@ — a handle alias), or
 --   * its RHS is itself a direct-escape form: a bare carrier, or a handle-
 --     capturing closure (@let f = \\x -> cell.set x@ — the closure is a carrier
---     even though its result type is a function, not a handle).
+--     even though its result type is a function, not a handle), or
+--   * it is an EQUATION-FORM local function (a binding WITH parameters) whose
+--     clause body closes over an in-scope carrier (@let f x = cell.set x@ — the
+--     same closure as the lambda form, but its RHS is the body 'TPerformOn' and
+--     its peeled result type is Unit, so neither of the two tests above catches
+--     it). See 'functionCapturesHandle'.
 --
--- It must NOT use a free-variable over-approximation: @let old = cell.get@ binds
--- a plain @U64@ (a perform CONSUMES the handle and returns a value), and @old@
--- references @cell@ in its RHS, so a free-var test would wrongly mark @old@ a
--- carrier and reject a later innocent use of @old@ in a non-handle slot.
+-- It must NOT use a free-variable over-approximation for a NULLARY binding:
+-- @let old = cell.get@ binds a plain @U64@ (a perform CONSUMES the handle and
+-- returns a value), and @old@ references @cell@ in its RHS, so a free-var test
+-- would wrongly mark @old@ a carrier and reject a later innocent use of @old@ in
+-- a non-handle slot. The equation-form test is therefore restricted to bindings
+-- that actually take parameters (closure values), leaving the nullary case to the
+-- two precise tests above.
 bindDecls :: Set Text -> Env -> [TLocalDecl CType] -> Env
 bindDecls carrierTys env decls = env
   { envCarriers = Set.union (envCarriers env) (Set.fromList carrierNames)
@@ -389,8 +414,19 @@ bindDecls carrierTys env decls = env
                               (Set.unions (map (handleBindersOfPat carrierTys) pats))
       , directlyEscapes inner rhs
           || isHandleType carrierTys (peelArrowResults (length pats) (typeOf rhs))
+          || functionCapturesHandle inner pats rhs
       ]
     typeOf (Texp t _) = t
+    -- An equation-form local function (params present) whose clause body closes
+    -- over an in-scope carrier: it is a handle-capturing closure value, the
+    -- equation-form analogue of 'directlyEscapes's 'TLam' case (remove the params,
+    -- intersect the body's free vars with the carriers). Nullary bindings are
+    -- excluded so the @let old = cell.get@ over-approximation is NOT reintroduced.
+    functionCapturesHandle carriers pats rhs =
+      not (null pats)
+        && let bound = Set.unions (map patVars pats)
+               fvs   = freeVars rhs `Set.difference` bound
+           in not (Set.null (Set.intersection fvs carriers))
 
 -- | Is this a second-class HANDLE type — an effect-instance handle
 -- @CTCon (TcEffect _) _@, or a MARKED carrier tycon (an @extern data@/@extern

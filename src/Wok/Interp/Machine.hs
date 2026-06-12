@@ -6,10 +6,12 @@ module Wok.Interp.Machine
   , runModule
   ) where
 
+import Control.Exception (throw, try, evaluate)
 import qualified Data.Map.Strict as Map
 import qualified Data.Map.Lazy as MapL
 import Data.Text (Text)
 import qualified Data.Text as Tx
+import System.IO.Unsafe (unsafePerformIO)
 import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
   , OpArm (..), Rhs (..), TopBind (..) )
@@ -66,8 +68,19 @@ evalExpr prims expr sc k = case expr of
     vs <- mapM (resolveAtom prims sc) args
     case Map.lookup j (scJoins sc) of
       Nothing -> Left (UnboundVar (renderJoin j))
-      Just (JoinPoint jsc ps jbody jk) ->
-        Right (Eval jbody jsc { scEnv = bindBinders ps vs (scEnv jsc) } jk)
+      Just (JoinPoint jsc ps jbody jk)
+        -- A join point's arity is fixed at its definition; a Jump supplying a
+        -- different number of arguments is an IR/compiler bug. Raise a loud
+        -- ArityError rather than letting bindBinders' `zip` silently truncate
+        -- (which would leave params unbound or drop extra args) -- converting a
+        -- structural bug into a silently wrong answer.
+        | length vs /= length ps ->
+            Left (ArityError
+              (Tx.pack "jump to " <> renderJoin j <> Tx.pack ": expected "
+                <> Tx.pack (show (length ps)) <> Tx.pack " argument(s), got "
+                <> Tx.pack (show (length vs))))
+        | otherwise ->
+            Right (Eval jbody jsc { scEnv = bindBinders ps vs (scEnv jsc) } jk)
 
   Handle e h ->
     -- A named handler binds its self-instance binder to a VInst carrying the
@@ -273,13 +286,60 @@ runModule (CoreModule binds) =
       -- A 0-arity bind evaluates to a Value once. Forcing a dictionary record
       -- only evaluates its spine to a VRecord (field closures capture gEnv
       -- lazily), so this does not recurse into other CAFs at force time.
-      -- A Left here means a compiler-generated CAF failed to evaluate, which is
-      -- an internal invariant violation (analogous to elaboration's
-      -- panic-on-impossible) -- dictionaries never fail to evaluate.
+      --
+      -- A 'Left' here is a genuine RuntimeError from THIS CAF's body. Because the
+      -- CAF lives in the lazy 'gEnv' as a pure 'Value' thunk, it cannot be
+      -- returned as a 'Left' from here; it is thrown as 'CafFailure' carrying the
+      -- ORIGINAL RuntimeError and re-caught at the 'runModule' boundary, where it
+      -- becomes the user's real 'Left RuntimeError' (no panic, no relabelling).
+      -- Compiler-generated CAFs (dictionaries) never fail, so the throw path is
+      -- only ever taken for a real user runtime error in a 0-arity binding.
       forceTop body = case run primTable (Eval body (Scope gEnv Map.empty) KDone) of
         Right v  -> v
-        Left err -> error ("runModule: CAF evaluation failed: " <> show err)
+        Left err -> throw (CafFailure err)
   in case [ tb | tb@(TopBind n _ _) <- binds, nameHint n == Tx.pack "main" ] of
-       (TopBind _ [] body : _) -> run primTable (Eval body (Scope gEnv Map.empty) KDone)
+       (TopBind _ [] body : _) ->
+         -- 'main' may force CAF thunks lazily; a 'CafFailure' thrown by one of
+         -- them is caught here and unwrapped to its original RuntimeError.
+         catchCaf (\() -> run primTable (Eval body (Scope gEnv Map.empty) KDone))
        (TopBind{}         : _) -> Left (ArityError (Tx.pack "main must take no arguments"))
        []                      -> Left (UnboundVar (Tx.pack "main"))
+
+-- | Run a thunk producing the program result, catching a 'CafFailure' thrown
+-- while forcing a lazy CAF thunk and turning it back into the original
+-- 'Left RuntimeError'.
+--
+-- The argument is a THUNK (@() -> ...@), not the 'Either' itself: were it the
+-- 'Either', GHC's strictness analysis would force it at the CALL site (this
+-- function is strict in its result), so the 'CafFailure' would be thrown OUTSIDE
+-- the 'try' and escape uncaught. Hiding the computation behind a lambda keeps the
+-- forcing inside the 'try'.
+--
+-- The 'Right' value is forced DEEPLY (the data spine 'renderValue' will later
+-- traverse -- 'VCon'/'VRecord' fields, recursively), not merely to WHNF, so a
+-- failing CAF embedded in a returned structure (e.g. @main = Some bad@) is caught
+-- here rather than later when the driver renders the value. 'unsafePerformIO' is
+-- sound: the action is pure (its only effect is the imprecise exception we
+-- ourselves threw and immediately catch) and deterministic.
+catchCaf :: (() -> Either RuntimeError Value) -> Either RuntimeError Value
+catchCaf k = unsafePerformIO $ do
+  res <- try (evaluate (forceResult (k ())))
+  pure $ case res of
+    Left (CafFailure err) -> Left err
+    Right ok              -> ok
+  where
+    forceResult e@(Left _) = e
+    forceResult (Right v)  = deepForceValue v `seq` Right v
+{-# NOINLINE catchCaf #-}
+
+-- | Force the renderable data spine of a 'Value': 'VCon'/'VRecord' fields are
+-- forced recursively (these are what 'renderValue' traverses, so a 'CafFailure'
+-- reachable from the output surfaces while we are inside 'catchCaf's 'try').
+-- Functional/opaque values ('VClosure'/'VPrim'/'VCont'/'VContP'/'VInst') and
+-- literals render without forcing their contents, so WHNF suffices for them.
+deepForceValue :: Value -> ()
+deepForceValue v = case v of
+  VLit l       -> l `seq` ()
+  VCon _ vs    -> foldr (\x acc -> deepForceValue x `seq` acc) () vs
+  VRecord _ m  -> foldr (\x acc -> deepForceValue x `seq` acc) () (Map.elems m)
+  _            -> v `seq` ()

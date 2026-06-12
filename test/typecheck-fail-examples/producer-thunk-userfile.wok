@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Bug #14: a USER file may not write a producer THUNK that manufactures a fresh
+-- carrier. `\ () -> Completed n` is a `() -> Step ...` factory; the direct form
+-- `leak n = Completed n` is already rejected (step-inline-escape-return.wok), so
+-- the thunked form must be rejected too. The producer-thunk exemption is now
+-- origin-gated to Embedded (prelude) code only.
+leak : U64 -> (() -> Step U64 () U64 (row e))
+leak n = \ () -> Completed n
+
+main : U64
+main = 0

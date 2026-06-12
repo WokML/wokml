@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+
+data Tri2 = Cons U64 U64 U64 | Empty2
+
+pick2 : Tri2 -> U64
+pick2 (Cons a b c) = b
+pick2 Empty2 = 0
+
+main = pick2 (Cons 1 2 3)

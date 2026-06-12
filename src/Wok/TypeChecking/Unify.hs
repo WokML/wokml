@@ -67,7 +67,7 @@ freeze t = do
       case tv of
         Unbound u _ _ -> pure (CTGen u)
         Link _ -> error "freeze: TVar was Link after force (caller invariant violation)"
-        Rigid u _ -> error ("freeze: unexpected Rigid (uniq " ++ show u ++ ")")
+        Rigid u _ _ -> error ("freeze: unexpected Rigid (uniq " ++ show u ++ ")")
 
 -- | Like 'freeze', but TOLERATES 'Rigid' skolems by mapping each @Rigid u@ to
 -- @CTGen u@ (the skolem's uniq used directly as the generic index), instead of
@@ -92,7 +92,7 @@ freezeTolerant t = do
       tv <- liftST $ readSTRef ref
       case tv of
         Unbound u _ _ -> pure (CTGen u)
-        Rigid u _ -> pure (CTGen u)
+        Rigid u _ _ -> pure (CTGen u)
         Link _ -> error "freezeTolerant: TVar was Link after force (caller invariant violation)"
 
 -- | Combined occurs check + level adjustment. Walks the type being
@@ -117,7 +117,7 @@ occursAdjust sp target lvl = go
               -- occursAdjust, and nothing writes to target in between. If
               -- target is Link here, a caller forgot to force first.
               error "occursAdjust: target was Link after force"
-            Rigid u _ ->
+            Rigid u _ _ ->
               throwError (OccursCheck sp u (CTGen u))
       | otherwise = do
           tv <- liftST $ readSTRef r
@@ -126,7 +126,7 @@ occursAdjust sp target lvl = go
             Unbound u l k ->
               when (l > lvl) $
                 liftST $ writeSTRef r (Unbound u lvl k)
-            Rigid _ _ -> pure ()  -- skolems have no mutable level
+            Rigid _ _ _ -> pure ()  -- skolems have no mutable level
     go (TCon _ ts) = mapM_ go ts
     go (TArr a r b) = go a >> go r >> go b
     go (TRecord _ row) = go row
@@ -157,6 +157,50 @@ rewriteRow sp l row = do
     RowEmpty ->
       throwError (UnknownField sp (Tx.pack "<row>") l)
     _ -> error "rewriteRow: expected a row"
+
+-- | The open-tail row variable of a row, if any: walk the (forced) row to its
+-- end and return the 'STRef' of a trailing row variable, or 'Nothing' for a
+-- closed row ('RowEmpty') or non-row. Used by 'unify' to detect the shared-tail
+-- case before bubbling a label, preventing 'rewriteRow' from looping.
+rowTailRef :: Row s -> TC s (Maybe (STRef s (TVar s)))
+rowTailRef row = do
+  row' <- force row
+  case row' of
+    RowExtend _ _ rest -> rowTailRef rest
+    TVar ref           -> pure (Just ref)
+    _                  -> pure Nothing
+
+-- | Like 'rewriteRow', but FAILS (with 'UnknownField', rewritten to a row error
+-- by the caller) instead of extending the row variable @forbidden@. This is the
+-- Leijen/Gaster-Jones side condition: bubbling a label must not extend the very
+-- tail variable shared with the other row, which would otherwise diverge.
+rewriteRowGuarded
+  :: SourceSpan
+  -> Maybe (STRef s (TVar s))  -- ^ the forbidden (shared) tail variable
+  -> Text
+  -> Row s
+  -> TC s (Type s, Row s)
+rewriteRowGuarded sp forbidden l row = do
+  row' <- force row
+  case row' of
+    RowExtend l' t rest
+      | l == l'   -> pure (t, rest)
+      | otherwise -> do
+          (t', rest') <- rewriteRowGuarded sp forbidden l rest
+          pure (t', RowExtend l' t rest')
+    TVar ref
+      | Just ref == forbidden ->
+          -- Extending the shared tail would loop; treat as label-not-found so
+          -- the caller surfaces a positioned RowMismatch.
+          throwError (UnknownField sp (Tx.pack "<row>") l)
+      | otherwise -> do
+          tFresh    <- freshTVar KStar
+          restFresh <- freshRVar
+          unifyVar sp ref (RowExtend l tFresh restFresh)
+          pure (tFresh, restFresh)
+    RowEmpty ->
+      throwError (UnknownField sp (Tx.pack "<row>") l)
+    _ -> error "rewriteRowGuarded: expected a row"
 
 -- | Like 'rewriteRow' but REFUSES to extend a row variable. Used for field
 -- access (@p.x@, Task 6): we want a clean error rather than silently
@@ -202,13 +246,24 @@ unify sp a b = do
       warnOnShadow sp row1
     (RowEmpty, RowEmpty) -> pure ()
     (RowExtend l1 t1 rest1, _) -> do
-      -- Bubble label @l1@ through @b'@. A label-not-found failure surfaces as an
-      -- 'UnknownField sp "<row>" l1' placeholder from 'rewriteRow'; rewrite it
-      -- into a positioned 'RowMismatch' showing BOTH full rows (the same shape as
-      -- the 'RowEmpty'/'RowExtend' arm below). Any other error (KindMismatch,
+      -- Leijen/Gaster-Jones SHARED-TAIL side condition (prevents divergence).
+      -- Bubbling @l1@ through @b'@ may reach @b'@'s open tail variable and want
+      -- to extend it with a fresh @RowExtend l1 _ _@. If that tail is the SAME
+      -- variable as @a'@'s own open tail (e.g. unifying @{A | e0} ~ {B | e0}@,
+      -- two distinct-head rows over one shared row var), extending it makes the
+      -- subsequent @unify rest1 rest2'@ re-encounter the identical shape one
+      -- level deeper -- forever. Detect the shared tail up front and fail with a
+      -- positioned row error instead of looping.
+      --
+      -- Bubble label @l1@ through @b'@. A label-not-found failure (genuine
+      -- absence OR the shared-tail guard firing) surfaces as an
+      -- 'UnknownField sp "<row>" l1' placeholder; rewrite it into a positioned
+      -- 'RowMismatch' showing BOTH full rows (the same shape as the
+      -- 'RowEmpty'/'RowExtend' arm below). Any other error (KindMismatch,
       -- OccursCheck, NominalMismatch from the recursive unifies, ...) is rethrown
       -- unchanged so we do not mask genuine failures.
-      (t2, rest2') <- rewriteRow sp l1 b' `catchError` \case
+      sharedTail <- rowTailRef rest1
+      (t2, rest2') <- rewriteRowGuarded sp sharedTail l1 b' `catchError` \case
         UnknownField{} -> do
           ca <- freeze a'
           cb <- freeze b'
@@ -246,7 +301,7 @@ kindOf t = do
       tv <- liftST $ readSTRef ref
       case tv of
         Unbound _ _ k -> pure k
-        Rigid _ k -> pure k
+        Rigid _ _ k -> pure k
         Link u -> kindOf u
 
 unifyVar :: SourceSpan -> STRef s (TVar s) -> Type s -> TC s ()
@@ -254,7 +309,7 @@ unifyVar sp ref t = do
   tv <- liftST $ readSTRef ref
   case tv of
     Link _ -> error "unifyVar: caller must have forced first"
-    Rigid u _ -> rigidUnify sp ref u t
+    Rigid u rlvl rk -> rigidUnify sp ref u rlvl rk t
     Unbound _ lvl k -> do
       tk <- kindOf t
       when (k /= tk) $ do
@@ -265,20 +320,37 @@ unifyVar sp ref t = do
       liftST $ writeSTRef ref (Link t)
 
 -- | A rigid skolem only unifies with itself (same STRef) or with an Unbound
--- inference variable (which gets pinned to the rigid). Any other combination
--- raises 'RigidEscape', because it means the body is less general than the
--- declared signature.
-rigidUnify :: SourceSpan -> STRef s (TVar s) -> Int -> Type s -> TC s ()
-rigidUnify sp ref u t = case t of
+-- inference variable (which gets pinned to the rigid) -- and then only when that
+-- metavar is SAME-KIND and lives at the skolem's level or DEEPER. Any other
+-- combination raises 'RigidEscape', because it means the body is less general
+-- than the declared signature.
+--
+-- The level guard is the crux of the fix for the @finalizeGroupTyped: unexpected
+-- escape@ panic: a metavar from a SHALLOWER (outer, older) scope than the skolem,
+-- once linked to it, would carry the rigid out into that enclosing scope where it
+-- is not in scope (e.g. a local @helper : a -> a@ whose body forces @a@ to equal
+-- an outer parameter). Reject it here as a positioned 'RigidEscape' rather than
+-- letting it surface later as an internal panic. This mirrors the level
+-- discipline 'occursAdjust' applies to ordinary unbound variables.
+rigidUnify :: SourceSpan -> STRef s (TVar s) -> Int -> Level -> Kind -> Type s -> TC s ()
+rigidUnify sp ref u (Level rlvl) rk t = case t of
   TVar r' | r' == ref -> pure ()
   TVar r' -> do
     tv' <- liftST $ readSTRef r'
     case tv' of
       Link _ -> error "rigidUnify: t must have been forced"
-      Unbound _ _ _ ->
+      Unbound _ (Level mlvl) mk -> do
+        -- A row (KEffect) metavar must never pin to a type (KStar) skolem or
+        -- vice versa; skolems are KStar-only today, but guard both ways.
+        when (mk /= rk) $ do
+          ca <- freezeTolerant (TVar ref)
+          cb <- freezeTolerant t
+          throwError (KindMismatch sp ca cb)
+        -- Outer-scope metavar pinned to a deeper skolem => the skolem escapes.
+        when (mlvl < rlvl) $ throwError (RigidEscape sp u)
         -- Pin the Unbound side to the Rigid (flip direction).
         liftST $ writeSTRef r' (Link (TVar ref))
-      Rigid _ _ ->
+      Rigid _ _ _ ->
         -- Two distinct rigids can't unify.
         throwError (RigidEscape sp u)
   _ -> throwError (RigidEscape sp u)

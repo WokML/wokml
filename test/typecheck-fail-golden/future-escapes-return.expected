@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: CarrierEscape Nothing "leak"
+typecheck: typecheck in Main: CarrierEscape (Just (7,1)) "leak"

@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+-- Bug #7 (catch-all variant). A refutable sub-pattern under a constructor
+-- (`Some 0`) followed by a wildcard catch-all must backtrack: `Some 5` fails the
+-- `0` test and falls to `other`. The flat one-Alt path committed to `Some` and
+-- raised NonExhaustiveCase. caseNeedsMatch triggers on any refutable sub-pattern,
+-- not only duplicate heads.
+classify : Option U64 -> U64
+classify o = case o of
+  Some 0 -> 100
+  other  -> 7
+
+main : U64
+main = classify (Some 0) + classify (Some 5) + classify None

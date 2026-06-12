@@ -176,10 +176,26 @@ freezeQuantifyG tolerateRigid recordQuant outer nextRef seenRef kindsRef = goT
           tv <- readSTRef ref
           case tv of
             Link _ -> error "freezeQuantify: TVar was Link after forceST (caller invariant violation)"
-            -- A row variable (kind KEffect) freezes to its uniq directly,
-            -- WITHOUT interning as a quantifier (preserving the old goR path).
-            Unbound u _ KEffect -> pure (CTGen u)
-            Rigid u _
+            -- A GENERALIZABLE row variable (KEffect, level > outer) is interned
+            -- and -- on the scheme-body path ('recordQuant') -- RECORDED as a
+            -- KEffect quantifier, exactly like a generalizable type var. Freezing
+            -- it to its RAW global uniq instead (the old goR shortcut) left it out
+            -- of the scheme's quantifier list, so a later (cross-module)
+            -- instantiation panicked `dangling CTGen u`, and the raw uniq could
+            -- collide with a small KStar quantifier index -- silently confusing
+            -- kinds (bug #5). 'instantiateQ' already allocates a fresh row var for
+            -- each recorded KEffect quantifier, so recording closes the hole.
+            --
+            -- A NON-generalizable row var (level <= outer) only ever reaches here
+            -- on the tolerant NODE-annotation path (the scheme-body path is gated
+            -- by 'hasOuterScopeVar', which walks rows): the ambient/residual row
+            -- pinned by an enclosing scope. It freezes to its uniq for the node
+            -- annotation as before -- harmless, because node CTypes are never
+            -- instantiated as schemes.
+            Unbound u (Level l) KEffect
+              | l > outer -> intern u (if recordQuant then Just KEffect else Nothing)
+              | otherwise -> pure (CTGen u)
+            Rigid u _ _
               | tolerateRigid -> intern u Nothing
               | otherwise -> error
                   ("freezeQuantify: unexpected Rigid (uniq " ++ show u
@@ -333,9 +349,15 @@ freezeSig s = fst <$> freezeSigSkolems s
 -- only; row (KEffect) vars do not carry class constraints.
 freezeSigSkolems :: Scheme -> TC s (Type s, Map.Map Int Int)
 freezeSigSkolems (Scheme vars _ body) = do
+  -- Mint each skolem at the CURRENT level: it stands for a variable universally
+  -- quantified by this signature, introduced at the scope where the signature is
+  -- frozen. A metavar from a SHALLOWER (outer) scope must not be pinned to it
+  -- (that would let the rigid escape its binding's scope) -- 'rigidUnify'
+  -- enforces this by comparing the metavar's level against this recorded level.
+  lvl <- currentLevel
   skolems <- mapM (\(i, k) -> do
                      u <- freshUniq
-                     ref <- liftST $ newSTRef (Rigid u k)
+                     ref <- liftST $ newSTRef (Rigid u lvl k)
                      pure (i, (u, TVar ref))
                   ) [ (i, k) | (i, k) <- vars, k /= KEffect ]
   rowVars <- mapM (\(i, _) -> do
@@ -1733,7 +1755,10 @@ inferExprW mono (Abs.EExpr head_ tails) = do
       (opTy, opName, opCs) <- inferInfixOpW mono op
       (rhsT, rhsNode) <- inferExprW mono rhs
       r1 <- freshTVar KStar
-      unify Nothing opTy (TArr fT RowEmpty (TArr rhsT RowEmpty r1))
+      -- Carry the operator token's own position so a mismatched operand (e.g.
+      -- @1 + "a"@) reports AT the operator rather than as a positionless
+      -- 'Mismatch Nothing' (bug #13).
+      unify (Just (infixOpPos op)) opTy (TArr fT RowEmpty (TArr rhsT RowEmpty r1))
       -- Mirror the resolved application `op lhs rhs` as a nested TApp whose
       -- head is the operator used as a value. r1 is the result type at this
       -- step; the running lhs node carries the accumulated chain. A constrained
@@ -2485,6 +2510,12 @@ inferInfixOpW mono (Abs.IOSym (Abs.VarSym (pos, name))) =
 inferInfixOpW mono (Abs.IOBT (Abs.VarId (pos, name))) =
   lookupOpNameW mono pos name
 
+-- | The source position of an infix operator token (the @VarSym@/backtick
+-- @VarId@ it was written as). Used to position operand-mismatch errors.
+infixOpPos :: Abs.InfixOp -> (Int, Int)
+infixOpPos (Abs.IOSym (Abs.VarSym (pos, _))) = pos
+infixOpPos (Abs.IOBT  (Abs.VarId (pos, _)))  = pos
+
 lookupOpNameW :: Map.Map Text (Type s) -> (Int, Int) -> Text -> TC s (Type s, Text, [(Text, Type s)])
 lookupOpNameW mono pos name =
   case Map.lookup name mono of
@@ -2763,36 +2794,31 @@ unifyGroupWith monoRec sigMap (name, tv, eqns) = do
       unify Nothing tv t
       pure (name, tv, eqDecls)
 
--- | Walk a forced type and report whether any unbound TVar has level <= outer.
--- When this is true the binding is monomorphic (its type is pinned by an
--- enclosing lambda or outer let) and must not be generalized.
-hasOuterScopeVar :: Int -> Type s -> TC s Bool
+-- | Walk a forced type and return the uniq of an unbound TVar with level <=
+-- outer (or a 'Rigid' skolem), if any. A 'Just' means the binding is pinned by
+-- an enclosing scope (or captured a skolem) and must not be generalized; the
+-- uniq lets a caller name the escaping variable in a diagnostic.
+hasOuterScopeVar :: Int -> Type s -> TC s (Maybe Int)
 hasOuterScopeVar outer = go
   where
     go ty = do
       ty' <- force ty
       case ty' of
-        TCon _ ts -> orM (map go ts)
-        TArr a r b -> do
-          a' <- go a
-          if a' then pure True else do
-            r' <- go r
-            if r' then pure True else go b
+        TCon _ ts -> firstM (map go ts)
+        TArr a r b -> firstM [go a, go r, go b]
         TRecord _ row -> go row
-        RowEmpty -> pure False
-        RowExtend _ ty2 rest -> do
-          a <- go ty2
-          if a then pure True else go rest
+        RowEmpty -> pure Nothing
+        RowExtend _ ty2 rest -> firstM [go ty2, go rest]
         TVar ref -> do
           tv <- liftST $ readSTRef ref
           case tv of
-            Unbound _ (Level l) _ -> pure (l <= outer)
-            Rigid _ _ -> pure True
+            Unbound u (Level l) _ -> pure (if l <= outer then Just u else Nothing)
+            Rigid u _ _ -> pure (Just u)
               -- A Rigid IS an outer-scope constant (it represents a skolem
               -- from an enclosing sig), so any binding that references one
               -- must stay monomorphic.
             Link _ -> error "hasOuterScopeVar: TVar was Link after force (caller invariant violation)"
-    orM = foldM (\acc m -> if acc then pure True else m) False
+    firstM = foldr (\m acc -> do { r <- m; maybe acc (pure . Just) r }) (pure Nothing)
 
 -- | Back at outer level: generalize an inferred type or verify a sig.
 -- Returns Left (name, tv) for monomorphic bindings (escape detected),
@@ -2809,10 +2835,10 @@ finalizeGroup sigMap (name, tv) =
       pure (Right (name, declared))
     Nothing -> do
       Level outer <- currentLevel
-      hasEscape <- hasOuterScopeVar outer tv
-      if hasEscape
-        then pure (Left (name, tv))
-        else do
+      mEscape <- hasOuterScopeVar outer tv
+      case mEscape of
+        Just _  -> pure (Left (name, tv))
+        Nothing -> do
           gen <- generalize tv
           pure (Right (name, gen))
 
@@ -2927,10 +2953,15 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
                      , tdClauses = clauses, tdEvidence = evParams }
     Nothing -> do
       Level outer <- currentLevel
-      hasEscape <- hasOuterScopeVar outer tv
-      when hasEscape $ error
-        ("finalizeGroupTyped: unexpected escape for top-level binding "
-        ++ Tx.unpack name)
+      mEscape <- hasOuterScopeVar outer tv
+      -- A top-level UNSIGNED binding whose inferred type still references an
+      -- outer-scope variable or a skolem is over-general: this happens when a
+      -- nested signed helper's skolem leaks out (e.g. `outer u = let helper :
+      -- a -> a; helper y = if .. then y else u in ..` -- the helper's `a` is
+      -- forced equal to `outer`'s parameter and escapes). Surface a positioned
+      -- 'EscapedTyVar' rather than the old `finalizeGroupTyped: unexpected
+      -- escape` internal panic (bug #4, layout-dependent path).
+      forM_ mEscape $ \u -> throwError (EscapedTyVar Nothing u)
       (gen, frozen, fcs) <- generalizeTyped tv synthetic accCs
       let clauses = unClauses name arity frozen
       -- Discharge the frozen constraints against the generalized scheme:
@@ -3302,22 +3333,35 @@ inferProgramTC seedEnv origin decls = do
               Nothing -> case lookupCon n env2 of
                 Just ci -> Just (schemeParamTypes (conScheme ci))
                 Nothing -> Nothing
-    -- A carrier PRODUCER exemption (the tail of a clause body may be an
-    -- inline-produced 'Step'/'Suspension' matching the declared result type) is
-    -- granted ONLY to the standard prelude (Embedded origin): @Std.Control@'s
-    -- @start@/@step@ are the blessed constructors of a 'Step'. A UserFile that
-    -- declared a function returning a carrier (e.g. @leak n = Completed n@) must
-    -- still be rejected with 'CarrierEscape' — returning a carrier is an escape
-    -- in user code (same trust boundary the Part 1 `extern` gate uses).
+    -- A carrier PRODUCER exemption is granted ONLY to the standard prelude
+    -- (Embedded origin): @Std.Control@'s @start@/@step@ are the blessed
+    -- constructors of a 'Step'. It covers TWO shapes, both origin-gated by the
+    -- same boundary (the same trust boundary the Part 1 `extern` gate uses):
+    --   * the clause-tail exemption: the tail of a clause body may be an
+    --     inline-produced 'Step'/'Suspension' matching the declared result type
+    --     (gated additionally on the declared result being a carrier); and
+    --   * the producer-THUNK exemption: a @\\() -> Completed n@ fresh-carrier
+    --     factory thunk (the @driveConc@ starter-thunk shape).
+    -- A UserFile returning a carrier (e.g. @leak n = Completed n@) or wrapping one
+    -- in a thunk (e.g. @leak n = \\() -> Completed n@) must still be rejected with
+    -- 'CarrierEscape' — both are escapes in user code.
     let producerExempt = case origin of Embedded -> True; UserFile _ -> False
+        -- Each top-level binding's source position (its LHS name token), so a
+        -- carrier/affine violation is reported AT the offending definition
+        -- instead of positionlessly (bug #13). TypedDecl carries no span, so we
+        -- recover it from the original decls by name.
+        declPosMap = Map.fromList
+          [ (funLHSName lhs, lhsPos lhs) | Abs.DEqn lhs _ _ <- decls ]
+        declSpan td = Map.findWithDefault Nothing (tdName td) declPosMap
     forM_ tds $ \td ->
       let arity = case tdClauses td of
                     ((pats, _) : _) -> length pats
                     []              -> 0
       in either throwError pure
            (checkCarriers carrierTys resolveParams
+                          producerExempt
                           (producerExempt && resultIsAffineCarrier carrierTys arity (tdScheme td))
-                          Nothing (tdName td) (tdClauses td))
+                          (declSpan td) (tdName td) (tdClauses td))
     -- Affine consumption bound on Futures (slice 4b, Task 5): beside the carrier
     -- rule, a second LOCAL post-inference pass rejecting a coroutine Future
     -- consumed more than once (resume XOR cancel; value reads do not count).
@@ -3330,7 +3374,7 @@ inferProgramTC seedEnv origin decls = do
                                     , not (Set.member (tdName td) externs) ]
     forM_ tds $ \td ->
       either throwError pure
-        (checkFutureAffine carrierTys ownNonExtern Nothing (tdName td) (tdClauses td))
+        (checkFutureAffine carrierTys ownNonExtern (declSpan td) (tdName td) (tdClauses td))
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
 

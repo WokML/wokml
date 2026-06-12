@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: CarrierEscape Nothing "boxed"
+typecheck: typecheck in Main: CarrierEscape (Just (11,1)) "boxed"
