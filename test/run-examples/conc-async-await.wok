@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+
+compute : () -> U64 with Conc
+compute u = let y = yield () in 21
+
+main : U64
+main = runConc (\ () -> let p = async compute in let q = async compute in await p + await q)

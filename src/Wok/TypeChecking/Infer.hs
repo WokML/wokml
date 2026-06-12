@@ -40,7 +40,7 @@ import Wok.TypeChecking.Env
   , envTyCons
   , extendCon, extendEffect, extendRecordCon, extendTyCon, extendVar
   , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
-import Wok.TypeChecking.Error (TypeError (..), Warning (..))
+import Wok.TypeChecking.Error (SourceSpan, TypeError (..), Warning (..))
 import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
 import Wok.TypeChecking.Unify (force, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
 import Wok.TypeChecking.Types
@@ -559,7 +559,16 @@ translateSig env ty = do
                 Just info
                   | tcArity info == length args -> do
                       checkArgKinds pos name args (tcParamKinds info)
-                      CTCon (resolveTyCon name) <$> mapM goT args
+                      argCTs <- mapM goT args
+                      -- Payload restriction (spec §3.3): a concurrency carrier
+                      -- (`Promise a` / `Chan a`) must transport only effect-free,
+                      -- first-order data. Reject a payload that contains a
+                      -- function arrow anywhere (a closure/thunk that could smuggle
+                      -- an effect across the carrier). A bare polymorphic payload
+                      -- (an unresolved quantified slot, CTGen) stays allowed.
+                      when (name `elem` concCarrierTys) $
+                        forM_ argCTs (checkConcPayload env' (Just pos))
+                      pure (CTCon (resolveTyCon name) argCTs)
                   | otherwise -> throwError
                       (ArityMismatch (Just pos) name (tcArity info) (length args))
                 Nothing -> case lookupEffect name env' of
@@ -802,6 +811,80 @@ resolveTyCon name
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
   | otherwise                       = TcUser name
+
+-- | The concurrency carriers (spec §3.3) whose payload type is restricted to
+-- effect-free, first-order data: 'Promise' and 'Chan' from @Std.Control@.
+concCarrierTys :: [Text]
+concCarrierTys = [Tx.pack "Promise", Tx.pack "Chan"]
+
+-- | Payload restriction for a concurrency carrier's type argument (spec §3.3).
+-- A @Promise a@ / @Chan a@ must transport only effect-free, first-order data, so
+-- the payload @a@ may not contain a function arrow anywhere: an arrow is a
+-- closure/thunk that could smuggle an effect (or a captured handle) across the
+-- carrier, defeating the load-bearing-row avoidance. We walk the RESOLVED type:
+--
+--   * 'CTArr'    -- a function type (with ANY effect row, including pure) is
+--                   rejected outright; this is the load-bearing case.
+--   * 'CTCon'    -- recurse into the data-type arguments, so a nested arrow
+--                   (e.g. @Pair (() -> U64) Bool@) is caught too. For a USER
+--                   tycon we ALSO look up its data constructors in the env and
+--                   walk each constructor's declared field types, so an arrow
+--                   hidden inside a wrapper (@data Box = Box (() -> U64)@,
+--                   @Chan Box@) cannot smuggle past the check. Field types are
+--                   walked RAW (no parameter substitution): a 'CTGen' parameter
+--                   slot carries no arrow itself, and any arrow instantiated AT
+--                   a parameter (@Chan (Wrap (() -> U64))@) appears in @args@,
+--                   which are walked anyway. A visited set of tycon names keeps
+--                   recursive data types (@data Tree = Node Tree Tree@) from
+--                   looping.
+--   * 'CTRecord' -- recurse into the record's field types (its row payloads).
+--   * 'CTGen'    -- a quantified slot: a bare polymorphic payload @Promise a@ is
+--                   ALLOWED (the prelude's generic combinators depend on this).
+--   * rows/other -- nothing arrow-shaped to reject.
+checkConcPayload :: Env -> SourceSpan -> CType -> TC s ()
+checkConcPayload env sp = go Set.empty
+  where
+    go _    t@CTArr{}            = throwError (ConcPayloadEffectful sp (prettyCType t))
+    go seen t@(CTCon tc args)    = do
+      -- An affine coro carrier (`Step`/`Suspension`, the extern-marked
+      -- tcCarrier tycons) is a captured one-shot continuation: caching it in a
+      -- promise cell / channel buffer would let it be resumed more than once.
+      -- Reject the tycon itself, anywhere in the payload, before recursing.
+      case tc of
+        TcUser n | maybe False tcCarrier (lookupTyCon n env) ->
+          throwError (ConcPayloadEffectful sp (prettyCType t))
+        _ -> pure ()
+      mapM_ (go seen) args
+      case tc of
+        TcUser n | not (Set.member n seen) -> goConFields (Set.insert n seen) n
+        _ -> pure ()
+    go seen (CTRecord _ row)     = goRow seen row
+    go _    (CTGen _)            = pure ()
+    go _    CREmpty              = pure ()
+    go seen (CRExtend _ ft rs)   = go seen ft >> goRow seen rs
+    -- A row's spine: CRExtend/CREmpty are handled above; a CTGen tail is the
+    -- only other shape and carries no payload to inspect.
+    goRow = go
+
+    -- Walk every data constructor's declared field types for a user tycon.
+    -- Positional constructors store their fields as the arrow spine of the
+    -- constructor scheme (field1 -> ... -> fieldN -> T); record constructors
+    -- store them directly. An extern tycon (Promise/Chan/Fiber/Transport
+    -- themselves) has no registered constructors -- nothing to walk.
+    goConFields seen n = case lookupTyCon n env of
+      Nothing   -> pure ()
+      Just info -> forM_ (tcCons info) $ \cn ->
+        case lookupCon cn env of
+          Just ci -> mapM_ (go seen)
+            (conFieldTys (conArity ci) (schemeBody (conScheme ci)))
+          Nothing -> case lookupRecordCon cn env of
+            Just rc -> mapM_ (go seen . snd) (rcFields rc)
+            Nothing -> pure ()
+
+    -- Peel exactly `arity` domains off a constructor scheme's arrow spine.
+    conFieldTys :: Int -> CType -> [CType]
+    conFieldTys k (CTArr d _ c) | k > 0 = d : conFieldTys (k - 1) c
+    conFieldTys _ _                     = []
 
 -- | Bottom elimination: if an operation's result type is @Never@, replace it
 -- with a fresh type variable so each perform of a non-returning operation is

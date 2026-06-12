@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Deterministic schedule (FIFO ready queue, round-robin), spawn order [worker 1, worker 2]:
+--   Root: newChan -> spawn w1 (parks at yield) -> spawn w2 (parks at yield) -> recv (parks, buffer empty)
+--   drain w1: send 1 -> wakes parked receiver (Root), delivers a=1; ready=[w2, Root]
+--   drain w2: send 2 -> no receiver parked, buffers [2]
+--   drain Root: a=1, recv -> buffer pops 2, b=2 -> 1*10+2 = 12
+
+worker : Chan U64 -> U64 -> () -> () with Conc
+worker ch tag u = let y = yield () in send ch tag
+
+main : U64
+main = runConc (\ () ->
+  let ch = newChan () in
+  let f1 = spawn (worker ch 1) in
+  let f2 = spawn (worker ch 2) in
+  let a = recv ch in
+  let b = recv ch in
+  a * 10 + b)

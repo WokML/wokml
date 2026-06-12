@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Regression: a race loser that diverges (re-enqueues itself via `yield`
+-- forever) must NOT hang the program. Root completion ends the program: as
+-- soon as raceAny's winner delivers and the root completes, the scheduler
+-- returns; the still-ready loser is dropped, never resumed again (daemonic,
+-- forkIO-style). If the drain policy regresses to drain-to-empty, this test
+-- hangs the suite -- loud and obvious, which is intended.
+
+fast : () -> U64 with Conc
+fast u = 100
+
+loopForever : () -> U64 with Conc
+loopForever u = let y = yield () in loopForever ()
+
+main : U64
+main = runConc (\ () -> raceAny [fast, loopForever])

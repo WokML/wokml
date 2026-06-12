@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- A producer thunk that CAPTURES an existing carrier and returns a derived carrier
+-- must still escape-fail. If this ever starts typechecking, the soundness guard
+-- ordering was reversed (the producer-thunk exemption must be GUARDED after
+-- directlyEscapes; regression guard for commit 036ad4e).
+leak : Suspension () () U64 (row e) -> () -> Step () () U64 (row e)
+leak s = \ () -> step s ()
+
+main : U64
+main = 0

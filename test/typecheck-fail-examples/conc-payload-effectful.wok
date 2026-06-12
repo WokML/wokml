@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect E = { op : () -> () }
+
+bad : Promise (() -> () with E) -> U64
+bad p = 0
+
+main : U64
+main = 0

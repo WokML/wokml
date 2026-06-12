@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- raceAny [slow, fast]: the fast (no-yield) child is SECOND, yet still wins ->
+-- proves a TRUE first-to-complete race, not a leftmost-pick. Winning schedule:
+-- newChan -> spawn(slow) parks at its first yield -> spawn(fast) runs to
+-- completion, sends 100 into the buffer -> recv pops 100 (the first value sent).
+-- The non-leftmost faster child wins. Result: 100.
+
+fast : () -> U64 with Conc
+fast u = 100
+
+slow : () -> U64 with Conc
+slow u = let a = yield () in let b = yield () in 200
+
+main : U64
+main = runConc (\ () -> raceAny [slow, fast])

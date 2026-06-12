@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+import Std.Control
+
+head0 : [a] -> a
+head0 xs = case xs of
+  h :: _ -> h
+  []     -> head0 xs
+
+gen : () -> U64 with Conc
+gen u = let y = yield () in 7
+
+useSurface : () -> [U64] with Conc
+useSurface u =
+  let ps = [async gen] ++ [async gen] in
+  [await (head0 ps)]
+
+main : U64
+main = runConc (\ () -> let (x, y) = (await (async gen), await (async gen)) in x + y)

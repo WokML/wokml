@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Soundness regression: a coro carrier (Step/Suspension, affine one-shot) must
+-- NOT cross the Conc transport. The promise cell caches the completed value and
+-- hands the SAME Suspension to every awaiter, so without the runtime guard the
+-- suspended tail runs TWICE with two different resume values (printed 112).
+-- The scheduler now walks every value entering a promise cell / channel and
+-- rejects captured continuations at the transport boundary.
+
+prod : () -> U64 with Coro () U64 + Conc
+prod u = let x = Coro.suspend () in x + 1
+
+feed : Step () U64 U64 (row e) -> U64 -> U64 with eff e
+feed s v = case s of
+  Completed r   -> r
+  Suspended x g -> run g v
+
+main : U64
+main = runConc (\ () ->
+  let p = async (\ () -> start prod) in
+  let s1 = await p in
+  let s2 = await p in
+  feed s1 10 + feed s2 100)

@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- parAll spawns each child (async) in order, then awaits each in order. Every
+-- child yields once then returns n; mapAsync starts them, mapAwait collects
+-- [1,2,3], summed = 6.
+
+mk : U64 -> () -> U64 with Conc
+mk n u = let y = yield () in n
+
+sumL : [U64] -> U64
+sumL xs = case xs of
+  []      -> 0
+  h :: t  -> h + sumL t
+
+main : U64
+main = runConc (\ () -> sumL (parAll [mk 1, mk 2, mk 3]))

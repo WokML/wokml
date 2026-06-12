@@ -143,3 +143,123 @@ runRace sa sb = case sa of
 
 race : (() -> r with Async + eff e) -> (() -> r with Async + eff e) -> r with eff e
 race a b = runRace (start (asCoro a)) (start (asCoro b))
+
+-- ============ Conc: provider-scheduled concurrency (slice 3, Provider A) ============
+-- Handles are PLAIN DATA wrapping a provider id (first-class; the real carriers live in
+-- the Haskell scheduler keyed by id). A Fiber is a lightweight cooperatively-scheduled
+-- computation (NOT an OS thread).
+data Fiber     = Fiber U64
+data Promise a = Promise U64        -- `a` PHANTOM: surface type-safety, erased at runtime
+data Chan a    = Chan U64           -- `a` PHANTOM
+
+-- Transport: a type-erased value in transit. Plain data, so first-class and storable in
+-- Request; the U64 slot is a label only, gated by erase/recall. `__coerce` is the one
+-- trusted runtime-identity retype.
+data Transport = Transport U64
+extern __coerce : a -> b
+
+erase : a -> Transport
+erase v = Transport (__coerce v)
+
+recall : Transport -> a
+recall t = case t of Transport n -> __coerce n
+
+recallId : Transport -> U64
+recallId t = recall t
+
+-- Request: the transport message. ReqSpawn/ReqAsync carry the adapted coro thunk ERASED
+-- into Transport (so the field is plain Transport, not an effectful function type).
+data Request
+  = ReqYield
+  | ReqSpawn Transport
+  | ReqAsync Transport
+  | ReqAwait U64
+  | ReqNewChan
+  | ReqSend U64 Transport
+  | ReqRecv U64
+-- Cancellation (`cancel` / a `ReqCancel` request) is deferred to a later slice:
+-- it needs fiber-id tracking plus finalizers, neither of which exists yet.
+
+effect Conc = { req : Request -> Transport }
+
+asConc : (() -> a with Conc + eff e) -> () -> a with Coro Request Transport + eff e
+asConc c _ = with Conc { req r k -> k (Coro.suspend r) } (c ())
+
+-- driveConc (Haskell) has no global env, so it cannot call the wok `start`. The
+-- wok side hands it already-`start`-wrapped STARTER THUNKS: each `() -> Step ...`,
+-- when applied to `()`, installs Coro and runs the producer to its first Step.
+--
+-- Residual-effect scope (LIMITATION): the residual row `e` here is STRUCTURAL.
+-- Provider A (driveConc) resumes coroutine segments under a fresh `KDone`, i.e.
+-- WITHOUT the ambient handler context. So spawned/async children must be
+-- effect-closed up to `Conc`: a child performing a non-`Conc` effect (e.g. Log)
+-- across a suspension is not yet runnable across resume -- it would hit an
+-- unhandled-effect error at runtime, not a type error. A documented limitation.
+extern __drive_conc : (() -> Step Request Transport a (row e) with eff e) -> a with eff e
+
+-- Residual-effect scope (LIMITATION): `e` is structural -- see __drive_conc above.
+-- Provider A resumes coroutine segments without the ambient handler context, so
+-- spawned/async children must be effect-closed up to `Conc`; non-`Conc` residual
+-- effects in children are not yet runnable across resume (documented limitation).
+-- This applies to the ROOT computation too, not only children: the root's own
+-- non-`Conc` residual performed AFTER its first suspension (yield/await/...) also
+-- runs under a fresh `KDone` and traps at runtime with an unhandled-effect error.
+runConc : (() -> a with Conc + eff e) -> a with eff e
+runConc c = __drive_conc (\ () -> start (asConc c))
+
+yield : () -> () with Conc
+yield u = let r = Conc.req ReqYield in ()
+
+spawn : (() -> () with Conc) -> Fiber with Conc
+spawn f = Fiber (recallId (Conc.req (ReqSpawn (erase (\ () -> start (asConc f))))))
+
+async : (() -> a with Conc) -> Promise a with Conc
+async f = Promise (recallId (Conc.req (ReqAsync (erase (\ () -> start (asConc (\ () -> erase (f ()))))))))
+
+await : Promise a -> a with Conc
+await p = recall (Conc.req (ReqAwait (promiseId p)))
+
+newChan : () -> Chan a with Conc
+newChan u = Chan (recallId (Conc.req ReqNewChan))
+
+send : Chan a -> a -> () with Conc
+send c v = let r = Conc.req (ReqSend (chanId c) (erase v)) in ()
+
+recv : Chan a -> a with Conc
+recv c = recall (Conc.req (ReqRecv (chanId c)))
+
+promiseId : Promise a -> U64
+promiseId p = case p of Promise n -> n
+chanId : Chan a -> U64
+chanId c = case c of Chan n -> n
+
+parAll : [() -> a with Conc] -> [a] with Conc
+parAll fs = mapAwait (mapAsync fs)
+
+mapAsync : [() -> a with Conc] -> [Promise a] with Conc
+mapAsync fs = case fs of
+  []      -> []
+  g :: gs -> [async g] ++ mapAsync gs
+
+mapAwait : [Promise a] -> [a] with Conc
+mapAwait ps = case ps of
+  []      -> []
+  p :: qs -> [await p] ++ mapAwait qs
+
+-- raceAny: TRUE first-to-complete race. Spawn each child to SEND its result to a
+-- shared channel, then `recv` once: the first value buffered = the first child to
+-- complete (under the deterministic schedule). Losers are DROPPED un-resumed once
+-- the root completes (daemonic, early-return drain): the scheduler returns the
+-- root's result and never re-enters still-ready/parked fibers, so a diverging
+-- loser cannot hang the program. No explicit cancellation -- fine for
+-- pure-up-to-Conc children. Reuses existing primitives (no scheduler change).
+raceAny : [() -> a with Conc] -> a with Conc
+raceAny fs =
+  let ch = newChan () in
+  let started = raceSpawn ch fs in
+  recv ch
+
+raceSpawn : Chan a -> [() -> a with Conc] -> [Fiber] with Conc
+raceSpawn ch fs = case fs of
+  []      -> []
+  f :: gs -> [spawn (\ () -> send ch (f ()))] ++ raceSpawn ch gs

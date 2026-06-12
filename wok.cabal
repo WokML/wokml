@@ -99,6 +99,7 @@ library
         Wok.Interp
         Wok.Interp.Value
         Wok.Interp.Prim
+        Wok.Interp.Sched
         Wok.Interp.Machine
     autogen-modules:
         Paths_wok

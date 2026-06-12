@@ -183,6 +183,17 @@ data TypeError
     -- identity, so @extern@ is permitted ONLY in the standard prelude (Embedded
     -- origin). Args: position (the enclosing binding; the typed AST carries no
     -- per-node span) and the offending extern name.
+  | ConcPayloadEffectful SourceSpan Text
+    -- ^ A @Promise a@ or @Chan a@ type-application was resolved with a payload
+    -- @a@ that contains a function arrow anywhere (a function-typed or
+    -- effect-carrying value). Such a payload could smuggle a closure/thunk
+    -- across a channel or promise, defeating the spec's load-bearing-row
+    -- avoidance (spec §3.3): the concurrency carriers must transport only
+    -- effect-free, first-order data. First-order data and bare polymorphic
+    -- payloads (an unresolved type variable / quantified slot) are allowed; the
+    -- check fires only on a concretely function-typed payload, walking into
+    -- data-type arguments to catch nested arrows. Args: position (the carrier
+    -- tycon's source span) and the offending payload type, rendered.
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint

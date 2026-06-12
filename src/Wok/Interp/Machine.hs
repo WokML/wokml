@@ -15,6 +15,7 @@ import Wok.IR.Anf
   , OpArm (..), Rhs (..), TopBind (..) )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.Interp.Prim (primTable)
+import qualified Wok.Interp.Sched as Sched
 import Wok.Interp.Value
 
 -- | Single small-step. Halts on Return into KDone.
@@ -130,6 +131,9 @@ enter prims fv args k = case fv of
         case r of
           PRDone v        -> if null over then Right (Return v k) else enter prims v over k
           PRApply g gargs -> enter prims g (gargs ++ over) k
+          PRDrive thunk   -> do
+            v <- Sched.driveConc enter run prims thunk
+            if null over then Right (Return v k) else enter prims v over k
   VCont kb -> case args of
     [v] -> Right (Return v (kb k))
     _   -> Left (ArityError (Tx.pack "continuation expects exactly one argument"))

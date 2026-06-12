@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Regression: the payload restriction (spec 3.3) must see through a user
+-- data constructor. Box wraps a function; Chan Box would smuggle the closure
+-- across the carrier.
+
+data Box = Box (() -> U64)
+
+bad : Chan Box -> U64
+bad c = 0
+
+main : U64
+main = 0

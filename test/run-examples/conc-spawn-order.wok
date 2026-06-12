@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+
+worker : () -> () with Conc
+worker u = let a = yield () in let b = yield () in ()
+
+main : U64
+main = runConc (\ () ->
+  let f1 = spawn worker in
+  let f2 = spawn worker in
+  let y1 = yield () in
+  let y2 = yield () in
+  42)

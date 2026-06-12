@@ -87,7 +87,7 @@ data Prim = Prim
 
 -- | A saturated primitive either produces a value or asks the machine to apply
 -- one value to others (this is how ($) is expressed without host recursion).
-data PrimResult = PRDone Value | PRApply Value [Value]
+data PrimResult = PRDone Value | PRApply Value [Value] | PRDrive Value
 
 -- | A labelled local continuation: the scope and continuation captured where
 -- the join was defined, plus its parameters and body.

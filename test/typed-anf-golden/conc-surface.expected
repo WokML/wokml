@@ -1,0 +1,39 @@
+head0 xs : [a0] =
+  case xs of
+    Cons h : a0 _ : [a0] -> h
+    Nil ->
+      let t : a0 = head0(xs)
+      t
+
+gen u : () =
+  let t : () = yield(())
+  let y : () = t
+  7
+
+useSurface u : () =
+  let t.5 : Promise U64 = async(gen)
+  let t.6 : [Promise U64] = Nil
+  let t.7 : [Promise U64] = Cons(t.5, t.6)
+  let t.8 : Promise U64 = async(gen)
+  let t.9 : [Promise U64] = Nil
+  let t.10 : [Promise U64] = Cons(t.8, t.9)
+  let t.11 : [Promise U64] = ++(t.7, t.10)
+  let ps : [Promise U64] = t.11
+  let t.1 : Promise U64 = head0(ps)
+  let t.2 : U64 = await(t.1)
+  let t.3 : [U64] = Nil
+  let t.4 : [U64] = Cons(t.2, t.3)
+  t.4
+
+main =
+  let t.7 : () -> U64 = \_ : () -> let t.1 : Promise U64 = async(gen)
+  let t.2 : U64 = await(t.1)
+  let t.3 : Promise U64 = async(gen)
+  let t.4 : U64 = await(t.3)
+  let t.5 : (U64, U64) = Tuple2(t.2, t.4)
+  case t.5 of
+    Tuple2 x : U64 y : U64 ->
+      let t.6 : U64 = +(x, y)
+      t.6
+  let t.8 : U64 = runConc(t.7)
+  t.8

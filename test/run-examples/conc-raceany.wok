@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- raceAny [fast, slow]: fast is leftmost AND completes first (no yield), so it
+-- wins. Winning schedule: newChan -> spawn(fast) runs to completion, sends 100
+-- into the buffer -> spawn(slow) parks at its first yield -> recv pops 100.
+-- Result: 100.
+
+fast : () -> U64 with Conc
+fast u = 100
+
+slow : () -> U64 with Conc
+slow u = let a = yield () in let b = yield () in 200
+
+main : U64
+main = runConc (\ () -> raceAny [fast, slow])

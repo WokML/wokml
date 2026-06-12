@@ -144,6 +144,18 @@ check ctx env allowed e@(Texp _ node)
   -- (via 'recurse') before any child expressions are checked, so nested
   -- escapes (e.g. @[start producer]@ inside an arm) are still caught.
   | isInlineFutureApp (ctxCarrierTys ctx) e, not allowed, not (ctxHandlerArm ctx) = err ctx
+  -- A PRODUCER THUNK: a lambda whose result type is itself an affine carrier
+  -- (e.g. @\\() -> start (asConc c)@ of type @() -> Step …@). Such a lambda is the
+  -- structural carrier constructor demanded by a driver that must call @start@
+  -- itself (the Haskell scheduler @driveConc@ has no global env, so the wok side
+  -- hands it @start@-wrapped starter thunks). The lambda's IMMEDIATE body is the
+  -- inline-produced carrier — the producer analogue of a handler arm / a
+  -- Step-result clause tail — so it is exempted exactly like those. The exemption
+  -- is single-level: 'recurse' (via the TLam case) checks the body with
+  -- 'ctxHandlerArm' set so only the flat top of the body is exempt; nested
+  -- escapes (a carrier stored in a list inside the body) still fire.
+  | isProducerThunk (ctxCarrierTys ctx) e =
+      recurse (ctx { ctxHandlerArm = True }) env node
   | otherwise = recurse (ctx { ctxHandlerArm = False }) env node
 
 -- | The value forms that carry a handle out of their position: a bare carrier
@@ -198,6 +210,19 @@ capturesHandleClosure carriers ty e = case ty of
 isInlineFutureApp :: Set Text -> TExpr -> Bool
 isInlineFutureApp carrierTys (Texp ty (TApp _ _)) = isAffineCarrierType carrierTys ty
 isInlineFutureApp _          _                    = False
+
+-- | Is this a PRODUCER THUNK — a lambda whose result type (after peeling its
+-- parameters) is an affine carrier (a 'Step'/'Suspension')? Such a lambda is a
+-- structural carrier constructor: a deferred @start@ that a driver must apply
+-- itself. Its immediate body is therefore exempted from the inline-carrier
+-- escape rule (see 'check'), the producer analogue of the handler-arm and
+-- Step-result-clause exemptions. (A lambda that CAPTURES an in-scope handle is
+-- still flagged separately by 'directlyEscapes' at its own position, so this
+-- exemption does not loosen the handle-escape rule.)
+isProducerThunk :: Set Text -> TExpr -> Bool
+isProducerThunk carrierTys (Texp ty (TLam pats _)) =
+  isAffineCarrierType carrierTys (peelArrowResults (length pats) ty)
+isProducerThunk _ _ = False
 
 -- | Recurse into a node's children, setting each child's @allowed@ flag and
 -- extending the environment where a binder is introduced.

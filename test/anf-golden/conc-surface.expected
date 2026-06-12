@@ -1,0 +1,39 @@
+head0 xs =
+  case xs of
+    Cons h _ -> h
+    Nil ->
+      let t = head0(xs)
+      t
+
+gen u =
+  let t = yield(())
+  let y = t
+  7
+
+useSurface u =
+  let t.5 = async(gen)
+  let t.6 = Nil
+  let t.7 = Cons(t.5, t.6)
+  let t.8 = async(gen)
+  let t.9 = Nil
+  let t.10 = Cons(t.8, t.9)
+  let t.11 = ++(t.7, t.10)
+  let ps = t.11
+  let t.1 = head0(ps)
+  let t.2 = await(t.1)
+  let t.3 = Nil
+  let t.4 = Cons(t.2, t.3)
+  t.4
+
+main =
+  let t.7 = \_ -> let t.1 = async(gen)
+  let t.2 = await(t.1)
+  let t.3 = async(gen)
+  let t.4 = await(t.3)
+  let t.5 = Tuple2(t.2, t.4)
+  case t.5 of
+    Tuple2 x y ->
+      let t.6 = +(x, y)
+      t.6
+  let t.8 = runConc(t.7)
+  t.8

@@ -32,6 +32,8 @@ prims =
   , coroResumeP
   , coroDoneP
   , coroCancelP
+  , coerceP
+  , driveConcP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -100,6 +102,23 @@ coroCancelP :: Prim
 coroCancelP = mkPrim (Tx.pack "__coro_cancel") 1 $ \args -> case args of
   [_] -> Right (PRDone (VLit LUnit))
   _   -> Left (ArityError (Tx.pack "__coro_cancel"))
+
+-- | `__coerce v` is the runtime identity: it recalls a wok type the elaborator
+-- erased (e.g. adapting a Conc root's carrier) without storing or changing the
+-- value. The host shim exists purely so the type-checker has a hole to hang the
+-- recalled type on.
+coerceP :: Prim
+coerceP = mkPrim (Tx.pack "__coerce") 1 $ \args -> case args of
+  [v] -> Right (PRDone v)
+  _   -> Left (ArityError (Tx.pack "__coerce"))
+
+-- | `__drive_conc thunk` hands a Conc root thunk to the machine, which dispatches
+-- to the scheduler (see "Wok.Interp.Sched"). The thunk is an adapted
+-- `() -> a with Coro Request Transport`.
+driveConcP :: Prim
+driveConcP = mkPrim (Tx.pack "__drive_conc") 1 $ \args -> case args of
+  [thunk] -> Right (PRDrive thunk)
+  _       -> Left (ArityError (Tx.pack "__drive_conc"))
 
 -- | (u32) : narrow a U64 to U32. v1 models integers as unbounded 'Integer' and
 -- does NOT model modular wrapping (consistent with the U64 arithmetic prims), so

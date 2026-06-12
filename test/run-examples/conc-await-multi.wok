@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+import Std.Control
+
+slow : () -> U64 with Conc
+slow u = let y = yield () in 42
+
+waiter : Promise U64 -> () -> U64 with Conc
+waiter p u = await p
+
+main : U64
+main = runConc (\ () ->
+  let p = async slow in
+  let a = async (waiter p) in
+  let b = async (waiter p) in
+  await a + await b + await p)

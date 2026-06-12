@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Log = { emit : U64 -> () }
+
+-- spec 3.1 pin: a spawned child must be effect-closed up to the runtime (here: pure up
+-- to Conc). A child performing an UNHANDLED user effect (Log) cannot be spawned -- its
+-- row does not unify with spawn's `() -> () with Conc` child slot. Rejected.
+bad : () -> Fiber with Conc
+bad u = spawn (\ () -> let r = Log.emit 1 in ())
+
+main : U64
+main = 0

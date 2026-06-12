@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Soundness: a coro carrier (Step/Suspension, affine one-shot) named in a
+-- Promise/Chan payload would be cached by the transport and resumable more
+-- than once. The payload restriction rejects the carrier TYCON itself, not
+-- just function arrows.
+
+bad : Chan (Step () () U64 (row e)) -> U64
+bad c = 0
+
+main : U64
+main = 0
