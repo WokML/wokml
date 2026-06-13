@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- POSITIVE: nested runConc where each level uses only its own handles is
+-- legitimate (a deterministic subworld) and must keep working, before and
+-- after the handle identity fix. Locks "nesting is supported, not forbidden"
+-- and (post-fix) that the id supply threads through a nested drive and back.
+
+fortyTwo : () -> U64 with Conc
+fortyTwo u = 42
+
+seven : () -> U64 with Conc
+seven u = 7
+
+nested : () -> U64 with Conc
+nested u =
+  let a = async fortyTwo in
+  let x = runConc (\ () -> let b = async seven in await b) in
+  let r = await a in
+  r + x
+
+main : U64
+main = runConc nested

@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Door 1, symmetric direction: an INNER runConc's promise escapes as its
+-- result and is awaited by the OUTER scheduler, which has minted its own
+-- same-numbered promise. Today this silently returns the outer 42 instead of
+-- the inner task's 7. After the fix it is a runtime error.
+
+fortyTwo : () -> U64 with Conc
+fortyTwo u = 42
+
+seven : () -> U64 with Conc
+seven u = 7
+
+main : U64
+main = runConc (\ () ->
+  let p = async fortyTwo in
+  let q = runConc (\ () -> async seven) in
+  await q)

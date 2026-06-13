@@ -204,6 +204,11 @@ extern __drive_conc : (() -> Step Request Transport a (row e) with eff e) -> a w
 -- This applies to the ROOT computation too, not only children: the root's own
 -- non-`Conc` residual performed AFTER its first suspension (yield/await/...) also
 -- runs under a fresh `KDone` and traps at runtime with an unhandled-effect error.
+--
+-- Handle identity: Fiber/Promise/Chan handles are bound to the scheduler
+-- instance that minted them. Using a handle under a different runConc (nested
+-- or later) is a runtime error ("not owned by this scheduler"), never a
+-- silent delivery. Nested runConc with its own handles is supported.
 runConc : (() -> a with Conc + eff e) -> a with eff e
 runConc c = __drive_conc (\ () -> start (asConc c))
 

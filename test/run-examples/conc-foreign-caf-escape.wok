@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Door 3 (CAF escape): a top-level constant runs runConc in its own lazily
+-- forced interpreter entry; its escaped promise collides with main's
+-- scheduler. Today this silently returns 7 instead of 42. After the
+-- per-entry region fix it is a runtime error.
+
+fortyTwo : () -> U64 with Conc
+fortyTwo u = 42
+
+seven : () -> U64 with Conc
+seven u = 7
+
+top : Promise U64
+top = runConc (\ () -> async fortyTwo)
+
+main : U64
+main = runConc (\ () -> let q = async seven in await top)

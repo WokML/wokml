@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Door 1 (nested runConc): an OUTER promise awaited under an INNER runConc.
+-- Today the inner scheduler silently serves its own same-numbered cell and
+-- this program returns 99 (the wrong promise's value). After the handle
+-- identity fix it is a runtime error: the handle is not owned by the inner
+-- scheduler. Spec: 2026-06-13-conc-handle-identity-design.md section 1.
+
+outerVal : () -> U64 with Conc
+outerVal u = 42
+
+innerVal : () -> U64 with Conc
+innerVal u = 99
+
+main : U64
+main = runConc (\ () ->
+  let p = async outerVal in
+  runConc (\ () ->
+    let q = async innerVal in
+    await p))

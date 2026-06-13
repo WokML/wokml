@@ -9,6 +9,9 @@ module Wok.Interp.Value
   , kontDepth
   , Config (..)
   , Step (..)
+  , IdSupply
+  , idRegionBound
+  , maxIdRegion
   , Prim (..)
   , PrimResult (..)
   , PrimTable
@@ -125,6 +128,25 @@ data Config
 
 -- | One step result.
 data Step = More Config | Done Value
+
+-- | Program-wide fresh-id supply for Conc handle ids, threaded through the
+-- machine so nested driveConc instances mint disjoint ids. Integer (not Word64)
+-- to match LInt; ids stay below 2^64 via the per-entry region scheme.
+type IdSupply = Integer
+
+-- | Size of one interpreter-entry id region (main, each forced CAF). Handle
+-- id = regionIndex * idRegionBound + localCounter. 16 region bits / 48
+-- counter bits inside the wok-visible U64.
+idRegionBound :: Integer
+idRegionBound = 2 ^ (48 :: Int)
+
+-- | Largest region index whose handles still fit in U64. A handle in region r
+-- tops out at @r * idRegionBound + (idRegionBound - 1)@, so r must not exceed
+-- @(2^64 - 1) `div` idRegionBound@. Region 0 is main; CAFs take 1..maxIdRegion,
+-- so this also bounds the number of top-level constants. Derived from
+-- 'idRegionBound' so the two halves of the bit layout cannot silently desync.
+maxIdRegion :: Integer
+maxIdRegion = (2 ^ (64 :: Int) - 1) `div` idRegionBound
 
 data RuntimeError
   = UnboundVar Text

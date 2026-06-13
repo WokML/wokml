@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Door 2 (sequential escape, NO nesting): a promise returned out of one
+-- runConc and awaited inside a later sibling that has minted its own
+-- same-numbered promise. Today this silently returns the sibling's 7 instead
+-- of 42. After the fix it is a runtime error.
+
+fortyTwo : () -> U64 with Conc
+fortyTwo u = 42
+
+seven : () -> U64 with Conc
+seven u = 7
+
+main : U64
+main =
+  let p = runConc (\ () -> async fortyTwo) in
+  runConc (\ () -> let q = async seven in await p)

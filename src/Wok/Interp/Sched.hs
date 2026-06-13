@@ -8,16 +8,19 @@ import qualified Data.Text as Tx
 
 import Wok.IR.Anf (Lit (..))
 import Wok.Interp.Value
-  ( Config, Kont (..), PrimTable, RuntimeError (..), Value (..), renderValue )
+  ( Config, IdSupply, idRegionBound, Kont (..), PrimTable, RuntimeError (..), Value (..), renderValue )
 
 -- | Re-enter a coro carrier (a VCont) or apply a starter thunk, producing the
 -- next machine 'Config'. Supplied by "Wok.Interp.Machine" to avoid an
--- import cycle (Machine already imports this module).
-type Enter = PrimTable -> Value -> [Value] -> Kont -> Either RuntimeError Config
+-- import cycle (Machine already imports this module). The 'IdSupply' rides
+-- alongside: a nested 'driveConc' reachable through 'enter' advances it and
+-- returns the advanced supply so callers always see the post-drive supply.
+type Enter = PrimTable -> IdSupply -> Value -> [Value] -> Kont -> Either RuntimeError (Config, IdSupply)
 
 -- | Run a 'Config' to its final 'Value' (i.e. to a `Done`). Supplied by
--- "Wok.Interp.Machine".
-type Run = PrimTable -> Config -> Either RuntimeError Value
+-- "Wok.Interp.Machine". The 'IdSupply' threads through so that handle ids
+-- minted by any nested 'driveConc' reached during the run are globally unique.
+type Run = PrimTable -> IdSupply -> Config -> Either RuntimeError (Value, IdSupply)
 
 -- | Drive a Conc root to its result with a deterministic, single-threaded,
 -- FIFO cooperative scheduler. The last argument is a `start`-wrapped STARTER
@@ -43,23 +46,42 @@ type Run = PrimTable -> Config -> Either RuntimeError Value
 --       resume value = VCon "Transport" [v]
 --     yield ignores it -> Transport unit; spawn does recallId -> Transport (LInt fid);
 --     async does recallId -> Transport (LInt pid); await does recall -> Transport v.
-driveConc :: Enter -> Run -> PrimTable -> Value -> Either RuntimeError Value
-driveConc enterF runF prims rootStarter = do
-  rootStep <- startCoro rootStarter
-  st0 <- processStep Root rootStep (Sched 0 Seq.empty Map.empty Map.empty Nothing)
+--
+-- Id supply contract: 'driveConc' seeds 'schNextId' from the incoming supply
+-- and returns the result paired with the next-free supply (the post-consumption
+-- counter), so nested drives (reached through child starts as well as resumes)
+-- mint globally disjoint ids.
+driveConc :: Enter -> Run -> PrimTable -> IdSupply -> Value -> Either RuntimeError (Value, IdSupply)
+driveConc enterF runF prims sup0 rootStarter = do
+  (rootStep, sup1) <- startCoro sup0 rootStarter
+  st0 <- processStep Root rootStep (Sched sup1 Seq.empty Map.empty Map.empty Nothing)
   loop st0
   where
     -- Start a coro from a starter thunk: apply it to unit under a fresh KDone,
     -- run to Done; the result is the first `Step` Value.
-    startCoro :: Value -> Either RuntimeError Value
-    startCoro starter = enterF prims starter [VLit LUnit] KDone >>= runF prims
+    startCoro :: IdSupply -> Value -> Either RuntimeError (Value, IdSupply)
+    startCoro sup starter = do
+      (cfg, sup1) <- enterF prims sup starter [VLit LUnit] KDone
+      runF prims sup1 cfg
 
     -- Resume a parked carrier with a resume value under a fresh KDone; run to
     -- Done; the result is the next `Step` Value. The carrier (a VCont) re-installs
     -- its Coro handler on re-entry, so the produced value is again a `Step`.
-    resumeCoro :: Value -> Value -> Either RuntimeError Value
-    resumeCoro carrier resumeVal =
-      enterF prims carrier [resumeVal] KDone >>= runF prims
+    resumeCoro :: IdSupply -> Value -> Value -> Either RuntimeError (Value, IdSupply)
+    resumeCoro sup carrier resumeVal = do
+      (cfg, sup1) <- enterF prims sup carrier [resumeVal] KDone
+      runF prims sup1 cfg
+
+    -- | Mint a fresh handle id. Refuses to wrap into the next entry's region
+    -- (2^48 - 1 ids mintable per interpreter entry — the region's last id is
+    -- sacrificed as the wrap sentinel; unreachable in practice, loud if reached).
+    mint :: Sched -> Either RuntimeError (Integer, Sched)
+    mint st =
+      let i    = schNextId st
+          next = i + 1
+      in if next `mod` idRegionBound == 0
+           then Left (PrimError (Tx.pack "conc: handle id space exhausted for this interpreter entry"))
+           else Right (i, st { schNextId = next })
 
     -- Fold a single Step into scheduler state.
     --
@@ -80,7 +102,7 @@ driveConc enterF runF prims rootStarter = do
     processStep owner step st = case step of
       VCon t [r] | t == completedTag ->
         case owner of
-          Root         -> Right st { schResult = Just r }
+          Root         -> Right (st { schResult = Just r })
           Detached     -> Right st
           Fulfils pid  -> fulfil pid r st
       VCon t [reqVal, carrier] | t == suspendedTag ->
@@ -89,22 +111,22 @@ driveConc enterF runF prims rootStarter = do
             -- Park; resume later with unit (yield ignores its resume value).
             Right (enqueue owner (transport (VLit LUnit)) carrier st)
           VCon rt [starterT] | rt == reqSpawnTag -> do
-            let fid = schNextId st
-                st1 = st { schNextId = fid + 1 }
+            (fid, st1) <- mint st
             childStarter <- unTransport starterT
-            childStep <- startCoro childStarter
+            (childStep, supAfterChild) <- startCoro (schNextId st1) childStarter
             -- Fire-and-forget: the child is Detached (its Completed is dropped).
-            st2 <- processStep Detached childStep st1
+            -- Write supAfterChild back before folding: the child's first segment may nest a runConc.
+            st2 <- processStep Detached childStep st1 { schNextId = supAfterChild }
             -- Resume the spawner with its new fiber id (recallId reads the LInt).
             Right (enqueue owner (transport (VLit (LInt fid))) carrier st2)
           VCon rt [starterT] | rt == reqAsyncTag -> do
-            let pid = schNextId st
-                st1 = st { schNextId = pid + 1
-                         , schCells = Map.insert pid (Pending Seq.empty) (schCells st) }
+            (pid, st1) <- mint st
+            let st1' = st1 { schCells = Map.insert pid (Pending Seq.empty) (schCells st1) }
             childStarter <- unTransport starterT
-            childStep <- startCoro childStarter
+            (childStep, supAfterChild) <- startCoro (schNextId st1') childStarter
             -- The child fulfils promise `pid` when it Completes.
-            st2 <- processStep (Fulfils pid) childStep st1
+            -- Write supAfterChild back before folding: the child's first segment may nest a runConc.
+            st2 <- processStep (Fulfils pid) childStep st1' { schNextId = supAfterChild }
             -- Resume the caller with the promise id (recallId reads the LInt).
             Right (enqueue owner (transport (VLit (LInt pid))) carrier st2)
           VCon rt [VLit (LInt pid)] | rt == reqAwaitTag ->
@@ -114,15 +136,14 @@ driveConc enterF runF prims rootStarter = do
                 Right (enqueue owner (transport v) carrier st)
               Just (Pending ws) ->
                 -- Park the awaiter on the cell; it is woken when `pid` is fulfilled.
-                Right st { schCells = Map.insert pid (Pending (ws |> (owner, carrier))) (schCells st) }
+                Right (st { schCells = Map.insert pid (Pending (ws |> (owner, carrier))) (schCells st) })
               Nothing ->
-                Left (PrimError (Tx.pack "driveConc: await on unknown promise " <> Tx.pack (show pid)))
+                Left (notOwned (Tx.pack "promise") pid)
           VCon rt [] | rt == reqNewChanTag -> do
             -- Allocate an empty channel and hand the caller its id (recallId).
-            let cid = schNextId st
-                st1 = st { schNextId = cid + 1
-                         , schChans = Map.insert cid (ChanState Seq.empty Seq.empty) (schChans st) }
-            Right (enqueue owner (transport (VLit (LInt cid))) carrier st1)
+            (cid, st1) <- mint st
+            let st2 = st1 { schChans = Map.insert cid (ChanState Seq.empty Seq.empty) (schChans st1) }
+            Right (enqueue owner (transport (VLit (LInt cid))) carrier st2)
           VCon rt [VLit (LInt cid), msg] | rt == reqSendTag -> do
             -- `msg` is the Transport-wrapped payload (wok side did `erase v`);
             -- strip the envelope to get the bare value to buffer / deliver.
@@ -145,7 +166,7 @@ driveConc enterF runF prims rootStarter = do
                     let st1 = st { schChans = Map.insert cid (ChanState (buf |> v) waiters) (schChans st) }
                     in Right (enqueue owner (transport (VLit LUnit)) carrier st1)
               Nothing ->
-                Left (PrimError (Tx.pack "driveConc: send on unknown channel " <> Tx.pack (show cid)))
+                Left (notOwned (Tx.pack "channel") cid)
           VCon rt [VLit (LInt cid)] | rt == reqRecvTag ->
             case Map.lookup cid (schChans st) of
               Just (ChanState buf waiters) ->
@@ -156,9 +177,9 @@ driveConc enterF runF prims rootStarter = do
                     in Right (enqueue owner (transport v) carrier st1)
                   -- Empty buffer: park the receiver on the channel (no resume now).
                   EmptyL ->
-                    Right st { schChans = Map.insert cid (ChanState buf (waiters |> (owner, carrier))) (schChans st) }
+                    Right (st { schChans = Map.insert cid (ChanState buf (waiters |> (owner, carrier))) (schChans st) })
               Nothing ->
-                Left (PrimError (Tx.pack "driveConc: recv on unknown channel " <> Tx.pack (show cid)))
+                Left (notOwned (Tx.pack "channel") cid)
           other ->
             Left (PrimError (Tx.pack "driveConc: unsupported request: " <> renderValue other))
       other ->
@@ -197,9 +218,9 @@ driveConc enterF runF prims rootStarter = do
     -- diverging loser cannot hang the program. If the queue empties BEFORE the
     -- root completed (awaiters still parked on unfulfilled cells / channels),
     -- that is a deadlock.
-    loop :: Sched -> Either RuntimeError Value
+    loop :: Sched -> Either RuntimeError (Value, IdSupply)
     loop st = case schResult st of
-      Just r  -> Right r
+      Just r  -> Right (r, schNextId st)
       Nothing -> case Seq.viewl (schReady st) of
         EmptyL
           | any pending (Map.elems (schCells st)) || any blocked (Map.elems (schChans st)) ->
@@ -208,8 +229,8 @@ driveConc enterF runF prims rootStarter = do
               Left (PrimError (Tx.pack "driveConc: ready queue drained before root completed"))
         (owner, resumeVal, carrier) :< rest -> do
           let st' = st { schReady = rest }
-          nextStep <- resumeCoro carrier resumeVal
-          st'' <- processStep owner nextStep st'
+          (nextStep, supAfterResume) <- resumeCoro (schNextId st') carrier resumeVal
+          st'' <- processStep owner nextStep st' { schNextId = supAfterResume }
           loop st''
 
     pending :: Cell -> Bool
@@ -280,6 +301,11 @@ checkNoCont boundary v
 promiseBoundary, chanBoundary :: Tx.Text
 promiseBoundary = Tx.pack "Promise"
 chanBoundary    = Tx.pack "Chan"
+
+-- | Ownership error for a handle that misses this scheduler's maps: minted by
+-- another runConc (foreign/stale) or forged. The text is golden-locked.
+notOwned :: Tx.Text -> Integer -> RuntimeError
+notOwned kind i = PrimError (Tx.pack "conc: " <> kind <> Tx.pack " not owned by this scheduler (created by another runConc, or forged): " <> Tx.pack (show i))
 
 -- | Wrap a value in the Transport envelope the wok side `recall`s.
 transport :: Value -> Value

@@ -122,9 +122,12 @@ extern cancel  : Fiber -> () with Conc
 **Token representation.** Only the *types* are plain `data`; the operations stay
 `extern` prims that build/read these `VCon`s. The `data` constructors are visible, so a
 user could pattern-match `Fiber id` or forge `Fiber 999`. That is harmless: the
-provider already **validates every token** (§6: slot live? generation matches? not
+provider already **validates every token** (slot live? generation matches? not
 already woken/cancelled?) — a forged or stale id is rejected at the boundary, exactly
-as required for untrusted foreign executors. What is lost is *encapsulation*, not
+as required for untrusted foreign executors. (As of 2026-06-13 Provider A actually
+delivers the cross-instance half of this: a handle presented to a scheduler that did
+not mint it is rejected, not silently served — see §11 "Cross-scheduler handle
+identity — RESOLVED".) What is lost is *encapsulation*, not
 *safety*; wok has no module-privacy mechanism anywhere yet (async-spec §11.2), so this
 costs nothing wok does not already lack, and it upgrades for free when privacy lands.
 The phantom `a` on `Promise a`/`Chan a` gives full payload type-safety at the surface
@@ -253,6 +256,14 @@ stored value to its `Promise`/`Chan`, so two handles of different `a` built from
 colliding ids cannot cross-deliver. This is the value-side counterpart to the §6
 id-forging validation: forging is caught at the boundary, and type-correct delivery is
 guaranteed at the boundary — both are provider obligations, not wok-checkable.
+
+> **Update (2026-06-13):** "two handles built from colliding ids" was a real,
+> live gap in Provider A across scheduler instances — handle ids were minted from
+> 0 per `runConc`, so a handle used under another scheduler addressed its
+> same-numbered cell. Now closed: handle ids are globally unique (see §11
+> "Cross-scheduler handle identity — RESOLVED" and
+> `2026-06-13-conc-handle-identity-design.md`), so this obligation is actually
+> delivered, not merely stated.
 
 ---
 
@@ -465,7 +476,7 @@ are the places it shifted. An auditor should check these did not leave residue.
 
 The Provider A interpreter scheduler shipped on `feat/slice-3-conc` (778 green,
 full-branch reviewed). These limitations are accepted for this slice and tracked for
-follow-ups; none is a soundness hole in what ships.
+follow-ups; none is a soundness hole in what ships. One (cross-scheduler handle identity) has since been resolved; see its entry below.
 
 - **Residual non-`Conc` effects in children are not runnable across resume.**
   `driveConc` resumes coroutine segments under a fresh `KDone`, which drops the ambient
@@ -491,12 +502,16 @@ follow-ups; none is a soundness hole in what ships.
   while the root still runs, then are dropped un-resumed once the root completes
   (daemonic, early-return drain; results discarded). Real cancellation needs fiber-id
   tracking + finalizers (`finally`), per §4.5/§4.6.
-- **Nested `runConc` id-space collision.** `Fiber`/`Promise`/`Chan` handles are plain
-  `U64` ids with no scheduler identity. An outer scheduler's handle used under an inner
-  `runConc` silently addresses the *inner* scheduler's same-numbered cell (verified:
-  cross-delivery and wrong-value `await` — no error, wrong answer). Avoid nesting
-  `runConc` until handles carry instance identity (e.g. a scheduler-unique tag checked
-  at request time).
+- **Cross-scheduler handle identity — RESOLVED (2026-06-13).** Handle ids are
+  now globally unique (machine-threaded supply + per-entry CAF regions), and a
+  handle used outside its minting scheduler is a runtime error ("not owned by
+  this scheduler") instead of silently aliasing a same-numbered cell. The
+  original entry covered only nested `runConc`; the fix also closed two doors
+  it missed (a handle escaping `runConc`'s result into a sibling, and a CAF's
+  scheduler colliding with main's). Nesting itself is supported. This makes
+  the §3.4 prim-trust obligation and the §6 validation promise
+  real in Provider A (both were vacuous under colliding ids). Design + rejected
+  alternatives: `2026-06-13-conc-handle-identity-design.md`.
 - **The payload restriction remains bypassable in known ways even after the
   data-con-field fix.** Carriers/closures still cross the *static* check via:
   constructor fields of types only referenced positionally, record-constructor fields

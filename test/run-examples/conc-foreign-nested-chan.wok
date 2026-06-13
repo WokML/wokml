@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Door 1, channel arm: a send on an OUTER channel under an INNER runConc is
+-- silently delivered to the inner scheduler's same-numbered channel, so the
+-- recv on the unrelated inner channel returns 7 (cross-delivery). After the
+-- fix the send is a runtime error (channel not owned by this scheduler).
+
+main : U64
+main = runConc (\ () ->
+  let ch = newChan () in
+  runConc (\ () ->
+    let ch2 = newChan () in
+    let ignored = send ch 7 in
+    recv ch2))
