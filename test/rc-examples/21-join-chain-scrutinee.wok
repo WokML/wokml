@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+
+-- CHAINED-JOINS scrutinee regression (F1): the value-position case has THREE
+-- arms, so the elaborator emits a CHAIN of merge joins (alt -> jump jk -> jump j)
+-- before reaching the join `j` whose continuation `Cell h xs` captures the
+-- SCRUTINEE `xs`. The scrutinee is NOT free in any alt body, and the capturing
+-- join is reached only TRANSITIVELY through the join chain --- so the old
+-- `altJumpTargets` (leading-Let to a single TAIL Jump) missed it, `capturedByJoins`
+-- omitted `xs`, `reused` was False, and `xs` was __rc_drop-ped at the alt entry
+-- while the join body still uses it (use-after-free / balance over-consume). With
+-- the complete reuse detection (all transitively reachable joins captured) the
+-- scrutinee stays live and is consumed at its real last use in the join body.
+data Cell = Cell U64 [U64]
+
+headCons : [U64] -> Cell
+headCons xs =
+  let h = case xs of
+            []          -> 0
+            y :: []     -> y
+            y :: _ :: _ -> y
+  in Cell h xs
+
+main = headCons [1, 2, 3]

@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- SCRUTINEE-IN-CAP regression: the value-position case elaborates to a merge
+-- join whose continuation `Cell h xs` captures the SCRUTINEE `xs` (the join cap
+-- contains xs). The scrutinee is NOT free in any alt body (the alts return 0 / y),
+-- so the old `reused` test missed it and dropped `xs` at the alt entry --- a
+-- use-after-free / balance over-consume. With the fix the scrutinee is kept live
+-- (it is captured by the jumped-to join) and consumed at its real last use in the
+-- join body, so the balance lint must hold (==[]).
+data Cell = Cell U64 [U64]
+
+headCons : [U64] -> Cell
+headCons xs =
+  let h = case xs of
+            []     -> 0
+            y :: _ -> y
+  in Cell h xs
+
+main = headCons [1, 2]

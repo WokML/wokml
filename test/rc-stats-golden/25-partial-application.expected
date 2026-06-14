@@ -1,0 +1,4 @@
+allocs   = 7
+frees    = 7
+peakLive = 5
+baseline = 0

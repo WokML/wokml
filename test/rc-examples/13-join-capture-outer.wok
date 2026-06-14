@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- NON-EMPTY-cap happy path: the value-position case elaborates to a merge join
+-- whose continuation `Cell h tag` captures the OUTER owned var `tag` (the join
+-- cap contains tag, NOT the scrutinee xs). The scrutinee is dropped on the empty
+-- branch and moved into the join on the cons branch; `tag` is reserved for the
+-- join body. The balance lint must hold (==[]).
+data Cell = Cell U64 [U64]
+
+prependHead : [U64] -> [U64] -> Cell
+prependHead tag xs =
+  let h = case xs of
+            []     -> 0
+            y :: _ -> y
+  in Cell h tag
+
+main = prependHead [9] [1, 2]

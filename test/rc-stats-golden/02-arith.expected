@@ -1,0 +1,4 @@
+allocs   = 0
+frees    = 0
+peakLive = 0
+baseline = 0

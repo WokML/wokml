@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+-- SHARED-BOOL regression (F3): a boxed Bool bound to `b` is used TWICE (both
+-- operands of `&&`), so the Perceus pass must DUP it on the first use and let
+-- both uses be moves the prim consumes. Before the fix Bool was treated as
+-- unboxed, so the pass inserted no dup; the boolOp prim then dropped a cell that
+-- was shared, producing a use-after-free / unbalanced heap. With the fix `b` is
+-- dup'd once and both operand cells are consumed, so the heap empties.
+useTwice : Bool -> Bool
+useTwice b = b && b
+
+main = useTwice (eqU64 1 1)

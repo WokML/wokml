@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+-- A case in value (let-bound) position elaborates to a merge join whose body is
+-- the continuation. Here the join body uses only its (unboxed) parameter, so the
+-- join captures no owned outer var: the boxed scrutinee `xs` is the case parent,
+-- dropped on the empty branch and reused (moved into the join) on the cons branch.
+firstOr : [U64] -> U64 -> U64
+firstOr xs d =
+  let h = case xs of
+            []     -> d
+            y :: _ -> y
+  in h + 1
+
+main = firstOr [7, 8] 0

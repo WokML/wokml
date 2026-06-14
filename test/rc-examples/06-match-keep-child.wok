@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+-- own-children / drop-parent: the Some branch KEEPS the boxed child `xs`
+-- (it is dup'd and returned); the parent option shell is dropped at the match.
+-- The None branch consumes the boxed default `d` instead, so both alts consume
+-- the same outer owned set {d}.
+unwrapOr : Option [U64] -> [U64] -> [U64]
+unwrapOr o d = case o of
+  Some xs -> xs
+  None    -> d
+
+main = unwrapOr (Some [1, 2]) [9]

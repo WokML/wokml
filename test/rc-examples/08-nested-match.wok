@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+
+data Tree = Leaf U64 | Node Tree Tree
+
+-- nested match / own-children chain: the `Node` alt keeps BOTH boxed children
+-- `l` and `r` (each dup'd, then consumed by the recursive calls), and drops the
+-- parent `Node` shell at the match. The `Leaf` alt has only an unboxed child, so
+-- it just drops the parent. The recursion is a self-reference to the (RC-exempt)
+-- global `sumTree`, so it never produces a counted edge.
+sumTree : Tree -> U64
+sumTree t = case t of
+  Leaf n   -> n
+  Node l r -> sumTree l + sumTree r
+
+main = sumTree (Node (Leaf 1) (Node (Leaf 2) (Leaf 3)))

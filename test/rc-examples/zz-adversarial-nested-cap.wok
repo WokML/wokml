@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+data Cell = Cell U64 [U64] [U64]
+
+-- Two outer captured vars (a, b). Nested value-position cases so intermediate
+-- joins exist; try to get distinct downstream joins capturing a vs b.
+build : [U64] -> [U64] -> [U64] -> Cell
+build a b xs =
+  let h =
+        case xs of
+          []     -> let g = case b of
+                              []     -> 0
+                              p :: _ -> p
+                    in g
+          y :: _ -> let g = case a of
+                              []     -> y
+                              q :: _ -> y + q
+                    in g
+  in Cell h a b
+
+main = build [5] [6] [1, 2]

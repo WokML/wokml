@@ -1,0 +1,38 @@
+module Main
+import Std.Base
+
+-- Partial application leak (F4 regression). A top-level multi-clause function
+-- applied to FEWER arguments than its arity is a covered 'RApp' (no 'RLam'
+-- appears, so the M1 first-order guard admits it), but each partial application
+-- allocates a fresh DYNAMIC closure cell on the RC store (the LT branch of
+-- 'enterRC' in "Wok.Interp.RC.Machine"). The Perceus pass treats the head of an
+-- 'RApp' as a MOVE (it emits no caller 'drop'), expecting the application to
+-- consume the closure's single reference; before the fix 'enterRC' never dropped
+-- the consumed closure cell, leaking every partial. The oracle that catches it is
+-- Suite B's heap-accounting invariant (stLive must return to the baseline 0).
+--
+-- 'add3' here exercises the LITERAL-capture chain (two partials: 'add3 1', then
+-- '(add3 1) 2'); 'addLen' exercises a BOXED capture (the partial closes over the
+-- list 'ys'), so the fix's incref-of-captures / drop-of-original discipline is
+-- checked for double-free as well as for the leak.
+data List = Nil | Cons U64 List
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil      -> 0
+  Cons h t -> h + sumList t
+
+add3 : U64 -> U64 -> U64 -> U64
+add3 a b c = a + b + c
+
+addLen : List -> U64 -> U64
+addLen xs n = n + sumList xs
+
+main =
+  let f = add3 1 in
+  let g = f 2 in
+  let r1 = g 3 in
+  let ys = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let h = addLen ys in
+  let r2 = h 10 in
+  r1 + r2

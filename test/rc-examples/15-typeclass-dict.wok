@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+
+-- Typeclass / instance-dictionary baseline (Suite B, Task 9). A user class with
+-- a single method elaborates to a dictionary record constructor; the instance
+-- desugars to a dict CAF `dict$Describe$Shape = Describe$Dict(<method-closure>)`.
+-- That CAF is an IMMORTAL GLOBAL: `runModuleRC` forces it once at load time and
+-- its allocated record lives for the module's lifetime, so it counts toward the
+-- baseline (baseline == 1), NOT toward a leak. `main` resolves `size` through the
+-- dict (a boxed method closure applied at the call head), so the program runs on
+-- the RC store as a first-order, no-handler program whose only persistent heap
+-- cell is the dictionary. The heap-empty oracle therefore asserts the BASELINE
+-- invariant: stLive == baseline (== 1) and allocs - frees == baseline, i.e.
+-- main's dynamic Circle shell is fully reclaimed on top of the immortal dict.
+class Describe a where
+  size : a -> U64
+
+data Shape = Circle U64 | Square U64
+
+instance Describe Shape where
+  size s = case s of
+    Circle r -> r
+    Square w -> w
+
+main = size (Circle 7)

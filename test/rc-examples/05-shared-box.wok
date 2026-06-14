@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+
+dupPair : [U64] -> ([U64], [U64])
+dupPair xs = (xs, xs)
+
+main = dupPair [1, 2]

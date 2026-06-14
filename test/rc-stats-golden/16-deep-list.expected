@@ -1,0 +1,4 @@
+allocs   = 9
+frees    = 9
+peakLive = 9
+baseline = 0

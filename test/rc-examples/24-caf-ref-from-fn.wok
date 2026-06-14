@@ -1,0 +1,31 @@
+module Main
+import Std.Base
+
+-- Value-CAF referenced from an arity>0 function (F2 regression). 'theList' is a
+-- 0-arity top-level bind whose body is a boxed value (a Cons spine); it is forced
+-- once at load time and lives for the module's lifetime (an immortal value-CAF,
+-- counted in the baseline). 'useList' is an arity>0 function whose body
+-- DEREFERENCES that CAF. The bug: 'reserveStatic' reserves a static placeholder
+-- cell per bind and closures capture the knotted env mapping each CAF's Unique to
+-- its reserved static address; the CAF (otherwise) branch of 'installBinds' only
+-- refined the accumulator env with the forced result and NEVER wrote it back into
+-- the reserved static cell. A function closure captures the UNREFINED knotEnv, so
+-- 'useList' dereferences the never-overwritten placeholder NCon
+-- "<uninstalled-global>" --- crashing with NonExhaustiveCase (sumList's case has
+-- no arm for the placeholder constructor) or yielding a silently wrong value. The
+-- fix writes the forced CAF result back into the reserved static cell so every
+-- captor (incl. forward-referencing function closures) resolves the real value.
+data List = Nil | Cons U64 List
+
+theList : List
+theList = Cons 1 (Cons 2 Nil)
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil       -> 0
+  Cons h t  -> h + sumList t
+
+useList : U64 -> U64
+useList n = sumList theList
+
+main = useList 10

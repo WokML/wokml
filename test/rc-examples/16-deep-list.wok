@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+
+-- Deep-list / recursive-drop at scale (Suite E, Task 11). We use an explicit
+-- 'List' type (rather than the built-in '[a]', whose '::' is pattern-only) so a
+-- spine of length n is exactly n 'Cons' shells terminating in one 'Nil' --- a
+-- predictable n + 1 boxed cells. 'build n' allocates that fresh spine and
+-- 'sumList' then consumes it cell-by-cell, so by exit every one of the n + 1
+-- cells has been reclaimed. This exercises the iterative (worklist) drop of the
+-- RC store through the WHOLE pipeline --- elaborate -> Perceus insertRC ->
+-- runModuleRC --- not just the Store-level unit test, and a dedicated harness
+-- pins frees == n + 1. 'build' and 'sumList' recurse via their own RC-exempt
+-- global names, so no counted back-edge ever forms.
+data List = Nil | Cons U64 List
+
+build : U64 -> List
+build n = case n of
+  0 -> Nil
+  _ -> Cons n (build (n - 1))
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil       -> 0
+  Cons y ys -> y + sumList ys
+
+main = sumList (build 8)

@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+data Point = Point { x : U64, y : U64 }
+
+sumXY : Point -> U64
+sumXY p = p.x + p.y
+
+main = sumXY (Point { x = 3, y = 4 })

@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+
+-- F5 regression: a LetRec body that RETURNS a group member.
+--
+-- `mk` builds a recursive closure `f` (a LetRec uncounted-region member) and
+-- returns it. The returned member transfers ownership to the caller, so it must
+-- NOT be dropped before the `Ret`, even though it is a ctxExempt group sibling.
+-- Before the fix the Ret rule put the returned member in `dead` (exempt vars are
+-- excluded from `moved`), emitting `__rc_drop(f)` before returning the freed
+-- handle -> the caller then receives a dead handle and double-frees / hits a
+-- use-after-free.
+--
+-- `main` takes ownership of the returned closure and lets it die WITHOUT applying
+-- it (applying a closure does not free its cell in M1 -- that is the deferred
+-- closure-RC frontier). The caller's drop is the second consume of the very
+-- handle `mk` returns: before the fix `mk` already freed it, so this is a UAF /
+-- double-free; after the fix `mk` hands back a live cell and the caller's single
+-- drop reclaims it, leaving the heap empty.
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in f
+
+main =
+  let g = mk 7
+  in 0

@@ -1,0 +1,468 @@
+main =
+  let t.1 = Circle(7)
+  case dict$Describe$Shape of
+    Describe$Dict f ->
+      let _dup = __rc_dup(f)
+      let t.2 = f(t.1)
+      t.2
+
+dict$Describe$Shape$m0 s =
+  case s of
+    Circle r ->
+      let _drop.1 = __rc_drop(s)
+      r
+    Square w ->
+      let _drop.2 = __rc_drop(s)
+      w
+
+dict$Describe$Shape =
+  let t = Describe$Dict(dict$Describe$Shape$m0)
+  t
+
+id x =
+  x
+
+const x y =
+  let _drop = __rc_drop(y)
+  x
+
+not x =
+  case x of
+    True ->
+      let _drop.1 = __rc_drop(x)
+      let t.1 = False
+      t.1
+    False ->
+      let _drop.2 = __rc_drop(x)
+      let t.2 = True
+      t.2
+
+dict$Eq$U64$m0 =
+  eqU64
+
+dict$Eq$U64$m1 x y =
+  let t.1 = dict$Eq$U64$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$U64 =
+  let t = Eq$Dict(dict$Eq$U64$m0, dict$Eq$U64$m1)
+  t
+
+dict$Eq$U32$m0 =
+  eqU32
+
+dict$Eq$U32$m1 x y =
+  let t.1 = dict$Eq$U32$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$U32 =
+  let t = Eq$Dict(dict$Eq$U32$m0, dict$Eq$U32$m1)
+  t
+
+dict$Eq$Option$m0 d$Eq$0 x y =
+  case x of
+    None ->
+      let _drop.1 = __rc_drop(x)
+      case y of
+        None ->
+          let _drop.2 = __rc_drop(y)
+          let t.1 = True
+          let _drop.3 = __rc_drop(d$Eq$0)
+          t.1
+        Some _ ->
+          let _drop.4 = __rc_drop(y)
+          let t.2 = False
+          let _drop.5 = __rc_drop(d$Eq$0)
+          t.2
+    Some a ->
+      let _dup.1 = __rc_dup(a)
+      let _drop.6 = __rc_drop(x)
+      case y of
+        None ->
+          let _drop.7 = __rc_drop(y)
+          let t.3 = False
+          let _drop.8 = __rc_drop(d$Eq$0)
+          let _drop.9 = __rc_drop(a)
+          t.3
+        Some b ->
+          let _dup.2 = __rc_dup(b)
+          let _drop.10 = __rc_drop(y)
+          case d$Eq$0 of
+            Eq$Dict f.1 f.2 ->
+              let _dup.3 = __rc_dup(f.1)
+              let _drop.11 = __rc_drop(d$Eq$0)
+              let t.4 = f.1(a, b)
+              t.4
+
+dict$Eq$Option$m1 d$Eq$0 x y =
+  let t.1 = dict$Eq$Option$m0(d$Eq$0, x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$Option d$Eq$0 =
+  let _dup = __rc_dup(d$Eq$0)
+  let t.1 = dict$Eq$Option$m0(d$Eq$0)
+  let t.2 = dict$Eq$Option$m1(d$Eq$0)
+  let t.3 = Eq$Dict(t.1, t.2)
+  t.3
+
+reader e c =
+  let t = c(self)
+  t
+  with self = {
+    return v -> v
+    Reader.ask(resume) ->
+      let res = resume(e)
+      res
+  }
+
+state i c =
+  let s = i
+  let t.1 = c(self)
+  t.1
+  with self = {
+    return v ->
+      let t.3 = Tuple2(v, s)
+      t.3
+    State.get(resume.1) ->
+      let res = resume.1(s, s)
+      res
+    State.set(x, resume.2) ->
+      let t.2 = resume.2(x, ())
+      t.2
+  }
+
+writer c =
+  let t.5 = Nil
+  let log = t.5
+  let t.1 = c(self)
+  t.1
+  with self = {
+    return v ->
+      let t.4 = Tuple2(v, log)
+      t.4
+    Writer.tell(w, resume) ->
+      let t.2 = ++(log, w)
+      let t.3 = resume(t.2, ())
+      t.3
+  }
+
+except c =
+  let t.1 = c(self)
+  t.1
+  with self = {
+    return v ->
+      let t.3 = Ok(v)
+      t.3
+    Except.throw(e, resume) ->
+      let t.2 = Err(e)
+      t.2
+  }
+
+start c =
+  let t.1 = c(())
+  t.1
+  with {
+    return v ->
+      let t.3 = __coro_done(v)
+      t.3
+    Coro.suspend(x, resume) ->
+      let t.2 = __coro_susp(x, resume)
+      t.2
+  }
+
+step s v =
+  let t = __coro_resume(s, v)
+  t
+
+run s v =
+  let t.1 = __coro_resume(s, v)
+  let t.2 = __coro_unwrap(t.1)
+  t.2
+
+cancel s =
+  let t = __coro_cancel(s)
+  t
+
+drainOne s =
+  case s of
+    Completed r ->
+      let _dup.1 = __rc_dup(r)
+      let _drop.1 = __rc_drop(s)
+      r
+    Suspended _ g ->
+      let _dup.2 = __rc_dup(g)
+      let _drop.2 = __rc_drop(s)
+      let t.1 = step(g, ())
+      let t.2 = drainOne(t.1)
+      t.2
+
+parBoth sa sb =
+  case sa of
+    Completed ra ->
+      let _dup.1 = __rc_dup(ra)
+      let _drop.1 = __rc_drop(sa)
+      case sb of
+        Completed rb.1 ->
+          let _dup.2 = __rc_dup(rb.1)
+          let _drop.2 = __rc_drop(sb)
+          let t.1 = Tuple2(ra, rb.1)
+          t.1
+        Suspended _.1 gb.1 ->
+          let _dup.3 = __rc_dup(gb.1)
+          let _drop.3 = __rc_drop(sb)
+          let t.2 = step(gb.1, ())
+          let t.3 = drainOne(t.2)
+          let t.4 = Tuple2(ra, t.3)
+          t.4
+    Suspended _.2 ga ->
+      let _dup.4 = __rc_dup(ga)
+      let _drop.4 = __rc_drop(sa)
+      case sb of
+        Completed rb.2 ->
+          let _dup.5 = __rc_dup(rb.2)
+          let _drop.5 = __rc_drop(sb)
+          let t.5 = step(ga, ())
+          let t.6 = drainOne(t.5)
+          let t.7 = Tuple2(t.6, rb.2)
+          t.7
+        Suspended _.3 gb.2 ->
+          let _dup.6 = __rc_dup(gb.2)
+          let _drop.6 = __rc_drop(sb)
+          let t.10 = step(ga, ())
+          let sa2 = t.10
+          let t.9 = step(gb.2, ())
+          let sb2 = t.9
+          let t.8 = parBoth(sa2, sb2)
+          t.8
+
+asCoro c _.1 =
+  let t.1 = c(())
+  t.1
+  with {
+    return v -> v
+    Async.yield(_.2, resume) ->
+      let t.2 = Coro.suspend(())
+      let t.3 = resume(t.2)
+      t.3
+  }
+
+par a b =
+  let t.1 = asCoro(a)
+  let t.2 = start(t.1)
+  let t.3 = asCoro(b)
+  let t.4 = start(t.3)
+  let t.5 = parBoth(t.2, t.4)
+  t.5
+
+runRace sa sb =
+  case sa of
+    Completed ra ->
+      let _dup.1 = __rc_dup(ra)
+      let _drop.1 = __rc_drop(sa)
+      case sb of
+        Completed rb.1 ->
+          let _drop.2 = __rc_drop(sb)
+          ra
+        Suspended _.1 gb.1 ->
+          let _drop.3 = __rc_drop(sb)
+          ra
+    Suspended _.2 ga ->
+      let _dup.2 = __rc_dup(ga)
+      let _drop.4 = __rc_drop(sa)
+      case sb of
+        Completed rb.2 ->
+          let _dup.3 = __rc_dup(rb.2)
+          let _drop.5 = __rc_drop(sb)
+          let _drop.6 = __rc_drop(ga)
+          rb.2
+        Suspended _.3 gb.2 ->
+          let _dup.4 = __rc_dup(gb.2)
+          let _drop.7 = __rc_drop(sb)
+          let t.3 = step(ga, ())
+          let sa2 = t.3
+          let t.2 = step(gb.2, ())
+          let sb2 = t.2
+          let t.1 = runRace(sa2, sb2)
+          t.1
+
+race a b =
+  let t.1 = asCoro(a)
+  let t.2 = start(t.1)
+  let t.3 = asCoro(b)
+  let t.4 = start(t.3)
+  let t.5 = runRace(t.2, t.4)
+  t.5
+
+erase v =
+  let t.1 = __coerce(v)
+  let t.2 = Transport(t.1)
+  t.2
+
+recall t.1 =
+  case t.1 of
+    Transport n ->
+      let _drop = __rc_drop(t.1)
+      let t.2 = __coerce(n)
+      t.2
+
+recallId t.1 =
+  let t.2 = recall(t.1)
+  t.2
+
+asConc c _ =
+  let t.1 = c(())
+  t.1
+  with {
+    return v -> v
+    Conc.req(r, resume) ->
+      let t.2 = Coro.suspend(r)
+      let t.3 = resume(t.2)
+      t.3
+  }
+
+runConc c =
+  let t.3 = \_ -> let t.1 = asConc(c)
+  let t.2 = start(t.1)
+  t.2
+  let t.4 = __drive_conc(t.3)
+  t.4
+
+yield u =
+  let t.1 = ReqYield
+  let t.2 = Conc.req(t.1)
+  let r = t.2
+  ()
+
+spawn f =
+  let t.3 = \_ -> let t.1 = asConc(f)
+  let t.2 = start(t.1)
+  t.2
+  let t.4 = erase(t.3)
+  let t.5 = ReqSpawn(t.4)
+  let t.6 = Conc.req(t.5)
+  let t.7 = recallId(t.6)
+  let t.8 = Fiber(t.7)
+  t.8
+
+async f =
+  let t.6 = \_.1 -> let t.3 = \_.2 -> let t.1 = f(())
+  let t.2 = erase(t.1)
+  t.2
+  let t.4 = asConc(t.3)
+  let t.5 = start(t.4)
+  t.5
+  let t.7 = erase(t.6)
+  let t.8 = ReqAsync(t.7)
+  let t.9 = Conc.req(t.8)
+  let t.10 = recallId(t.9)
+  let t.11 = Promise(t.10)
+  t.11
+
+await p =
+  let t.1 = promiseId(p)
+  let t.2 = ReqAwait(t.1)
+  let t.3 = Conc.req(t.2)
+  let t.4 = recall(t.3)
+  t.4
+
+newChan u =
+  let t.1 = ReqNewChan
+  let t.2 = Conc.req(t.1)
+  let t.3 = recallId(t.2)
+  let t.4 = Chan(t.3)
+  t.4
+
+send c v =
+  let t.1 = chanId(c)
+  let t.2 = erase(v)
+  let t.3 = ReqSend(t.1, t.2)
+  let t.4 = Conc.req(t.3)
+  let r = t.4
+  ()
+
+recv c =
+  let t.1 = chanId(c)
+  let t.2 = ReqRecv(t.1)
+  let t.3 = Conc.req(t.2)
+  let t.4 = recall(t.3)
+  t.4
+
+promiseId p =
+  case p of
+    Promise n ->
+      let _drop = __rc_drop(p)
+      n
+
+chanId c =
+  case c of
+    Chan n ->
+      let _drop = __rc_drop(c)
+      n
+
+parAll fs =
+  let t.1 = mapAsync(fs)
+  let t.2 = mapAwait(t.1)
+  t.2
+
+mapAsync fs =
+  case fs of
+    Nil ->
+      let _drop.1 = __rc_drop(fs)
+      let t.1 = Nil
+      t.1
+    Cons g gs ->
+      let _dup.1 = __rc_dup(g)
+      let _dup.2 = __rc_dup(gs)
+      let _drop.2 = __rc_drop(fs)
+      let t.2 = async(g)
+      let t.3 = Nil
+      let t.4 = Cons(t.2, t.3)
+      let t.5 = mapAsync(gs)
+      let t.6 = ++(t.4, t.5)
+      t.6
+
+mapAwait ps =
+  case ps of
+    Nil ->
+      let _drop.1 = __rc_drop(ps)
+      let t.1 = Nil
+      t.1
+    Cons p qs ->
+      let _dup.1 = __rc_dup(p)
+      let _dup.2 = __rc_dup(qs)
+      let _drop.2 = __rc_drop(ps)
+      let t.2 = await(p)
+      let t.3 = Nil
+      let t.4 = Cons(t.2, t.3)
+      let t.5 = mapAwait(qs)
+      let t.6 = ++(t.4, t.5)
+      t.6
+
+raceAny fs =
+  let t.3 = newChan(())
+  let ch = t.3
+  let _dup = __rc_dup(ch)
+  let t.2 = raceSpawn(ch, fs)
+  let started = t.2
+  let _drop = __rc_drop(started)
+  let t.1 = recv(ch)
+  t.1
+
+raceSpawn ch fs =
+  case fs of
+    Nil ->
+      let t.1 = Nil
+      t.1
+    Cons f gs ->
+      let t.4 = \_ -> let t.2 = f(())
+      let t.3 = send(ch, t.2)
+      t.3
+      let t.5 = spawn(t.4)
+      let t.6 = Nil
+      let t.7 = Cons(t.5, t.6)
+      let t.8 = raceSpawn(ch, gs)
+      let t.9 = ++(t.7, t.8)
+      t.9

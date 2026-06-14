@@ -96,11 +96,16 @@ library
         Wok.IR.Elaborate
         Wok.IR.Match
         Wok.IR.Multiplicity
+        Wok.IR.Perceus
+        Wok.IR.Reachable
         Wok.Interp
         Wok.Interp.Value
         Wok.Interp.Prim
         Wok.Interp.Sched
         Wok.Interp.Machine
+        Wok.Interp.RC.Value
+        Wok.Interp.RC.Prim
+        Wok.Interp.RC.Machine
     autogen-modules:
         Paths_wok
     other-modules:
@@ -136,6 +141,8 @@ test-suite wok-tests
         tasty,
         tasty-golden,
         tasty-hunit,
+        tasty-quickcheck,
+        QuickCheck,
         bytestring,
         containers,
         filepath,

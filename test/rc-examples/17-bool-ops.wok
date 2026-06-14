@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+
+-- Boolean prims (&&, ||) over dynamically-allocated boxed Bools. Bool is the
+-- nullary constructor True/False, so every `True`/`False` here allocates a fresh
+-- heap cell (RVBox). The Perceus pass moves these owned operand cells INTO the
+-- boolOp prim, which must DROP both operands while allocating its fresh result.
+-- Without that drop the operand cells leak (Suite B: stLive > baseline). Two
+-- nested ops chain a freshly-allocated result back into a second op, so both the
+-- literal operands and the intermediate result are exercised as owned moves.
+main = (True && False) || True

@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+-- CASE-ON-BOOL regression (F3): `eqU64 1 1` allocates a boxed Bool (RVBox of
+-- NCon True/False) that is the scrutinee of a `case`. The RC interpreter ALWAYS
+-- heap-allocates Bool, so the pass MUST own/drop the Bool scrutinee shell after
+-- the match. Before the fix, `isBoxedType` reported Bool as unboxed, so the pass
+-- never parent-dropped the scrutinee and the cell leaked (Suite B: stLive >
+-- baseline). With the fix the scrutinee shell is dropped and the heap empties.
+main = case eqU64 1 1 of
+  True  -> 0
+  False -> 1

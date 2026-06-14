@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+
+data Choice = UseList [U64] | UseDefault
+
+-- conditional consume / drop-on-the-dead-branch: in `UseList`, the owned
+-- default `d` is DEAD (never used) so it is dropped at that alt's entry; the
+-- kept child `xs` is dup'd and returned, and the parent `c` shell is dropped.
+-- In `UseDefault`, `d` is moved out and the parent `c` is dropped. Both alts
+-- consume the same outer owned set {c, d}.
+pick : Choice -> [U64] -> [U64]
+pick c d = case c of
+  UseList xs -> xs
+  UseDefault -> d
+
+main = pick UseDefault [1, 2]

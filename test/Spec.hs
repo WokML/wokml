@@ -4,6 +4,10 @@ module Main where
 import Test.Tasty
 import Test.Tasty.Golden (goldenVsString, findByExtension)
 import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck (testProperty, QuickCheckTests (..))
+import Test.QuickCheck
+  ( Gen, Property, forAllShrink, counterexample, choose, elements, sized )
+import Control.Monad.State.Strict (StateT, runStateT, state, lift)
 
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Map.Strict as Map
@@ -32,15 +36,22 @@ import qualified Wok.SourceOrigin as SO
 import qualified Wok.Prelude as Prelude
 import qualified Wok.Loader as Loader
 import qualified Wok.Pipeline as Pipeline
-import Wok.IR.Name (Unique (..), Name (..), JoinId (..), runFresh, freshUnique, freshName, freshJoin)
+import Wok.IR.Name (Unique (..), Name (..), JoinId (..), Fresh, runFresh, freshUnique, freshName, freshJoin)
 import qualified Wok.IR.Anf as Anf
 import Wok.IR.Elaborate (elaborateModule)
 import qualified Wok.IR.Elaborate as Elab
 import qualified Wok.Interp.Value as IV
 import qualified Wok.Interp.Prim as IP
 import qualified Wok.Interp.Machine as IM
+import qualified Wok.Interp.RC.Value as St
+import qualified Wok.Interp.RC.Prim as RCP
+import qualified Wok.Interp.RC.Machine as RCM
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
+import qualified Wok.IR.Perceus as Perceus
+import Wok.IR.Reachable
+  ( pruneToReachable, exprUniques
+  , firstOrderNoHandlerViolations )
 import qualified Wok.IR.Multiplicity as Mult
 import Wok.IR.Multiplicity (Card (..))
 import Wok.IR.Anf
@@ -68,6 +79,7 @@ main = do
   runFiles           <- findByExtension [".wok"] "test/run-examples"
   multFiles          <- findByExtension [".wok"] "test/multiplicity-examples"
   multFailFiles      <- findByExtension [".wok"] "test/multiplicity-fail-examples"
+  perceusFiles       <- findByExtension [".wok"] "test/rc-examples"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -152,6 +164,12 @@ main = do
     , matchCompilerTests
     , matchCoverageTests
     , multiplicityUnitTests
+    , rcStoreTests
+    , rcDropTests
+    , rcIncrefTests
+    , rcMachineTests
+    , rcModuleTests
+    , rcLetRecTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -182,6 +200,26 @@ main = do
     , testGroup "multiplicity fail golden"
         [ goldenVsString (takeBaseName f) (multFailGoldenFor f) (multFailHarness f)
         | f <- multFailFiles ]
+    , testGroup "perceus golden"
+        [ goldenVsString (takeBaseName f) (perceusGoldenFor f) (perceusDumpHarness f)
+        | f <- perceusFiles ]
+    , testGroup "perceus lint"
+        [ testCase (takeBaseName f) (perceusLintHarness f)
+        | f <- perceusFiles ]
+    , testGroup "rc differential"
+        [ testCase (takeBaseName f) (rcDifferentialHarness f)
+        | f <- perceusFiles ]
+    , testGroup "rc stats"
+        [ testGroup "heap accounting"
+            [ testCase (takeBaseName f) (rcStatsHarness f)
+            | f <- perceusFiles ]
+        , testGroup "golden"
+            [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
+            | f <- perceusFiles ]
+        ]
+    , rcTeethTests perceusFiles
+    , rcDeepListTests
+    , rcPropertyTests
     ]
 
 goldenFor :: FilePath -> FilePath
@@ -299,6 +337,43 @@ multFailHarness path = do
       case Pipeline.elaborateCheckedFull entryName ms of
         Left s  -> pure (BL.pack (s <> "\n"))
         Right _ -> pure (BL.pack "UNEXPECTED: elaboration succeeded (no multishot error)\n")
+
+-- ---------------------------------------------------------------------------
+-- Perceus pass golden + balance lint (Task 5)
+--
+-- The golden pins the dump of the dup/drop-instrumented ANF (load ->
+-- elaborateProgramFull -> Perceus.insertRC -> Perceus.prettyPerceus). The lint
+-- HUnit asserts the static balance invariant (every owned binder reaches
+-- exactly one consume on every path) holds for the instrumented corpus.
+
+perceusGoldenFor :: FilePath -> FilePath
+perceusGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/rc-perceus-golden"
+
+perceusDumpHarness :: FilePath -> IO BL.ByteString
+perceusDumpHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s  -> pure (BL.pack ("elaborate: " <> s <> "\n"))
+        Right cm -> pure (BL.pack (T.unpack (Perceus.prettyPerceus cm) <> "\n"))
+
+perceusLintHarness :: FilePath -> Assertion
+perceusLintHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s  -> assertFailure ("elaborate: " <> s)
+        Right cm ->
+          case Perceus.balanceLint cm of
+            []          -> pure ()
+            violations  -> assertFailure
+              ("balance lint violations:\n"
+                 <> unlines (map T.unpack violations))
 
 -- | The "extended" env an ordinary user module sees: B.initialEnv with the
 -- Std.Base prelude's decls layered on top. Used by unit tests that need to
@@ -6069,3 +6144,1595 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
       OpArm (T.pack "Tick") (T.pack "tick") [] (bnd kName) resumeOnce
     multishotArm =
       OpArm (T.pack "Choice") (T.pack "flip") [] (bnd kName) resumeTwiceSeq
+
+-- ---------------------------------------------------------------------------
+-- RC store tests (Task 0: owned heap foundation)
+
+rcStoreTests :: TestTree
+rcStoreTests = testGroup "rc store"
+  [ testCase "alloc gives fresh addrs and counts" $ do
+      let s0 = St.emptyStore
+          (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) s0
+          (b, s2) = St.alloc (St.NCon (T.pack "Nil") []) s1
+      a @?= 0
+      b @?= 1
+      St.stLive (St.stStats s2) @?= 2
+      St.stAllocs (St.stStats s2) @?= 2
+  , testCase "deref reads a live cell" $ do
+      let (a, s1) = St.alloc (St.NCon (T.pack "True") []) St.emptyStore
+      case St.deref a s1 of
+        Right c -> St.cNode c @?= St.NCon (T.pack "True") []
+        Left e  -> assertFailure ("unexpected: " <> show e)
+  , testCase "deref of absent addr fails" $
+      case St.deref 99 St.emptyStore of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected failure on absent addr"
+  ]
+
+rcDropTests :: TestTree
+rcDropTests = testGroup "rc drop"
+  [ testCase "drop frees a unique leaf" $ do
+      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.dropAddr a s1 of
+        Right s2 -> do
+          St.stFrees (St.stStats s2) @?= 1
+          St.stLive  (St.stStats s2) @?= 0
+          case St.deref a s2 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "UAF not trapped"
+        Left e -> assertFailure (show e)
+  , testCase "double free is trapped" $ do
+      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.dropAddr a s1 of
+        Right s2 ->
+          case St.dropAddr a s2 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "double-free not trapped"
+        Left e -> assertFailure (show e)
+  , testCase "drop recursively frees children" $ do
+      let (h, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+          (t, s2) = St.alloc (St.NCon (T.pack "Nil") []) s1
+          (c, s3) = St.alloc (St.NCon (T.pack "Cons") [St.RVBox h, St.RVBox t]) s2
+      case St.dropAddr c s3 of
+        Right s4 -> St.stLive (St.stStats s4) @?= 0
+        Left e   -> assertFailure (show e)
+  , testCase "deep list drops iteratively (no stack overflow)" $ do
+      let n = 200000 :: Int
+          -- NOTE: build is GHC-stack-recursive (GHC grows its stack); this test isolates dropAddr's EXPLICIT iterativeness, not the builder's.
+          build 0 s = St.alloc (St.NCon (T.pack "Nil") []) s
+          build k s =
+            let (rest, s') = build (k - 1) s
+            in St.alloc (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt (fromIntegral k)), St.RVBox rest]) s'
+          (top, s1) = build n St.emptyStore
+      case St.dropAddr top s1 of
+        Right s2 -> St.stLive (St.stStats s2) @?= 0
+        Left e   -> assertFailure (show e)
+  ]
+
+rcIncrefTests :: TestTree
+rcIncrefTests = testGroup "rc incref"
+  [ testCase "incref bumps rc from 1 to 2" $ do
+      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.incref a s1 of
+        Right s2 ->
+          case St.deref a s2 of
+            Right c -> St.cRc c @?= 2
+            Left e  -> assertFailure ("deref after incref: " <> show e)
+        Left e -> assertFailure ("incref failed: " <> show e)
+  , testCase "incref on dead addr returns Left" $ do
+      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.dropAddr a s1 of
+        Right s2 ->
+          case St.incref a s2 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "incref of dead addr should return Left"
+        Left e -> assertFailure ("drop failed: " <> show e)
+  , testCase "incref then two drops frees exactly once" $ do
+      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.incref a s1 of
+        Left e -> assertFailure ("incref failed: " <> show e)
+        Right s2 ->
+          case St.dropAddr a s2 of
+            Left e  -> assertFailure ("first drop failed: " <> show e)
+            Right s3 -> do
+              St.stFrees (St.stStats s3) @?= 0
+              case St.deref a s3 of
+                Left e  -> assertFailure ("cell freed too early: " <> show e)
+                Right _ ->
+                  case St.dropAddr a s3 of
+                    Left e  -> assertFailure ("second drop failed: " <> show e)
+                    Right s4 -> do
+                      St.stFrees (St.stStats s4) @?= 1
+                      St.stLive  (St.stStats s4) @?= 0
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC machine tests (Task 2: store-threaded CEK over the no-handler fragment)
+--
+-- Each program is a HAND-INSTRUMENTED ANF: dup/drop are inserted manually (the
+-- automatic Perceus pass is Task 5). We run it from an empty store, render the
+-- result EXACTLY as the reference renderer would, then drop the result handle,
+-- and assert the heap is empty (stLive == 0) -- i.e. every allocation was
+-- balanced by a free.
+
+-- | A boxed binder with a placeholder type (the machine ignores binder types;
+-- only the Unique identity matters for env lookup).
+rcBnd :: Name.Name -> Anf.Binder
+rcBnd n = Anf.Binder n Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
+
+-- | Run a hand-instrumented Expr from the empty store, then RENDER the result
+-- and DROP it (if boxed). Returns the rendered text and the final live-cell
+-- count. A 'Left' anywhere is reported as a test failure.
+runAndAccount :: Anf.Expr -> IO (Text, Int)
+runAndAccount e =
+  case RCM.runExprRC RCP.rcPrimTable Map.empty St.emptyStore e of
+    Left err -> assertFailure ("rc run failed: " <> show err)
+    Right (v, s) ->
+      case St.renderRCValue s v of
+        Left err -> assertFailure ("render failed: " <> show err)
+        Right txt ->
+          case v of
+            St.RVBox a ->
+              case St.dropAddr a s of
+                Left err -> assertFailure ("result drop failed: " <> show err)
+                Right s' -> pure (txt, St.stLive (St.stStats s'))
+            St.RVLit _ -> pure (txt, St.stLive (St.stStats s))
+
+rcMachineTests :: TestTree
+rcMachineTests = testGroup "rc machine"
+  [ testCase "list literal renders and heap empties after result drop" $ do
+      -- let n   = Nil
+      --     c2  = Cons 2 n
+      --     xs  = Cons 1 c2
+      -- in xs                      -- => [1, 2]
+      (txt, live) <- runAndAccount $ runFresh $ do
+        nNil <- freshName (T.pack "n")
+        nC2  <- freshName (T.pack "c2")
+        nXs  <- freshName (T.pack "xs")
+        pure $
+          Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+            (Anf.Let (rcBnd nC2)
+              (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 2), Anf.AVar nNil])
+              (Anf.Let (rcBnd nXs)
+                (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nC2])
+                (Anf.Ret (Anf.AVar nXs))))
+      txt @?= T.pack "[1, 2]"
+      live @?= 0
+
+  , testCase "record projection: dup kept field, drop parent, heap empties" $ do
+      -- let l0 = Nil
+      --     l1 = Cons 1 l0          -- the field we keep
+      --     m0 = Nil
+      --     m1 = Cons 2 m0          -- the field we discard (freed via parent drop)
+      --     p  = Pair { fst = l1, snd = m1 }
+      --     k  = p.fst              -- alias into the record (NOT yet owned)
+      --     k' = __rc_dup k         -- take ownership of the kept field
+      --     _  = __rc_drop p        -- frees the record shell AND the discarded snd
+      -- in k'                       -- => [1]
+      (txt, live) <- runAndAccount $ runFresh $ do
+        nL0 <- freshName (T.pack "l0"); nL1 <- freshName (T.pack "l1")
+        nM0 <- freshName (T.pack "m0"); nM1 <- freshName (T.pack "m1")
+        nP  <- freshName (T.pack "p");  nK  <- freshName (T.pack "k")
+        nK' <- freshName (T.pack "kp"); nU  <- freshName (T.pack "u")
+        let dropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
+            dupName  = Name.Name (T.pack "__rc_dup")  (Unique (-2))
+        pure $
+          Anf.Let (rcBnd nL0) (Anf.RCon (T.pack "Nil") [])
+          (Anf.Let (rcBnd nL1) (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nL0])
+          (Anf.Let (rcBnd nM0) (Anf.RCon (T.pack "Nil") [])
+          (Anf.Let (rcBnd nM1) (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 2), Anf.AVar nM0])
+          (Anf.Let (rcBnd nP)
+            (Anf.RRecord (T.pack "Pair")
+              [ (T.pack "fst", Anf.AVar nL1), (T.pack "snd", Anf.AVar nM1) ])
+          (Anf.Let (rcBnd nK)  (Anf.RProj (T.pack "fst") (Anf.AVar nP))
+          (Anf.Let (rcBnd nK') (Anf.RApp (Anf.AVar dupName) [Anf.AVar nK])
+          (Anf.Let (rcBnd nU)  (Anf.RApp (Anf.AVar dropName) [Anf.AVar nP])
+          (Anf.Ret (Anf.AVar nK')))))))))
+      txt @?= T.pack "[1]"
+      live @?= 0
+
+  , testCase "__rc_drop frees a tuple and returns unit; result is a literal" $ do
+      -- let p = Tuple2 1 2
+      --     _ = __rc_drop p
+      -- in 99                       -- => 99, heap empty (the tuple was freed)
+      (txt, live) <- runAndAccount $ runFresh $ do
+        nP <- freshName (T.pack "p"); nU <- freshName (T.pack "u")
+        let dropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
+        pure $
+          Anf.Let (rcBnd nP)
+            (Anf.RCon (T.pack "Tuple2") [Anf.ALit (Anf.LInt 1), Anf.ALit (Anf.LInt 2)])
+          (Anf.Let (rcBnd nU) (Anf.RApp (Anf.AVar dropName) [Anf.AVar nP])
+          (Anf.Ret (Anf.ALit (Anf.LInt 99))))
+      txt @?= T.pack "99"
+      live @?= 0
+
+  , testCase "__rc_dup is a no-op on a literal" $ do
+      -- let x = __rc_dup 5 in x     -- => 5, no allocation at all
+      (txt, live) <- runAndAccount $ runFresh $ do
+        nX <- freshName (T.pack "x")
+        let dupName = Name.Name (T.pack "__rc_dup") (Unique (-2))
+        pure $
+          Anf.Let (rcBnd nX) (Anf.RApp (Anf.AVar dupName) [Anf.ALit (Anf.LInt 5)])
+          (Anf.Ret (Anf.AVar nX))
+      txt @?= T.pack "5"
+      live @?= 0
+
+  , testCase "shared value: one dup balances two drops, heap empties" $ do
+      -- let s  = Cons 7 Nil          -- a value shared by two consumers
+      --     s' = __rc_dup s          -- second owner
+      --     a  = Tuple2 s 1          -- consumes the original ownership
+      --     b  = Tuple2 s' 2         -- consumes the duped ownership
+      --     _  = __rc_drop a         -- frees a AND its share of s
+      --     _  = __rc_drop b         -- frees b AND the LAST share of s
+      -- in 0                         -- => 0, heap empty
+      (txt, live) <- runAndAccount $ runFresh $ do
+        nNil <- freshName (T.pack "nil"); nS <- freshName (T.pack "s")
+        nS'  <- freshName (T.pack "sp");  nA <- freshName (T.pack "a")
+        nB   <- freshName (T.pack "b");   nU1 <- freshName (T.pack "u1")
+        nU2  <- freshName (T.pack "u2")
+        let dropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
+            dupName  = Name.Name (T.pack "__rc_dup")  (Unique (-2))
+        pure $
+          Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+          (Anf.Let (rcBnd nS)  (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 7), Anf.AVar nNil])
+          (Anf.Let (rcBnd nS') (Anf.RApp (Anf.AVar dupName) [Anf.AVar nS])
+          (Anf.Let (rcBnd nA)  (Anf.RCon (T.pack "Tuple2") [Anf.AVar nS, Anf.ALit (Anf.LInt 1)])
+          (Anf.Let (rcBnd nB)  (Anf.RCon (T.pack "Tuple2") [Anf.AVar nS', Anf.ALit (Anf.LInt 2)])
+          (Anf.Let (rcBnd nU1) (Anf.RApp (Anf.AVar dropName) [Anf.AVar nA])
+          (Anf.Let (rcBnd nU2) (Anf.RApp (Anf.AVar dropName) [Anf.AVar nB])
+          (Anf.Ret (Anf.ALit (Anf.LInt 0)))))))))
+      txt @?= T.pack "0"
+      live @?= 0
+
+  , testCase "Case derefs the scrutinee, binds children, then drop-parent empties the heap" $ do
+      -- let n  = Nil
+      --     xs = Cons 42 n
+      -- in case xs of
+      --      Cons h t -> let _ = __rc_drop xs   -- own-children / drop-parent:
+      --                  in h                    --   h is a literal (no dup),
+      --                                           --   so drop the whole shell xs
+      --                                           --   (recursively freeing n)
+      --      Nil      -> 0                        -- => 42, heap empty
+      -- This is the canonical Perceus shape for a Case whose kept children are
+      -- unboxed: the shell is freed at the match, recursively releasing the tail.
+      (txt, live) <- runAndAccount $ runFresh $ do
+        nNil <- freshName (T.pack "n");  nXs <- freshName (T.pack "xs")
+        nH   <- freshName (T.pack "h");  nT  <- freshName (T.pack "t")
+        nU   <- freshName (T.pack "u")
+        let dropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
+        pure $
+          Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+          (Anf.Let (rcBnd nXs) (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 42), Anf.AVar nNil])
+          (Anf.Case (Anf.AVar nXs)
+            [ Anf.AltCon (T.pack "Cons") [rcBnd nH, rcBnd nT]
+                (Anf.Let (rcBnd nU) (Anf.RApp (Anf.AVar dropName) [Anf.AVar nXs])
+                  (Anf.Ret (Anf.AVar nH)))
+            , Anf.AltCon (T.pack "Nil") []
+                (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+            ]))
+      txt @?= T.pack "42"
+      live @?= 0
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC whole-module tests (Task 3: runModuleRC, static globals, result drop)
+--
+-- These run a HAND-INSTRUMENTED 'CoreModule' end to end through 'runModuleRC':
+-- top-level binds are installed into the static immortal region (never counted,
+-- never dup/drop'd), 'main' is run, and its result is rendered then dropped. We
+-- assert the rendered output AND that the DYNAMIC heap empties (stLive == 0).
+
+-- | A top-level bind. The name's hint matters only for 'main' (located by hint);
+-- every other bind is reached by its 'Unique' through the static env.
+rcTop :: Name.Name -> [Anf.Binder] -> Anf.Expr -> Anf.TopBind
+rcTop = Anf.TopBind
+
+rcModuleTests :: TestTree
+rcModuleTests = testGroup "rc module"
+  [ testCase "static global function: called by main, never counted, heap empties" $ do
+      -- id2 x = x                          -- a top-level FUNCTION (static closure)
+      -- main  = let xs = Cons 1 (Cons 2 Nil)   -- dynamic allocation
+      --             ys = id2 xs                -- call the static global
+      --             _  = __rc_drop ys          -- frees the list (ys aliases xs)
+      --         in 0                           -- => 0, dynamic heap empty
+      let (txt, st, bl) = runFresh $ do
+            -- global function 'id2'
+            nId  <- freshName (T.pack "id2")
+            nIdX <- freshName (T.pack "x")
+            -- main locals
+            nMain <- freshName (T.pack "main")
+            nNil  <- freshName (T.pack "n");  nC2  <- freshName (T.pack "c2")
+            nXs   <- freshName (T.pack "xs"); nYs  <- freshName (T.pack "ys")
+            nU    <- freshName (T.pack "u")
+            let dropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
+                idBind = rcTop nId [rcBnd nIdX] (Anf.Ret (Anf.AVar nIdX))
+                mainBody =
+                  Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBnd nC2)
+                    (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 2), Anf.AVar nNil])
+                  (Anf.Let (rcBnd nXs)
+                    (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nC2])
+                  (Anf.Let (rcBnd nYs) (Anf.RApp (Anf.AVar nId) [Anf.AVar nXs])
+                  (Anf.Let (rcBnd nU)  (Anf.RApp (Anf.AVar dropName) [Anf.AVar nYs])
+                  (Anf.Ret (Anf.ALit (Anf.LInt 0)))))))
+                mainBind = rcTop nMain [] mainBody
+            pure (Anf.CoreModule [idBind, mainBind])
+            >>= \cm -> case RCM.runModuleRC cm of
+                         Left err  -> error ("runModuleRC failed: " <> show err)
+                         Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
+      txt @?= T.pack "0"
+      -- The dynamic heap is empty: every dynamic alloc was freed, and the static
+      -- global closure was NEVER counted (so it does not show up in stLive).
+      -- No value-CAFs in this module, so baseline == 0.
+      bl @?= (0 :: Int)
+      St.stLive st @?= bl
+      St.stAllocs st @?= St.stFrees st
+
+  , testCase "boxed result is dropped by runModuleRC; heap empties" $ do
+      -- main = Cons 1 (Cons 2 Nil)         -- returns a boxed list directly;
+      --                                     -- runModuleRC renders THEN drops it.
+      let (txt, st, bl) = runFresh $ do
+            nMain <- freshName (T.pack "main")
+            nNil  <- freshName (T.pack "n"); nC2 <- freshName (T.pack "c2")
+            nXs   <- freshName (T.pack "xs")
+            let mainBody =
+                  Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBnd nC2)
+                    (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 2), Anf.AVar nNil])
+                  (Anf.Let (rcBnd nXs)
+                    (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nC2])
+                  (Anf.Ret (Anf.AVar nXs))))
+            pure (Anf.CoreModule [rcTop nMain [] mainBody])
+            >>= \cm -> case RCM.runModuleRC cm of
+                         Left err  -> error ("runModuleRC failed: " <> show err)
+                         Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
+      txt @?= T.pack "[1, 2]"
+      -- No value-CAFs, baseline == 0.
+      bl @?= (0 :: Int)
+      St.stLive st @?= bl
+      St.stAllocs st @?= St.stFrees st
+
+  , testCase "literal result, no allocation: empty heap, zero allocs" $ do
+      -- main = 99                           -- => 99, no allocation, no drop
+      let (txt, st, bl) = runFresh $ do
+            nMain <- freshName (T.pack "main")
+            pure (Anf.CoreModule [rcTop nMain [] (Anf.Ret (Anf.ALit (Anf.LInt 99)))])
+            >>= \cm -> case RCM.runModuleRC cm of
+                         Left err  -> error ("runModuleRC failed: " <> show err)
+                         Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
+      txt @?= T.pack "99"
+      -- No value-CAFs, baseline == 0.
+      bl @?= (0 :: Int)
+      St.stLive st @?= bl
+      St.stAllocs st @?= (0 :: Int)
+
+  , testCase "missing main is a loud error" $
+      case RCM.runModuleRC (Anf.CoreModule []) of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected runModuleRC to reject a module with no main"
+
+  , testCase "out-of-scope HOF (standalone RLam reachable from main) is rejected, not leaked" $ do
+      -- A higher-order program: 'main' applies a helper to a standalone lambda
+      -- value. The reachable bind contains an 'RLam', which is OUT OF SCOPE for
+      -- M1's first-order/no-handler fragment. Before the boundary guard,
+      -- 'runModuleRC' ran it and SILENTLY LEAKED (the standalone lambda body is
+      -- excluded from Perceus coverage, so its captures are never dropped). The
+      -- guard must now reject the whole-module run loudly instead.
+      --
+      --   apply f x = f x
+      --   main = let b  = Cons 1 Nil
+      --              r  = apply (\y -> 7) b
+      --          in r
+      let cm = runFresh $ do
+            nApply <- freshName (T.pack "apply")
+            nF     <- freshName (T.pack "f")
+            nX     <- freshName (T.pack "x")
+            nR0    <- freshName (T.pack "r0")
+            nMain  <- freshName (T.pack "main")
+            nNil   <- freshName (T.pack "nil")
+            nB     <- freshName (T.pack "b")
+            nLam   <- freshName (T.pack "lam")
+            nY     <- freshName (T.pack "y")
+            nR     <- freshName (T.pack "r")
+            let applyBody =
+                  Anf.Let (rcBnd nR0) (Anf.RApp (Anf.AVar nF) [Anf.AVar nX])
+                  (Anf.Ret (Anf.AVar nR0))
+                applyBind = rcTop nApply [rcBnd nF, rcBnd nX] applyBody
+                mainBody =
+                  Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBnd nB)
+                    (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nNil])
+                  (Anf.Let (rcBnd nLam)
+                    (Anf.RLam [rcBnd nY] (Anf.Ret (Anf.ALit (Anf.LInt 7))))
+                  (Anf.Let (rcBnd nR)
+                    (Anf.RApp (Anf.AVar nApply) [Anf.AVar nLam, Anf.AVar nB])
+                  (Anf.Ret (Anf.AVar nR)))))
+                mainBind = rcTop nMain [] mainBody
+            pure (Anf.CoreModule [applyBind, mainBind])
+      case RCM.runModuleRC cm of
+        Right run -> assertFailure
+          ("expected runModuleRC to REJECT an out-of-scope HOF module, but it ran: "
+            <> T.unpack (RCM.rcOutput run))
+        Left (Interp.PrimError msg) ->
+          assertBool
+            ("expected the M1 first-order/no-handler boundary error, got: " <> T.unpack msg)
+            (T.pack "first-order/no-handler fragment only" `T.isInfixOf` msg)
+        Left other -> assertFailure
+          ("expected a PrimError boundary rejection, got: " <> show other)
+
+  -- -------------------------------------------------------------------------
+  -- Immortal baseline tests (Task 3 follow-up).
+  --
+  -- A value-CAF (0-arity constant bind other than 'main') is forced at load
+  -- time; its result lives on the DYNAMIC heap for the lifetime of the module.
+  -- These cells are immortal globals: they must not be counted as a leak.
+  --
+  -- The oracle:  rcBaseline > 0  (the CAF allocated dynamic cells)
+  --              stLive == rcBaseline  (main's work balanced; no extra leak)
+  --
+  -- Without the baseline fix, stLive would be > 0 after main completes even
+  -- though there is no leak, falsely reporting a heap imbalance.
+
+  , testCase "value-CAF (pair) allocates immortal cells; baseline>0 and stLive==baseline" $ do
+      -- pair = Tuple2 1 2              -- a value-CAF: allocates 1 cell at load time
+      -- main = 0                       -- does not allocate; => "0"
+      --
+      -- After installation, baseline = 1 (the Tuple2 cell is live).
+      -- main allocates nothing and returns a literal, so stLive stays at 1.
+      -- Oracle: baseline == 1, stLive == 1 (== baseline), no leak on top.
+      let (txt, st, bl) = runFresh $ do
+            nPair  <- freshName (T.pack "pair")
+            nPairV <- freshName (T.pack "pairV")  -- local binder inside the CAF body
+            nMain  <- freshName (T.pack "main")
+            let pairBind = rcTop nPair []
+                             (Anf.Let (rcBnd nPairV)
+                               (Anf.RCon (T.pack "Tuple2")
+                                 [ Anf.ALit (Anf.LInt 1)
+                                 , Anf.ALit (Anf.LInt 2) ])
+                               (Anf.Ret (Anf.AVar nPairV)))
+                mainBind = rcTop nMain [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+            pure (Anf.CoreModule [pairBind, mainBind])
+            >>= \cm -> case RCM.runModuleRC cm of
+                         Left err  -> error ("runModuleRC failed: " <> show err)
+                         Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
+      txt @?= T.pack "0"
+      -- The value-CAF genuinely allocated a dynamic cell: baseline must be > 0.
+      -- (If this were 0 the test would not exercise the immortal-baseline fix.)
+      assertBool "baseline > 0: value-CAF allocated at least one immortal cell" (bl > 0)
+      -- main did no allocation and held no references to the pair, so the
+      -- dynamic heap must be exactly at the baseline (no leak on top of it).
+      St.stLive st @?= bl
+
+  , testCase "value-CAF list allocates multiple immortal cells; baseline>0 and stLive==baseline" $ do
+      -- xs   = Cons 10 (Cons 20 Nil)   -- value-CAF: 3 cells at load (Nil, Cons 20, Cons 10)
+      -- main = 0                        -- does not allocate; => "0"
+      --
+      -- After installation, baseline = 3.
+      -- main allocates nothing; stLive stays at 3.
+      -- Oracle: baseline == 3, stLive == 3 (== baseline), no leak on top.
+      let (txt, st, bl) = runFresh $ do
+            nXs   <- freshName (T.pack "xs")
+            nMain <- freshName (T.pack "main")
+            nNil  <- freshName (T.pack "nil")
+            nC2   <- freshName (T.pack "c2")
+            nC1   <- freshName (T.pack "c1")  -- local binder for the head Cons
+            let xsBind = rcTop nXs []
+                           (Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+                           (Anf.Let (rcBnd nC2)
+                             (Anf.RCon (T.pack "Cons") [ Anf.ALit (Anf.LInt 20)
+                                                       , Anf.AVar nNil ])
+                           (Anf.Let (rcBnd nC1)
+                             (Anf.RCon (T.pack "Cons") [ Anf.ALit (Anf.LInt 10)
+                                                       , Anf.AVar nC2 ])
+                           (Anf.Ret (Anf.AVar nC1)))))
+                mainBind = rcTop nMain [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+            pure (Anf.CoreModule [xsBind, mainBind])
+            >>= \cm -> case RCM.runModuleRC cm of
+                         Left err  -> error ("runModuleRC failed: " <> show err)
+                         Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
+      txt @?= T.pack "0"
+      -- The list CAF allocated 3 cells (Nil, Cons 20, Cons 10); baseline >= 3.
+      assertBool "baseline > 0: list CAF allocated immortal cells" (bl > 0)
+      -- main did nothing dynamic; stLive must equal the baseline exactly.
+      St.stLive st @?= bl
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC local mutual recursion (Task 4: LetRec uncounted region)
+--
+-- A local 'LetRec' group of mutually-recursive closures is an UNCOUNTED REGION:
+-- intra-group edges (even's env references odd, and vice versa) do NOT
+-- contribute to reference counts, so the closure-env knot never forms a counted
+-- cycle. The group is dropped as a UNIT at scope exit -- dropping one member
+-- frees that member's cell but does NOT traverse a sibling edge (same region),
+-- so siblings are neither double-freed nor leaked; each is freed by its own
+-- scope-exit drop.
+--
+-- We run a HAND-INSTRUMENTED program with the canonical mutual-recursion shape:
+--
+--   letrec even = \n -> case eqU64 n 0 of
+--                         True  -> let _ = drop bool in 1
+--                         False -> let _ = drop bool; m = n - 1 in odd m
+--          odd  = \n -> case eqU64 n 0 of
+--                         True  -> let _ = drop bool in 0
+--                         False -> let _ = drop bool; m = n - 1 in even m
+--   in let r  = even 4          -- => 1 (4 is even)
+--          _  = drop even       -- scope exit: drop the group as a unit
+--          _  = drop odd
+--      in r
+--
+-- Each call allocates one boxed Bool (from eqU64) which its branch drops, so the
+-- only residue at scope exit is the two-closure region, dropped explicitly. The
+-- result (1) is an unboxed literal, so runAndAccount has nothing further to free.
+
+-- | Compiler-internal prim handles. dup/drop and the arithmetic/comparison
+-- prims are resolved by HINT through the prim table (see 'callFn' in
+-- "Wok.Interp.RC.Machine"), so any negative 'Unique' that cannot collide with a
+-- 'runFresh'-minted binder works as the identity.
+rcDropName, rcEqName, rcSubName :: Name.Name
+rcDropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
+rcEqName   = Name.Name (T.pack "eqU64")     (Unique (-3))
+rcSubName  = Name.Name (T.pack "-")         (Unique (-4))
+
+-- | A parity-clause body: @\\param -> case eqU64 param 0 of { True -> baseLit;
+-- False -> sibling (param - 1) }@, fully ANF-instrumented with a drop of the
+-- freshly-allocated boxed Bool in each branch. All fresh names are minted in the
+-- SAME 'Fresh' computation as the surrounding group, so no Unique collides (a
+-- nested 'runFresh' would restart the counter at 0 and alias the group binders).
+rcParityClause :: Name.Name -> Integer -> Name.Name -> Fresh Anf.Expr
+rcParityClause param baseLit sibling = do
+  nZ <- freshName (T.pack "z");  nB <- freshName (T.pack "b")
+  nU <- freshName (T.pack "u");  nM <- freshName (T.pack "m")
+  nRec <- freshName (T.pack "rec")
+  pure $
+    Anf.Let (rcBnd nZ) (Anf.RAtom (Anf.ALit (Anf.LInt 0)))
+    (Anf.Let (rcBnd nB)
+      (Anf.RApp (Anf.AVar rcEqName) [Anf.AVar param, Anf.AVar nZ])
+    (Anf.Case (Anf.AVar nB)
+      [ Anf.AltCon (T.pack "True") []
+          (Anf.Let (rcBnd nU) (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nB])
+            (Anf.Ret (Anf.ALit (Anf.LInt baseLit))))
+      , Anf.AltCon (T.pack "False") []
+          (Anf.Let (rcBnd nU) (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nB])
+           (Anf.Let (rcBnd nM)
+             (Anf.RApp (Anf.AVar rcSubName) [Anf.AVar param, Anf.ALit (Anf.LInt 1)])
+           (Anf.Let (rcBnd nRec)
+             (Anf.RApp (Anf.AVar sibling) [Anf.AVar nM])
+             (Anf.Ret (Anf.AVar nRec)))))
+      ]))
+
+-- | Build the canonical mutual-recursion program:
+--
+--   letrec even = \n -> case eqU64 n 0 of True -> 1; False -> odd (n-1)
+--          odd  = \n -> case eqU64 n 0 of True -> 0; False -> even (n-1)
+--   in let r = <entry> <arg>
+--          _ = drop <dropFirst>
+--          _ = drop <dropSecond>      -- group dropped as a unit, in this order
+--      in r
+--
+-- 'entryIsEven' selects which member 'main' calls; 'dropEvenFirst' selects the
+-- scope-exit drop order, so a test can exercise dropping a sibling BEFORE the
+-- one it points at (the uncounted-edge case).
+rcMutualProgram :: Bool -> Integer -> Bool -> Fresh Anf.Expr
+rcMutualProgram entryIsEven arg dropEvenFirst = do
+  nEven <- freshName (T.pack "even"); nOdd <- freshName (T.pack "odd")
+  nEN   <- freshName (T.pack "en");   nON  <- freshName (T.pack "on")
+  nR    <- freshName (T.pack "r")
+  nU1   <- freshName (T.pack "u1");   nU2  <- freshName (T.pack "u2")
+  evenBody <- rcParityClause nEN 1 nOdd
+  oddBody  <- rcParityClause nON 0 nEven
+  let entry      = if entryIsEven then nEven else nOdd
+      (d1, d2)   = if dropEvenFirst then (nEven, nOdd) else (nOdd, nEven)
+  pure $
+    Anf.LetRec
+      [ (rcBnd nEven, [rcBnd nEN], evenBody)
+      , (rcBnd nOdd,  [rcBnd nON], oddBody)
+      ]
+      (Anf.Let (rcBnd nR) (Anf.RApp (Anf.AVar entry) [Anf.ALit (Anf.LInt arg)])
+       (Anf.Let (rcBnd nU1) (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar d1])
+        (Anf.Let (rcBnd nU2) (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar d2])
+         (Anf.Ret (Anf.AVar nR)))))
+
+rcLetRecTests :: TestTree
+rcLetRecTests = testGroup "rc letrec"
+  [ testCase "local mutual recursion: even 4 = 1, group drops as a unit, heap empties" $ do
+      (txt, live) <- runAndAccount $ runFresh (rcMutualProgram True 4 True)
+      txt @?= T.pack "1"
+      live @?= 0
+
+  , testCase "odd 4 = 0 via the same group" $ do
+      (txt, live) <- runAndAccount $ runFresh (rcMutualProgram False 4 True)
+      txt @?= T.pack "0"
+      live @?= 0
+
+  , testCase "dropping one sibling before the one it points at does not double-free or leak" $ do
+      -- Drop odd FIRST, then even. Because intra-group edges are uncounted,
+      -- freeing odd does NOT traverse its edge to even (same region), so even is
+      -- still live and is freed by its own drop. Neither double-free nor leak.
+      (txt, live) <- runAndAccount $ runFresh (rcMutualProgram True 3 False)
+      txt @?= T.pack "0"   -- even 3 = False = 0
+      live @?= 0
+
+  -- F6 regression. A covered local 'LetRec' group whose closure bodies reference
+  -- a value-CAF must NOT decref the CAF when the group is dropped at scope exit.
+  --
+  -- The interpreter captures the WHOLE enclosing scope (incl. the CAF's handle)
+  -- into each group closure cell. Before F2 made the CAF a static (negative)
+  -- handle in the captured env, the group closure captured the CAF's DYNAMIC
+  -- counted cell uncounted; at scope exit each member's drop cascaded through
+  -- 'countedChildren' into that CAF edge (region-less, so NOT filtered as a
+  -- same-region sibling), decref-ing the CAF once PER MEMBER -> premature free /
+  -- double-free / stLive below baseline. The invariant: dropping a letrec group
+  -- must not decref a cell the group does not own (globals/CAFs/outer borrows).
+  --
+  -- Shape (run through the REAL pass + runModuleRC, exactly as the corpus does):
+  --   caf  = Cons 99 Nil                    -- value-CAF: 2 immortal cells
+  --   main = letrec f = \x -> caf           -- two closures, both capture caf
+  --                 g = \x -> caf
+  --          in 0                           -- => 0, group dropped at scope exit
+  -- The group is covered (main has no boxed enclosing locals, the CAF is a global
+  -- reference, not a local), so Perceus instruments it with one scope-exit
+  -- __rc_drop per member. main allocates nothing dynamic, so the ONLY live cells
+  -- after main are the two immortal CAF cells: stLive must equal the baseline.
+  , testCase "covered letrec group capturing a value-CAF: no double-free, stLive==baseline" $ do
+      let (txt, st, bl) = runFresh $ do
+            nCaf  <- freshName (T.pack "caf")
+            nCafV <- freshName (T.pack "cafV")
+            nNil  <- freshName (T.pack "nil")
+            nMain <- freshName (T.pack "main")
+            nF    <- freshName (T.pack "f");  nG <- freshName (T.pack "g")
+            nFX   <- freshName (T.pack "fx"); nGX <- freshName (T.pack "gx")
+            let listTy   = Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]
+                rcBndL n = Anf.Binder n Anf.Unrestricted listTy
+                -- value-CAF: caf = Cons 99 Nil  (2 boxed cells)
+                cafBind = rcTop nCaf []
+                  (Anf.Let (rcBndL nNil) (Anf.RCon (T.pack "Nil") [])
+                   (Anf.Let (rcBndL nCafV)
+                     (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 99), Anf.AVar nNil])
+                     (Anf.Ret (Anf.AVar nCafV))))
+                -- each member closure simply returns the captured CAF.
+                memberBody = Anf.Ret (Anf.AVar nCaf)
+                mainBody =
+                  Anf.LetRec
+                    [ (rcBndL nF, [rcBndL nFX], memberBody)
+                    , (rcBndL nG, [rcBndL nGX], memberBody)
+                    ]
+                    (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+                mainBind = rcTop nMain [] mainBody
+                cm = Anf.CoreModule [cafBind, mainBind]
+            case RCM.runModuleRC (Perceus.insertRC cm) of
+              Left err  -> error ("runModuleRC failed: " <> show err)
+              Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
+      txt @?= T.pack "0"
+      -- The CAF allocated immortal cells; the test only has teeth if baseline > 0.
+      assertBool "baseline > 0: value-CAF allocated immortal cells" (bl > 0)
+      -- The group drop must NOT have touched the CAF: stLive stays at the baseline.
+      St.stLive st @?= bl
+
+  -- F1 FOLLOW-UP (review #4) regression. The Jump rule reserves the TRANSITIVE
+  -- captured set (union over closeJoins{j}) so an outer Jump does not drop a var
+  -- a DOWNSTREAM chained join will consume. The join-body seeding ('jDelta') must
+  -- be SYMMETRIC with that reservation: it must seed with the transitive cap too,
+  -- not just the join's own cap. Otherwise a join j1 whose body is a Case --- one
+  -- arm chaining to a downstream j2 that captures the outer var 'w', the other arm
+  -- NOT mentioning w --- never OWNS w (w is in cap(j2), not cap(j1), and not free
+  -- in j1's body), so its non-forwarding arm never drops w => w LEAKS on that path
+  -- even though the outer Jump reserved it.
+  --
+  -- This exact ANF shape (an intermediate Case-bodied join that reaches the
+  -- w-capturing join only TRANSITIVELY) is not currently emitted by the surface
+  -- elaborator (it inlines/specializes the w-using continuation into each arm, so
+  -- w lands in that join's OWN cap), so the regression is pinned at the IR level:
+  --
+  --   g w =                                  -- w : [U64], owned boxed param
+  --     join j2(y) = let c = Cons y w in c   -- builds with w  => w in cap(j2)
+  --     join j1(z) =                         -- body is a CASE; w NOT free here
+  --       case z of
+  --         0 -> 0                           -- non-forwarding: w must be DROPPED
+  --         _ -> jump j2(7)                  -- chains to j2 (reserves w)
+  --     jump j1(sel)                         -- outer jump: reserves transitive cap
+  --   main = g [1,2,3] 0                      -- take the sel=0 (leaking) path
+  --
+  -- On the sel=0 path g returns a literal, so w is never moved out and MUST be
+  -- dropped inside g. Before the symmetric-jDelta fix w is un-owned in j1's body
+  -- and leaks (stLive > baseline = 0); after, j1's body owns w and its Case drops
+  -- it on the non-forwarding arm. We assert BOTH a runnable heap-empty oracle
+  -- (stLive == baseline) AND a clean 'balanceLint' (no over-consume / leak report).
+  , testCase "F1 follow-up: transitive-cap join body drops a reserved outer var on its non-forwarding arm" $ do
+      let buildCM sel = runFresh $ do
+            nG    <- freshName (T.pack "g")
+            nW    <- freshName (T.pack "w")
+            nMain <- freshName (T.pack "main")
+            nNil  <- freshName (T.pack "nil")
+            nC2   <- freshName (T.pack "c2")
+            nC1   <- freshName (T.pack "c1")
+            j2    <- freshJoin; j1 <- freshJoin
+            nY    <- freshName (T.pack "y")   -- j2 param (unboxed U64)
+            nZ    <- freshName (T.pack "z")   -- j1 param (unboxed U64)
+            nCell <- freshName (T.pack "cell")
+            nGv   <- freshName (T.pack "gv")
+            let listTy    = Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]
+                u64Ty     = Ty.CTCon Ty.TcU64 []
+                rcBndL n  = Anf.Binder n Anf.Unrestricted listTy   -- BOXED
+                rcBndU n  = Anf.Binder n Anf.Unrestricted u64Ty    -- unboxed
+                -- g w = join j2(y)=Cons y w ; join j1(z)=case z {0->0; _->jump j2 7}
+                --       ; jump j1 sel
+                gBody =
+                  Anf.LetJoin j2 [rcBndU nY]
+                    (Anf.Let (rcBndL nCell)
+                       (Anf.RCon (T.pack "Cons") [Anf.AVar nY, Anf.AVar nW])
+                       (Anf.Ret (Anf.AVar nCell)))
+                  (Anf.LetJoin j1 [rcBndU nZ]
+                    (Anf.Case (Anf.AVar nZ)
+                       [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+                       , Anf.AltDefault (Anf.Jump j2 [Anf.ALit (Anf.LInt 7)]) ])
+                  (Anf.Jump j1 [Anf.ALit (Anf.LInt sel)]))
+                gBind = rcTop nG [rcBndL nW] gBody
+                -- main = let nil=Nil; c2=Cons 2 nil; c1=Cons 1 c2; gv = g c1 in gv
+                mainBody =
+                  Anf.Let (rcBndL nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBndL nC2)
+                     (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 2), Anf.AVar nNil])
+                  (Anf.Let (rcBndL nC1)
+                     (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nC2])
+                  (Anf.Let (rcBndL nGv) (Anf.RApp (Anf.AVar nG) [Anf.AVar nC1])
+                  (Anf.Ret (Anf.AVar nGv)))))
+                mainBind = rcTop nMain [] mainBody
+            pure (Anf.CoreModule [gBind, mainBind])
+      -- (a) production pass must balance: no over-consume / leak lint findings.
+      let cm0 = buildCM 0
+      assertEqual "balanceLint must be clean on the transitive-cap join shape"
+        [] (Perceus.balanceLint cm0)
+      -- (b) runnable heap-empty oracle on the LEAKING (sel=0) path: w must be
+      -- dropped inside g on the non-forwarding arm. baseline == 0 (no value-CAFs);
+      -- before the fix this leaks the [1,2,3] spine (stLive == 3 > 0).
+      case RCM.runModuleRC (Perceus.insertRC cm0) of
+        Left err  -> assertFailure ("runModuleRC failed: " <> show err)
+        Right run -> do
+          let st = RCM.rcStats run
+              bl = RCM.rcBaseline run
+          assertEqual "no value-CAFs: baseline must be 0" 0 bl
+          assertEqual "sel=0 (non-forwarding) path: w must be dropped, heap empty"
+            bl (St.stLive st)
+
+  -- DIRECT-USE + FORWARD regression (review focus #1, and the move-variant of #2).
+  -- A join body that BOTH moves an owned outer var directly into a binding AND
+  -- forwards (tail-jumps) to a DOWNSTREAM join that also consumes that var has TWO
+  -- consumers of one owned unit, so the pass MUST dup it. The 'Let' dup-planner
+  -- keyed only on 'freeVarsExpr body' (syntactic free vars), which does NOT see a
+  -- var delivered IMPLICITLY through a downstream join's 'cap'; without the fix it
+  -- planned no dup and 'consumedHere' relinquished the var at the direct move, so
+  -- the downstream join then consumed a var already moved -> use-after-free /
+  -- double-free (balanceLint: over-consume of w). The fix makes the dup-planner and
+  -- 'consumedHere' treat 'bodyReservedCap' as "needed later", exactly as the
+  -- prompt-drop 'keepInBody' already does. This shape is not emitted by the surface
+  -- elaborator (the corpus '--dump-perceus' goldens are unchanged by the fix), so
+  -- the regression is pinned at the IR level:
+  --
+  --   f w =                                    -- w : [U64], owned boxed param
+  --     join j2(yb) = let c2 = Pair yb w in c2 -- uses w  => w in cap(j2)
+  --     join j1(z)  = let u  = Cons 0 w        -- DIRECT move of w
+  --                   in jump j2(u)            -- forwards u; w arrives via cap(j2)
+  --     jump j1(9)                             -- outer jump: reserves transitive cap
+  --   main = let nil=Nil; c1=Cons 1 nil; r = f c1 in r
+  --
+  -- The returned Pair(u, w) shares w (referenced through both u's tail and the
+  -- Pair's own field), so the single owned unit MUST be dup'd or the result-drop
+  -- double-frees w. We assert a clean 'balanceLint' AND a runnable heap-empty
+  -- oracle (stLive == baseline == 0).
+  , testCase "review #1: join body moving an outer var AND forwarding it dups (no double-consume)" $ do
+      let cm = runFresh $ do
+            nF    <- freshName (T.pack "f")
+            nW    <- freshName (T.pack "w")
+            nMain <- freshName (T.pack "main")
+            nNil  <- freshName (T.pack "nil")
+            nC1   <- freshName (T.pack "c1")
+            nR    <- freshName (T.pack "r")
+            j2    <- freshJoin; j1 <- freshJoin
+            nYb   <- freshName (T.pack "yb")   -- j2 param (boxed list)
+            nZ    <- freshName (T.pack "z")    -- j1 param (unboxed U64)
+            nU    <- freshName (T.pack "u")    -- j1 direct-use binder (boxed list)
+            nC2   <- freshName (T.pack "c2")   -- j2 result (boxed Pair)
+            let listTy   = Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]
+                u64Ty    = Ty.CTCon Ty.TcU64 []
+                rcBndL n = Anf.Binder n Anf.Unrestricted listTy   -- BOXED
+                rcBndU n = Anf.Binder n Anf.Unrestricted u64Ty    -- unboxed
+                fBody =
+                  Anf.LetJoin j2 [rcBndL nYb]
+                    (Anf.Let (rcBndL nC2)
+                       (Anf.RCon (T.pack "Pair") [Anf.AVar nYb, Anf.AVar nW])
+                       (Anf.Ret (Anf.AVar nC2)))
+                  (Anf.LetJoin j1 [rcBndU nZ]
+                    (Anf.Let (rcBndL nU)
+                       (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 0), Anf.AVar nW])
+                       (Anf.Jump j2 [Anf.AVar nU]))
+                  (Anf.Jump j1 [Anf.ALit (Anf.LInt 9)]))
+                fBind = rcTop nF [rcBndL nW] fBody
+                mainBody =
+                  Anf.Let (rcBndL nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBndL nC1)
+                     (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nNil])
+                  (Anf.Let (rcBndL nR) (Anf.RApp (Anf.AVar nF) [Anf.AVar nC1])
+                  (Anf.Ret (Anf.AVar nR))))
+                mainBind = rcTop nMain [] mainBody
+            pure (Anf.CoreModule [fBind, mainBind])
+      -- (a) production pass must balance: no over-consume / leak lint findings.
+      assertEqual "balanceLint must be clean on the direct-use+forward join shape"
+        [] (Perceus.balanceLint cm)
+      -- (b) runnable heap-empty oracle: the result Pair shares w, so without the
+      -- dup the result-drop double-frees w. baseline == 0 (no value-CAFs).
+      case RCM.runModuleRC (Perceus.insertRC cm) of
+        Left err  -> assertFailure ("runModuleRC failed: " <> show err)
+        Right run -> do
+          let st = RCM.rcStats run
+              bl = RCM.rcBaseline run
+          assertEqual "no value-CAFs: baseline must be 0" 0 bl
+          assertEqual "direct-use+forward: w dup'd, heap empties" bl (St.stLive st)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Suite A: differential run over the no-handler / first-order corpus (Task 8)
+--
+-- For each program in test/rc-examples/, run BOTH interpreters in the same test:
+--
+--   * the REFERENCE interpreter on the ORIGINAL (pre-Perceus) ANF
+--       (Interp.runModule -> Interp.renderValue), and
+--   * the RC interpreter on the Perceus-INSTRUMENTED ANF
+--       (Machine.runModuleRC . Perceus.insertRC -> rcOutput).
+--
+-- dup/drop never change values, so the two rendered outputs must be
+-- byte-identical. Because the RC interpreter is an INDEPENDENT implementation,
+-- this is a genuine differential signal (a bug in either side surfaces as a
+-- divergence rather than hiding identically in both).
+--
+-- Error path: we compare SUCCESS outputs. If BOTH sides return 'Left' we treat
+-- it as a match WITHOUT comparing the error text -- the RC and reference error
+-- renderings differ by design (different RuntimeError constructors / messages).
+-- A one-sided failure is a real divergence and fails the test.
+--
+-- M1 scope guard: M1 is the first-order, no-handler fragment. We reject any
+-- corpus program whose CODE REACHABLE FROM 'main' contains a handler/operation
+-- ('Handle'/'ROp' -- effect handlers are deferred) or a first-class local
+-- closure ('RLam' -- HOFs / partial application / closure RC are deferred to
+-- M1.5). We scope the check to the reachable call graph rather than the whole
+-- elaborated module on purpose: 'elaborateProgramFull' inlines the entire
+-- prelude (which DOES contain handlers and lambdas), but none of it is reached
+-- by a first-order corpus 'main', so it never executes on the RC store.
+
+rcDifferentialHarness :: FilePath -> Assertion
+rcDifferentialHarness path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s   -> assertFailure ("elaborate: " <> s)
+        Right cm -> do
+          -- M1 scope guard: reject handlers / operations / first-class closures
+          -- anywhere in the code reachable from 'main'.
+          case firstOrderNoHandlerViolations cm of
+            [] -> pure ()
+            vs -> assertFailure
+              (path <> ": not a first-order no-handler program (M1 scope):\n"
+                 <> unlines (map T.unpack vs))
+          -- Prune to the binds reachable from 'main' before running. This is a
+          -- semantics-preserving dead-bind elimination: a top-level bind never
+          -- reached from 'main' cannot affect main's result. We prune for BOTH
+          -- interpreters so they execute byte-identical programs. It is REQUIRED
+          -- for the RC interpreter: 'runModuleRC' force-evaluates every value-CAF
+          -- eagerly at load time, whereas 'elaborateProgramFull' inlines the whole
+          -- prelude (incl. dictionary CAFs that bottom out in prims the RC store
+          -- does not bind); pruning drops those unreached CAFs so only the
+          -- first-order corpus actually runs.
+          let pruned = pruneToReachable cm
+              refRes = Interp.runModule pruned
+              rcRes  = RCM.runModuleRC (Perceus.insertRC pruned)
+          case (refRes, rcRes) of
+            (Right v, Right run) ->
+              Interp.renderValue v @?= RCM.rcOutput run
+            (Left _, Left _) ->
+              -- Both failed: a match by design (error text differs between the
+              -- reference and RC interpreters; we do not compare it).
+              pure ()
+            (Right v, Left rerr) ->
+              assertFailure
+                ( "divergence: reference SUCCEEDED ("
+                    <> T.unpack (Interp.renderValue v)
+                    <> ") but RC interpreter FAILED: " <> show rerr )
+            (Left rerr, Right run) ->
+              assertFailure
+                ( "divergence: reference FAILED (" <> show rerr
+                    <> ") but RC interpreter SUCCEEDED ("
+                    <> T.unpack (RCM.rcOutput run) <> ")" )
+
+-- ---------------------------------------------------------------------------
+-- Suite E: deep-list recursive-drop at scale (Task 11)
+--
+-- The corpus carries a small (N == 8) deep-list program at
+-- 'test/rc-examples/16-deep-list.wok', which is golden-pinned and runs through
+-- Suites A/B/D like every other corpus file. This dedicated harness additionally
+-- runs a LARGE (N == 50000) variant --- kept out of the auto-discovered corpus
+-- so it is not golden-pinned --- end-to-end through the WHOLE pipeline
+-- (elaborate -> Perceus insertRC -> runModuleRC) and asserts the exact heap
+-- accounting for a freshly built, fully consumed spine of length N:
+--
+--   * frees    == N + 1  (N 'Cons' shells + one 'Nil', every one reclaimed),
+--   * allocs   == N + 1  (nothing else is allocated; baseline == 0),
+--   * peakLive == N + 1  (the whole spine is live before it is consumed),
+--   * stLive   == 0      (heap-empty at exit).
+--
+-- Reaching 'frees == N + 1' at this scale proves the RC store's drop is
+-- ITERATIVE (a worklist, not host recursion): a recursive drop of a 50000-cell
+-- spine would otherwise overflow the Haskell stack. This is the same property as
+-- the Store-level unit test in 'rc drop', but exercised end-to-end through the
+-- '__rc_drop' calls the Perceus pass actually inserts.
+
+rcDeepListTests :: TestTree
+rcDeepListTests = testGroup "rc deep-list"
+  [ testCase ("frees == N + 1 at scale (N = " <> show deepListN <> ")") $ do
+      instrumented <- rcStatsPrepare "test/rc-deep-list/scale.wok"
+      case RCM.runModuleRC instrumented of
+        Left rerr -> assertFailure ("RC interpreter failed: " <> show rerr)
+        Right run -> do
+          let st       = RCM.rcStats run
+              baseline = RCM.rcBaseline run
+              expected = deepListN + 1
+          assertEqual "this program retains no global baseline"
+            0 baseline
+          assertEqual "frees must equal N + 1 (every spine cell reclaimed)"
+            expected (St.stFrees st)
+          assertEqual "allocs must equal N + 1 (only the spine is allocated)"
+            expected (St.stAllocs st)
+          assertEqual "peakLive must equal N + 1 (whole spine live before consume)"
+            expected (St.stPeak st)
+          assertEqual "stLive must be 0 at exit (heap-empty)"
+            0 (St.stLive st)
+  ]
+  where
+    deepListN :: Int
+    deepListN = 50000
+
+-- ---------------------------------------------------------------------------
+-- Suite B: heap accounting + --dump-rc-stats golden (Task 9)
+--
+-- For each program in test/rc-examples/, after running it on the RC interpreter,
+-- assert the BASELINE heap invariant: every dynamic allocation made by 'main' is
+-- reclaimed, leaving exactly the immortal global/dictionary-CAF baseline live:
+--
+--     stLive          == rcBaseline   AND
+--     stAllocs - stFrees == rcBaseline
+--
+-- We assert against the baseline, NOT against zero, because 'runModuleRC' forces
+-- every value-CAF (e.g. an instance-dictionary record) at load time; those cells
+-- are immortal globals, not leaks (see 'RCRun's documentation). For a module
+-- whose 'main' allocates nothing persistent, rcBaseline == 0 and the invariant
+-- reduces to the textbook heap-empty (stLive == 0, allocs == frees). The corpus
+-- includes a typeclass program (15-typeclass-dict) whose dictionary CAF makes
+-- rcBaseline == 1, exercising the non-zero-baseline path.
+--
+-- A second golden test pins the four accounting numbers (allocs/frees/peakLive/
+-- baseline) per program via 'Machine.renderRcStats' --- the same bytes the
+-- '--dump-rc-stats' CLI mode emits --- so a regression (a move silently turning
+-- into a dup, or a dropped/duplicated drop) surfaces as a golden diff.
+--
+-- Both harnesses share the differential harness's M1 scope guard and reachable
+-- pruning, so they run the same byte-identical first-order programs.
+
+rcStatsGoldenFor :: FilePath -> FilePath
+rcStatsGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/rc-stats-golden"
+
+-- | Load -> elaborate -> M1 scope guard -> prune-to-reachable -> insertRC. The
+-- shared front end for both Suite B harnesses; returns the pruned, instrumented
+-- module ready for 'runModuleRC', or an 'assertFailure' on any front-end error.
+rcStatsPrepare :: FilePath -> IO Anf.CoreModule
+rcStatsPrepare path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s   -> assertFailure ("elaborate: " <> s)
+        Right cm -> do
+          case firstOrderNoHandlerViolations cm of
+            [] -> pure ()
+            vs -> assertFailure
+              (path <> ": not a first-order no-handler program (M1 scope):\n"
+                 <> unlines (map T.unpack vs))
+          pure (Perceus.insertRC (pruneToReachable cm))
+
+-- | Suite B heap-accounting assertion: run the instrumented module and check the
+-- baseline invariant.
+rcStatsHarness :: FilePath -> Assertion
+rcStatsHarness path = do
+  instrumented <- rcStatsPrepare path
+  case RCM.runModuleRC instrumented of
+    Left rerr -> assertFailure ("RC interpreter failed: " <> show rerr)
+    Right run -> do
+      let st       = RCM.rcStats run
+          baseline = RCM.rcBaseline run
+      assertEqual (path <> ": stLive must return to the immortal baseline")
+        baseline (St.stLive st)
+      assertEqual (path <> ": allocs - frees must equal the immortal baseline")
+        baseline (St.stAllocs st - St.stFrees st)
+
+-- | Suite B golden: the '--dump-rc-stats' bytes for a corpus program.
+rcStatsDumpHarness :: FilePath -> IO BL.ByteString
+rcStatsDumpHarness path = do
+  instrumented <- rcStatsPrepare path
+  case RCM.runModuleRC instrumented of
+    Left rerr -> pure (BL.pack ("RC interpreter failed: " <> show rerr <> "\n"))
+    Right run -> pure (BL.pack (T.unpack (RCM.renderRcStats run)))
+
+-- ---------------------------------------------------------------------------
+-- Suite C(b): fault injection --- the oracle has TEETH (Task 10)
+--
+-- The differential + heap-accounting oracle is only worth anything if it CATCHES
+-- a wrong dup/drop placement. To prove it does, we deliberately break the pass
+-- with 'Perceus.insertRCMutated' (a tests-only post-pass that perturbs exactly
+-- one RC call; the production 'insertRC' is untouched) and assert each mutation
+-- makes the oracle fail LOUDLY somewhere on the corpus:
+--
+--   * 'OmitOneDrop'      --- a leak: the Suite B baseline invariant breaks
+--     (@stLive > rcBaseline@) on at least one program.
+--   * 'OmitOneDup'       --- under-counting a shared value: the RC run trips a
+--     'Left' use-after-free / double-free, OR 'balanceLint' reports an
+--     over-consume on the mutated module.
+--   * 'DuplicateOneDrop' --- over-relinquishing: the RC run trips a 'Left'
+--     double-free on at least one program.
+--
+-- Each test asserts the FAILURE is DETECTED --- i.e. the mutated run does NOT
+-- satisfy the oracle on at least one corpus program. A mutation that the oracle
+-- failed to catch on EVERY program would be a vacuous oracle, and the test fails.
+--
+-- We share the front end with Suite B (same load -> elaborate -> M1 scope guard
+-- -> prune), then apply the MUTATED instrumentation instead of the correct one.
+
+rcTeethTests :: [FilePath] -> TestTree
+rcTeethTests perceusFiles = testGroup "rc teeth"
+  [ testCase "OmitOneDrop leaks (Suite B baseline breaks somewhere)" $ do
+      detected <- Control.Monad.filterM
+                    (teethLeakDetected Perceus.OmitOneDrop) perceusFiles
+      assertBool
+        ("OmitOneDrop produced NO leak on any corpus program --- the heap-accounting "
+           <> "oracle is vacuous")
+        (not (null detected))
+  , testCase "OmitOneDup trips UAF/double-free or balance over-consume somewhere" $ do
+      detected <- Control.Monad.filterM
+                    (teethUnsoundDetected Perceus.OmitOneDup) perceusFiles
+      assertBool
+        ("OmitOneDup was caught by NEITHER the RC run nor balanceLint on any corpus "
+           <> "program --- the oracle is vacuous")
+        (not (null detected))
+  , testCase "DuplicateOneDrop trips a double-free somewhere" $ do
+      detected <- Control.Monad.filterM
+                    (teethRunFailDetected Perceus.DuplicateOneDrop) perceusFiles
+      assertBool
+        ("DuplicateOneDrop produced NO RC-run failure on any corpus program --- the "
+           <> "double-free trap is vacuous")
+        (not (null detected))
+  ]
+
+-- | Load + elaborate + M1-guard + prune a corpus file, then instrument it with a
+-- MUTATED Perceus pass. Returns 'Nothing' for a file outside the M1 fragment (so
+-- the teeth tests silently skip it, exactly as Suite B would refuse it) and
+-- 'Just' the mutated module otherwise.
+teethPrepareMutated :: Perceus.Mutation -> FilePath -> IO (Maybe Anf.CoreModule)
+teethPrepareMutated mut path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left _ -> pure Nothing
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left _   -> pure Nothing
+        Right cm
+          | not (null (firstOrderNoHandlerViolations cm)) -> pure Nothing
+          | otherwise ->
+              pure (Just (Perceus.insertRCMutated mut (pruneToReachable cm)))
+
+-- | Does 'OmitOneDrop' make Suite B's baseline invariant FAIL on this file via a
+-- genuine LEAK? A leak shows up as @stLive > rcBaseline@ (more live cells than the
+-- immortal baseline) OR as @stAllocs - stFrees > rcBaseline@. We deliberately do
+-- NOT count a 'Left' as a leak: the plan says OmitOneDrop must make Suite B report
+-- @stLive > baseline@, so this asserts the SPECIFIC leak path, not just "something
+-- went wrong". 'Nothing' (out of fragment) or a clean (balanced) run -> NOT
+-- detected.
+teethLeakDetected :: Perceus.Mutation -> FilePath -> IO Bool
+teethLeakDetected mut path = do
+  mcm <- teethPrepareMutated mut path
+  case mcm of
+    Nothing -> pure False
+    Just cm -> case RCM.runModuleRC cm of
+      Left _    -> pure False  -- a run failure is not the leak signal we assert
+      Right run ->
+        let st       = RCM.rcStats run
+            baseline = RCM.rcBaseline run
+        in pure (St.stLive st > baseline
+                   || (St.stAllocs st - St.stFrees st) > baseline)
+
+-- | Does the mutation make the RC RUN fail with a 'Left' on this file
+-- (use-after-free / double-free / dangling)? 'Nothing' or a clean run -> 'False'.
+teethRunFailDetected :: Perceus.Mutation -> FilePath -> IO Bool
+teethRunFailDetected mut path = do
+  mcm <- teethPrepareMutated mut path
+  case mcm of
+    Nothing -> pure False
+    Just cm -> pure (case RCM.runModuleRC cm of
+                       Left _  -> True
+                       Right _ -> False)
+
+-- | Does the mutation make the oracle catch UNSOUNDNESS on this file --- EITHER
+-- the RC run trips a 'Left' (UAF/double-free), OR 'Perceus.lintInstrumented'
+-- flags an over-consume on the mutated, instrumented module? We lint the
+-- ALREADY-mutated bytes via 'lintInstrumented' (the plain 'balanceLint' re-runs
+-- the CORRECT 'insertRC', which would hide the mutation). Either signal counts.
+teethUnsoundDetected :: Perceus.Mutation -> FilePath -> IO Bool
+teethUnsoundDetected mut path = do
+  runFail <- teethRunFailDetected mut path
+  if runFail
+    then pure True
+    else do
+      mcm <- teethPrepareMutated mut path
+      pure (case mcm of
+              Nothing -> False
+              Just cm -> not (null (Perceus.lintInstrumented cm)))
+
+-- ---------------------------------------------------------------------------
+-- Suite F: property-based differential + heap-empty (Task 12)
+--
+-- The curated corpus (Suites A/B/D/E) pins specific programs; this suite throws
+-- RANDOM first-order ANF at the same oracle so it catches placement bugs the
+-- corpus misses. For every generated program we assert ALL THREE oracle signals
+-- at once:
+--
+--   1. DIFFERENTIAL: the reference interpreter (on the PRE-Perceus ANF) and the
+--      RC interpreter (on the Perceus-INSTRUMENTED ANF) render byte-identical
+--      output. 'dup'/'drop' do not change values, so any divergence is a bug.
+--   2. HEAP-EMPTY: after the RC run, @stLive == rcBaseline@ AND
+--      @stAllocs - stFrees == rcBaseline@ (the baseline invariant; generated
+--      programs have no global CAFs so the baseline is 0 in practice, but we
+--      assert against the reported baseline for robustness).
+--   3. NO UAF / DOUBLE-FREE: the RC run returns 'Right' (the store tombstone
+--      traps surface any use-after-free / double-free as a 'Left').
+--
+-- The generator emits WELL-SCOPED, FIRST-ORDER ANF directly (no surface syntax,
+-- no loader/elaborator): Lit / Con / Record / Proj / Case / Let over a small
+-- fixed set of nullary+binary constructors and saturated binary integer prims.
+-- There are NO lambdas / HOF / partial application / effects, so every program
+-- is squarely in the M1 fragment. Because both interpreters resolve constructors
+-- structurally and prims by name (and 'renderValue'/'renderRCValue' agree byte
+-- for byte), a directly-built @main = e@ module runs identically on both without
+-- the type checker --- exactly the differential we want. Binder types are
+-- generated FAITHFULLY (Int = unboxed U64; Pair/List/Record = boxed) so the
+-- Perceus pass inserts dup/drop on precisely the reference-counted values.
+
+rcPropertyTests :: TestTree
+rcPropertyTests =
+  localOption (QuickCheckTests 500) $
+    testGroup "rc property"
+      [ testProperty "differential output + heap-empty + no UAF/double-free"
+          prop_rcDifferential
+      ]
+
+-- | The single Suite F property. Generate a first-order program, then assert the
+-- three oracle signals. On failure, attach the pretty-printed instrumented ANF
+-- and both interpreters' results as a counterexample (so a shrink/seed is
+-- diagnosable without re-running by hand).
+prop_rcDifferential :: Property
+prop_rcDifferential =
+  forAllShrink genProgram shrinkProgram $ \cm ->
+    let refRes = Interp.runModule cm
+        rcRes  = RCM.runModuleRC (Perceus.insertRC cm)
+        report =
+          "instrumented ANF:\n"
+            <> T.unpack (Perceus.prettyPerceus cm)
+            <> "\n\nreference: " <> showRes (fmap Interp.renderValue refRes)
+            <> "\nrc:        " <> showRcRes rcRes
+    in counterexample report $
+         case (refRes, rcRes) of
+           (Right v, Right run) ->
+             let outOk      = Interp.renderValue v == RCM.rcOutput run
+                 st         = RCM.rcStats run
+                 baseline   = RCM.rcBaseline run
+                 liveOk     = St.stLive st == baseline
+                 balancedOk = St.stAllocs st - St.stFrees st == baseline
+             in counterexample "output / heap-empty / balanced mismatch"
+                  (outOk && liveOk && balancedOk)
+           (Left _, Left _) ->
+             -- Both failed the same way by construction (a generated divide is
+             -- the only partial prim and we never emit it; this branch is a
+             -- defensive match, treated as agreement).
+             counterexample "both interpreters failed (treated as agreement)" True
+           _ ->
+             counterexample "divergence: exactly one interpreter failed" False
+  where
+    showRes (Right t)  = T.unpack t
+    showRes (Left e)   = "FAILED (" <> show e <> ")"
+    showRcRes (Right run) = T.unpack (RCM.rcOutput run)
+    showRcRes (Left e)    = "FAILED (" <> show e <> ")"
+
+-- ---------------------------------------------------------------------------
+-- The first-order ANF generator
+--
+-- A program is @main = e@ where @e@ produces a value of a randomly chosen type.
+-- Generation runs in @StateT Int Gen@: the 'Int' is a monotonic fresh-Unique
+-- supply (so every binder is globally unique => well-scoped by construction),
+-- and 'Gen' drives the random choices. A typed environment @[(Name, GTy)]@ of
+-- in-scope binders lets leaves reference earlier bindings of a compatible type.
+
+-- | The closed first-order type universe the generator ranges over. Every one is
+-- rendered identically by the reference and RC interpreters.
+data GTy
+  = GInt            -- unboxed U64 scalar
+  | GPair           -- boxed   Pair(Int, Int)
+  | GList           -- boxed   cons-list of Int (Cons(Int, GList) | Nil)
+  | GRec            -- boxed   record R { fst : Int, snd : Int }
+  deriving (Eq, Show)
+
+-- | Map a generator type to the 'CType' carried by binders of that type. The
+-- Perceus pass keys boxedness off this type ('isBoxedType'): 'GInt' is unboxed
+-- (no dup/drop), the other three are boxed (reference-counted).
+gtyCType :: GTy -> Ty.CType
+gtyCType GInt  = Ty.CTCon Ty.TcU64 []
+gtyCType GPair = Ty.CTCon (Ty.TcTuple 2) [Ty.CTCon Ty.TcU64 [], Ty.CTCon Ty.TcU64 []]
+gtyCType GList = Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]
+gtyCType GRec  = Ty.CTRecord recTyName Ty.CREmpty
+
+recTyName :: Text
+recTyName = T.pack "R"
+
+-- | Generation monad: a fresh-Unique counter threaded over 'Gen'.
+type GenM = StateT Int Gen
+
+-- | Pull a fresh, globally-unique 'Name' with a readable hint.
+freshN :: Text -> GenM Name
+freshN hint = state (\u -> (Name hint (Unique u), u + 1))
+
+-- | A typed binder over a generated type.
+gBinder :: Text -> GTy -> GenM Binder
+gBinder hint ty = do
+  n <- freshN hint
+  pure (Binder n Unrestricted (gtyCType ty))
+
+-- | Lift a 'Gen' action into 'GenM'.
+liftG :: Gen a -> GenM a
+liftG = lift
+
+-- | Weighted choice among 'GenM' alternatives (a 'GenM' analogue of QuickCheck's
+-- 'frequency'). Zero-weight entries are ignored; at least one positive-weight
+-- entry must be supplied.
+freqM :: [(Int, GenM a)] -> GenM a
+freqM xs = do
+  let live = [ (w, a) | (w, a) <- xs, w > 0 ]
+      total = sum (map fst live)
+  pick <- liftG (choose (1, total))
+  go pick live
+  where
+    go _ [] = error "freqM: empty / all-zero weights"
+    go k ((w, a) : rest)
+      | k <= w    = a
+      | otherwise = go (k - w) rest
+
+-- | The whole-program generator: @main = e@, scaled by the QuickCheck size.
+genProgram :: Gen CoreModule
+genProgram = sized $ \sz -> do
+  ty <- elements [GInt, GPair, GList, GRec]
+  (body, _) <- runStateT (genExpr [] (max 1 (min sz 8)) ty) 0
+  mainN <- pure (Name (T.pack "main") (Unique 1000000))
+  pure (CoreModule [TopBind mainN [] body])
+
+-- | Generate an ANF 'Expr' of result type @ty@ under typed environment @env@,
+-- with a fuel budget @n@ bounding nesting depth. The environment lists in-scope
+-- boxed/unboxed binders the leaves may reference.
+genExpr :: [(Name, GTy)] -> Int -> GTy -> GenM Expr
+genExpr env n ty
+  | n <= 0    = Ret <$> genAtom env ty
+  | otherwise =
+      freqM
+        [ (2, Ret <$> genAtom env ty)
+        , (4, genLet env n ty)
+        , (if scrutinizable env then 3 else 0, genCase env n ty)
+        , (if n >= 3 then 3 else 0, genJoinCluster env n ty)
+        ]
+
+-- | A 'let x = rhs in body' producing @ty@. The rhs produces some intermediate
+-- type; the body (under x in scope) produces @ty@.
+genLet :: [(Name, GTy)] -> Int -> GTy -> GenM Expr
+genLet env n ty = do
+  rhsTy <- liftG (elements [GInt, GPair, GList, GRec])
+  (b, rhs) <- genRhs env (n - 1) rhsTy
+  body <- genExpr ((bndName b, rhsTy) : env) (n - 1) ty
+  pure (Let b rhs body)
+
+-- | Generate a 'Let' binder of type @ty@ together with its (already-ANF) rhs.
+genRhs :: [(Name, GTy)] -> Int -> GTy -> GenM (Binder, Rhs)
+genRhs env _n ty = do
+  b <- gBinder (hintFor ty) ty
+  rhs <- case ty of
+    GInt  -> genIntRhs env
+    GPair -> do x <- genAtom env GInt
+                y <- genAtom env GInt
+                pure (RCon (T.pack "Tuple2") [x, y])
+    GList -> freqM
+               [ (1, pure (RCon (T.pack "Nil") []))
+               , (3, do hd <- genAtom env GInt
+                        tl <- genAtom env GList
+                        pure (RCon (T.pack "Cons") [hd, tl])) ]
+    GRec  -> do a <- genAtom env GInt
+                c <- genAtom env GInt
+                pure (RRecord recTyName [(T.pack "fst", a), (T.pack "snd", c)])
+  pure (b, rhs)
+
+-- | An integer-producing rhs: either a saturated binary prim over two int atoms,
+-- a projection of a boxed value's int field, or a plain int atom.
+genIntRhs :: [(Name, GTy)] -> GenM Rhs
+genIntRhs env = do
+  let projSources =
+        [ (nm, lbl)
+        | (nm, GRec) <- env, lbl <- [T.pack "fst", T.pack "snd"] ]
+  freqM
+    [ (4, do op <- liftG (elements [T.pack "+", T.pack "-", T.pack "*"])
+             x  <- genAtom env GInt
+             y  <- genAtom env GInt
+             pure (RApp (AVar (primName op)) [x, y]))
+    , (if null projSources then 0 else 2,
+         do (nm, lbl) <- liftG (elements projSources)
+            pure (RProj lbl (AVar nm)))
+    , (2, RAtom <$> genAtom env GInt)
+    ]
+
+-- | A 'case' scrutinizing an in-scope boxed value (Pair / List / Record) and
+-- producing @ty@ in every alt. Every alt consumes the same owned set, exercising
+-- the Perceus branch-reconciliation / own-children-drop-parent rules.
+genCase :: [(Name, GTy)] -> Int -> GTy -> GenM Expr
+genCase env n ty = do
+  (scrut, scrutTy) <- liftG (elements (scrutCandidates env))
+  case scrutTy of
+    GPair -> do
+      xb <- gBinder (T.pack "px") GInt
+      yb <- gBinder (T.pack "py") GInt
+      body <- genExpr ((bndName xb, GInt) : (bndName yb, GInt) : env) (n - 1) ty
+      pure (Case (AVar scrut) [AltCon (T.pack "Tuple2") [xb, yb] body])
+    GRec -> do
+      -- A record has no constructor to match; scrutinize via a default alt that
+      -- keeps the record live for projection in the body.
+      body <- genExpr env (n - 1) ty
+      pure (Case (AVar scrut) [AltDefault body])
+    GList -> do
+      hb   <- gBinder (T.pack "h") GInt
+      tb   <- gBinder (T.pack "t") GList
+      consBody <- genExpr ((bndName hb, GInt) : (bndName tb, GList) : env) (n - 1) ty
+      nilBody  <- genExpr env (n - 1) ty
+      pure (Case (AVar scrut)
+              [ AltCon (T.pack "Cons") [hb, tb] consBody
+              , AltCon (T.pack "Nil") [] nilBody ])
+    GInt -> Ret <$> genAtom env ty   -- unreachable (filtered by scrutCandidates)
+
+-- | Boxed in-scope binders usable as 'case' scrutinees.
+scrutCandidates :: [(Name, GTy)] -> [(Name, GTy)]
+scrutCandidates env = [ (nm, t) | (nm, t) <- env, t /= GInt ]
+
+scrutinizable :: [(Name, GTy)] -> Bool
+scrutinizable = not . null . scrutCandidates
+
+-- | A trivial atom of the requested type: prefer an in-scope binder of that type,
+-- otherwise a literal/constant. For 'GInt' a random small literal; for the boxed
+-- types, a canonical empty/zero constant so a leaf always type-checks structurally.
+genAtom :: [(Name, GTy)] -> GTy -> GenM Atom
+genAtom env ty =
+  let candidates = [ AVar nm | (nm, t) <- env, t == ty ]
+  in case ty of
+       GInt -> freqM
+                 [ (3, ALit . LInt . toInteger <$> liftG (choose (0, 20 :: Int)))
+                 , (if null candidates then 0 else 4, liftG (elements candidates))
+                 ]
+       _    -> if null candidates
+                 then pure (constAtomFor ty)
+                 else liftG (elements candidates)
+
+-- | A canonical closed constant atom for a boxed type, used when no in-scope
+-- binder of that type exists. These are LITERAL/nullary forms only (an atom must
+-- be trivial); compound constants are introduced via 'genRhs' lets, so the only
+-- nullary boxed constant we can express as a bare atom is the empty list 'Nil'...
+-- which is itself a constructor, NOT an atom. Therefore boxed leaves fall back to
+-- a unit literal sentinel only when truly unavoidable; in practice 'genExpr'
+-- seeds boxed bindings via 'genLet' before requesting a boxed atom, so this path
+-- is not hit for well-fuelled programs. To stay TOTAL we emit a zero int literal,
+-- which is only ever reached at fuel 0 with an empty env and is harmless because
+-- the differential compares whatever both interpreters produce identically.
+constAtomFor :: GTy -> Atom
+constAtomFor _ = ALit (LInt 0)
+
+hintFor :: GTy -> Text
+hintFor GInt  = T.pack "i"
+hintFor GPair = T.pack "p"
+hintFor GList = T.pack "xs"
+hintFor GRec  = T.pack "r"
+
+-- | The 'Name' under which a binary integer prim is referenced. The 'Unique' is
+-- irrelevant: both interpreters resolve prims by HINT (the textual name) when the
+-- name is absent from the runtime env (see 'callFn'/the reference 'enter'), so a
+-- placeholder unique suffices.
+primName :: Text -> Name
+primName op = Name op (Unique 2000000)
+
+-- ---------------------------------------------------------------------------
+-- Adversarial join clusters (Suite F, review #1 follow-up)
+--
+-- The base generator emits no joins, so the recurring "a var consumed somewhere
+-- the dup/drop placement didn't see" bug class was unreachable by random programs:
+--   * F1     -- a Case whose scrutinee is captured only by a join reached
+--               TRANSITIVELY through a chain (reuse detection must close over it);
+--   * #4     -- a join that owns a var only via the TRANSITIVE cap and so must
+--               DROP it on a non-forwarding arm of its own body;
+--   * §1     -- a join body that MOVES a captured var AND forwards onward to a
+--               downstream join that also uses it (two consumers => a dup).
+--
+-- 'genJoinCluster' synthesizes a value-position case on a freshly-seeded boxed
+-- capture whose continuation is a chain of joins capturing that var, directly in
+-- ANF. It only owes STRUCTURAL validity (well-scoped, arity-correct jumps, covered
+-- fragment); the existing triple oracle (differential output + heap-empty +
+-- balanced, with a UAF/double-free trapped as a 'Left') checks that the PASS got
+-- the reference counting right. Reverting any of the three fixes makes the
+-- corresponding kind below fail at runtime (a leak or a trapped use-after-free).
+
+-- | How an INTERMEDIATE join (one that is not the deepest in the chain) treats the
+-- captured scrutinee. The deepest join always uses the capture (so it is in that
+-- join's cap); the intermediates differ:
+data IntermediateKind
+  = PureForward     -- ^ body is a bare 'Jump' onward: the capture is reached only
+                    --   TRANSITIVELY through the deepest join (exercises F1).
+  | MoveForward     -- ^ body MOVES the capture into a dead binding then jumps on:
+                    --   the capture lives in two places => a dup is required (§1).
+  | BranchForward   -- ^ body is a 'Case' on its int param, one arm forwarding and
+                    --   one not, so the capture (owned only via the transitive cap)
+                    --   must be DROPPED on the non-forwarding arm (#4).
+  deriving (Eq, Show)
+
+-- | A fresh 'JoinId' from the same monotonic supply as binder names.
+freshJoinId :: GenM JoinId
+freshJoinId = state (\u -> (JoinId (Unique u), u + 1))
+
+-- | Generate an adversarial join cluster producing @ty@. Seeds its own boxed
+-- capture, so it needs nothing from @env@ and is available whenever there is fuel.
+genJoinCluster :: [(Name, GTy)] -> Int -> GTy -> GenM Expr
+genJoinCluster env n ty = do
+  -- Pure-forward weighted twice so the F1 path is well represented.
+  kind  <- liftG (elements [PureForward, PureForward, MoveForward, BranchForward])
+  depth <- case kind of
+             PureForward   -> liftG (choose (1, 3 :: Int))
+             MoveForward   -> liftG (choose (2, 3 :: Int))
+             BranchForward -> pure (2 :: Int)
+  -- Seed a fresh non-empty capture list  s = Cons h Nil  (so the Cons arm runs).
+  nilN <- freshN (T.pack "n0")
+  sN   <- freshN (T.pack "s")
+  hN   <- freshN (T.pack "h")
+  tN   <- freshN (T.pack "t")
+  h0   <- liftG (choose (0, 9 :: Int))
+  jHead    <- freshJoinId
+  restJids <- mapM (const freshJoinId) [2 .. depth]
+  let jids = jHead : restJids
+  params <- mapM (const (freshN (T.pack "r"))) jids
+  let listTy  = gtyCType GList
+      intTy   = gtyCType GInt
+      -- BranchForward needs head arg 0 so j1's non-forwarding arm runs at runtime
+      -- (review #4 shows up there as a leak); otherwise any nonzero forward arg.
+      headArg = if kind == BranchForward then 0 else 1 :: Int
+      armTo j = Jump j [ALit (LInt (toInteger headArg))]
+      -- The capture is NOT referenced in the arms (it reaches the joins only
+      -- through the cap) -- exactly the F1 trap.
+      caseE   = Case (AVar sN)
+                  [ AltCon (T.pack "Cons")
+                      [Binder hN Unrestricted intTy, Binder tN Unrestricted listTy]
+                      (armTo jHead)
+                  , AltCon (T.pack "Nil") [] (armTo jHead) ]
+      succs   = map Just restJids ++ [Nothing]   -- successor of each join; deepest -> Nothing
+      triples = zip3 jids params succs
+  -- Build each join body, then nest deepest-OUTERMOST (foldM: head ends innermost,
+  -- delivering the Case; each later join wraps the accumulator).
+  nest <- Control.Monad.foldM
+            (\acc (jid, pN, mSucc) -> do
+               body <- genJoinBody env n ty sN kind pN mSucc
+               pure (LetJoin jid [Binder pN Unrestricted intTy] body acc))
+            caseE
+            triples
+  pure $ Let (Binder nilN Unrestricted listTy) (RCon (T.pack "Nil") [])
+       $ Let (Binder sN Unrestricted listTy)
+             (RCon (T.pack "Cons") [ALit (LInt (toInteger h0)), AVar nilN])
+       $ nest
+
+-- | One join body. @mSucc = Nothing@ marks the deepest join (it captures @sN@ and
+-- produces @ty@); otherwise it is an intermediate whose shape follows @kind@.
+genJoinBody :: [(Name, GTy)] -> Int -> GTy -> Name -> IntermediateKind -> Name -> Maybe JoinId -> GenM Expr
+genJoinBody env n ty sN kind pN mSucc =
+  let listTy = gtyCType GList
+  in case mSucc of
+       Nothing -> do
+         -- Deepest join: USE the capture (a dead Cons that moves it -> sN is in the
+         -- cap), then produce @ty@ by the ordinary rules.
+         capN  <- freshN (T.pack "cap")
+         inner <- genExpr env (n - 1) ty
+         pure (Let (Binder capN Unrestricted listTy)
+                   (RCon (T.pack "Cons") [ALit (LInt 0), AVar sN]) inner)
+       Just jn -> case kind of
+         PureForward -> pure (Jump jn [ALit (LInt 1)])
+         MoveForward -> do
+           uN <- freshN (T.pack "u")
+           pure (Let (Binder uN Unrestricted listTy)
+                     (RCon (T.pack "Cons") [ALit (LInt 0), AVar sN])
+                     (Jump jn [ALit (LInt 1)]))
+         BranchForward -> do
+           nf <- genExpr env (n - 1) ty     -- non-forwarding arm (does not use sN)
+           pure (Case (AVar pN)
+                   [ AltLit (LInt 0) nf
+                   , AltDefault (Jump jn [ALit (LInt 1)]) ])
+
+-- | Shrinking: drop the program toward a constant. We shrink the single 'main'
+-- bind's body to its trivial sub-results (a 'Ret' of a contained atom, an alt
+-- body, or a let body), preserving well-scopedness by only ever REPLACING an
+-- expression with one of its own sub-expressions whose free variables are a
+-- subset of the original's. The simplest safe shrink: replace the body with a
+-- 'Ret' of a literal of the same shape is unsound (type may differ), so we only
+-- climb into structurally-contained sub-expressions.
+shrinkProgram :: CoreModule -> [CoreModule]
+shrinkProgram (CoreModule [TopBind n ps body]) =
+  [ CoreModule [TopBind n ps body'] | body' <- shrinkExpr body ]
+shrinkProgram _ = []
+
+-- | Sub-expressions reachable by peeling one constructor layer, restricted to
+-- those that remain WELL-SCOPED on their own (no free variable bound only by the
+-- peeled layer). Returns same-typed continuations only (a let body, an alt body),
+-- never a differently-typed fragment.
+shrinkExpr :: Expr -> [Expr]
+shrinkExpr e = case e of
+  Let b _ body
+    | not (Name.nameUniq (bndName b) `Set.member` exprUniques body) -> [body]
+    | otherwise -> []
+  Case _ alts ->
+    [ altBody | alt <- alts
+              , Just altBody <- [altClosedBody alt] ]
+  -- A join cluster: recursively shrink the delivering body, keeping the join
+  -- DEFINED so no 'Jump' is stranded; additionally offer dropping the whole join
+  -- iff the delivering body never jumps to it. We never extract a join body alone
+  -- (it may reference the join params or the captured var).
+  LetJoin j ps jb body ->
+    [ LetJoin j ps jb body' | body' <- shrinkExpr body ]
+      ++ [ body | not (exprJumpsTo j body) ]
+  _ -> []
+  where
+    -- Only extract an alt body that is well-scoped on its own: no free child
+    -- binder, and no 'Jump' (which would dangle once its enclosing join is gone).
+    altClosedBody (AltCon _ bs b)
+      | not (any (\bd -> Name.nameUniq (bndName bd) `Set.member` exprUniques b) bs)
+      , not (exprHasJump b) = Just b
+      | otherwise = Nothing
+    altClosedBody (AltLit _ b)   | not (exprHasJump b) = Just b
+                                 | otherwise           = Nothing
+    altClosedBody (AltDefault b) | not (exprHasJump b) = Just b
+                                 | otherwise           = Nothing
+
+-- | Does @e@ contain any 'Jump' (which would dangle if extracted from its
+-- enclosing join)? Used to keep 'shrinkExpr' from producing ill-scoped fragments.
+exprHasJump :: Expr -> Bool
+exprHasJump (Jump _ _)         = True
+exprHasJump (Ret _)            = False
+exprHasJump (Let _ _ e)        = exprHasJump e
+exprHasJump (Case _ alts)      = any (exprHasJump . clusterAltBody) alts
+exprHasJump (LetJoin _ _ jb e) = exprHasJump jb || exprHasJump e
+exprHasJump (LetRec ds e)      = any (\(_, _, b) -> exprHasJump b) ds || exprHasJump e
+exprHasJump (Handle e _)       = exprHasJump e
+
+-- | Does @e@ jump to the specific join @j@ (so dropping @j@'s binder would strand it)?
+exprJumpsTo :: JoinId -> Expr -> Bool
+exprJumpsTo j (Jump j' _)        = j == j'
+exprJumpsTo _ (Ret _)            = False
+exprJumpsTo j (Let _ _ e)        = exprJumpsTo j e
+exprJumpsTo j (Case _ alts)      = any (exprJumpsTo j . clusterAltBody) alts
+exprJumpsTo j (LetJoin _ _ jb e) = exprJumpsTo j jb || exprJumpsTo j e
+exprJumpsTo j (LetRec ds e)      = any (\(_, _, b) -> exprJumpsTo j b) ds || exprJumpsTo j e
+exprJumpsTo j (Handle e _)       = exprJumpsTo j e
+
+clusterAltBody :: Anf.Alt -> Expr
+clusterAltBody (AltCon _ _ b) = b
+clusterAltBody (AltLit _ b)   = b
+clusterAltBody (AltDefault b) = b

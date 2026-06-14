@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+
+-- Local mutual recursion: the two helpers form one LetRec uncounted region.
+-- Intra-group references (ev <-> od) are uncounted edges that emit no dup/drop;
+-- the group is dropped as a unit (one drop per member) at the LetRec scope exit.
+--
+-- The enclosing scope holds only the unboxed counter `n`, so the group's closure
+-- cells capture no dynamic boxed local: dropping the group cascades into nothing
+-- on the dynamic heap, and the region frees cleanly (cascade-safe; see the
+-- LetRec coverage note in Wok.IR.Perceus).
+parity : U64 -> U64
+parity n =
+  let
+    ev k = case k of
+      0 -> 1
+      _ -> od (k - 1)
+    od k = case k of
+      0 -> 0
+      _ -> ev (k - 1)
+  in ev n
+
+main = parity 4

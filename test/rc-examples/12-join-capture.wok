@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+-- A merge join whose result is boxed and flows through the continuation. On the
+-- empty branch the owned `tag` is moved into the join (and the empty `xs` shell
+-- dropped); on the cons branch `xs` itself is moved into the join (and the unused
+-- `tag` dropped). Both jump sites reconcile to the join's expected owned set.
+pickTag : [U64] -> [U64] -> [U64]
+pickTag tag xs =
+  let chosen = case xs of
+                 []     -> tag
+                 _ :: _ -> xs
+  in chosen
+
+main = pickTag [9] [1, 2]

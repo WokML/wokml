@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+data Flagged = Flagged Bool U64
+
+-- STORE-BOOL-IN-FIELD regression (F3): a boxed Bool is stored in a constructor
+-- field, then later projected out by a `case` and consumed. The owned Bool is
+-- moved into the `Flagged` shell; when the shell is matched and dropped, its
+-- boxed Bool child must be recursively dropped too. Before the fix Bool was
+-- treated as unboxed so the field child was never counted/dropped and the cell
+-- leaked. With the fix the heap empties.
+unwrap : Flagged -> U64
+unwrap f = case f of
+  Flagged flag n -> case flag of
+    True  -> n
+    False -> 0
+
+main = unwrap (Flagged (eqU64 1 1) 7)

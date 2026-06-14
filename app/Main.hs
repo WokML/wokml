@@ -10,7 +10,10 @@ import System.IO (hPutStrLn, stderr)
 
 import Wok.IR.Anf (prettyModuleTyped)
 import Wok.IR.Multiplicity (prettyMultiplicity)
+import qualified Wok.IR.Perceus as Perceus
+import Wok.IR.Reachable (pruneToReachable)
 import qualified Wok.Interp as Interp
+import qualified Wok.Interp.RC.Machine as RCM
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
 import qualified Wok.TypeChecking as TC
@@ -20,9 +23,15 @@ import qualified Wok.TypeChecking as TC
 -- ----------------------------------------------------------------
 
 usage :: String
-usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --dump-multiplicity | --run]"
+usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --dump-perceus | --dump-multiplicity | --dump-rc-stats | --run]"
 
-data CliMode = ModePrintSchemes | ModeDumpAnf | ModeDumpMultiplicity | ModeRun
+data CliMode
+  = ModePrintSchemes
+  | ModeDumpAnf
+  | ModeDumpPerceus
+  | ModeDumpMultiplicity
+  | ModeDumpRcStats
+  | ModeRun
 
 main :: IO ()
 main = do
@@ -39,7 +48,9 @@ parseCli = go Nothing [] ModePrintSchemes
     go _        _  _  ["-I"]               = Left ("-I requires an argument\n" ++ usage)
     go e        xs md ("-I" : f : rest)    = go e (f : xs) md rest
     go e        xs _  ("--dump-anf" : rest) = go e xs ModeDumpAnf rest
+    go e        xs _  ("--dump-perceus" : rest) = go e xs ModeDumpPerceus rest
     go e        xs _  ("--dump-multiplicity" : rest) = go e xs ModeDumpMultiplicity rest
+    go e        xs _  ("--dump-rc-stats" : rest) = go e xs ModeDumpRcStats rest
     go e        xs _  ("--run" : rest)      = go e xs ModeRun rest
     go Nothing  xs md (a : rest)           = go (Just a) xs md rest
     go (Just _) _  _  (a : _)             =
@@ -58,6 +69,11 @@ runApp entry extras mode = do
       ModeDumpAnf -> case Pipeline.elaborateProgram entryName ms of
         Left msg  -> hPutStrLn stderr msg >> exitFailure
         Right cm  -> TIO.putStrLn (prettyModuleTyped cm)
+      -- Whole-program elaboration so the dump includes prelude binds (matches
+      -- the `perceus golden` harness), then run the Perceus dup/drop pass.
+      ModeDumpPerceus -> case Pipeline.elaborateProgramFull entryName ms of
+        Left msg  -> hPutStrLn stderr msg >> exitFailure
+        Right cm  -> TIO.putStrLn (Perceus.prettyPerceus cm)
       -- Whole-program elaboration: the proof artifact must include handler arms
       -- defined in imported modules (e.g. the prelude `Coro.suspend` arm that
       -- desugars to the genuine `__coro_susp` escape sink), so the dump agrees
@@ -66,6 +82,18 @@ runApp entry extras mode = do
       ModeDumpMultiplicity -> case Pipeline.elaborateProgramFullTrusted entryName ms of
         Left msg          -> hPutStrLn stderr msg >> exitFailure
         Right (cm, trust) -> TIO.putStrLn (prettyMultiplicity trust cm)
+      -- Whole-program elaboration, then prune to the binds reachable from 'main'
+      -- (a semantics-preserving dead-bind elimination: 'elaborateProgramFull'
+      -- inlines the whole prelude, but only the reachable first-order corpus
+      -- actually runs on the RC store). Then run the Perceus pass and the RC
+      -- interpreter, and dump the dynamic-heap accounting. Mirrors the Suite B
+      -- golden harness so the CLI output and the golden agree byte-for-byte.
+      ModeDumpRcStats -> case Pipeline.elaborateProgramFull entryName ms of
+        Left msg  -> hPutStrLn stderr msg >> exitFailure
+        Right cm  ->
+          case RCM.runModuleRC (Perceus.insertRC (pruneToReachable cm)) of
+            Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure
+            Right run -> TIO.putStr (RCM.renderRcStats run)
       ModeRun -> case Pipeline.elaborateCheckedFull entryName ms of
         Left msg -> hPutStrLn stderr msg >> exitFailure
         Right cm -> case Interp.runModule cm of

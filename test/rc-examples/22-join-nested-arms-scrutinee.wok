@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+
+-- ALL-ARMS-NESTED scrutinee regression (F1): every arm of the outer case on the
+-- scrutinee `xs` is ITSELF a nested case before reaching the value-position merge
+-- join whose continuation `Pair n xs` captures the SCRUTINEE `xs`. The capturing
+-- join is therefore reached only through a nested Case inside each arm (and a join
+-- chain), never as a leading-Let tail of an arm --- exactly the shape the old
+-- `altJumpTargets` missed. Without complete (transitive, full-recursive) reuse
+-- detection `xs` is __rc_drop-ped at an arm entry while the join body still uses
+-- it (use-after-free / balance over-consume); with the fix it stays live and is
+-- consumed at its real last use in the join body.
+data Wrap = Wrap [U64]
+data Pair = Pair U64 Wrap
+
+classify : Wrap -> Pair
+classify xs =
+  let n = case xs of
+            Wrap ys ->
+              case ys of
+                []     -> 0
+                z :: _ -> z
+  in Pair n xs
+
+main = classify (Wrap [7, 8])

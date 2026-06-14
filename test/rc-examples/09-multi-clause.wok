@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+-- Multi-clause function: elaborates to a decision tree whose leaves Jump to a
+-- per-clause join point. The first clause's join keeps the boxed tail children
+-- (xs, ys) -- they are dup'd at the match and moved into the join via the jump;
+-- the fall-through join (constant 0) takes no args, so every owned list shell
+-- reaching it is dropped before the jump.
+sumPairs : [U64] -> [U64] -> U64
+sumPairs (x :: xs) (y :: ys) = x + y + sumPairs xs ys
+sumPairs _         _         = 0
+
+main = sumPairs [1, 2, 3] [10, 20, 30]

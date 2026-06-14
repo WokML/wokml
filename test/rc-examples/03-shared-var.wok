@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+
+double : U64 -> U64
+double n = n + n
+
+main = double (10 + 5)

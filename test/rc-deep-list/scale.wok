@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+
+-- Large-scale variant of test/rc-examples/16-deep-list.wok, kept OUT of the
+-- auto-discovered corpus dir so it is NOT golden-pinned at 50000 cells. The
+-- dedicated 'rc deep-list' harness runs this through the full pipeline
+-- (elaborate -> Perceus insertRC -> runModuleRC) and asserts frees == N + 1,
+-- proving the RC store's ITERATIVE (worklist) drop reclaims a long spine at
+-- scale without host-stack overflow --- the same property the Store-level unit
+-- test checks, but now end-to-end through the inserted __rc_drop calls.
+data List = Nil | Cons U64 List
+
+build : U64 -> List
+build n = case n of
+  0 -> Nil
+  _ -> Cons n (build (n - 1))
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil       -> 0
+  Cons y ys -> y + sumList ys
+
+main = sumList (build 50000)
