@@ -11,11 +11,12 @@ module Wok.Interp.RC.Machine
 
 import Control.Monad (foldM)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Lit (..)
-  , Rhs (..), TopBind (..) )
+  , Rhs (..), TopBind (..), binderUnique, freeVarsExpr )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.Interp.RC.Prim (rcPrimTable)
@@ -109,9 +110,18 @@ evalExprRC prims expr sc k s = case expr of
         -- references to all siblings (including itself).
         groupEnv     = foldl' (\e ((b, _, _), a) -> bindRCBinder b (RVBox a) e)
                               (rscEnv sc) (zip defs addrs)
-        -- Install each member's real closure node over the shared knotted env.
+        -- Install each member's real closure node. Each member captures only the
+        -- free variables of its body (minus its own parameters); the knot still
+        -- ties because siblings ARE free vars of a body that calls them, so they
+        -- remain in each member's captured env. Enclosing owned locals that NO
+        -- member references are excluded, so the group drop's cascade does not
+        -- decref cells the group does not own.
         s''          = foldl' (\st ((_, ps, bdy), a) ->
-                                 writeRegionCell a (NClosure groupEnv ps bdy) st)
+                                 let fvs  = freeVarsExpr bdy
+                                              `Set.difference`
+                                              Set.fromList (map binderUnique ps)
+                                     cenv = Map.restrictKeys groupEnv fvs
+                                 in writeRegionCell a (NClosure cenv ps bdy) st)
                               s' (zip defs addrs)
     in Right (REval body sc { rscEnv = groupEnv } k s'')
 
@@ -136,7 +146,10 @@ evalRhsRC prims b rhs body sc k s = case rhs of
     cont (RVBox a) s'
 
   RLam ps e ->
-    let (a, s') = alloc (NClosure (rscEnv sc) ps e) s
+    let fvs     = freeVarsExpr e `Set.difference`
+                    Set.fromList (map binderUnique ps)
+        cenv    = Map.restrictKeys (rscEnv sc) fvs
+        (a, s') = alloc (NClosure cenv ps e) s
     in cont (RVBox a) s'
 
   RProj l a -> do
@@ -380,21 +393,21 @@ data RCRun = RCRun
 -- itself is a 0-arity bind but is run explicitly below, not at load time.
 runModuleRC :: CoreModule -> Either RuntimeError RCRun
 runModuleRC cm@(CoreModule binds) = do
-  -- 0. Boundary guard. M1 implements only the FIRST-ORDER, no-handler fragment.
-  --    A module whose code reachable from 'main' contains a first-class closure
-  --    ('RLam') or an effect feature ('Handle'/'ROp') is OUT OF SCOPE: running it
-  --    would silently leak (e.g. a standalone 'RLam' body is excluded from
-  --    Perceus coverage, so its params/captures are never dropped). Reject loudly
-  --    at the whole-module entry rather than running-and-leaking. (The
-  --    differential/stats test harnesses pre-filter the corpus on the same
-  --    predicate, so this is a no-op for in-scope programs.)
+  -- 0. Boundary guard. The RC interpreter supports the handler-free fragment
+  --    (closures/'RLam' are admitted as of M1.5; 'Handle'/'ROp' effect features
+  --    remain out of scope, as does a standalone closure capturing a 'LetRec'
+  --    sibling --- see the TODO in "Wok.IR.Reachable"). A module whose code
+  --    reachable from 'main' uses any of these is rejected loudly rather than
+  --    running-and-miscompiling. (The differential/stats test harnesses
+  --    pre-filter the corpus on the same predicate, so this is a no-op for
+  --    in-scope programs.)
   case firstOrderNoHandlerViolations cm of
     []         -> Right ()
     violations ->
       Left (PrimError
         (Tx.pack
-           "RC interpreter (M1): first-order/no-handler fragment only \
-           \-- higher-order/effect features unsupported:\n"
+           "RC interpreter: code reachable from 'main' uses an unsupported \
+           \feature:\n"
           <> Tx.intercalate (Tx.pack "\n") violations))
   -- 1. Reserve a static address for every top-level bind, building the knotted
   --    static env (every global maps to its handle before any body runs) and a

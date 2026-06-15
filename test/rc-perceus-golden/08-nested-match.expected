@@ -456,9 +456,15 @@ raceAny fs =
 raceSpawn ch fs =
   case fs of
     Nil ->
+      let _drop.1 = __rc_drop(fs)
       let t.1 = Nil
+      let _drop.2 = __rc_drop(ch)
       t.1
     Cons f gs ->
+      let _dup.1 = __rc_dup(f)
+      let _dup.2 = __rc_dup(gs)
+      let _drop.3 = __rc_drop(fs)
+      let _dup.3 = __rc_dup(ch)
       let t.4 = \_ -> let t.2 = f(())
       let t.3 = send(ch, t.2)
       t.3

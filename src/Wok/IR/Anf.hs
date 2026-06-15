@@ -13,6 +13,12 @@ module Wok.IR.Anf
   , prettyModule
   , prettyModuleTyped
   , prettyExpr
+    -- * Free-variable analysis
+  , freeVarsExpr
+  , freeVarsRhs
+  , freeVarsAlt
+  , atomVars
+  , binderUnique
   ) where
 
 import Data.Map.Strict (Map)
@@ -420,3 +426,51 @@ prettyExpr e =
   let tbl = buildHintTableExpr e
   in renderExpr erasedBndFmt tbl e
 
+-- ---------------------------------------------------------------------------
+-- Free-variable analysis
+--
+-- The standard ANF free-var walk: a binder removes its own Unique from the
+-- free set of its scope. Only term variables ('AVar') contribute; literals,
+-- constructor tags, effect labels, and join ids do not.
+
+-- | The free term variables (as 'Unique's) of an ANF expression: every 'AVar'
+-- reference not bound by an enclosing binder. The single source of truth shared
+-- by the Perceus pass and the RC interpreter for computing closure captures.
+freeVarsExpr :: Expr -> Set Unique
+freeVarsExpr (Ret a)            = atomVars a
+freeVarsExpr (Let b r e)        =
+  freeVarsRhs r `Set.union` Set.delete (binderUnique b) (freeVarsExpr e)
+freeVarsExpr (LetRec defs body) =
+  let groupU = Set.fromList (map (\(b, _, _) -> binderUnique b) defs)
+      bodyFv = freeVarsExpr body
+      defFv  = Set.unions
+                 [ freeVarsExpr d `Set.difference` Set.fromList (map binderUnique ps)
+                 | (_, ps, d) <- defs ]
+  in (bodyFv `Set.union` defFv) `Set.difference` groupU
+freeVarsExpr (Case a alts)      = atomVars a `Set.union` Set.unions (map freeVarsAlt alts)
+freeVarsExpr (LetJoin _ ps jb e) =
+  let psU = Set.fromList (map binderUnique ps)
+  in (freeVarsExpr jb `Set.difference` psU) `Set.union` freeVarsExpr e
+freeVarsExpr (Jump _ as)        = Set.unions (map atomVars as)
+freeVarsExpr (Handle e _)       = freeVarsExpr e
+
+freeVarsAlt :: Alt -> Set Unique
+freeVarsAlt (AltCon _ bs e) = freeVarsExpr e `Set.difference` Set.fromList (map binderUnique bs)
+freeVarsAlt (AltLit _ e)    = freeVarsExpr e
+freeVarsAlt (AltDefault e)  = freeVarsExpr e
+
+freeVarsRhs :: Rhs -> Set Unique
+freeVarsRhs (RAtom a)        = atomVars a
+freeVarsRhs (RApp f as)      = Set.unions (map atomVars (f : as))
+freeVarsRhs (RCon _ as)      = Set.unions (map atomVars as)
+freeVarsRhs (RLam ps e)      = freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps)
+freeVarsRhs (ROp m _ _ as)   = Set.unions (map atomVars (maybe as (: as) m))
+freeVarsRhs (RRecord _ flds) = Set.unions (map (atomVars . snd) flds)
+freeVarsRhs (RProj _ a)      = atomVars a
+
+atomVars :: Atom -> Set Unique
+atomVars (AVar n) = Set.singleton (nameUniq n)
+atomVars (ALit _) = Set.empty
+
+binderUnique :: Binder -> Unique
+binderUnique = nameUniq . bndName

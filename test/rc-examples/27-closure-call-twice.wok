@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+-- The closure value is consumed by each call, so calling it twice forces the
+-- pass to insert one dup of the closure (rc must reach 2).
+data Box = Box U64
+
+unbox : Box -> U64
+unbox b = case b of Box v -> v
+
+main =
+  let b = Box 7 in
+  let f = \n -> n + unbox b in
+  f 1 + f 2

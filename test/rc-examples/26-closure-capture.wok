@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+-- A closure captures a boxed owned local (the list `xs`) and is called once.
+data List = Nil | Cons U64 List
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil      -> 0
+  Cons h t -> h + sumList t
+
+main =
+  let xs = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let f = \n -> n + sumList xs in
+  f 10

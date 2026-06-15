@@ -1,27 +1,27 @@
-parity n =
-  letrec
-    ev k.1 =
-      case k.1 of
-        0 -> 1
-        _ ->
-          let t.2 = -(k.1, 1)
-          let t.3 = od(t.2)
-          t.3
-    od k.2 =
-      case k.2 of
-        0 -> 0
-        _ ->
-          let t.4 = -(k.2, 1)
-          let t.5 = ev(t.4)
-          t.5
-  let t.1 = ev(n)
-  let _drop.1 = __rc_drop(ev)
-  let _drop.2 = __rc_drop(od)
-  t.1
+sumList xs =
+  case xs of
+    Nil ->
+      let _drop.1 = __rc_drop(xs)
+      0
+    Cons h t.1 ->
+      let _dup = __rc_dup(t.1)
+      let _drop.2 = __rc_drop(xs)
+      let t.2 = sumList(t.1)
+      let t.3 = +(h, t.2)
+      t.3
 
 main =
-  let t = parity(4)
-  t
+  let t.5 = Nil
+  let t.6 = Cons(3, t.5)
+  let t.7 = Cons(2, t.6)
+  let t.8 = Cons(1, t.7)
+  let xs = t.8
+  let t.4 = \n -> let t.2 = sumList(xs)
+  let t.3 = +(n, t.2)
+  t.3
+  let f = t.4
+  let t.1 = f(10)
+  t.1
 
 id x =
   x

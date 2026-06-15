@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- Two TRULY mutually recursive members BOTH capture the same enclosing boxed
+-- local `b` (shared capture): the group build must provide two owning units
+-- (one per capturing member) via the multiset dup. Non-escaping.
+data Box = Box U64
+
+main =
+  let b = Box 7 in
+  let
+    f k = case k of
+      0 -> case b of Box v -> v
+      _ -> g (k - 1)
+    g k = case k of
+      0 -> case b of Box v -> v
+      _ -> f (k - 1)
+  in f 3

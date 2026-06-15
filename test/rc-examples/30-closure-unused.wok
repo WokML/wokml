@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+
+-- A closure that captures a boxed local but is NEVER called: the cell dies at
+-- its last point of liveness and the drop cascade frees the capture (affine
+-- drop-without-run). Heap must still return to baseline.
+data Box = Box U64
+
+main =
+  let b = Box 99 in
+  let f = \n -> n + (case b of Box v -> v) in
+  123

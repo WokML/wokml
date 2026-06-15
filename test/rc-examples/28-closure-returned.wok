@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+-- An escaping closure: returned from a helper, then applied by main. The capture
+-- must stay alive until the closure is dropped (ownership transfers out).
+data Box = Box U64
+
+unbox : Box -> U64
+unbox b = case b of Box v -> v
+
+makeAdder : U64 -> (U64 -> U64)
+makeAdder k = let b = Box k in \n -> n + unbox b
+
+main = (makeAdder 40) 2

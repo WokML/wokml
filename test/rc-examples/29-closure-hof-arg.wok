@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+-- A higher-order function takes a closure argument and applies it.
+apply1 : (U64 -> U64) -> U64 -> U64
+apply1 g x = g x
+
+data Box = Box U64
+unbox : Box -> U64
+unbox b = case b of Box v -> v
+
+main =
+  let b = Box 5 in
+  apply1 (\n -> n + unbox b) 37

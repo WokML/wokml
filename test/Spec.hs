@@ -6280,7 +6280,37 @@ runAndAccount e =
 
 rcMachineTests :: TestTree
 rcMachineTests = testGroup "rc machine"
-  [ testCase "list literal renders and heap empties after result drop" $ do
+  [ testCase "boundary rejects a standalone closure capturing a LetRec sibling" $ do
+      -- Phase 1 review finding: this shape DOUBLE-FREES if compiled (the closure
+      -- cell's drop-cascade and the LetRec group drop both release the sibling).
+      -- The boundary guard must REJECT it (a sound refusal). See the loud TODO in
+      -- 'Wok.IR.Reachable' and spec section 5.7.
+      --   main = let f n = 0 (LetRec) ; let h = \m -> f m ; in 0
+      let u64    = Ty.CTCon Ty.TcU64 []
+          funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+          fName' = Name (T.pack "f") (Unique 990001)
+          mName' = Name (T.pack "m") (Unique 990004)
+          rName' = Name (T.pack "r") (Unique 990005)
+          fBnd'  = Anf.Binder fName' Anf.Unrestricted funTy
+          nBnd'  = Anf.Binder (Name (T.pack "n") (Unique 990002)) Anf.Unrestricted u64
+          hBnd'  = Anf.Binder (Name (T.pack "h") (Unique 990003)) Anf.Unrestricted funTy
+          mBnd'  = Anf.Binder mName' Anf.Unrestricted u64
+          rBnd'  = Anf.Binder rName' Anf.Unrestricted u64
+          mkBody cap =
+            Anf.LetRec [(fBnd', [nBnd'], Anf.Ret (Anf.ALit (Anf.LInt 0)))]
+              (Anf.Let hBnd'
+                 (Anf.RLam [mBnd']
+                    (if cap
+                       then Anf.Let rBnd' (Anf.RApp (Anf.AVar fName') [Anf.AVar mName'])
+                                          (Anf.Ret (Anf.AVar rName'))
+                       else Anf.Ret (Anf.AVar mName')))
+                 (Anf.Ret (Anf.ALit (Anf.LInt 0))))
+          cmWith cap = Anf.CoreModule
+            [ Anf.TopBind (Name (T.pack "main") (Unique 990000)) [] (mkBody cap) ]
+      assertBool "sibling-capturing closure must be rejected"
+        (not (null (firstOrderNoHandlerViolations (cmWith True))))
+      firstOrderNoHandlerViolations (cmWith False) @?= []
+  , testCase "list literal renders and heap empties after result drop" $ do
       -- let n   = Nil
       --     c2  = Cons 2 n
       --     xs  = Cons 1 c2
@@ -6412,7 +6442,122 @@ rcMachineTests = testGroup "rc machine"
             ]))
       txt @?= T.pack "42"
       live @?= 0
+
+  , testCase "RLam free-var capture: uncaptured local survives closure drop" $ do
+      -- Build an env holding an owned boxed local y (rc=1) that the lambda does
+      -- NOT reference. Allocate the closure, then DROP it via __rc_drop (the
+      -- Perceus-inserted scope-exit drop), then return y.
+      --
+      -- Under the old whole-env capture: dropping f cascades into y (y is in
+      -- f's cenv), decrementing y from rc=1 to rc=0 and freeing y. The final
+      -- Ret (AVar yName) then tries to look up yAddr which is now dead ->
+      -- use-after-free (Right with a dead address, or Left if deref fails).
+      -- Specifically, the final Ret returns RVBox yAddr, and since yAddr is in
+      -- stDead, any subsequent deref (e.g. renderRCValue) would error. But since
+      -- our test just checks the returned address equals yAddr, we need to verify
+      -- yAddr is still LIVE (not in stDead). We check stLive increased back.
+      --
+      -- Under the NEW free-var-only capture: y is NOT in f's cenv, so dropping
+      -- f does not touch y. y survives with rc=1.
+      --
+      --   let f  = \x -> 0    -- does NOT reference y
+      --       _u = __rc_drop f -- Perceus scope-exit drop: drop the closure
+      --   in y                 -- y must still be alive (not freed by drop f)
+      let yU        = Unique 1000
+          yName     = Name.Name (T.pack "y") yU
+          fU        = Unique 1002
+          fName     = Name.Name (T.pack "f") fU
+          xU        = Unique 1001
+          xName     = Name.Name (T.pack "x") xU
+          uU        = Unique 1003
+          uName     = Name.Name (T.pack "_u") uU
+          dropName  = Name.Name (T.pack "__rc_drop") (Unique (-1))
+          u64Ty     = Ty.CTCon Ty.TcU64 []
+          px        = Anf.Binder xName Anf.Unrestricted u64Ty
+          -- f = \x -> 0   (body does NOT mention y)
+          e = Anf.Let (Anf.Binder fName Anf.Unrestricted u64Ty)
+                      (Anf.RLam [px] (Anf.Ret (Anf.ALit (Anf.LInt 0))))
+                      (Anf.Let (Anf.Binder uName Anf.Unrestricted u64Ty)
+                               (Anf.RApp (Anf.AVar dropName) [Anf.AVar fName])
+                               (Anf.Ret (Anf.AVar yName)))
+          s0          = St.emptyStore
+          (yAddr, s1) = St.alloc (St.NCon (T.pack "Y") []) s0
+          env         = Map.fromList [(yU, St.RVBox yAddr)]
+      case RCM.runExprRC RCP.rcPrimTable env s1 e of
+        Left err     -> assertFailure ("expected success, got: " <> show err)
+        Right (v, sf) -> do
+          -- y must still be live (not freed by the closure drop)
+          assertBool "y must not be in stDead after closure drop"
+            (St.stLive (St.stStats sf) >= 1)
+          case v of
+            St.RVBox a -> a @?= yAddr
+            other      -> assertFailure ("expected RVBox y, got " <> show other)
+
+  , test_closureInstrumentationHeapEmpty
+  , test_closureLintClean
+  , test_closureLintTeeth
   ]
+
+-- | A hand-built closure module (Task 3): a boxed local 'b' is captured by a
+-- closure 'f' (which ignores its unboxed param and returns the unpacked field),
+-- then 'f' is applied. Running the INSTRUMENTED body must end heap-empty: the
+-- capture 'b' is consumed by the Case drop-parent inside the closure body and
+-- the closure cell is consumed on application.
+--
+--   main =
+--     let b = Box 7
+--     in let f = \x -> case b of Box v -> v
+--        in let r = f 5
+--           in r
+closureModule :: Anf.CoreModule
+closureModule =
+  Anf.CoreModule [Anf.TopBind mainName [] body]
+  where
+    mainName = Name.Name (T.pack "main") (Unique 2000)
+    bN  = Name.Name (T.pack "b") (Unique 2001)
+    fN  = Name.Name (T.pack "f") (Unique 2002)
+    rN  = Name.Name (T.pack "r") (Unique 2003)
+    xN  = Name.Name (T.pack "x") (Unique 2004)
+    vN  = Name.Name (T.pack "v") (Unique 2005)
+    boxTy = Ty.CTCon (Ty.TcUser (T.pack "Box")) []   -- isBoxedType => True
+    u64Ty = Ty.CTCon Ty.TcU64 []                     -- unboxed
+    funTy = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []   -- boxed via catch-all
+    bB = Anf.Binder bN Anf.Unrestricted boxTy
+    fB = Anf.Binder fN Anf.Unrestricted funTy
+    rB = Anf.Binder rN Anf.Unrestricted u64Ty
+    xB = Anf.Binder xN Anf.Unrestricted u64Ty
+    vB = Anf.Binder vN Anf.Unrestricted u64Ty
+    body =
+      Anf.Let bB (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 7)])
+        (Anf.Let fB
+          (Anf.RLam [xB]
+            (Anf.Case (Anf.AVar bN)
+              [Anf.AltCon (T.pack "Box") [vB] (Anf.Ret (Anf.AVar vN))]))
+          (Anf.Let rB (Anf.RApp (Anf.AVar fN) [Anf.ALit (Anf.LInt 5)])
+            (Anf.Ret (Anf.AVar rN))))
+
+test_closureInstrumentationHeapEmpty :: TestTree
+test_closureInstrumentationHeapEmpty =
+  testCase "closure instrumentation: build+call is heap-empty" $
+    case Perceus.insertRC closureModule of
+      Anf.CoreModule (Anf.TopBind _ _ body0 : _) ->
+        case RCM.runExprRC RCP.rcPrimTable Map.empty St.emptyStore body0 of
+          Left err      -> assertFailure ("run failed: " <> show err)
+          Right (_, st) -> St.stLive (St.stStats st) @?= 0
+      Anf.CoreModule [] -> assertFailure "insertRC dropped the module's binds"
+
+-- | Task 4: the balanced closure module lints clean (capture-as-consume and the
+-- lambda-body scope are both accounted by 'balanceLint').
+test_closureLintClean :: TestTree
+test_closureLintClean = testCase "closure lint: balanced closure lints clean" $
+  Perceus.balanceLint closureModule @?= []
+
+-- | Task 4 teeth: omit one inserted drop and the lint must report the imbalance,
+-- proving it is genuinely counting the closure's consumes (not just un-refusing).
+test_closureLintTeeth :: TestTree
+test_closureLintTeeth = testCase "closure lint: missing capture drop is reported" $
+  assertBool "expected a non-empty lint report"
+    (not (null (Perceus.lintInstrumented (Perceus.insertRCMutated Perceus.OmitOneDrop closureModule))))
 
 -- ---------------------------------------------------------------------------
 -- RC whole-module tests (Task 3: runModuleRC, static globals, result drop)
@@ -6511,19 +6656,24 @@ rcModuleTests = testGroup "rc module"
         Left _  -> pure ()
         Right _ -> assertFailure "expected runModuleRC to reject a module with no main"
 
-  , testCase "out-of-scope HOF (standalone RLam reachable from main) is rejected, not leaked" $ do
-      -- A higher-order program: 'main' applies a helper to a standalone lambda
-      -- value. The reachable bind contains an 'RLam', which is OUT OF SCOPE for
-      -- M1's first-order/no-handler fragment. Before the boundary guard,
-      -- 'runModuleRC' ran it and SILENTLY LEAKED (the standalone lambda body is
-      -- excluded from Perceus coverage, so its captures are never dropped). The
-      -- guard must now reject the whole-module run loudly instead.
+  , testCase "HOF with standalone RLam is admitted and runs (M1.5 boundary)" $ do
+      -- As of M1.5 'firstOrderNoHandlerViolations' no longer flags 'RLam', so
+      -- 'runModuleRC' admits a higher-order program. This test verifies the
+      -- boundary guard does NOT reject such a program (it produces the expected
+      -- output rather than raising a PrimError).
       --
       --   apply f x = f x
       --   main = let b  = Cons 1 Nil
-      --              r  = apply (\y -> 7) b
+      --              lam = \y -> 7
+      --              r  = apply lam b
       --          in r
-      let cm = runFresh $ do
+      --
+      -- NB: this hand-built AST uses rcBnd which annotates every binder with
+      -- TcUnit, so Perceus treats every variable as unboxed and inserts no drops.
+      -- The 'b' allocation leaks in this synthetic test; that is expected and
+      -- acceptable here because the heap-balance invariant is fully covered by
+      -- the corpus programs 26-30 which use correctly typed source programs.
+      let txt = runFresh $ do
             nApply <- freshName (T.pack "apply")
             nF     <- freshName (T.pack "f")
             nX     <- freshName (T.pack "x")
@@ -6548,17 +6698,11 @@ rcModuleTests = testGroup "rc module"
                     (Anf.RApp (Anf.AVar nApply) [Anf.AVar nLam, Anf.AVar nB])
                   (Anf.Ret (Anf.AVar nR)))))
                 mainBind = rcTop nMain [] mainBody
-            pure (Anf.CoreModule [applyBind, mainBind])
-      case RCM.runModuleRC cm of
-        Right run -> assertFailure
-          ("expected runModuleRC to REJECT an out-of-scope HOF module, but it ran: "
-            <> T.unpack (RCM.rcOutput run))
-        Left (Interp.PrimError msg) ->
-          assertBool
-            ("expected the M1 first-order/no-handler boundary error, got: " <> T.unpack msg)
-            (T.pack "first-order/no-handler fragment only" `T.isInfixOf` msg)
-        Left other -> assertFailure
-          ("expected a PrimError boundary rejection, got: " <> show other)
+                cm = Anf.CoreModule [applyBind, mainBind]
+            case RCM.runModuleRC (Perceus.insertRC cm) of
+              Left err  -> error ("runModuleRC failed: " <> show err)
+              Right run -> pure (RCM.rcOutput run)
+      txt @?= T.pack "7"
 
   -- -------------------------------------------------------------------------
   -- Immortal baseline tests (Task 3 follow-up).
@@ -6968,6 +7112,335 @@ rcLetRecTests = testGroup "rc letrec"
               bl = RCM.rcBaseline run
           assertEqual "no value-CAFs: baseline must be 0" 0 bl
           assertEqual "direct-use+forward: w dup'd, heap empties" bl (St.stLive st)
+
+  -- Task 7: LetRec member free-var capture tightening.
+  --
+  -- A boxed local 'y' lives in the enclosing scope. The LetRec group (ev/od)
+  -- is a standard mutual-recursion pair that does NOT reference 'y'. Under the
+  -- OLD whole-env capture, each member's NClosure captures 'y' via 'groupEnv';
+  -- when the group is dropped at scope exit (explicit __rc_drop of each member),
+  -- the cascade for each member walks its cenv, finds 'y' (a non-sibling dynamic
+  -- cell), decrefs it, and frees it prematurely (use-after-free). Under the NEW
+  -- free-var-only capture, 'y' is NOT in any member's cenv, so the cascade never
+  -- touches it and 'y' is still live after the group drop.
+  --
+  -- Shape (using runExprRC with y pre-loaded in the env):
+  --   letrec ev k = case eqU64 k 0 of True -> 1; False -> od (k-1)
+  --          od k = case eqU64 k 0 of True -> 0; False -> ev (k-1)
+  --   in let r  = ev 2
+  --          u1 = __rc_drop ev
+  --          u2 = __rc_drop od
+  --      in y                -- y must still be live after the group drop
+  --
+  -- We verify: (a) the expression evaluates to RVBox yAddr (y is the result),
+  -- (b) stLive >= 1 because y's cell is still allocated and not freed (the
+  --     literal result of 'ev 2' frees nothing on drop), and (c) deref yAddr
+  --     succeeds (y not in stDead). Under the OLD whole-env capture both members
+  --     captured y, so the two group drops double-freed it.
+  , testCase "LetRec free-var capture: uncaptured enclosing local survives group drop" $ do
+      -- Pre-allocate y as a standalone dynamic cell NOT referenced by ev/od.
+      let yU          = Unique 9001
+          yName       = Name.Name (T.pack "y") yU
+          s0          = St.emptyStore
+          (yAddr, s1) = St.alloc (St.NCon (T.pack "Y") []) s0
+          env         = Map.fromList [(yU, St.RVBox yAddr)]
+          -- Build the LetRec expression using freshly minted names.
+          -- y is in 'env' but NOT free in either member's body.
+          e = runFresh $ do
+                nEv <- freshName (T.pack "ev"); nOd <- freshName (T.pack "od")
+                nEN <- freshName (T.pack "en"); nON <- freshName (T.pack "on")
+                nR  <- freshName (T.pack "r")
+                nU1 <- freshName (T.pack "u1")
+                nU2 <- freshName (T.pack "u2")
+                nU3 <- freshName (T.pack "u3")
+                evenBody <- rcParityClause nEN 1 nOd
+                oddBody  <- rcParityClause nON 0 nEv
+                pure $
+                  Anf.LetRec
+                    [ (rcBnd nEv, [rcBnd nEN], evenBody)
+                    , (rcBnd nOd, [rcBnd nON], oddBody)
+                    ]
+                    (Anf.Let (rcBnd nR)
+                       (Anf.RApp (Anf.AVar nEv) [Anf.ALit (Anf.LInt 2)])
+                    (Anf.Let (rcBnd nU1)
+                       (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nEv])
+                    (Anf.Let (rcBnd nU2)
+                       (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nOd])
+                    -- Drop the result of ev 2 (a literal, so drop is a no-op)
+                    -- and return y so we can inspect whether y's address is live.
+                    (Anf.Let (rcBnd nU3)
+                       (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nR])
+                    (Anf.Ret (Anf.AVar yName))))))
+      case RCM.runExprRC RCP.rcPrimTable env s1 e of
+        Left err      -> assertFailure ("expected success, got: " <> show err)
+        Right (v, sf) -> do
+          -- y must still be live after the group drop; stLive >= 1 means y's
+          -- cell was NOT freed by the cascade through the members' cenv.
+          assertBool "y must not be freed by the LetRec group drop"
+            (St.stLive (St.stStats sf) >= 1)
+          case v of
+            St.RVBox a -> do
+              a @?= yAddr
+              case St.deref yAddr sf of
+                Left err2 -> assertFailure ("deref y after group drop failed: " <> show err2)
+                Right _   -> pure ()
+            other -> assertFailure ("expected RVBox y, got " <> show other)
+
+  -- M1.5 PHASE 2 (Task 8) --- NON-ESCAPING enclosing capture is instrumented.
+  --
+  --   caf  = Box 7                            -- value-CAF (1 immortal cell)
+  --   main =
+  --     let b = caf                           -- enclosing boxed local (alias of CAF)
+  --     in letrec f x = case b of Box v -> v  -- captures b (BORROWED), only called
+  --        in let r = f 5
+  --           in r                            -- => 7, group dropped at scope exit
+  --
+  -- Single-member capture: the borrow model moves b into the region (capOcc[b]=1,
+  -- need(b)=1, dups(b)=0); at the group drop f's cascade decrefs b exactly once.
+  -- The CAF cell is immortal, so stLive must equal the baseline (b aliases it via
+  -- a static handle, never counted). The point is that the group is now COVERED
+  -- and instrumented (pre-Phase-2 it was passed through unchanged).
+  , testCase "non-escaping LetRec capturing one enclosing local: covered, heap==baseline, lint clean" $ do
+      let (txt, st, bl, lintOut) = runFresh $ do
+            nCaf <- freshName (T.pack "caf")
+            nMain <- freshName (T.pack "main")
+            nB   <- freshName (T.pack "b")
+            nF   <- freshName (T.pack "f");  nX <- freshName (T.pack "x")
+            nV   <- freshName (T.pack "v");  nR <- freshName (T.pack "r")
+            let boxTy    = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+                u64Ty    = Ty.CTCon Ty.TcU64 []
+                bndB n   = Anf.Binder n Anf.Unrestricted boxTy
+                bndU n   = Anf.Binder n Anf.Unrestricted u64Ty
+                cafBind  = rcTop nCaf []
+                  (Anf.Let (bndB nB) (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 7)])
+                    (Anf.Ret (Anf.AVar nB)))
+                memberBody =
+                  Anf.Case (Anf.AVar nB)
+                    [Anf.AltCon (T.pack "Box") [bndU nV] (Anf.Ret (Anf.AVar nV))]
+                mainBody =
+                  Anf.Let (bndB nB) (Anf.RAtom (Anf.AVar nCaf))
+                    (Anf.LetRec
+                      [ (bndU nF, [bndU nX], memberBody) ]
+                      (Anf.Let (bndU nR) (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 5)])
+                        (Anf.Ret (Anf.AVar nR))))
+                cm = Anf.CoreModule [cafBind, rcTop nMain [] mainBody]
+            case RCM.runModuleRC (Perceus.insertRC cm) of
+              Left err  -> error ("runModuleRC failed: " <> show err)
+              Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run,
+                                 Perceus.balanceLint cm)
+      txt @?= T.pack "7"
+      assertBool "baseline > 0: the Box CAF allocated an immortal cell" (bl > 0)
+      St.stLive st @?= bl
+      lintOut @?= ([] :: [Text])
+
+  -- M1.5 PHASE 2 (Task 8) --- SHARED enclosing capture (multiset dup). TWO members
+  -- both capture the same enclosing local b, so capOcc[b]=2, need(b)=2, dups(b)=1.
+  -- The build emits ONE __rc_dup b; at the group drop BOTH members cascade-decref
+  -- b once each (2 total), balanced by the original unit + the dup. Reverting the
+  -- multiset dup (dups(b)=0) would leave b with one unit and two decrefs => a
+  -- double-free; this test pins the multiset accounting.
+  --
+  --   caf  = Box 7
+  --   main =
+  --     let b = caf
+  --     in letrec f x = case b of Box v -> v   -- captures b
+  --               g x = case b of Box v -> v   -- ALSO captures b
+  --        in let r = f 5
+  --           in r                             -- => 7, both members drop at exit
+  , testCase "shared LetRec capture (two members, one b): multiset dup, heap==baseline, lint clean" $ do
+      let (txt, st, bl, lintOut) = runFresh $ do
+            nCaf <- freshName (T.pack "caf")
+            nMain <- freshName (T.pack "main")
+            nB   <- freshName (T.pack "b")
+            nF   <- freshName (T.pack "f");  nX <- freshName (T.pack "x")
+            nG   <- freshName (T.pack "g");  nY <- freshName (T.pack "y")
+            nV   <- freshName (T.pack "v");  nW <- freshName (T.pack "w")
+            nR   <- freshName (T.pack "r")
+            let boxTy    = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+                u64Ty    = Ty.CTCon Ty.TcU64 []
+                bndB n   = Anf.Binder n Anf.Unrestricted boxTy
+                bndU n   = Anf.Binder n Anf.Unrestricted u64Ty
+                cafBind  = rcTop nCaf []
+                  (Anf.Let (bndB nB) (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 7)])
+                    (Anf.Ret (Anf.AVar nB)))
+                clause vn = Anf.Case (Anf.AVar nB)
+                  [Anf.AltCon (T.pack "Box") [bndU vn] (Anf.Ret (Anf.AVar vn))]
+                mainBody =
+                  Anf.Let (bndB nB) (Anf.RAtom (Anf.AVar nCaf))
+                    (Anf.LetRec
+                      [ (bndU nF, [bndU nX], clause nV)
+                      , (bndU nG, [bndU nY], clause nW)
+                      ]
+                      (Anf.Let (bndU nR) (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 5)])
+                        (Anf.Ret (Anf.AVar nR))))
+                cm = Anf.CoreModule [cafBind, rcTop nMain [] mainBody]
+            case RCM.runModuleRC (Perceus.insertRC cm) of
+              Left err  -> error ("runModuleRC failed: " <> show err)
+              Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run,
+                                 Perceus.balanceLint cm)
+      txt @?= T.pack "7"
+      assertBool "baseline > 0: the Box CAF allocated an immortal cell" (bl > 0)
+      St.stLive st @?= bl
+      lintOut @?= ([] :: [Text])
+
+  -- M1.5 PHASE 2 (Task 8, Part B) --- ESCAPING enclosing capture is REJECTED.
+  -- A group that captures an enclosing boxed local AND RETURNS a member (the member
+  -- binder flows out of the LetRec body as a value) cannot be soundly instrumented
+  -- (region-lifetime extension deferred, spec 5.1/5.7). The boundary guard must
+  -- refuse it. CONTROL: the SAME group shape WITHOUT the enclosing capture (members
+  -- reference only siblings/params, no enclosing b) is NOT rejected by this rule.
+  --
+  --   main =
+  --     let b = Box 7                          -- enclosing boxed local
+  --     in letrec f x = case b of Box v -> v   -- captures b
+  --        in f                                -- RETURNS the member f => ESCAPES
+  , testCase "escaping LetRec capturing an enclosing local: boundary rejects it (control passes)" $ do
+      let boxTy   = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+          u64Ty   = Ty.CTCon Ty.TcU64 []
+          funTy   = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+          bName   = Name (T.pack "b") (Unique 970001)
+          fName   = Name (T.pack "f") (Unique 970002)
+          xName   = Name (T.pack "x") (Unique 970003)
+          vName   = Name (T.pack "v") (Unique 970004)
+          bBnd    = Anf.Binder bName Anf.Unrestricted boxTy
+          fBnd    = Anf.Binder fName Anf.Unrestricted funTy
+          xBnd    = Anf.Binder xName Anf.Unrestricted u64Ty
+          vBnd    = Anf.Binder vName Anf.Unrestricted u64Ty
+          -- capture: member reads the enclosing b; nocap: member ignores b.
+          memberBody captures =
+            if captures
+              then Anf.Case (Anf.AVar bName)
+                     [Anf.AltCon (T.pack "Box") [vBnd] (Anf.Ret (Anf.AVar vName))]
+              else Anf.Ret (Anf.AVar xName)
+          mkBody captures =
+            Anf.Let bBnd (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 7)])
+              (Anf.LetRec [(fBnd, [xBnd], memberBody captures)]
+                 (Anf.Ret (Anf.AVar fName)))         -- RETURN f => member escapes
+          cmWith captures = Anf.CoreModule
+            [ Anf.TopBind (Name (T.pack "main") (Unique 970000)) [] (mkBody captures) ]
+      -- Teeth: the capturing-and-escaping group fires the violation.
+      assertBool "escaping enclosing-capture group must be rejected"
+        (not (null (firstOrderNoHandlerViolations (cmWith True))))
+      -- Control: the same escaping group WITHOUT the enclosing capture is NOT
+      -- rejected by this rule (a member that escapes but captures nothing enclosing
+      -- is the existing 23-letrec-return-member shape, still covered).
+      firstOrderNoHandlerViolations (cmWith False) @?= []
+
+  -- M1.5 PHASE 2 REVIEW FINDING 1 (verified DOUBLE-FREE) --- a member that CONSUMES
+  -- (moves) an enclosing capture is REJECTED. The borrow model exempts captures
+  -- (no move, no drop in the body); but passing a capture by VALUE to a call moves
+  -- it (the callee drops it) AND the group-drop cascade also frees it => double-free.
+  -- The boundary must refuse it. CONTROL: the SAME group shape using a BORROWED READ
+  -- (a Case scrutinee keeping only the unboxed field, exactly like 31/32) is NOT
+  -- rejected.
+  --
+  --   peek p = 0
+  --   main = let b = Box 6
+  --          in letrec go k = case k of 0 -> peek b ; _ -> go (k-1)   -- peek b MOVES b
+  --          in let r = go 1 in r
+  , testCase "consuming LetRec capture (member passes capture by value): boundary rejects it" $ do
+      let boxTy   = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+          u64Ty   = Ty.CTCon Ty.TcU64 []
+          funTy   = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+          peekName = Name (T.pack "peek") (Unique 960001)
+          pName    = Name (T.pack "p")    (Unique 960002)
+          bName    = Name (T.pack "b")    (Unique 960003)
+          goName   = Name (T.pack "go")   (Unique 960004)
+          kName    = Name (T.pack "k")    (Unique 960005)
+          vName    = Name (T.pack "v")    (Unique 960006)
+          rName    = Name (T.pack "r")    (Unique 960007)
+          pBnd     = Anf.Binder pName  Anf.Unrestricted boxTy
+          bBnd     = Anf.Binder bName  Anf.Unrestricted boxTy
+          goBnd    = Anf.Binder goName Anf.Unrestricted funTy
+          kBnd     = Anf.Binder kName  Anf.Unrestricted u64Ty
+          vBnd     = Anf.Binder vName  Anf.Unrestricted u64Ty
+          rBnd     = Anf.Binder rName  Anf.Unrestricted u64Ty
+          peekBind = Anf.TopBind peekName [pBnd] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+          -- consuming=True : 0 -> peek b      (b is a CALL ARGUMENT => moved)
+          -- consuming=False: 0 -> case b of Box v -> v   (BORROWED READ, like 31/32)
+          memberBody consuming =
+            Anf.Case (Anf.AVar kName)
+              [ Anf.AltLit (Anf.LInt 0)
+                  (if consuming
+                     then Anf.Let rBnd (Anf.RApp (Anf.AVar peekName) [Anf.AVar bName])
+                                       (Anf.Ret (Anf.AVar rName))
+                     else Anf.Case (Anf.AVar bName)
+                            [Anf.AltCon (T.pack "Box") [vBnd] (Anf.Ret (Anf.AVar vName))])
+              , Anf.AltDefault
+                  (Anf.Let kBnd (Anf.RApp (Anf.AVar goName) [Anf.ALit (Anf.LInt 0)])
+                     (Anf.Ret (Anf.AVar kName)))
+              ]
+          mkBody consuming =
+            Anf.Let bBnd (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 6)])
+              (Anf.LetRec [(goBnd, [kBnd], memberBody consuming)]
+                 (Anf.Let rBnd (Anf.RApp (Anf.AVar goName) [Anf.ALit (Anf.LInt 1)])
+                    (Anf.Ret (Anf.AVar rName))))
+          cmWith consuming = Anf.CoreModule
+            [ peekBind
+            , Anf.TopBind (Name (T.pack "main") (Unique 960000)) [] (mkBody consuming) ]
+      -- Teeth: the consuming-capture group fires the violation.
+      assertBool "consuming-capture group must be rejected"
+        (not (null (firstOrderNoHandlerViolations (cmWith True))))
+      -- Control: the borrowed-read shape (Case scrutinee keeping only the unboxed
+      -- field, like 31/32) is NOT rejected by this rule.
+      firstOrderNoHandlerViolations (cmWith False) @?= []
+
+  -- M1.5 PHASE 2 REVIEW FINDING 2 (verified LEAK) --- a NESTED inner LetRec whose
+  -- member captures an OUTER group member (cross-region counted edge) is EXCLUDED
+  -- from coverage by the pass ('capturesRegion', spec 5.5) but was passed through
+  -- UN-instrumented => leak. The boundary must refuse it. CONTROL: the same nested
+  -- shape where the inner member does NOT reference the outer member is NOT rejected.
+  --
+  --   main = letrec outer k = ... outer (k-1)
+  --          in letrec inner j = case j of 0 -> outer 1 ; _ -> inner (j-1)  -- inner CALLS outer
+  --          in inner 2
+  , testCase "cross-region LetRec capture (inner member calls outer member): boundary rejects it" $ do
+      let u64Ty   = Ty.CTCon Ty.TcU64 []
+          funTy   = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+          outerN  = Name (T.pack "outer") (Unique 950001)
+          kName   = Name (T.pack "k")     (Unique 950002)
+          innerN  = Name (T.pack "inner") (Unique 950003)
+          jName   = Name (T.pack "j")     (Unique 950004)
+          tName   = Name (T.pack "t")     (Unique 950005)
+          rName   = Name (T.pack "r")     (Unique 950006)
+          outerB  = Anf.Binder outerN Anf.Unrestricted funTy
+          kBnd    = Anf.Binder kName  Anf.Unrestricted u64Ty
+          innerB  = Anf.Binder innerN Anf.Unrestricted funTy
+          jBnd    = Anf.Binder jName  Anf.Unrestricted u64Ty
+          tBnd    = Anf.Binder tName  Anf.Unrestricted u64Ty
+          rBnd    = Anf.Binder rName  Anf.Unrestricted u64Ty
+          outerBody =
+            Anf.Case (Anf.AVar kName)
+              [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+              , Anf.AltDefault
+                  (Anf.Let kBnd (Anf.RApp (Anf.AVar outerN) [Anf.ALit (Anf.LInt 0)])
+                     (Anf.Ret (Anf.AVar kName)))
+              ]
+          -- crosses=True : inner's base case CALLS the outer member (cross-region).
+          -- crosses=False: inner's base case returns a literal (no outer reference).
+          innerBody crosses =
+            Anf.Case (Anf.AVar jName)
+              [ Anf.AltLit (Anf.LInt 0)
+                  (if crosses
+                     then Anf.Let tBnd (Anf.RApp (Anf.AVar outerN) [Anf.ALit (Anf.LInt 1)])
+                                       (Anf.Ret (Anf.AVar tName))
+                     else Anf.Ret (Anf.ALit (Anf.LInt 0)))
+              , Anf.AltDefault
+                  (Anf.Let jBnd (Anf.RApp (Anf.AVar innerN) [Anf.ALit (Anf.LInt 0)])
+                     (Anf.Ret (Anf.AVar jName)))
+              ]
+          mkBody crosses =
+            Anf.LetRec [(outerB, [kBnd], outerBody)]
+              (Anf.LetRec [(innerB, [jBnd], innerBody crosses)]
+                 (Anf.Let rBnd (Anf.RApp (Anf.AVar innerN) [Anf.ALit (Anf.LInt 2)])
+                    (Anf.Ret (Anf.AVar rName))))
+          cmWith crosses = Anf.CoreModule
+            [ Anf.TopBind (Name (T.pack "main") (Unique 950000)) [] (mkBody crosses) ]
+      -- Teeth: the cross-region group fires the violation.
+      assertBool "cross-region capture group must be rejected"
+        (not (null (firstOrderNoHandlerViolations (cmWith True))))
+      -- Control: the same nested shape with NO cross-region reference is NOT rejected.
+      firstOrderNoHandlerViolations (cmWith False) @?= []
   ]
 
 -- ---------------------------------------------------------------------------
@@ -6990,14 +7463,13 @@ rcLetRecTests = testGroup "rc letrec"
 -- renderings differ by design (different RuntimeError constructors / messages).
 -- A one-sided failure is a real divergence and fails the test.
 --
--- M1 scope guard: M1 is the first-order, no-handler fragment. We reject any
--- corpus program whose CODE REACHABLE FROM 'main' contains a handler/operation
--- ('Handle'/'ROp' -- effect handlers are deferred) or a first-class local
--- closure ('RLam' -- HOFs / partial application / closure RC are deferred to
--- M1.5). We scope the check to the reachable call graph rather than the whole
+-- RC scope guard: the RC interpreter supports the handler-free fragment
+-- (closures included, as of M1.5). We reject any corpus program whose CODE
+-- REACHABLE FROM 'main' contains a handler/operation ('Handle'/'ROp' -- effects
+-- are M2). We scope the check to the reachable call graph rather than the whole
 -- elaborated module on purpose: 'elaborateProgramFull' inlines the entire
--- prelude (which DOES contain handlers and lambdas), but none of it is reached
--- by a first-order corpus 'main', so it never executes on the RC store.
+-- prelude (which DOES contain handlers), but none of it is reached by a
+-- handler-free corpus 'main', so it never executes on the RC store.
 
 rcDifferentialHarness :: FilePath -> Assertion
 rcDifferentialHarness path = do
@@ -7008,12 +7480,12 @@ rcDifferentialHarness path = do
       case Pipeline.elaborateProgramFull entryName ms of
         Left s   -> assertFailure ("elaborate: " <> s)
         Right cm -> do
-          -- M1 scope guard: reject handlers / operations / first-class closures
-          -- anywhere in the code reachable from 'main'.
+          -- RC scope guard: reject handlers / operations ('Handle'/'ROp')
+          -- anywhere in the code reachable from 'main' (closures are admitted).
           case firstOrderNoHandlerViolations cm of
             [] -> pure ()
             vs -> assertFailure
-              (path <> ": not a first-order no-handler program (M1 scope):\n"
+              (path <> ": not a handler-free program (Handle/ROp out of scope):\n"
                  <> unlines (map T.unpack vs))
           -- Prune to the binds reachable from 'main' before running. This is a
           -- semantics-preserving dead-bind elimination: a top-level bind never
@@ -7116,7 +7588,7 @@ rcDeepListTests = testGroup "rc deep-list"
 -- into a dup, or a dropped/duplicated drop) surfaces as a golden diff.
 --
 -- Both harnesses share the differential harness's M1 scope guard and reachable
--- pruning, so they run the same byte-identical first-order programs.
+-- pruning, so they run the same byte-identical handler-free programs.
 
 rcStatsGoldenFor :: FilePath -> FilePath
 rcStatsGoldenFor f =
@@ -7137,7 +7609,7 @@ rcStatsPrepare path = do
           case firstOrderNoHandlerViolations cm of
             [] -> pure ()
             vs -> assertFailure
-              (path <> ": not a first-order no-handler program (M1 scope):\n"
+              (path <> ": not a handler-free program (Handle/ROp out of scope):\n"
                  <> unlines (map T.unpack vs))
           pure (Perceus.insertRC (pruneToReachable cm))
 
@@ -7433,6 +7905,8 @@ genExpr env n ty
         , (4, genLet env n ty)
         , (if scrutinizable env then 3 else 0, genCase env n ty)
         , (if n >= 3 then 3 else 0, genJoinCluster env n ty)
+        , (if n >= 3 then 3 else 0, genClosureCluster env n ty)
+        , (if n >= 3 then 3 else 0, genLetRecCaptureCluster env n ty)
         ]
 
 -- | A 'let x = rhs in body' producing @ty@. The rhs produces some intermediate
@@ -7666,6 +8140,224 @@ genJoinBody env n ty sN kind pN mSucc =
            pure (Case (AVar pN)
                    [ AltLit (LInt 0) nf
                    , AltDefault (Jump jn [ALit (LInt 1)]) ])
+
+-- ---------------------------------------------------------------------------
+-- Adversarial closure clusters (Suite F, M1.5 Task 6)
+--
+-- 'genClosureCluster' seeds a fresh boxed capture (a Pair of two ints), builds
+-- an 'RLam' that captures and CONSUMES it via a 'Case', then exercises one of
+-- four shapes that stress different RC obligations the Perceus pass must satisfy:
+--
+--   ClosureCallOnce   -- f built and called once; f and capture consumed by call
+--   ClosureCallTwice  -- f called twice; pass must DUP f before the first call
+--                       so the second call still has a live copy
+--   ClosureDrop       -- f built and NEVER called; pass must DROP f (which
+--                       cascades to the capture)
+--   ClosureBranch     -- f built; one Case arm calls it, the other drops it;
+--                       pass must balance dup/drop across the two arms
+--
+-- The closure body is always: @\x -> case cap of Tuple2 px py -> px@ (returns
+-- the first int field, ignoring the unboxed param @x@).  The program result is
+-- always GInt so the heap returns to baseline after a correct Perceus pass.
+
+-- | The four structural shapes for 'genClosureCluster'.
+data ClosureShape
+  = ClosureCallOnce    -- ^ call f exactly once
+  | ClosureCallTwice   -- ^ call f twice (forces a dup of the closure)
+  | ClosureDrop        -- ^ build f and drop without calling (tests drop cascade)
+  | ClosureBranch      -- ^ call f in one branch, drop in the other
+  deriving (Eq, Show)
+
+-- | Generate an adversarial closure cluster producing @ty@. Seeds its own
+-- boxed capture, so it is self-contained and available whenever there is fuel.
+-- The closure binder carries @'Ty.CTCon' ('Ty.TcUser' "Fun") []@ so 'isBoxedType'
+-- tracks it as a heap-allocated cell (the same convention as 'closureModule').
+genClosureCluster :: [(Name, GTy)] -> Int -> GTy -> GenM Expr
+genClosureCluster env n ty = do
+  shape <- liftG (elements [ClosureCallOnce, ClosureCallTwice, ClosureDrop, ClosureBranch])
+  -- Seed the capture: a Pair of two random int literals.
+  v0 <- liftG (choose (0, 9 :: Int))
+  v1 <- liftG (choose (0, 9 :: Int))
+  capN <- freshN (T.pack "cap")
+  fN   <- freshN (T.pack "f")
+  xN   <- freshN (T.pack "x")
+  pxN  <- freshN (T.pack "fpx")
+  pyN  <- freshN (T.pack "fpy")
+  let pairTy = gtyCType GPair   -- CTCon (TcTuple 2) [U64, U64]  -- boxed
+      funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []  -- boxed (catch-all)
+      intTy  = gtyCType GInt    -- CTCon TcU64 []               -- unboxed
+      capB   = Binder capN Unrestricted pairTy
+      fB     = Binder fN  Unrestricted funTy
+      xB     = Binder xN  Unrestricted intTy
+      pxB    = Binder pxN Unrestricted intTy
+      pyB    = Binder pyN Unrestricted intTy
+      -- The closure body: consume cap via case, return first field.
+      lamBody = Case (AVar capN)
+                  [ AltCon (T.pack "Tuple2") [pxB, pyB]
+                      (Ret (AVar pxN)) ]
+      lam    = RLam [xB] lamBody
+      -- One call of f with an unboxed arg; produces GInt.
+      callF result body =
+        Let (Binder result Unrestricted intTy)
+            (RApp (AVar fN) [ALit (LInt 0)])
+            body
+  -- Build the closure-seeding prefix, then add the shape-specific continuation.
+  let seedPrefix inner =
+        Let capB (RCon (T.pack "Tuple2") [ALit (LInt (toInteger v0)), ALit (LInt (toInteger v1))])
+          (Let fB lam inner)
+  case shape of
+    ClosureCallOnce -> do
+      rN    <- freshN (T.pack "r")
+      inner <- genExpr ((rN, GInt) : env) (n - 1) ty
+      pure $ seedPrefix (callF rN inner)
+
+    ClosureCallTwice -> do
+      r1N   <- freshN (T.pack "r1")
+      r2N   <- freshN (T.pack "r2")
+      inner <- genExpr ((r2N, GInt) : (r1N, GInt) : env) (n - 1) ty
+      pure $ seedPrefix
+        (callF r1N (callF r2N inner))
+
+    ClosureDrop -> do
+      -- Never call f; Perceus must drop f (cascade to cap) at scope exit.
+      -- Result comes from genExpr so ty is satisfied.
+      inner <- genExpr env (n - 1) ty
+      pure $ seedPrefix inner
+
+    ClosureBranch -> do
+      -- A Case where one arm CALLS f and the other DROPS it: the pass must
+      -- instrument BOTH arms (dup-then-consume on the call arm, a drop on the
+      -- non-calling arm) and balance them. The scrutinee is pinned to 0 so the
+      -- CALL arm always runs at runtime (the double-free-on-f risk is the
+      -- adversarial half worth executing every case; the drop arm is still
+      -- statically instrumented and balanceLint-checked). Mirrors the
+      -- 'BranchForward' precedent in 'genJoinCluster'.
+      rN    <- freshN (T.pack "r")
+      -- call arm: call f, bind result, continue
+      callBody <- genExpr ((rN, GInt) : env) (n - 1) ty
+      -- drop arm: f is NOT called; Perceus must drop it here
+      dropBody <- genExpr env (n - 1) ty
+      pure $ seedPrefix
+        (Case (ALit (LInt 0))
+          [ AltLit (LInt 0)      (callF rN callBody)
+          , AltDefault            dropBody ])
+
+-- ---------------------------------------------------------------------------
+-- Adversarial LetRec capture clusters (Suite F, M1.5 Task 10)
+--
+-- 'genLetRecCaptureCluster' seeds a fresh boxed capture (a Pair of two ints),
+-- builds a TWO-member MUTUALLY-RECURSIVE 'LetRec' group where BOTH members
+-- capture it (it is free in both bodies, so capOcc=2), and exercises it
+-- non-escapingly (the group is called once; the result is unboxed). The pass
+-- instruments the capture-consuming base-case arm of BOTH members statically;
+-- which arm actually fires at runtime depends on the call parity, but the RC
+-- accounting (and 'balanceLint') must balance for both regardless.
+--
+-- STRUCTURAL INVARIANTS that make this adversarial:
+--
+--   SharedCapture  -- both members capture the SAME boxed local; the pass must
+--                     emit one 'dup' of the capture (multiset accounting: need=2,
+--                     dups=1). Reverting the dup plan empties it and causes a
+--                     double-free / use-after-free detectable by the heap-empty
+--                     oracle and 'balanceLint'.
+--
+-- The two members are TRULY MUTUALLY RECURSIVE (f calls g, g calls f) so the
+-- elaborator/generator puts them in a SINGLE 'LetRec' node (not two nested
+-- single-member groups, which would trigger the cross-region-capture deferral).
+-- The group is NON-ESCAPING: the result is an unboxed GInt extracted by calling
+-- 'f'; no member is returned, stored, or passed as a non-head argument.
+--
+-- Member bodies:
+--   f kN1 = case kN1 of
+--     0 -> case capN of Tuple2 pxN1 pyN1 -> pxN1   (consume cap, return int)
+--     _ -> gN(kN1 - 1)                              (call sibling, mutual-rec)
+--   g kN2 = case kN2 of
+--     0 -> case capN of Tuple2 pxN2 pyN2 -> pyN2   (consume cap, return int)
+--     _ -> fN(kN2 - 1)                              (call sibling, mutual-rec)
+--
+-- 'cap' is BORROWED inside each body (the pass adds it to ctxExempt for the
+-- member scope): the case-on-cap destructs it structurally but no drop is
+-- emitted inside. The drops come from the group's scope-exit drop cascade: one
+-- member drop per capture occurrence => the multiset dup must supply two units.
+
+-- | Generate an adversarial LetRec capture cluster producing @ty@. Seeds its
+-- own boxed capture, so it is self-contained and available whenever there is
+-- fuel. The result is always 'GInt' (unboxed), so the heap returns to baseline
+-- after a correct Perceus pass.
+genLetRecCaptureCluster :: [(Name, GTy)] -> Int -> GTy -> GenM Expr
+genLetRecCaptureCluster env n ty = do
+  -- Seed the capture: a Pair of two random int literals (the shared boxed local).
+  v0   <- liftG (choose (0, 9 :: Int))
+  v1   <- liftG (choose (0, 9 :: Int))
+  capN <- freshN (T.pack "cap")
+  fN   <- freshN (T.pack "lrf")
+  gN   <- freshN (T.pack "lrg")
+  kN1  <- freshN (T.pack "k1")
+  kN2  <- freshN (T.pack "k2")
+  ks1N <- freshN (T.pack "ks1")
+  ks2N <- freshN (T.pack "ks2")
+  pxN1 <- freshN (T.pack "px1")
+  pyN1 <- freshN (T.pack "py1")
+  pxN2 <- freshN (T.pack "px2")
+  pyN2 <- freshN (T.pack "py2")
+  r1N  <- freshN (T.pack "r1")
+  r2N  <- freshN (T.pack "r2")
+  rN   <- freshN (T.pack "lrr")
+  let pairTy = gtyCType GPair   -- boxed Pair
+      intTy  = gtyCType GInt    -- unboxed U64
+      capB   = Binder capN Unrestricted pairTy
+      fB     = Binder fN   Unrestricted intTy   -- result type (not arrow)
+      gB     = Binder gN   Unrestricted intTy
+      kB1    = Binder kN1  Unrestricted intTy
+      kB2    = Binder kN2  Unrestricted intTy
+      ks1B   = Binder ks1N Unrestricted intTy
+      ks2B   = Binder ks2N Unrestricted intTy
+      pxB1   = Binder pxN1 Unrestricted intTy
+      pyB1   = Binder pyN1 Unrestricted intTy
+      pxB2   = Binder pxN2 Unrestricted intTy
+      pyB2   = Binder pyN2 Unrestricted intTy
+      r1B    = Binder r1N  Unrestricted intTy
+      r2B    = Binder r2N  Unrestricted intTy
+      rB     = Binder rN   Unrestricted intTy
+      -- Body of f: case k of 0 -> case cap of Tuple2 px py -> px
+      --                       _ -> let ks = k - 1; r = g(ks); r
+      -- capN and gN are free in this body: capN is the shared boxed capture,
+      -- gN is a sibling (exempt, never dup'd/drop'd inside).
+      fBody  = Case (AVar kN1)
+                 [ AltLit (LInt 0)
+                     (Case (AVar capN)
+                       [ AltCon (T.pack "Tuple2") [pxB1, pyB1]
+                           (Ret (AVar pxN1)) ])
+                 , AltDefault
+                     (Let ks1B (RApp (AVar (primName (T.pack "-")))
+                                     [AVar kN1, ALit (LInt 1)])
+                       (Let r1B (RApp (AVar gN) [AVar ks1N])
+                         (Ret (AVar r1N)))) ]
+      -- Body of g: case k of 0 -> case cap of Tuple2 px py -> py
+      --                       _ -> let ks = k - 1; r = f(ks); r
+      -- capN and fN are free in this body.
+      gBody  = Case (AVar kN2)
+                 [ AltLit (LInt 0)
+                     (Case (AVar capN)
+                       [ AltCon (T.pack "Tuple2") [pxB2, pyB2]
+                           (Ret (AVar pyN2)) ])
+                 , AltDefault
+                     (Let ks2B (RApp (AVar (primName (T.pack "-")))
+                                     [AVar kN2, ALit (LInt 1)])
+                       (Let r2B (RApp (AVar fN) [AVar ks2N])
+                         (Ret (AVar r2N)))) ]
+  -- The continuation uses rN (a GInt) and proceeds to produce @ty@.
+  inner <- genExpr ((rN, GInt) : env) (n - 1) ty
+  pure $
+    -- seed the shared boxed capture
+    Let capB (RCon (T.pack "Tuple2")
+                   [ALit (LInt (toInteger v0)), ALit (LInt (toInteger v1))]) $
+    -- the two-member mutually-recursive group (f calls g, g calls f => truly mutual)
+    LetRec
+      [ (fB, [kB1], fBody)
+      , (gB, [kB2], gBody) ]
+    -- non-escaping call: result is unboxed; no member is returned or stored
+    (Let rB (RApp (AVar fN) [ALit (LInt 2)]) inner)
 
 -- | Shrinking: drop the program toward a constant. We shrink the single 'main'
 -- bind's body to its trivial sub-results (a 'Ret' of a contained atom, an alt

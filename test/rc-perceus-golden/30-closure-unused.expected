@@ -1,27 +1,16 @@
-parity n =
-  letrec
-    ev k.1 =
-      case k.1 of
-        0 -> 1
-        _ ->
-          let t.2 = -(k.1, 1)
-          let t.3 = od(t.2)
-          t.3
-    od k.2 =
-      case k.2 of
-        0 -> 0
-        _ ->
-          let t.4 = -(k.2, 1)
-          let t.5 = ev(t.4)
-          t.5
-  let t.1 = ev(n)
-  let _drop.1 = __rc_drop(ev)
-  let _drop.2 = __rc_drop(od)
-  t.1
-
 main =
-  let t = parity(4)
-  t
+  let t.3 = Box(99)
+  let b = t.3
+  let t.2 = \n -> join j71(r) =
+    let t.1 = +(n, r)
+    t.1
+  case b of
+    Box v ->
+      let _drop.1 = __rc_drop(b)
+      jump j71(v)
+  let f = t.2
+  let _drop.2 = __rc_drop(f)
+  123
 
 id x =
   x
