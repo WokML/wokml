@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+
+-- M2a-1 case #1 (DEFERRED): a LetRec member that CONSUMES (moves) an enclosing
+-- boxed capture 'b'.  Consuming-capture support was deferred -- the runtime
+-- consume count is dynamic/undecidable (a build-site dup plan leaks or
+-- use-after-frees depending on call pattern), so the boundary guard REJECTS any
+-- consuming use of an enclosing capture; only borrowed reads are admitted.  The
+-- proper fix is borrow-passing (a later slice).  This file is a REJECTED
+-- reproducer (firstOrderNoHandlerViolations returns a non-empty list).
+data Box = Box U64
+data Bit = Lo | Hi
+
+peekA : Box -> U64
+peekA box = case box of
+  Box v -> v
+
+peekB : Box -> U64
+peekB box = case box of
+  Box v -> v
+
+main =
+  let b = Box 6 in
+  let bit = Lo in
+  let
+    go t = case t of
+      Lo -> peekA b
+      Hi -> peekB b
+  in go bit

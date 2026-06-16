@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #19 (DIRECT sibling-into-list-constructor LOCAL DROP, ACCEPTED):
+-- the LetRec group sibling 'f' is stored into a 'Cons' cell that is DROPPED
+-- LOCALLY ('Cons f Nil' bound to a dead local; the result is the scalar 0).
+-- Local mirror of #14 (44-sibling-listcon-escape). Same double-free class as #18:
+-- before the cascade fix, dropping the 'Cons' cell cascaded into the region
+-- member 'f', which the group's unit-drop then freed again.
+data FList = Nil | Cons (U64 -> U64) FList
+
+mk : U64 -> U64
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let z = Cons f Nil
+  in 0
+
+main = mk 7

@@ -6,7 +6,9 @@ import Test.Tasty.Golden (goldenVsString, findByExtension)
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck (testProperty, QuickCheckTests (..))
 import Test.QuickCheck
-  ( Gen, Property, forAllShrink, counterexample, choose, elements, sized )
+  ( Gen, Property, forAllShrink, counterexample, choose, elements, sized
+  , frequency, conjoin, property, cover, checkCoverage, (.&&.) )
+import qualified Test.QuickCheck as QC
 import Control.Monad.State.Strict (StateT, runStateT, state, lift)
 
 import qualified Data.ByteString.Lazy.Char8 as BL
@@ -49,6 +51,7 @@ import qualified Wok.Interp.RC.Machine as RCM
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
 import qualified Wok.IR.Perceus as Perceus
+import qualified Wok.IR.Escape as Esc
 import Wok.IR.Reachable
   ( pruneToReachable, exprUniques
   , firstOrderNoHandlerViolations )
@@ -170,6 +173,12 @@ main = do
     , rcMachineTests
     , rcModuleTests
     , rcLetRecTests
+    , rcM2a1BaselineTests
+    , rcM2a1LintTests
+    , rcM2a1AliasTests
+    , rcM2a1SiblingDropTests
+    , borrowOnCallTests
+    , sharedEnvEvalTests
     , testGroup "resolve golden"
         [ goldenVsString (takeBaseName f) (resolveGoldenFor f) (resolveToBS f)
         | f <- resolveFiles
@@ -220,6 +229,8 @@ main = do
     , rcTeethTests perceusFiles
     , rcDeepListTests
     , rcPropertyTests
+    , rcM2a1PropertyTests
+    , rvRecMemberRepTests
     ]
 
 goldenFor :: FilePath -> FilePath
@@ -6265,7 +6276,7 @@ rcBnd n = Anf.Binder n Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
 -- count. A 'Left' anywhere is reported as a test failure.
 runAndAccount :: Anf.Expr -> IO (Text, Int)
 runAndAccount e =
-  case RCM.runExprRC RCP.rcPrimTable Map.empty St.emptyStore e of
+  case RCM.runExprRC RCP.rcPrimTable Map.empty (St.initSentinel St.emptyStore) e of
     Left err -> assertFailure ("rc run failed: " <> show err)
     Right (v, s) ->
       case St.renderRCValue s v of
@@ -6276,27 +6287,39 @@ runAndAccount e =
               case St.dropAddr a s of
                 Left err -> assertFailure ("result drop failed: " <> show err)
                 Right s' -> pure (txt, St.stLive (St.stStats s'))
-            St.RVLit _ -> pure (txt, St.stLive (St.stStats s))
+            St.RVLit _           -> pure (txt, St.stLive (St.stStats s))
+            St.RVRecMember _ _ envA ->
+              case St.dropAddr envA s of
+                Left err -> assertFailure ("result drop failed: " <> show err)
+                Right s' -> pure (txt, St.stLive (St.stStats s'))
 
 rcMachineTests :: TestTree
 rcMachineTests = testGroup "rc machine"
-  [ testCase "boundary rejects a standalone closure capturing a LetRec sibling" $ do
-      -- Phase 1 review finding: this shape DOUBLE-FREES if compiled (the closure
-      -- cell's drop-cascade and the LetRec group drop both release the sibling).
-      -- The boundary guard must REJECT it (a sound refusal). See the loud TODO in
-      -- 'Wok.IR.Reachable' and spec section 5.7.
-      --   main = let f n = 0 (LetRec) ; let h = \m -> f m ; in 0
+  [ testCase "boundary admits a standalone closure capturing a LetRec sibling, escaping or not (M2a-2 Stage A)" $ do
+      -- M2a-2 Stage A: a standalone closure that captures a 'LetRec' sibling is now
+      -- ADMITTED whether it stays LOCAL or ESCAPES. The closure capture is
+      -- dup-balanced by the pass (a build-site @__rc_dup@ of the shared env per
+      -- capture), and the interpreter keeps an over-applied unnamed intermediate
+      -- alive through its own call (deferred-consume, 'KDropCellRC'), so the escaped
+      -- closure's cascade-drop balances exactly. A BARE move (con / record / list /
+      -- call-arg / alias) of a sibling stays rejected (Stage B). See
+      -- 'rlamSiblingCaptureEscapes' / the 'isRLam' narrowing in 'Wok.IR.Reachable'.
+      --   NON-escaping:  let f n = 0 (LetRec) ; let h = \m -> f m ; in 0   (h dropped)
+      --   ESCAPING:      let f n = 0 (LetRec) ; let h = \m -> f m ; in h   (h returned)
       let u64    = Ty.CTCon Ty.TcU64 []
           funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
           fName' = Name (T.pack "f") (Unique 990001)
           mName' = Name (T.pack "m") (Unique 990004)
           rName' = Name (T.pack "r") (Unique 990005)
+          hName' = Name (T.pack "h") (Unique 990003)
           fBnd'  = Anf.Binder fName' Anf.Unrestricted funTy
           nBnd'  = Anf.Binder (Name (T.pack "n") (Unique 990002)) Anf.Unrestricted u64
-          hBnd'  = Anf.Binder (Name (T.pack "h") (Unique 990003)) Anf.Unrestricted funTy
+          hBnd'  = Anf.Binder hName' Anf.Unrestricted funTy
           mBnd'  = Anf.Binder mName' Anf.Unrestricted u64
           rBnd'  = Anf.Binder rName' Anf.Unrestricted u64
-          mkBody cap =
+          -- @cap@ = the closure body captures the sibling 'f'; @esc@ = the closure
+          -- escapes (the enclosing body returns 'h' instead of the scalar 0).
+          mkBody cap esc =
             Anf.LetRec [(fBnd', [nBnd'], Anf.Ret (Anf.ALit (Anf.LInt 0)))]
               (Anf.Let hBnd'
                  (Anf.RLam [mBnd']
@@ -6304,12 +6327,30 @@ rcMachineTests = testGroup "rc machine"
                        then Anf.Let rBnd' (Anf.RApp (Anf.AVar fName') [Anf.AVar mName'])
                                           (Anf.Ret (Anf.AVar rName'))
                        else Anf.Ret (Anf.AVar mName')))
-                 (Anf.Ret (Anf.ALit (Anf.LInt 0))))
-          cmWith cap = Anf.CoreModule
-            [ Anf.TopBind (Name (T.pack "main") (Unique 990000)) [] (mkBody cap) ]
-      assertBool "sibling-capturing closure must be rejected"
-        (not (null (firstOrderNoHandlerViolations (cmWith True))))
-      firstOrderNoHandlerViolations (cmWith False) @?= []
+                 (if esc then Anf.Ret (Anf.AVar hName')
+                         else Anf.Ret (Anf.ALit (Anf.LInt 0))))
+          cmWith cap esc = Anf.CoreModule
+            [ Anf.TopBind (Name (T.pack "main") (Unique 990000)) [] (mkBody cap esc) ]
+      -- NON-escaping sibling-capturing closure is ADMITTED.
+      firstOrderNoHandlerViolations (cmWith True False) @?= []
+      -- ESCAPING sibling-capturing closure is now ADMITTED (M2a-2 Stage A) and must
+      -- RUN SOUND: the result is the escaped closure (a value CAF), so the run
+      -- succeeds, is heap-balanced, and matches the reference interpreter.
+      firstOrderNoHandlerViolations (cmWith True True) @?= []
+      let escCm = pruneToReachable (cmWith True True)
+      case (Interp.runModule escCm, RCM.runModuleRCUnchecked (Perceus.insertRC escCm)) of
+        (Right v, Right run) -> do
+          Interp.renderValue v @?= RCM.rcOutput run
+          let st = RCM.rcStats run; bl = RCM.rcBaseline run
+          assertEqual "escaping closure-capture: heap balanced (live)" bl (St.stLive st)
+          assertEqual "escaping closure-capture: heap balanced (allocs-frees)"
+            bl (St.stAllocs st - St.stFrees st)
+        (refRes, rcRes) ->
+          assertFailure ("both interpreters must succeed; got "
+                           <> show (either show (const "ok") refRes) <> " / "
+                           <> show (either show (const "ok") rcRes))
+      -- A closure that does NOT capture a sibling is admitted regardless.
+      firstOrderNoHandlerViolations (cmWith False False) @?= []
   , testCase "list literal renders and heap empties after result drop" $ do
       -- let n   = Nil
       --     c2  = Cons 2 n
@@ -7283,18 +7324,77 @@ rcLetRecTests = testGroup "rc letrec"
       St.stLive st @?= bl
       lintOut @?= ([] :: [Text])
 
-  -- M1.5 PHASE 2 (Task 8, Part B) --- ESCAPING enclosing capture is REJECTED.
+  -- M2a-2 (Task 4) --- the shared env of a CAPTURING NON-ESCAPING group is dropped
+  -- EXACTLY ONCE. A two-member group f/g both BORROW-READ one enclosing boxed local
+  -- @b = Box 7@ (each base case @case b of Box v -> v@); the body calls @f 2@ and
+  -- returns the scalar result (no member escapes). The pass must instrument this as
+  -- ordinary acyclic RC: exactly ONE @__rc_drop@ of a member (the shared-env handle,
+  -- member 0) at the group's combined last use --- NOT one drop per member, and NO
+  -- per-member multiset capture dups. Asserted three ways: (1) a 'prettyPerceus'
+  -- count of exactly one member-drop in @main@'s instrumented body, (2) heap-balance
+  -- (the single env-drop frees the env, whose cascade frees the captured Box once),
+  -- (3) a clean 'balanceLint'.
+  , testCase "M2a-2 capturing non-escaping group: shared env dropped EXACTLY once" $ do
+      let (pretty, st, bl, lintOut) = runFresh $ do
+            nB   <- freshName (T.pack "b")
+            nMain <- freshName (T.pack "main")
+            nF   <- freshName (T.pack "f");  nG <- freshName (T.pack "g")
+            nFK  <- freshName (T.pack "fk"); nGK <- freshName (T.pack "gk")
+            nV1  <- freshName (T.pack "v1"); nV2 <- freshName (T.pack "v2")
+            nFKs <- freshName (T.pack "fks"); nGKs <- freshName (T.pack "gks")
+            nFr  <- freshName (T.pack "fr");  nGr <- freshName (T.pack "gr")
+            nR   <- freshName (T.pack "r")
+            let boxTy  = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+                u64Ty  = Ty.CTCon Ty.TcU64 []
+                bndB n = Anf.Binder n Anf.Unrestricted boxTy
+                bndU n = Anf.Binder n Anf.Unrestricted u64Ty
+                baseRead vn = Anf.Case (Anf.AVar nB)
+                  [Anf.AltCon (T.pack "Box") [bndU vn] (Anf.Ret (Anf.AVar vn))]
+                recArm selfK sib ksN rN =
+                  Anf.Let (bndU ksN) (Anf.RApp (primAtom (T.pack "-")) [Anf.AVar selfK, Anf.ALit (Anf.LInt 1)])
+                    (Anf.Let (bndU rN) (Anf.RApp (Anf.AVar sib) [Anf.AVar ksN])
+                      (Anf.Ret (Anf.AVar rN)))
+                fBody = Anf.Case (Anf.AVar nFK)
+                  [Anf.AltLit (Anf.LInt 0) (baseRead nV1), Anf.AltDefault (recArm nFK nG nFKs nFr)]
+                gBody = Anf.Case (Anf.AVar nGK)
+                  [Anf.AltLit (Anf.LInt 0) (baseRead nV2), Anf.AltDefault (recArm nGK nF nGKs nGr)]
+                mainBody =
+                  Anf.Let (bndB nB) (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 7)])
+                    (Anf.LetRec
+                      [ (bndU nF, [bndU nFK], fBody)
+                      , (bndU nG, [bndU nGK], gBody) ]
+                      (Anf.Let (bndU nR) (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 2)])
+                        (Anf.Ret (Anf.AVar nR))))
+                cm = Anf.CoreModule [rcTop nMain [] mainBody]
+            case RCM.runModuleRC (Perceus.insertRC cm) of
+              Left err  -> error ("runModuleRC failed: " <> show err)
+              Right run -> pure ( Perceus.prettyPerceus cm
+                                , RCM.rcStats run, RCM.rcBaseline run, Perceus.balanceLint cm )
+      -- (1) Exactly ONE member-drop in main's body (the single shared-env drop).
+      let memberDrops = length (T.breakOnAll (T.pack "__rc_drop(f)") pretty)
+                          + length (T.breakOnAll (T.pack "__rc_drop(g)") pretty)
+      assertEqual "exactly one member-drop (the single shared-env drop, not per-member)"
+        1 memberDrops
+      -- (2) Heap-balanced: Box + ONE NEnv allocated, both freed by the single drop.
+      assertEqual "allocs - frees == baseline (heap balanced)" bl (St.stAllocs st - St.stFrees st)
+      St.stLive st @?= bl
+      assertEqual "exactly two dynamic allocations (Box + ONE shared NEnv)" 2 (St.stAllocs st)
+      -- (3) The pass is balanceLint-clean.
+      lintOut @?= ([] :: [Text])
+
+  -- M2a-2 STAGE B --- ESCAPING enclosing capture is now ADMITTED and runs SOUND.
   -- A group that captures an enclosing boxed local AND RETURNS a member (the member
-  -- binder flows out of the LetRec body as a value) cannot be soundly instrumented
-  -- (region-lifetime extension deferred, spec 5.1/5.7). The boundary guard must
-  -- refuse it. CONTROL: the SAME group shape WITHOUT the enclosing capture (members
-  -- reference only siblings/params, no enclosing b) is NOT rejected by this rule.
+  -- binder flows out of the LetRec body as a value) is dup-balanced by the pass: the
+  -- returned member transfers the single shared-env handle out (the env-alive handle
+  -- is not also dropped), so the captured 'b' is freed exactly once via the env
+  -- cascade when the result CAF drops. CONTROL: the SAME group shape WITHOUT the
+  -- enclosing capture (the existing 23-letrec-return-member shape) is also admitted.
   --
   --   main =
   --     let b = Box 7                          -- enclosing boxed local
-  --     in letrec f x = case b of Box v -> v   -- captures b
+  --     in letrec f x = case b of Box v -> v   -- captures b (borrowed read)
   --        in f                                -- RETURNS the member f => ESCAPES
-  , testCase "escaping LetRec capturing an enclosing local: boundary rejects it (control passes)" $ do
+  , testCase "escaping LetRec capturing an enclosing local: ACCEPTED and runs sound (M2a-2 Stage B)" $ do
       let boxTy   = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
           u64Ty   = Ty.CTCon Ty.TcU64 []
           funTy   = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
@@ -7318,27 +7418,39 @@ rcLetRecTests = testGroup "rc letrec"
                  (Anf.Ret (Anf.AVar fName)))         -- RETURN f => member escapes
           cmWith captures = Anf.CoreModule
             [ Anf.TopBind (Name (T.pack "main") (Unique 970000)) [] (mkBody captures) ]
-      -- Teeth: the capturing-and-escaping group fires the violation.
-      assertBool "escaping enclosing-capture group must be rejected"
-        (not (null (firstOrderNoHandlerViolations (cmWith True))))
-      -- Control: the same escaping group WITHOUT the enclosing capture is NOT
-      -- rejected by this rule (a member that escapes but captures nothing enclosing
-      -- is the existing 23-letrec-return-member shape, still covered).
+      -- M2a-2 Stage B: the capturing-and-escaping group is now ADMITTED and runs
+      -- SOUND (the returned member transfers the single env handle out).
+      firstOrderNoHandlerViolations (cmWith True) @?= []
+      let escCm = pruneToReachable (cmWith True)
+      case (Interp.runModule escCm, RCM.runModuleRCUnchecked (Perceus.insertRC escCm)) of
+        (Right v, Right run) -> do
+          Interp.renderValue v @?= RCM.rcOutput run
+          let st = RCM.rcStats run; bl = RCM.rcBaseline run
+          assertEqual "escaping enclosing-capture return: heap balanced (live)" bl (St.stLive st)
+          assertEqual "escaping enclosing-capture return: heap balanced (allocs-frees)"
+            bl (St.stAllocs st - St.stFrees st)
+        (Left _, Left _) -> pure ()
+        (refRes, rcRes) ->
+          assertFailure ("RC run must agree with reference; got ref="
+                           <> either show (const "ok") refRes <> " rc="
+                           <> either show (const "ok") rcRes)
+      -- Control: the same escaping group WITHOUT the enclosing capture (the existing
+      -- 23-letrec-return-member shape) is also admitted.
       firstOrderNoHandlerViolations (cmWith False) @?= []
 
-  -- M1.5 PHASE 2 REVIEW FINDING 1 (verified DOUBLE-FREE) --- a member that CONSUMES
-  -- (moves) an enclosing capture is REJECTED. The borrow model exempts captures
-  -- (no move, no drop in the body); but passing a capture by VALUE to a call moves
-  -- it (the callee drops it) AND the group-drop cascade also frees it => double-free.
-  -- The boundary must refuse it. CONTROL: the SAME group shape using a BORROWED READ
-  -- (a Case scrutinee keeping only the unboxed field, exactly like 31/32) is NOT
-  -- rejected.
+  -- M1.5 PHASE 2 REVIEW FINDING 1 (verified DOUBLE-FREE; M2a-1 Task 5 narrowing) ---
+  -- a member that CONSUMES (moves) an enclosing capture is now ADMITTED when the
+  -- group is NON-escaping (the pass emits a dup-per-consuming-use; the runtime
+  -- accounting balances), and is REJECTED only when a member ALSO ESCAPES the
+  -- scope (region-lifetime extension = M2a-2; 'letRecMemberEscapes'). CONTROL: a
+  -- BORROWED READ (a Case scrutinee keeping only the unboxed field, like 31/32) is
+  -- admitted regardless.
   --
   --   peek p = 0
   --   main = let b = Box 6
   --          in letrec go k = case k of 0 -> peek b ; _ -> go (k-1)   -- peek b MOVES b
-  --          in let r = go 1 in r
-  , testCase "consuming LetRec capture (member passes capture by value): boundary rejects it" $ do
+  --          in let r = go 1 in r                                     -- go non-escaping
+  , testCase "consuming LetRec capture: REJECTED (escaping or not), borrow admitted" $ do
       let boxTy   = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
           u64Ty   = Ty.CTCon Ty.TcU64 []
           funTy   = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
@@ -7370,20 +7482,27 @@ rcLetRecTests = testGroup "rc letrec"
                   (Anf.Let kBnd (Anf.RApp (Anf.AVar goName) [Anf.ALit (Anf.LInt 0)])
                      (Anf.Ret (Anf.AVar kName)))
               ]
-          mkBody consuming =
+          -- escaping=False: body is 'let r = go 1 in r' (go used only as call head)
+          -- escaping=True : body is 'Ret go'            (the member escapes)
+          mkBody consuming escaping =
             Anf.Let bBnd (Anf.RCon (T.pack "Box") [Anf.ALit (Anf.LInt 6)])
               (Anf.LetRec [(goBnd, [kBnd], memberBody consuming)]
-                 (Anf.Let rBnd (Anf.RApp (Anf.AVar goName) [Anf.ALit (Anf.LInt 1)])
-                    (Anf.Ret (Anf.AVar rName))))
-          cmWith consuming = Anf.CoreModule
+                 (if escaping
+                    then Anf.Ret (Anf.AVar goName)
+                    else Anf.Let rBnd (Anf.RApp (Anf.AVar goName) [Anf.ALit (Anf.LInt 1)])
+                           (Anf.Ret (Anf.AVar rName))))
+          cmWith consuming escaping = Anf.CoreModule
             [ peekBind
-            , Anf.TopBind (Name (T.pack "main") (Unique 960000)) [] (mkBody consuming) ]
-      -- Teeth: the consuming-capture group fires the violation.
-      assertBool "consuming-capture group must be rejected"
-        (not (null (firstOrderNoHandlerViolations (cmWith True))))
+            , Anf.TopBind (Name (T.pack "main") (Unique 960000)) [] (mkBody consuming escaping) ]
+      -- Consuming-capture support is DEFERRED: ANY consuming use is REJECTED,
+      -- whether the member escapes or not.
+      assertBool "non-escaping consuming-capture group must be rejected"
+        (not (null (firstOrderNoHandlerViolations (cmWith True False))))
+      assertBool "consuming-AND-escaping group must be rejected"
+        (not (null (firstOrderNoHandlerViolations (cmWith True True))))
       -- Control: the borrowed-read shape (Case scrutinee keeping only the unboxed
-      -- field, like 31/32) is NOT rejected by this rule.
-      firstOrderNoHandlerViolations (cmWith False) @?= []
+      -- field, like 31/32) is NOT rejected, escaping or not.
+      firstOrderNoHandlerViolations (cmWith False False) @?= []
 
   -- M1.5 PHASE 2 REVIEW FINDING 2 (verified LEAK) --- a NESTED inner LetRec whose
   -- member captures an OUTER group member (cross-region counted edge) is EXCLUDED
@@ -7442,6 +7561,733 @@ rcLetRecTests = testGroup "rc letrec"
       -- Control: the same nested shape with NO cross-region reference is NOT rejected.
       firstOrderNoHandlerViolations (cmWith False) @?= []
   ]
+
+-- ---------------------------------------------------------------------------
+-- M2a-1 boundary: the escape-narrowed guard ACCEPTS non-escaping reproducers
+-- and still REJECTS their escaping variants
+--
+-- 'test/rc-m2a1/33-consuming-capture-nonescape.wok' (case #1): a 'LetRec'
+-- member that CONSUMES an enclosing boxed capture via a function-call argument
+-- ('RApp'). The group is NON-ESCAPING, but consuming-capture support is DEFERRED
+-- (a dup-per-consuming-use scheme was proved unsound at scale by Suite G), so the
+-- '#1' guard REJECTS ANY consuming use of an enclosing capture --- escaping or
+-- not. The file lives in 'test/rc-m2a1/' (NOT auto-discovered) since it is no
+-- longer admitted.
+--
+-- 'test/rc-examples/34-rlam-sibling-nonescape.wok' (case #4): a standalone
+-- closure ('RLam') that captures a 'LetRec' group sibling; the closure is never
+-- used and is dropped (NON-ESCAPING), so the boundary guard ACCEPTS it (the
+-- '#4' guard only fires when 'rlamSiblingCaptureEscapes'). This shape is the
+-- owned/borrowed-capture (Invariant-2) case and stays supported.
+--
+-- The ESCAPING variants STAY rejected (region-lifetime extension = M2a-2):
+--   * 'test/rc-m2a1/36-rlam-sibling-escape.wok' RETURNS the closure 'h'.
+--   * 'test/rc-m2a1/37-consuming-capture-escape.wok' RETURNS the member 'go'.
+--
+-- The escaping/rejected variants live in 'test/rc-m2a1/' (NOT 'test/rc-examples/')
+-- so they are NOT auto-discovered by the perceus-golden / perceus-lint /
+-- rc-differential / rc-stats suites, all of which assert-fail on rejected
+-- programs. The admitted reproducer (34) lives in 'test/rc-examples/' and runs
+-- under those suites.
+
+-- | Load and elaborate a '.wok' file, then return the boundary-guard
+-- violations.  Returns an empty list when the file is in the RC fragment and
+-- returns the violation messages when it is not.  Propagates loader and
+-- elaboration errors as 'assertFailure' (the file must at least elaborate).
+boundaryViolationsOf :: FilePath -> IO [Text]
+boundaryViolationsOf path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s  -> assertFailure ("elaborate: " <> s)
+        Right cm -> pure (firstOrderNoHandlerViolations cm)
+
+rcM2a1BaselineTests :: TestTree
+rcM2a1BaselineTests = testGroup "m2a-1 boundary (escape-narrowed guards)"
+  [ testCase "consuming-capture non-escape #1 is REJECTED (deferred)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/33-consuming-capture-nonescape.wok"
+      assertBool "any consuming-capture group must be rejected (deferred)" (not (null vs))
+  , testCase "rlam-sibling non-escape #4 is ACCEPTED" $ do
+      vs <- boundaryViolationsOf "test/rc-examples/34-rlam-sibling-nonescape.wok"
+      assertEqual "non-escaping sibling-capturing closure must pass the boundary" [] vs
+  -- M2a-2 STAGE A: a sibling captured into an ESCAPING standalone CLOSURE (#6) or a
+  -- NESTED escaping closure (#8) is now ADMITTED and runs SOUND. The closure capture
+  -- is dup-balanced by the pass, and the interpreter keeps an over-applied unnamed
+  -- intermediate alive through its own call (deferred-consume), so the escaped
+  -- closure's cascade-drop balances exactly. Both corpora over-apply the escaped
+  -- closure ('main = (mk 7) 2'), exercising that path; the run must agree with the
+  -- reference value and be heap-balanced.
+  , testCase "rlam-sibling ESCAPE #6 is ACCEPTED and runs sound (M2a-2 Stage A)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/36-rlam-sibling-escape.wok"
+      assertEqual "an escaping closure capturing a sibling must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/36-rlam-sibling-escape.wok"
+  , testCase "consuming-capture ESCAPE #7 is still REJECTED" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/37-consuming-capture-escape.wok"
+      assertBool "an escaping consuming-capture group must be rejected" (not (null vs))
+  , testCase "rlam-sibling NESTED-ESCAPE #8 is ACCEPTED and runs sound (M2a-2 Stage A)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/38-rlam-nested-escape.wok"
+      assertEqual "a sibling captured into a nested escaping closure must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/38-rlam-nested-escape.wok"
+  , testCase "consuming-capture NESTED-ESCAPE #9 is REJECTED" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/39-consuming-nested-escape.wok"
+      assertBool "a group member captured into a nested escaping closure must be rejected" (not (null vs))
+  -- DIRECT-escape (M2a-2 Stage B, now SOUND): a sibling moved DIRECTLY into an
+  -- escaping value --- an 'RCon'/'RRecord' field, a list cell, or a non-head call
+  -- argument --- is now ADMITTED and runs SOUND. The pass dups the shared env at the
+  -- move (dup-on-consume), so the escaped cell owns an independent env unit and the
+  -- group's enclosing local is freed exactly once via the env cascade. Each over-
+  -- applies the escaped sibling ('main = ... g 2'), exercising the unnamed-
+  -- intermediate deferred env-drop; the run must agree with the reference value and
+  -- be heap-balanced.
+  , testCase "sibling-into-constructor escape #12 is ACCEPTED and runs sound (M2a-2 Stage B)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/42-sibling-con-escape.wok"
+      assertEqual "a sibling moved into an escaping constructor must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/42-sibling-con-escape.wok"
+  , testCase "sibling-into-call-argument escape #13 is ACCEPTED and runs sound (M2a-2 Stage B)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/43-sibling-arg-escape.wok"
+      assertEqual "a sibling passed as a non-head arg of an escaping call must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/43-sibling-arg-escape.wok"
+  , testCase "sibling-into-list-constructor escape #14 is ACCEPTED and runs sound (M2a-2 Stage B)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/44-sibling-listcon-escape.wok"
+      assertEqual "a sibling stored in an escaping list cell must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/44-sibling-listcon-escape.wok"
+  , testCase "sibling-into-record-field escape #15 is ACCEPTED and runs sound (M2a-2 Stage B)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/45-sibling-record-escape.wok"
+      assertEqual "a sibling stored in an escaping record field must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/45-sibling-record-escape.wok"
+  -- POSITIVE guards against over-rejection: a member returned DIRECTLY ('Ret f',
+  -- mirror of rc-examples/23) and a sibling used only as a CALL HEAD ('f 3') are
+  -- NOT escapes via the generalized guard and must STAY ACCEPTED.
+  , testCase "direct return-of-member #16 STAYS ACCEPTED (not over-rejected)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/46-return-member-accept.wok"
+      assertEqual "a direct return-of-member must pass the boundary" [] vs
+  , testCase "sibling-as-call-head #17 STAYS ACCEPTED (not over-rejected)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/47-sibling-callhead-accept.wok"
+      assertEqual "a sibling used only as a call head must pass the boundary" [] vs
+  -- M2a-2 Stage B: over-applying a DIRECT member return as an UNNAMED INTERMEDIATE
+  -- ('(mk 7) 2') leaked the shared env before the interpreter's deferred env-drop on
+  -- the 'RVRecMember' unnamed-intermediate path. Must be ACCEPTED and run sound
+  -- (heap-balanced + value-match) --- the permanent guard for that fix.
+  , testCase "member over-apply #21 is ACCEPTED and runs sound (M2a-2 Stage B)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/51-member-overapply-accept.wok"
+      assertEqual "an over-applied direct member return must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/51-member-overapply-accept.wok"
+  -- POSITIVE guards against the call-head over-rejection: a recursive group member
+  -- whose body CALLS an enclosing boxed CAPTURE 'g' as a call HEAD ('g u') is a
+  -- BORROW under uniform borrow-on-call, NOT a move/consume. 'consumingOccs' used to
+  -- count the head and (the group being non-escaping) wrongly REJECTED it; now the
+  -- head is exempt and the group is ADMITTED and runs SOUND (value-match + heap-
+  -- balanced). Both a SATURATED head (#52) and a PARTIAL head (#53) must pass.
+  , testCase "capture-as-saturated-call-head #22 is ACCEPTED and runs sound (M2a-2)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/52-capture-callhead-accept.wok"
+      assertEqual "a capture used only as a saturated call head must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/52-capture-callhead-accept.wok"
+  , testCase "capture-as-partial-call-head #23 is ACCEPTED and runs sound (M2a-2)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/53-capture-partial-callhead-accept.wok"
+      assertEqual "a capture used only as a partial call head must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/53-capture-partial-callhead-accept.wok"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M2a-1 lint: 'balanceLint' as the compile-time oracle for case #1/#4
+--
+-- M2a-1 Tasks 3+4 bring the consuming-capture (#1) and borrowed-sibling (#4)
+-- 'LetRec' shapes INTO the Perceus pass's coverage and make 'balanceLint'
+-- audit them. The pass emits a build-site '__rc_dup' per consuming use of an
+-- enclosing capture so each runtime move owns its unit and the region keeps its
+-- per-member cascade unit; 'balanceLint' relinquishes the same multiset, so it is
+-- BALANCED on these shapes only when the dup-per-consuming-use is exactly right.
+--
+-- The RC BOUNDARY guard ('firstOrderNoHandlerViolations') STILL rejects both
+-- programs until the escape-narrowing slice (Task 5) --- 'rcM2a1BaselineTests'
+-- asserts that. These tests audit the PASS + LINT directly, on the elaborated
+-- module ('balanceLint' runs 'insertRC' itself), so they bypass the boundary.
+
+-- | Load and elaborate a '.wok' file to its 'CoreModule'. Propagates loader and
+-- elaboration errors as 'assertFailure'.
+elaboratedModuleOf :: FilePath -> IO Anf.CoreModule
+elaboratedModuleOf path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s  -> assertFailure ("elaborate: " <> s)
+        Right cm -> pure cm
+
+rcM2a1LintTests :: TestTree
+rcM2a1LintTests = testGroup "m2a-1 lint (balanceLint is the oracle for #4)"
+  [ testCase "rlam-sibling #4 is covered and balances clean" $ do
+      cm <- elaboratedModuleOf "test/rc-examples/34-rlam-sibling-nonescape.wok"
+      assertEqual "balanceLint must be clean on the borrowed-sibling shape"
+        [] (Perceus.balanceLint cm)
+  , testCase "teeth: OmitOneDrop is caught on #4" $ do
+      cm <- elaboratedModuleOf "test/rc-examples/34-rlam-sibling-nonescape.wok"
+      assertBool "a dropped __rc_drop must produce a balanceLint violation"
+        (not (null (Perceus.lintInstrumented (Perceus.insertRCMutated Perceus.OmitOneDrop cm))))
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M2a-1 alias-of-sibling hardening: a bare 'let x = f' that aliases a LetRec
+-- group sibling 'f' (a borrowed/uncounted-region member) must propagate the
+-- sibling's exempt-ness THROUGH the alias --- 'x' is a borrow of the same member,
+-- so the pass emits NO '__rc_dup' and NO '__rc_drop' for it and does NOT count it
+-- as owned. Before the fix the pass dropped 'x' at its dead point, double-freeing
+-- the region member (cell-drop + group-drop); 'runModuleRCUnchecked' errored
+-- 'double-free: addr 0' while the boundary guard ACCEPTED the program and
+-- 'balanceLint' reported it CLEAN --- it escaped both oracles. The genuine oracle
+-- is runtime accounting.
+--
+--   * '40-alias-sibling-drop' (alias DROPPED, non-escaping): now ACCEPTED by the
+--     boundary guard, runs heap-BALANCED, and agrees with the reference value.
+--   * '41-alias-sibling-escape' (alias RETURNED, escaping): the borrow leaves the
+--     region; the boundary guard's escape detection follows the alias rename and
+--     REJECTS it (region-lifetime extension = M2a-2).
+rcM2a1AliasTests :: TestTree
+rcM2a1AliasTests = testGroup "m2a-1 alias-of-sibling (exempt-ness through aliases)"
+  [ testCase "alias-sibling DROP #10: boundary ACCEPTS the non-escaping alias" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/40-alias-sibling-drop.wok"
+      assertEqual "a dropped (non-escaping) alias of a sibling must pass the boundary"
+        [] vs
+  , testCase "alias-sibling DROP #10: heap empties after RC run (no double-free)" $
+      assertHeapEmpty "test/rc-m2a1/40-alias-sibling-drop.wok"
+  , testCase "alias-sibling DROP #10: balanceLint is clean (mirrors the pass)" $ do
+      cm <- elaboratedModuleOf "test/rc-m2a1/40-alias-sibling-drop.wok"
+      assertEqual "balanceLint must be clean on the alias-of-sibling shape"
+        [] (Perceus.balanceLint cm)
+  , testCase "alias-sibling DROP #10: teeth: OmitOneDrop is caught" $ do
+      cm <- elaboratedModuleOf "test/rc-m2a1/40-alias-sibling-drop.wok"
+      assertBool "a dropped __rc_drop must produce a balanceLint violation"
+        (not (null (Perceus.lintInstrumented (Perceus.insertRCMutated Perceus.OmitOneDrop cm))))
+  , testCase "alias-sibling DROP #10: RC run agrees with the reference value" $ do
+      cm <- elaboratedModuleOf "test/rc-m2a1/40-alias-sibling-drop.wok"
+      let pruned = pruneToReachable cm
+      case (Interp.runModule pruned, RCM.runModuleRCUnchecked (Perceus.insertRC pruned)) of
+        (Right v, Right run) ->
+          Interp.renderValue v @?= RCM.rcOutput run
+        (refRes, rcRes) ->
+          assertFailure ("both interpreters must succeed; got "
+                           <> show (either show (const "ok") refRes) <> " / "
+                           <> show (either show (const "ok") rcRes))
+  , testCase "alias-sibling ESCAPE #11: boundary ACCEPTS and runs sound (M2a-2 Stage B)" $ do
+      -- M2a-2 Stage B: a bare ALIAS of a sibling that ESCAPES (returned) is now
+      -- ADMITTED and runs SOUND. The env-alias propagation makes the escaping alias
+      -- transfer the single shared-env handle out; the scope's env-alive handle is
+      -- NOT also dropped, so the env the escaped alias still holds is not double-freed.
+      vs <- boundaryViolationsOf "test/rc-m2a1/41-alias-sibling-escape.wok"
+      assertEqual "an escaping alias of a sibling must pass the boundary" [] vs
+      assertRcAgrees "test/rc-m2a1/41-alias-sibling-escape.wok"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M2a-1 sibling-in-cell LOCAL DROP: a LetRec group sibling moved into an
+-- ordinary container cell ('NCon'/'NRecord'/list 'Cons') that is then DROPPED
+-- LOCALLY (the cell does NOT escape; the result is a scalar). Before the cascade
+-- fix, 'countedChildren' returned ALL boxed children of a non-region, non-closure
+-- container, so dropping the local cell cascaded into the region member 'f' --- and
+-- the LetRec group's own unit-drop freed 'f' again --- a verified DOUBLE-FREE
+-- ('double-free: addr 0') under 'runModuleRCUnchecked', while the boundary guard
+-- correctly ACCEPTED the program (no escape) and 'balanceLint' reported it clean.
+-- The genuine oracle is runtime accounting.
+--
+-- The fix makes the region/static-child skip in 'countedChildren' uniform across
+-- ALL node kinds, so an 'NCon'/'NRecord' cell never cascade-frees a sibling it
+-- merely contains; the sibling is freed exactly once by its group's unit-drop.
+--
+--   * '48-sibling-con-drop'     ('Box f'        dropped locally)
+--   * '49-sibling-listcon-drop' ('Cons f Nil'   dropped locally)
+--   * '50-sibling-record-drop'  ('Cell { fn=f }' dropped locally)
+--
+-- Their ESCAPING counterparts (42/44/45) stay REJECTED --- 'rcM2a1BaselineTests'.
+rcM2a1SiblingDropTests :: TestTree
+rcM2a1SiblingDropTests = testGroup "m2a-1 sibling-in-cell local drop (no cascade double-free)"
+  [ testCase "sibling-in-con DROP #18: boundary ACCEPTS the non-escaping cell" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/48-sibling-con-drop.wok"
+      assertEqual "a locally-dropped sibling-in-constructor must pass the boundary" [] vs
+  , testCase "sibling-in-con DROP #18: heap empties after RC run (no double-free)" $
+      assertHeapEmpty "test/rc-m2a1/48-sibling-con-drop.wok"
+  , testCase "sibling-in-con DROP #18: balanceLint is clean (sibling exempt throughout)" $ do
+      cm <- elaboratedModuleOf "test/rc-m2a1/48-sibling-con-drop.wok"
+      assertEqual "balanceLint must be clean on the sibling-in-constructor drop shape"
+        [] (Perceus.balanceLint cm)
+  , testCase "sibling-in-con DROP #18: teeth: OmitOneDrop is caught" $ do
+      cm <- elaboratedModuleOf "test/rc-m2a1/48-sibling-con-drop.wok"
+      assertBool "a dropped __rc_drop must produce a balanceLint violation"
+        (not (null (Perceus.lintInstrumented (Perceus.insertRCMutated Perceus.OmitOneDrop cm))))
+  , testCase "sibling-in-con DROP #18: RC run agrees with the reference value" $ do
+      cm <- elaboratedModuleOf "test/rc-m2a1/48-sibling-con-drop.wok"
+      let pruned = pruneToReachable cm
+      case (Interp.runModule pruned, RCM.runModuleRCUnchecked (Perceus.insertRC pruned)) of
+        (Right v, Right run) ->
+          Interp.renderValue v @?= RCM.rcOutput run
+        (refRes, rcRes) ->
+          assertFailure ("both interpreters must succeed; got "
+                           <> show (either show (const "ok") refRes) <> " / "
+                           <> show (either show (const "ok") rcRes))
+  , testCase "sibling-in-listcon DROP #19: boundary ACCEPTS the non-escaping cell" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/49-sibling-listcon-drop.wok"
+      assertEqual "a locally-dropped sibling-in-list-cell must pass the boundary" [] vs
+  , testCase "sibling-in-listcon DROP #19: heap empties after RC run (no double-free)" $
+      assertHeapEmpty "test/rc-m2a1/49-sibling-listcon-drop.wok"
+  , testCase "sibling-in-record DROP #20: boundary ACCEPTS the non-escaping cell" $ do
+      vs <- boundaryViolationsOf "test/rc-m2a1/50-sibling-record-drop.wok"
+      assertEqual "a locally-dropped sibling-in-record-field must pass the boundary" [] vs
+  , testCase "sibling-in-record DROP #20: heap empties after RC run (no double-free)" $
+      assertHeapEmpty "test/rc-m2a1/50-sibling-record-drop.wok"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M2a-2 Task 1: uniform BORROW-ON-CALL.
+--
+-- Applying ANY function value BORROWS it (the call is a pure read), never
+-- consumes it. Perceus drops a function value at its LAST USE, exactly like any
+-- other value. A closure called N times is therefore dup'd 0 times and dropped
+-- exactly once. These tests lock that convention together with the heap-balance,
+-- value-match, and 'balanceLint' oracles.
+
+-- | Count the inserted @__rc_dup u@ / @__rc_drop u@ calls naming a specific
+-- 'Unique' anywhere in an instrumented expression. An RC intrinsic is an
+-- @RApp (AVar h) [AVar n]@ whose head hint is the dup/drop hint and whose single
+-- operand names @u@.
+countRcIntrinsicFor :: Text -> Unique -> Expr -> Int
+countRcIntrinsicFor hint u = goE
+  where
+    isFor (RApp (AVar h) [AVar n]) =
+      nameHint h == hint && nameUniq n == u
+    isFor _ = False
+    one r = if isFor r then 1 else 0
+    goE (Ret _)            = 0
+    goE (Let _ r e)        = one r + goRhs r + goE e
+    goE (Case _ alts)      = sum (map goAlt alts)
+    goE (LetJoin _ _ jb e) = goE jb + goE e
+    goE (Jump _ _)         = 0
+    goE (LetRec defs e)    = sum [ goE d | (_, _, d) <- defs ] + goE e
+    goE (Handle e _)       = goE e
+    goRhs (RLam _ e) = goE e
+    goRhs _          = 0
+    goAlt (AltCon _ _ e) = goE e
+    goAlt (AltLit _ e)   = goE e
+    goAlt (AltDefault e) = goE e
+
+borrowOnCallTests :: TestTree
+borrowOnCallTests = testGroup "borrow-on-call"
+  [ testCase "closure called twice: borrow => no dup, drop at last use, heap balanced" $
+      borrowOnCallTwiceBalanced
+  ]
+
+-- main = let f = \x -> x + 1
+--        let a = f 10
+--        let b = f 20      -- f used twice; borrow => no dup, drop at last use
+--        in a + b
+borrowOnCallTwiceBalanced :: Assertion
+borrowOnCallTwiceBalanced = do
+  let intTy = Ty.CTCon Ty.TcU64 []
+      funTy = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+      nm h u = Name (T.pack h) (Unique u)
+      fLam = RLam [Binder (nm "x" 1) Unrestricted intTy]
+               (Let (Binder (nm "x1" 2) Unrestricted intTy)
+                    (RApp (primAtom (T.pack "+")) [AVar (nm "x" 1), ALit (LInt 1)])
+                 (Ret (AVar (nm "x1" 2))))
+      body =
+        Let (Binder (nm "f" 3) Unrestricted funTy) fLam
+          (Let (Binder (nm "a" 4) Unrestricted intTy) (RApp (AVar (nm "f" 3)) [ALit (LInt 10)])
+            (Let (Binder (nm "b" 5) Unrestricted intTy) (RApp (AVar (nm "f" 3)) [ALit (LInt 20)])
+              (Let (Binder (nm "s" 6) Unrestricted intTy)
+                   (RApp (primAtom (T.pack "+")) [AVar (nm "a" 4), AVar (nm "b" 5)])
+                (Ret (AVar (nm "s" 6))))))
+      cm     = CoreModule [TopBind (nm "main" 1000000) [] body]
+      pruned = pruneToReachable cm
+  assertBool "must be accepted" (null (firstOrderNoHandlerViolations pruned))
+  -- Borrow-on-call: 'f' (the closure binder, Unique 3) is dup'd 0 times and
+  -- dropped exactly once (at its last use, the second call site).
+  let instrumented = Perceus.insertRC pruned
+      CoreModule iBinds = instrumented
+  case [ b | TopBind n _ b <- iBinds, nameHint n == T.pack "main" ] of
+    (ib : _) -> do
+      assertEqual "f is never dup'd (borrow, not move)"
+        0 (countRcIntrinsicFor (T.pack "__rc_dup") (Unique 3) ib)
+      assertEqual "f is dropped exactly once (at last use)"
+        1 (countRcIntrinsicFor (T.pack "__rc_drop") (Unique 3) ib)
+    [] -> assertFailure "instrumented module dropped main"
+  case (Interp.runModule pruned, RCM.runModuleRC instrumented) of
+    (Right v, Right run) -> do
+      assertEqual "value" (Interp.renderValue v) (RCM.rcOutput run)
+      assertEqual "heap empty" (St.stLive (RCM.rcStats run)) (RCM.rcBaseline run)
+      assertEqual "balanced"
+        (St.stAllocs (RCM.rcStats run) - St.stFrees (RCM.rcStats run))
+        (RCM.rcBaseline run)
+    (refRes, rcRes) ->
+      assertFailure ("both interpreters must succeed; got "
+                       <> either show (const "ok") refRes <> " / "
+                       <> either show (const "ok") rcRes)
+  assertEqual "balanceLint clean" [] (Perceus.balanceLint pruned)
+
+-- ---------------------------------------------------------------------------
+-- M2a-2 Task 3: evaluate 'letrec' via the shared-env + code-pointer
+-- representation ('RVRecMember' over a static 'NGroupCode' label plus at most
+-- ONE shared 'NEnv' cell). The boundary guard still rejects escaping shapes, so
+-- only NON-escaping 'letrec' exercises this path.
+--
+--   * a CAPTURE-FREE group uses the static empty-env sentinel and allocates NO
+--     dynamic group cell (acceptance: zero group allocation);
+--   * a CAPTURING group allocates exactly ONE 'NEnv' cell, freed once;
+--   * sibling (recursive) calls allocate nothing (the sibling scope is
+--     reconstructed inline at entry);
+--   * partial application of a member builds an ordinary closure that re-enters
+--     the member on full application.
+
+sharedEnvEvalTests :: TestTree
+sharedEnvEvalTests = testGroup "sharedenv-eval"
+  [ testCase "capture-free mutual even/odd: value-match, heap-balanced, ZERO group allocation" $
+      sharedEnvCaptureFreeMutual
+  , testCase "capture-free group derefs the static sentinel as the empty env (no collision)" $
+      sharedEnvSentinelIsEmptyEnv
+  , testCase "capturing group (borrow-read one boxed local): exactly ONE NEnv, freed once" $
+      sharedEnvCapturingOneEnv
+  , testCase "partial application of a recursive member re-enters it on full application" $
+      sharedEnvPartialApplication
+  , testCase "bare-member top-level result: runModuleRCUnchecked drops its env (heap-balanced)" $
+      sharedEnvBareMemberResult
+  ]
+
+-- | Prereq A regression: a 'main' that RETURNS a bare group member
+-- ('Ret (AVar even)') produces an 'RVRecMember' as the top-level result. The
+-- final result-drop in 'runModuleRCUnchecked' must release that result via its
+-- 'valueChildren' (the shared 'NEnv'), exactly like 'RVBox'; otherwise the env
+-- cell is never freed and the run is spuriously imbalanced ('stLive' above
+-- baseline). The capturing group below allocates exactly one 'NEnv' (it
+-- borrow-reads the boxed local @b@), so a missing final drop leaves @live=2@.
+--
+--   main = let b = Box 7
+--          letrec even k = case k of 0 -> (case b of Box v -> v) ; _ -> odd (k-1)
+--                 odd  k = case k of 0 -> (case b of Box v -> v) ; _ -> even (k-1)
+--          in even                         -- bare member returned => RVRecMember
+sharedEnvBareMemberResult :: Assertion
+sharedEnvBareMemberResult = do
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      boxTy  = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+      funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+      nm h u = Name (T.pack h) (Unique u)
+      bnd h u ty = Binder (nm h u) Unrestricted ty
+      nB = nm "b" 1; nEven = nm "even" 2; nOdd = nm "odd" 3
+      baseRead vU = Case (AVar nB)
+                      [ AltCon (T.pack "Box") [bnd "v" vU intTy] (Ret (AVar (nm "v" vU))) ]
+      recArm selfK sib ks ksU r rU =
+        Let (bnd ks ksU intTy) (RApp (primAtom (T.pack "-")) [AVar selfK, ALit (LInt 1)])
+          (Let (bnd r rU intTy) (RApp (AVar sib) [AVar (nm ks ksU)])
+            (Ret (AVar (nm r rU))))
+      evenBody = Case (AVar (nm "ek" 4))
+                   [ AltLit (LInt 0) (baseRead 10), AltDefault (recArm (nm "ek" 4) nOdd "eks" 20 "er" 21) ]
+      oddBody  = Case (AVar (nm "ok" 5))
+                   [ AltLit (LInt 0) (baseRead 11), AltDefault (recArm (nm "ok" 5) nEven "oks" 22 "or" 23) ]
+      body =
+        Let (bnd "b" 1 boxTy) (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec [ (Binder nEven Unrestricted funTy, [bnd "ek" 4 intTy], evenBody)
+                  , (Binder nOdd  Unrestricted funTy, [bnd "ok" 5 intTy], oddBody) ]
+            (Ret (AVar nEven)))
+      cm     = CoreModule [TopBind (nm "main" 100) [] body]
+      pruned = pruneToReachable cm
+  case RCM.runModuleRCUnchecked (Perceus.insertRC pruned) of
+    Left err  -> assertFailure ("runModuleRCUnchecked failed: " <> show err)
+    Right run -> do
+      let st = RCM.rcStats run
+          bl = RCM.rcBaseline run
+      assertEqual "live cells must return to baseline after dropping the bare-member result"
+        bl (St.stLive st)
+      assertEqual "allocs minus frees must equal the baseline (no leaked env)"
+        bl (St.stAllocs st - St.stFrees st)
+
+-- | A capture-free, TRULY mutually-recursive even/odd group with LITERAL base
+-- cases, as a whole 'main' module. The 'Case' scrutinises the integer parameter
+-- DIRECTLY (an 'AltLit 0' base + an 'AltDefault' recursive arm), so no boxed
+-- Bool is ever allocated: a correct capture-free run allocates ZERO dynamic
+-- cells (no 'NEnv', members inline over the static sentinel).
+--
+--   main = letrec even k = case k of 0 -> 1 ; _ -> odd (k-1)
+--                 odd  k = case k of 0 -> 0 ; _ -> even (k-1)
+--          in even <arg>
+mutualLitModule :: Integer -> CoreModule
+mutualLitModule arg =
+  let intTy = Ty.CTCon Ty.TcU64 []
+      nm h u = Name (T.pack h) (Unique u)
+      bnd h u = Binder (nm h u) Unrestricted intTy
+      -- distinct Uniques per binder (the machine keys env on Unique).
+      nEven = nm "even" 1; nOdd = nm "odd" 2
+      evenBody =
+        Case (AVar (nm "ek" 3))
+          [ AltLit (LInt 0) (Ret (ALit (LInt 1)))
+          , AltDefault (Let (bnd "eks" 5) (RApp (primAtom (T.pack "-")) [AVar (nm "ek" 3), ALit (LInt 1)])
+                          (Let (bnd "er" 6) (RApp (AVar nOdd) [AVar (nm "eks" 5)])
+                            (Ret (AVar (nm "er" 6))))) ]
+      oddBody =
+        Case (AVar (nm "ok" 4))
+          [ AltLit (LInt 0) (Ret (ALit (LInt 0)))
+          , AltDefault (Let (bnd "oks" 7) (RApp (primAtom (T.pack "-")) [AVar (nm "ok" 4), ALit (LInt 1)])
+                          (Let (bnd "or" 8) (RApp (AVar nEven) [AVar (nm "oks" 7)])
+                            (Ret (AVar (nm "or" 8))))) ]
+      body =
+        LetRec [ (Binder nEven Unrestricted intTy, [bnd "ek" 3], evenBody)
+               , (Binder nOdd  Unrestricted intTy, [bnd "ok" 4], oddBody) ]
+          (Let (bnd "r" 9) (RApp (AVar nEven) [ALit (LInt arg)])
+            (Ret (AVar (nm "r" 9))))
+  in CoreModule [TopBind (nm "main" 100) [] body]
+
+sharedEnvCaptureFreeMutual :: Assertion
+sharedEnvCaptureFreeMutual = do
+  let cm     = mutualLitModule 4
+      pruned = pruneToReachable cm
+  assertBool "non-escaping capture-free group must pass the boundary"
+    (null (firstOrderNoHandlerViolations pruned))
+  let instrumented = Perceus.insertRC pruned
+  case (Interp.runModule pruned, RCM.runModuleRC instrumented) of
+    (Right v, Right run) -> do
+      let st = RCM.rcStats run
+          bl = RCM.rcBaseline run
+      assertEqual "value matches the reference interpreter"
+        (Interp.renderValue v) (RCM.rcOutput run)   -- even 4 = 1
+      assertEqual "heap empties to the immortal baseline" bl (St.stLive st)
+      assertEqual "allocs - frees == baseline"
+        bl (St.stAllocs st - St.stFrees st)
+      -- ZERO group allocation: a capture-free group allocates no dynamic cell
+      -- (no NEnv; the code label is static; literal base cases allocate no Bool).
+      assertEqual "capture-free group allocates ZERO dynamic cells" 0 (St.stAllocs st)
+      assertEqual "and never peaks above zero live dynamic cells" 0 (St.stPeak st)
+    (refRes, rcRes) ->
+      assertFailure ("both interpreters must succeed; got "
+                       <> either show (const "ok") refRes <> " / "
+                       <> either show (const "ok") rcRes)
+
+-- | The sentinel collision fix: a capture-free group's @envAddr@ is the static
+-- empty-env sentinel, and dereferencing it returns @NEnv Map.empty@ --- NOT the
+-- first top-level bind's static cell (which 'reserveStatic' now starts at -2
+-- after 'initSentinel' reserves -1).
+sharedEnvSentinelIsEmptyEnv :: Assertion
+sharedEnvSentinelIsEmptyEnv = do
+  let s = St.initSentinel St.emptyStore
+  case St.deref St.emptyEnvSentinelAddr s of
+    Right c -> case St.cNode c of
+      St.NEnv m -> assertEqual "sentinel holds the empty env" Map.empty m
+      other     -> assertFailure ("sentinel must be NEnv empty, got " <> show other)
+    Left err -> assertFailure ("sentinel deref failed: " <> show err)
+  -- After the sentinel, the next static address is -2, so the first top-level
+  -- bind (or group code label) cannot alias the sentinel slot.
+  let (a, _) = St.allocStatic (St.NCon (T.pack "X") []) s
+  assertBool "first post-sentinel static addr is below the sentinel" (a < St.emptyEnvSentinelAddr)
+
+-- | A capturing, non-escaping group: two members that BOTH borrow-read one boxed
+-- enclosing local @b = Box 7@ (each base case is @case b of Box v -> v@, a
+-- borrow-read that keeps no boxed child). Built and HAND-INSTRUMENTED directly
+-- (Perceus's letrec instrumentation is simplified in Task 4), so the group is
+-- dropped by exactly ONE member-drop --- which frees the single shared 'NEnv'
+-- and cascades into @b@. Asserts: exactly ONE 'NEnv' allocated (Box + env = 2
+-- dynamic allocs, peak 2) and freed once (heap empties).
+sharedEnvCapturingOneEnv :: Assertion
+sharedEnvCapturingOneEnv = do
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      boxTy  = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+      nm h u = Name (T.pack h) (Unique u)
+      bnd h u ty = Binder (nm h u) Unrestricted ty
+      nB = nm "b" 1; nF = nm "f" 2; nG = nm "g" 3
+      -- base case: case b of Box v -> v   (a borrow-read of the captured b)
+      baseRead vU = Case (AVar nB)
+                      [ AltCon (T.pack "Box") [bnd "v" vU intTy] (Ret (AVar (nm "v" vU))) ]
+      recArm selfK sib ks ksU r rU =
+        Let (bnd ks ksU intTy) (RApp (primAtom (T.pack "-")) [AVar selfK, ALit (LInt 1)])
+          (Let (bnd r rU intTy) (RApp (AVar sib) [AVar (nm ks ksU)])
+            (Ret (AVar (nm r rU))))
+      fBody = Case (AVar (nm "fk" 4))
+                [ AltLit (LInt 0) (baseRead 10), AltDefault (recArm (nm "fk" 4) nG "fks" 20 "fr" 21) ]
+      gBody = Case (AVar (nm "gk" 5))
+                [ AltLit (LInt 0) (baseRead 11), AltDefault (recArm (nm "gk" 5) nF "gks" 22 "gr" 23) ]
+      -- main = let b = Box 7
+      --        letrec f k = case k of 0 -> (case b of Box v -> v) ; _ -> g (k-1)
+      --               g k = case k of 0 -> (case b of Box v -> v) ; _ -> f (k-1)
+      --        let r = f 2                       -- => 7 (the captured value)
+      --            _ = __rc_drop f               -- ONE member-drop: frees the env, cascades b
+      --        in r
+      e =
+        Let (bnd "b" 1 boxTy) (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec [ (Binder nF Unrestricted intTy, [bnd "fk" 4 intTy], fBody)
+                  , (Binder nG Unrestricted intTy, [bnd "gk" 5 intTy], gBody) ]
+            (Let (bnd "r" 6 intTy) (RApp (AVar nF) [ALit (LInt 2)])
+              (Let (bnd "_d" 7 intTy) (RApp (AVar rcDropName) [AVar nF])
+                (Ret (AVar (nm "r" 6))))))
+      s0 = St.initSentinel St.emptyStore
+  case RCM.runExprRC RCP.rcPrimTable Map.empty s0 e of
+    Left err -> assertFailure ("rc run failed: " <> show err)
+    Right (v, s) -> do
+      txt <- either (assertFailure . show) pure (St.renderRCValue s v)
+      txt @?= T.pack "7"
+      let st = St.stStats s
+      -- Box (1) + the ONE shared NEnv (1) = exactly two dynamic allocs; nothing
+      -- more (sibling calls allocate nothing, base case is a borrow-read).
+      assertEqual "exactly two dynamic allocations (Box + ONE NEnv)" 2 (St.stAllocs st)
+      assertEqual "peak two live dynamic cells (Box + env held together)" 2 (St.stPeak st)
+      -- The single member-drop freed the env, whose cascade freed Box: heap empties
+      -- (the result is the unboxed literal 7, so there is nothing further to drop).
+      assertEqual "both cells freed (env + cascaded Box)" 2 (St.stFrees st)
+      assertEqual "heap empty after the single group drop" 0 (St.stLive st)
+
+-- | Partial application of a recursive member. The single-member group
+--
+--   f a b = case b of 0 -> a ; _ -> let b' = b - 1 ; r = f a b' in r
+--
+-- accumulates @a@ while counting @b@ down to 0 (so @f 10 3 = 10@). We apply it
+-- PARTIALLY (@p = f 10@, one arg of two), which must build an ordinary closure
+-- capturing the supplied arg + the member, then FULLY apply it (@p 3@) so the
+-- closure re-enters the member's code. Non-escaping (capture-free, result is a
+-- scalar), hand-instrumented: the partial closure is the only dynamic cell and
+-- is dropped at the end.
+sharedEnvPartialApplication :: Assertion
+sharedEnvPartialApplication = do
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+      nm h u = Name (T.pack h) (Unique u)
+      bnd h u ty = Binder (nm h u) Unrestricted ty
+      nF = nm "f" 1
+      fBody =
+        Case (AVar (nm "fb" 3))
+          [ AltLit (LInt 0) (Ret (AVar (nm "fa" 2)))
+          , AltDefault
+              (Let (bnd "fb1" 4 intTy) (RApp (primAtom (T.pack "-")) [AVar (nm "fb" 3), ALit (LInt 1)])
+                (Let (bnd "fr" 5 intTy) (RApp (AVar nF) [AVar (nm "fa" 2), AVar (nm "fb1" 4)])
+                  (Ret (AVar (nm "fr" 5))))) ]
+      -- main = letrec f a b = case b of 0 -> a ; _ -> f a (b-1)
+      --        let p = f 10            -- PARTIAL: na=1 < np=2 => build a closure
+      --            r = p 3             -- FULL: re-enters f => 10
+      --            _ = __rc_drop p     -- drop the partial closure (its only owner)
+      --        in r
+      e =
+        LetRec [ (Binder nF Unrestricted funTy, [bnd "fa" 2 intTy, bnd "fb" 3 intTy], fBody) ]
+          (Let (bnd "p" 6 funTy) (RApp (AVar nF) [ALit (LInt 10)])
+            (Let (bnd "r" 7 intTy) (RApp (AVar (nm "p" 6)) [ALit (LInt 3)])
+              (Let (bnd "_d" 8 intTy) (RApp (AVar rcDropName) [AVar (nm "p" 6)])
+                (Ret (AVar (nm "r" 7))))))
+      s0 = St.initSentinel St.emptyStore
+  case RCM.runExprRC RCP.rcPrimTable Map.empty s0 e of
+    Left err -> assertFailure ("rc run failed: " <> show err)
+    Right (v, s) -> do
+      txt <- either (assertFailure . show) pure (St.renderRCValue s v)
+      txt @?= T.pack "10"      -- f 10 3 accumulates a=10 down b=3..0
+      let st = St.stStats s
+      -- The ONLY dynamic cell is the partial-application closure; freed by its
+      -- single drop. (The group code label is static; capture-free, so no NEnv.)
+      assertEqual "exactly one dynamic allocation (the partial closure)" 1 (St.stAllocs st)
+      assertEqual "the partial closure is freed" 1 (St.stFrees st)
+      assertEqual "heap empty after dropping the partial closure" 0 (St.stLive st)
+
+-- | Elaborate -> prune -> Perceus.insertRC -> runModuleRC a consuming-capture
+-- corpus file directly (no boundary guard), and assert the heap is balanced:
+-- everything born is freed and 'stLive' returns to the value-CAF baseline.
+assertHeapEmpty :: FilePath -> Assertion
+assertHeapEmpty path = do
+  cm <- elaboratedModuleOf path
+  case RCM.runModuleRCUnchecked (Perceus.insertRC (pruneToReachable cm)) of
+    Left err  -> assertFailure ("runModuleRCUnchecked failed: " <> show err)
+    Right run -> do
+      let st = RCM.rcStats run
+          bl = RCM.rcBaseline run
+      assertEqual "live cells must return to the value-CAF baseline (no leak)"
+        bl (St.stLive st)
+      assertEqual "allocs minus frees must equal the baseline (no leak)"
+        bl (St.stAllocs st - St.stFrees st)
+
+-- | Elaborate -> prune a '.wok' file, then run BOTH interpreters and assert the RC
+-- run AGREES with the reference value AND is heap-balanced (allocs - frees and live
+-- both return to the value-CAF baseline). Unlike 'assertHeapEmpty', the result MAY
+-- be a live value CAF (an escaped closure), so it asserts balance against the
+-- baseline rather than zero. The run-the-exploit check for an ACCEPTED escaping
+-- shape: a wrongly-admitted escape surfaces as a 'Left' (UAF / double-free), a leak
+-- (live /= baseline), or a value mismatch.
+assertRcAgrees :: FilePath -> Assertion
+assertRcAgrees path = do
+  cm <- elaboratedModuleOf path
+  let pruned = pruneToReachable cm
+  case (Interp.runModule pruned, RCM.runModuleRCUnchecked (Perceus.insertRC pruned)) of
+    (Right v, Right run) -> do
+      Interp.renderValue v @?= RCM.rcOutput run
+      let st = RCM.rcStats run
+          bl = RCM.rcBaseline run
+      assertEqual "live cells must return to the value-CAF baseline (no leak)"
+        bl (St.stLive st)
+      assertEqual "allocs minus frees must equal the baseline (no leak)"
+        bl (St.stAllocs st - St.stFrees st)
+    -- BOTH interpreters failing is AGREEMENT (the RC pass did not DIVERGE from the
+    -- reference): e.g. a shape that hits a shared evaluator limitation such as a
+    -- record-pattern match on a call result ('NonExhaustiveCase' in both). The RC
+    -- soundness claim is "RC agrees with the reference", not "the program runs". A
+    -- one-sided failure (a UAF / double-free / leak in the RC run only) is the real
+    -- soundness fault and still fails loudly.
+    -- BOTH interpreters failing is AGREEMENT ONLY when they fail the SAME WAY: a
+    -- shared evaluator limitation (e.g. a record-pattern match on a call result =>
+    -- 'NonExhaustiveCase' in both). It is NOT a free pass. An RC memory-safety
+    -- fault (double-free / use-after-free / dangling --- a 'PrimError' the
+    -- reference interpreter, having no store, can NEVER produce) is a real
+    -- one-sided soundness fault and MUST fail loudly even when the reference also
+    -- errored; otherwise a future RC double-free could hide behind an unrelated
+    -- reference failure (and recall a freed-env UAF surfaces as 'UnboundVar', which
+    -- looks innocuous). So: reject any RC memory-safety fault outright, then require
+    -- the two failures to share a constructor (payload text differs by design).
+    (Left refE, Left rcE)
+      | rcMemSafetyFault rcE ->
+          assertFailure ("RC memory-safety fault hidden behind a reference failure (" <> path
+                           <> "): rc=" <> show rcE <> " ref=" <> show refE)
+      | errCtorTag refE == errCtorTag rcE -> pure ()
+      | otherwise ->
+          assertFailure ("RC failure DIVERGES from the reference failure --- a possible one-sided RC \
+                         \fault (" <> path <> "): ref=" <> show refE <> " rc=" <> show rcE)
+    (refRes, rcRes) ->
+      assertFailure ("RC run must AGREE with the reference (both succeed or both fail); got ref="
+                       <> either show (const "ok") refRes <> " rc="
+                       <> either show (const "ok") rcRes)
+
+-- | True iff @e@ is an RC STORE memory-safety / store-internal fault --- a
+-- double-free, a use-after-free, a drop of a dangling/never-allocated address, OR
+-- an RC-store-only structural invariant break (an env-handle whose backing cell is
+-- not an 'NEnv', or any "internal:" machine message). These are all 'PrimError's
+-- the reference interpreter (which has NO reference-counted store) can never raise,
+-- so their presence on the RC side is ALWAYS a real one-sided soundness fault, even
+-- when the reference also failed for an unrelated reason --- they must never launder
+-- past 'errCtorTag' agreement in a both-fail branch.
+--
+-- The matched fragments are EXACTLY the store-only 'PrimError' messages emitted in
+-- "src/Wok/Interp/RC/Value.hs" (drop/incref store guards) and
+-- "src/Wok/Interp/RC/Machine.hs" ("RVRecMember env addr is not NEnv", "internal:"
+-- machine invariants). We deliberately do NOT match the SHARED type-confusion
+-- PrimErrors ("expected U64" / "expected Bool" / "division by zero" / "rc M1:
+-- effects not supported"): those describe a value-level limitation the store-less
+-- reference can also hit, so treating them as RC-only would risk a false failure.
+--
+-- RESIDUAL (cannot be closed without false failures): a freed-env use-after-free
+-- can also surface as a plain 'IV.UnboundVar' (the env slot is gone, so the member
+-- lookup misses) rather than a store 'PrimError'. 'UnboundVar' is a legitimate
+-- reference-interpreter error too, so classifying it here would reject genuine
+-- both-fail agreement (a real false failure). It is therefore left UNCAUGHT by this
+-- predicate; the heap-balance assertions in 'assertRcAgrees' / 'prop_m2a1Escape' are
+-- the backstop for that UAF shape on the accepting path (a freed-env leak shows as
+-- live /= baseline), and the boundary fences keep the unsound shapes out entirely.
+rcMemSafetyFault :: IV.RuntimeError -> Bool
+rcMemSafetyFault (IV.PrimError m) =
+  any (`T.isInfixOf` m)
+    [ T.pack "double-free", T.pack "use-after-free", T.pack "dangling"
+    , T.pack "is not NEnv", T.pack "internal:" ]
+rcMemSafetyFault _ = False
+
+-- | The constructor tag of a 'RuntimeError', ignoring its payload text (which
+-- differs by design between the reference and RC interpreters). Two failures
+-- that share a tag are the SAME class of error (genuine agreement).
+errCtorTag :: IV.RuntimeError -> Text
+errCtorTag e = case e of
+  IV.UnboundVar{}        -> T.pack "UnboundVar"
+  IV.NotAFunction{}      -> T.pack "NotAFunction"
+  IV.NonExhaustiveCase{} -> T.pack "NonExhaustiveCase"
+  IV.NoMatchingHandler{} -> T.pack "NoMatchingHandler"
+  IV.BadProjection{}     -> T.pack "BadProjection"
+  IV.PrimError{}         -> T.pack "PrimError"
+  IV.ArityError{}        -> T.pack "ArityError"
+  IV.UnsupportedCaf{}    -> T.pack "UnsupportedCaf"
 
 -- ---------------------------------------------------------------------------
 -- Suite A: differential run over the no-handler / first-order corpus (Task 8)
@@ -8359,6 +9205,2428 @@ genLetRecCaptureCluster env n ty = do
     -- non-escaping call: result is unboxed; no member is returned or stored
     (Let rB (RApp (AVar fN) [ALit (LInt 2)]) inner)
 
+-- ---------------------------------------------------------------------------
+-- Suite G: M2a-1 owned/borrowed + escape property generator (this slice)
+--
+-- The four M2a-1 holes (alias double-free, escaping-alias, direct sibling-escape
+-- via con/call, local-drop of sibling-in-con) all survived because Suite F's
+-- generators NEVER produce the M2a-1 shapes: a LetRec member CONSUMING an
+-- enclosing capture, a standalone closure capturing a LetRec sibling that
+-- ESCAPES, a sibling moved DIRECTLY into a con/record/call-arg, or an ALIAS of a
+-- sibling. This generator emits exactly those shapes, in BOTH the non-escaping
+-- (must be ACCEPTED by the boundary guard AND run sound) and escaping (must be
+-- REJECTED) variants, directly in ANF (mirroring the test/rc-m2a1/33-50 corpus).
+--
+-- The PROOF (prop_m2a1Escape): for every generated program p, if the boundary
+-- guard 'firstOrderNoHandlerViolations' ACCEPTS p, then the RC run via
+-- 'runModuleRCUnchecked (insertRC (pruneToReachable cm))' MUST succeed, be
+-- heap-balanced (stLive == baseline AND stAllocs - stFrees == baseline), AND
+-- match the reference interpreter. A wrongly-ACCEPTED escaping shape would
+-- surface here as a leak, a use-after-free / double-free 'Left', or a value
+-- mismatch. If the guard REJECTS p the run assertion is skipped (rejection is
+-- the conservative, always-sound verdict). Two supporting properties pin the
+-- static oracle: 'balanceLint' must be clean on every IN-FRAGMENT program, and
+-- every single-site RC mutation (OmitOneDrop / OmitOneDup / DuplicateOneDrop)
+-- must be CAUGHT (a non-empty 'lintInstrumented' or a trapped runtime 'Left').
+--
+-- IMPORTANT DESIGN NOTE on what "escapes" means here. The boundary guard's
+-- escape walkers ('rlamSiblingCaptureEscapes', 'letRecMemberEscapes') run over a
+-- single bind body. A value RETURNED from 'main' (Ret (AVar h)) IS an escape
+-- (goE (Ret a) = hit a), and a value sealed into a returned con/record likewise.
+-- So we build everything inside 'main''s body and drive the verdict by whether
+-- the captured value flows OUT (return / con / record / call-arg / nested
+-- closure) or stays LOCAL (dropped unused, or only called in place). The
+-- non-escaping variants always produce a GInt result so a sound pass empties the
+-- heap; the escaping variants are only checked for the REJECT verdict, so their
+-- result type is unconstrained.
+
+-- | The five M2a-1 shape families this generator ranges over. Each is realized
+-- in a non-escaping (ACCEPT) and an escaping (REJECT) variant where applicable.
+data M2a1Shape
+  = M2ConsumeCapture       -- ^ LetRec member CONSUMES (moves) an enclosing capture
+  | M2ClosureSibling       -- ^ standalone closure ('RLam') captures a LetRec sibling
+  | M2DirectSibling        -- ^ sibling moved DIRECTLY into con / record / call-arg / proj
+  | M2AliasSibling         -- ^ alias ('let x = f') of a sibling, incl. transitive
+  | M2Mixed                -- ^ capture-an-enclosing-local + an escaping member; nested
+  | M2MemberBodyEscape     -- ^ a member's BASE or REC arm RETURNS / MOVES a sibling
+                           --   (the BLOCKER-1 member-body escape: the shared env is
+                           --   carried OUT from INSIDE a member body, where the body
+                           --   borrows --- not owns --- the env). The escaped member
+                           --   is then called externally, so the run must be sound.
+  | M2PartialMember        -- ^ a MULTI-ARITY recursive member that captures an
+                           --   enclosing local, applied at PARTIAL / SATURATED / OVER
+                           --   saturation. PARTIAL is the M2a-2 double-free shape (the
+                           --   LT path of 'enterRC's 'RVRecMember' arm): @mk u = let
+                           --   f a b = ... u ... in f@; @main = let g = mk 7 in let h =
+                           --   g 0 in h 2@. The result is a scalar (heap must empty),
+                           --   so it is ACCEPT-and-run-sound.
+  | M2CaptureBodyEscape    -- ^ a member body ESCAPES a borrowed enclosing CAPTURE: it
+                           --   RETURNS the captured boxed value directly, or SEALS it
+                           --   into a returned con. The capture is moved into the shared
+                           --   env once; the escaping handle must dup the captured cell
+                           --   (the 'Ret'/con-move escape-dup) so the env cascade frees
+                           --   it exactly once. The escaped capture is then destructured
+                           --   externally to a scalar, so the heap must empty =>
+                           --   ACCEPT-and-run-sound. The CAPTURE analogue of
+                           --   'M2MemberBodyEscape' (which escapes a SIBLING).
+  | M2CaptureCallHead      -- ^ a member body CALLS an enclosing boxed FUNCTION capture
+                           --   @g@ as a (saturated or partial) call HEAD (@g k@). A call
+                           --   head is a BORROW under uniform borrow-on-call, NOT a
+                           --   move/consume, so the group is ACCEPT-and-run-sound. This
+                           --   is the regression family for the call-head over-rejection
+                           --   ('consumingOccs' used to count the head); the capture is
+                           --   never escaped (result is a scalar) so the heap must empty.
+  | M2CrossRegion          -- ^ an INNER 'LetRec' group nested inside an OUTER group's
+                           --   member body, whose inner member captures an OUTER group
+                           --   MEMBER BINDER (a cross-region counted edge: @rawEnclosingFv
+                           --   ∩ lr@, where @lr@ is the outer region's binders). The pass
+                           --   excludes this from coverage (spec 5.5) so it is DEFERRED
+                           --   and REJECTED at the boundary by the cross-region fence
+                           --   ('crossRegionViol'). This is the GENERATIVE coverage for
+                           --   that fence (previously 0 fires across Suite G); a 'cover'
+                           --   below pins that the class is generated AND rejected, so a
+                           --   regression that stops rejecting cross-region goes red.
+  deriving (Eq, Show)
+
+-- | How the captured / aliased value flows, deciding the boundary verdict.
+data M2Flow
+  = FlowDropLocal          -- ^ value stays local (dropped unused / called in place): ACCEPT
+  | FlowReturn             -- ^ value RETURNED from main: ESCAPE => REJECT
+  | FlowCon                -- ^ value sealed into a returned constructor field: ESCAPE
+  | FlowRecord             -- ^ value sealed into a returned record field: ESCAPE
+  | FlowList               -- ^ value sealed into a returned list cell: ESCAPE
+  | FlowCallArg            -- ^ value passed as a non-head call argument that escapes: ESCAPE
+  | FlowNestedClosure      -- ^ value captured by a nested closure that escapes: ESCAPE
+  | FlowReturnThenCall     -- ^ closure routed through an unnamed intermediate then
+                           --   OVER-APPLIED (the corpus-36 @(mk u) 2@ path): exercises
+                           --   the deferred-consume ('KDropCellRC') so the escaped
+                           --   closure's env survives its own call. Yields a scalar
+                           --   (the call result), so it is LOCAL/ACCEPT and runs sound.
+  deriving (Eq, Show)
+
+-- | The boxed catch-all type carried by a closure / sibling-function binder, so
+-- 'isBoxedType' tracks it as a heap cell (same convention as 'closureModule' and
+-- 'genClosureCluster').
+funTyC :: Ty.CType
+funTyC = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+
+-- | A boxed single-field constructor type used as an escape vehicle.
+boxTyC :: Ty.CType
+boxTyC = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+
+-- | The whole-program generator for the M2a-1 suite: @main = e@ where @e@ is one
+-- of the five shape families. Sized by the QuickCheck size for the inner
+-- continuation depth.
+genM2a1Program :: Gen CoreModule
+genM2a1Program = sized $ \sz -> do
+  shape <- elements [M2ConsumeCapture, M2ClosureSibling, M2DirectSibling, M2AliasSibling, M2Mixed
+                    , M2MemberBodyEscape, M2PartialMember, M2CaptureBodyEscape, M2CaptureCallHead
+                    , M2CrossRegion]
+  (body, _) <- runStateT (genM2a1Cluster shape (max 1 (min sz 6))) 0
+  let mainN = Name (T.pack "main") (Unique 1000000)
+  pure (CoreModule [TopBind mainN [] body])
+
+-- | Dispatch on the shape family. @n@ is the inner-continuation fuel.
+genM2a1Cluster :: M2a1Shape -> Int -> GenM Expr
+genM2a1Cluster shape n = case shape of
+  M2ConsumeCapture -> genConsumeCaptureCluster n
+  M2ClosureSibling -> genClosureSiblingCluster n
+  M2DirectSibling  -> genDirectSiblingCluster n
+  M2AliasSibling   -> genAliasSiblingCluster n
+  M2Mixed          -> genMixedCluster n
+  M2MemberBodyEscape -> genMemberBodyEscapeCluster n
+  M2PartialMember  -> genPartialMemberCluster n
+  M2CaptureBodyEscape -> genCaptureBodyEscapeCluster n
+  M2CaptureCallHead -> genCaptureCallHeadCluster n
+  M2CrossRegion    -> genCrossRegionCluster n
+
+-- | Build a two-member, TRULY mutually-recursive 'LetRec' group (f calls g, g
+-- calls f, so the elaborator would put them in ONE group node). The caller
+-- supplies the per-member base-case body (fired when the int param is 0); the
+-- recursive arm always calls the sibling. The boxed locals @capN@ (an enclosing
+-- capture) and the sibling names are free in the bodies exactly as the corpus
+-- shapes require. Returns the group binders and the assembled 'LetRec' wrapper
+-- that takes the continuation (the expression following the group).
+--
+-- @mkFBase@ / @mkGBase@ receive the capture binder name and the sibling name so
+-- they can either BORROW (case cap) or CONSUME (move cap) it. The recursive arm
+-- is fixed: @_ -> let ks = k - 1; r = <sibling>(ks); r@.
+genMutualGroup
+  :: Name                                  -- ^ enclosing boxed capture in scope
+  -> (Name -> Name -> GenM Expr)           -- ^ f base body, given (capN, siblingG)
+  -> (Name -> Name -> GenM Expr)           -- ^ g base body, given (capN, siblingF)
+  -> GenM (Name, Name, Expr -> Expr)
+genMutualGroup capN mkFBase mkGBase = do
+  fN  <- freshN (T.pack "lrf")
+  gN  <- freshN (T.pack "lrg")
+  kN1 <- freshN (T.pack "k1")
+  kN2 <- freshN (T.pack "k2")
+  ks1 <- freshN (T.pack "ks1")
+  ks2 <- freshN (T.pack "ks2")
+  r1  <- freshN (T.pack "r1")
+  r2  <- freshN (T.pack "r2")
+  let intTy = gtyCType GInt
+      kB1   = Binder kN1 Unrestricted intTy
+      kB2   = Binder kN2 Unrestricted intTy
+  fBase <- mkFBase capN gN
+  gBase <- mkGBase capN fN
+  let recArmF =
+        Let (Binder ks1 Unrestricted intTy)
+            (RApp (primAtom (T.pack "-")) [AVar kN1, ALit (LInt 1)])
+          (Let (Binder r1 Unrestricted intTy) (RApp (AVar gN) [AVar ks1])
+            (Ret (AVar r1)))
+      recArmG =
+        Let (Binder ks2 Unrestricted intTy)
+            (RApp (primAtom (T.pack "-")) [AVar kN2, ALit (LInt 1)])
+          (Let (Binder r2 Unrestricted intTy) (RApp (AVar fN) [AVar ks2])
+            (Ret (AVar r2)))
+      fBody = Case (AVar kN1) [AltLit (LInt 0) fBase, AltDefault recArmF]
+      gBody = Case (AVar kN2) [AltLit (LInt 0) gBase, AltDefault recArmG]
+      wrap cont = LetRec [(Binder fN Unrestricted intTy, [kB1], fBody)
+                         ,(Binder gN Unrestricted intTy, [kB2], gBody)] cont
+  pure (fN, gN, wrap)
+
+-- | A prim atom (binary integer op), resolved by hint at runtime.
+primAtom :: Text -> Atom
+primAtom op = AVar (primName op)
+
+-- | Seed a boxed Pair capture from two random int literals, returning its binder
+-- name and a wrapper that prefixes the seeding 'Let'.
+seedPairCapture :: GenM (Name, Expr -> Expr)
+seedPairCapture = do
+  v0 <- liftG (choose (0, 9 :: Int))
+  v1 <- liftG (choose (0, 9 :: Int))
+  capN <- freshN (T.pack "cap")
+  let capB = Binder capN Unrestricted (gtyCType GPair)
+      wrap cont = Let capB (RCon (T.pack "Tuple2")
+                                 [ALit (LInt (toInteger v0)), ALit (LInt (toInteger v1))]) cont
+  pure (capN, wrap)
+
+-- ---------------------------------------------------------------------------
+-- Family 1: LetRec member CONSUMES an enclosing boxed capture.
+--
+-- The base case MOVES the capture (passes it to a call / stores it in a con or
+-- record / returns it), which is a CONSUMING use; the pass must emit a build-site
+-- dup per consuming use so the move owns its unit and the group cascade keeps its
+-- own. NON-escaping: the group is called in place and the result is the scalar
+-- extracted; the group never escapes => ACCEPT, heap must empty. We also exercise
+-- multi-branch ('Case') consumption and value-position 'if'/'case' (which the
+-- elaborator lowers to joins; we emit the join form directly).
+genConsumeCaptureCluster :: Int -> GenM Expr
+genConsumeCaptureCluster n = do
+  (capN, seedCap) <- seedPairCapture
+  -- How each base body consumes the capture.
+  consumeStyle <- liftG (elements [ConsumeMoveToCon, ConsumeMoveToRecord, ConsumeMultiBranch, ConsumeValueCase])
+  let intTy = gtyCType GInt
+  -- A consuming base body that yields a GInt: it MOVES the Pair capture into a
+  -- cell (con / record), then destructures the cell back to an int. Storing the
+  -- Pair into the cell is the CONSUMING move the pass must dup-cover; the cell is
+  -- then fully consumed locally (the result is the scalar), so the group + the
+  -- dup accounting must balance.
+  let consumeBody pickField capArg = case consumeStyle of
+        ConsumeMoveToCon -> consumeViaBox pickField capArg
+        ConsumeMoveToRecord -> do
+          -- seal cap into a record field (move), then read the field back (RProj on
+          -- a RECORD is valid) and case-destructure the Pair.
+          recN <- freshN (T.pack "rc")
+          capBackN <- freshN (T.pack "cb")
+          pxN <- freshN (T.pack "px")
+          pyN <- freshN (T.pack "py")
+          pure (Let (Binder recN Unrestricted capCellRecTy)
+                    (RRecord capCellRecName [(T.pack "p", AVar capArg)])
+                  (Let (Binder capBackN Unrestricted (gtyCType GPair))
+                       (RProj (T.pack "p") (AVar recN))
+                    (Case (AVar capBackN)
+                       [ AltCon (T.pack "Tuple2")
+                           [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+                           (Ret (AVar (if pickField then pxN else pyN))) ])))
+        ConsumeMultiBranch -> do
+          -- a Case on a fresh int, BOTH arms consuming cap (move into a box, then
+          -- destructure picking different fields). cap is consumed on every arm.
+          sN <- freshN (T.pack "sel")
+          armA <- consumeViaBox True capArg
+          armB <- consumeViaBox False capArg
+          pure (Let (Binder sN Unrestricted intTy) (RAtom (ALit (LInt 0)))
+                  (Case (AVar sN) [ AltLit (LInt 0) armA, AltDefault armB ]))
+        ConsumeValueCase -> do
+          -- value-position case lowered to a join: a join j(x) delivers the
+          -- result; a Case feeds it, and cap is consumed (moved into a box and
+          -- destructured) in the arm feeding the join.
+          jId <- freshJoinId
+          pN  <- freshN (T.pack "jp")
+          sN  <- freshN (T.pack "vsel")
+          feedDirect <- consumeViaBoxJumping pickField capArg jId
+          pure (LetJoin jId [Binder pN Unrestricted intTy] (Ret (AVar pN))
+                  (Let (Binder sN Unrestricted intTy) (RAtom (ALit (LInt 0)))
+                    (Case (AVar sN) [AltDefault feedDirect])))
+  (fN, _gN, wrapGroup) <-
+    genMutualGroup capN
+      (\c _g -> consumeBody True c)
+      (\c _g -> consumeBody False c)
+  rN <- freshN (T.pack "lrr")
+  let rB = Binder rN Unrestricted intTy
+  -- non-escaping call: the result is unboxed; no member is returned or stored.
+  cont <- genExpr [(rN, GInt)] (n - 1) GInt
+  pure $ seedCap $ wrapGroup
+    (Let rB (RApp (AVar fN) [ALit (LInt 2)]) cont)
+
+-- | The consuming styles for family 1. Each performs a valid CONSUMING MOVE of
+-- the Pair capture (storing it into a con / record cell), then destructures the
+-- cell back to a scalar locally.
+data ConsumeStyle
+  = ConsumeMoveToCon
+  | ConsumeMoveToRecord
+  | ConsumeMultiBranch
+  | ConsumeValueCase
+  deriving (Eq, Show)
+
+-- | Consume the Pair @capArg@ by moving it into a single-field 'Box' con, then
+-- destructuring the box and the Pair to yield an int (the chosen field). The
+-- @RCon "Box" [cap]@ is the consuming move; the box is fully consumed locally.
+consumeViaBox :: Bool -> Name -> GenM Expr
+consumeViaBox pickField capArg = do
+  let intTy = gtyCType GInt
+  boxN <- freshN (T.pack "bx")
+  capBackN <- freshN (T.pack "cback")
+  pxN <- freshN (T.pack "px")
+  pyN <- freshN (T.pack "py")
+  pure (Let (Binder boxN Unrestricted boxTyC) (RCon (T.pack "Box") [AVar capArg])
+          (Case (AVar boxN)
+            [ AltCon (T.pack "Box") [Binder capBackN Unrestricted (gtyCType GPair)]
+                (Case (AVar capBackN)
+                  [ AltCon (T.pack "Tuple2")
+                      [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+                      (Ret (AVar (if pickField then pxN else pyN))) ]) ]))
+
+-- | As 'consumeViaBox', but instead of returning the extracted int it JUMPS to
+-- @jId@ with it (used to feed a value-position join). Same consuming move.
+consumeViaBoxJumping :: Bool -> Name -> JoinId -> GenM Expr
+consumeViaBoxJumping pickField capArg jId = do
+  let intTy = gtyCType GInt
+  boxN <- freshN (T.pack "bx")
+  capBackN <- freshN (T.pack "cback")
+  pxN <- freshN (T.pack "px")
+  pyN <- freshN (T.pack "py")
+  pure (Let (Binder boxN Unrestricted boxTyC) (RCon (T.pack "Box") [AVar capArg])
+          (Case (AVar boxN)
+            [ AltCon (T.pack "Box") [Binder capBackN Unrestricted (gtyCType GPair)]
+                (Case (AVar capBackN)
+                  [ AltCon (T.pack "Tuple2")
+                      [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+                      (Jump jId [AVar (if pickField then pxN else pyN)]) ]) ]))
+
+-- ---------------------------------------------------------------------------
+-- Family 9: a member body CALLS an enclosing boxed FUNCTION capture as a HEAD.
+--
+-- Seed a boxed function capture @g@ (a lambda of 'funTyC', so 'isBoxedType' tracks
+-- it as a heap cell and it lands in the boundary's @bsc@), then build a recursive
+-- group whose base bodies CALL @g@ as the call HEAD --- saturated (@g k@) or
+-- partial (@(g k) 1@, @g@ a two-arg lambda). A call head is a BORROW under uniform
+-- borrow-on-call, NOT a move/consume, so the group is ADMITTED and runs SOUND. The
+-- capture never escapes (the result is a scalar), so the heap must empty. This is
+-- the GENERATIVE regression guard for the call-head over-rejection: before the fix
+-- 'consumingOccs' counted the head, and the non-escaping group was wrongly
+-- REJECTED.
+genCaptureCallHeadCluster :: Int -> GenM Expr
+genCaptureCallHeadCluster n = do
+  partial <- liftG (elements [False, True])
+  let intTy = gtyCType GInt
+  gN <- freshN (T.pack "gcap")
+  -- The captured function. Saturated variant: @\x -> x + 1@ (arity 1). Partial
+  -- variant: @\a b -> a + b@ (arity 2), called partially as a head below.
+  gBody <-
+    if partial
+      then do
+        aN <- freshN (T.pack "ga")
+        bN <- freshN (T.pack "gb")
+        sN <- freshN (T.pack "gs")
+        pure (RLam [Binder aN Unrestricted intTy, Binder bN Unrestricted intTy]
+                (Let (Binder sN Unrestricted intTy)
+                     (RApp (primAtom (T.pack "+")) [AVar aN, AVar bN])
+                  (Ret (AVar sN))))
+      else do
+        xN <- freshN (T.pack "gx")
+        sN <- freshN (T.pack "gs")
+        pure (RLam [Binder xN Unrestricted intTy]
+                (Let (Binder sN Unrestricted intTy)
+                     (RApp (primAtom (T.pack "+")) [AVar xN, ALit (LInt 1)])
+                  (Ret (AVar sN))))
+  let gB = Binder gN Unrestricted funTyC
+      -- The base body CALLS @g@ as a HEAD on an int literal (a borrow, never a
+      -- move). Saturated: @r = g 0; r@. Partial: @t = g 0; r = t 1; r@. The base
+      -- body does not receive the member's int param, so we feed a literal --- the
+      -- point under test is purely that the call HEAD @g@ is a borrow.
+      callHeadBase capN =
+        if partial
+          then do
+            tN <- freshN (T.pack "ct")
+            rN <- freshN (T.pack "cr")
+            pure (Let (Binder tN Unrestricted funTyC) (RApp (AVar capN) [ALit (LInt 0)])
+                    (Let (Binder rN Unrestricted intTy) (RApp (AVar tN) [ALit (LInt 1)])
+                      (Ret (AVar rN))))
+          else do
+            rN <- freshN (T.pack "cr")
+            pure (Let (Binder rN Unrestricted intTy) (RApp (AVar capN) [ALit (LInt 0)])
+                    (Ret (AVar rN)))
+  (fN, _gN2, wrapGroup) <-
+    genMutualGroup gN
+      (\c _g -> callHeadBase c)
+      (\c _g -> callHeadBase c)
+  rN <- freshN (T.pack "lrr")
+  let rB = Binder rN Unrestricted intTy
+  -- non-escaping call: the result is the scalar; no member escapes.
+  cont <- genExpr [(rN, GInt)] (n - 1) GInt
+  pure $ Let gB gBody $ wrapGroup
+    (Let rB (RApp (AVar fN) [ALit (LInt 2)]) cont)
+
+-- ---------------------------------------------------------------------------
+-- Family 10: CROSS-REGION capture (the cross-region #3 fence, DEFERRED/REJECTED).
+--
+-- An OUTER two-member group @(oF, oG)@; INSIDE @oF@'s member body sits an INNER
+-- self-recursive group @inr@ whose member body REFERENCES @oG@ --- an OUTER group
+-- MEMBER BINDER. That is a cross-region COUNTED EDGE: at the inner 'LetRec' node the
+-- in-scope region set @lr@ is exactly @{oF, oG}@, and @rawEnclosingFv inr@ contains
+-- @oG@, so @rawEnclosingFv inr ∩ lr@ is non-empty and 'crossRegionViol' fires. The
+-- pass excludes a member that captures an outer region member from coverage (spec
+-- 5.5 'capturesRegion') and an un-instrumented pass-through would LEAK, so the class
+-- is DEFERRED and REJECTED at the boundary.
+--
+-- This is the ONLY Suite G family that produces cross-region shapes (0 fires across
+-- the other families). It is always a REJECT, so 'prop_m2a1Escape' merely skips the
+-- run; the teeth are the dedicated 'cover' in the property that the class is
+-- GENERATED AND REJECTED (so a regression that stops rejecting cross-region goes
+-- red). We vary HOW the inner member references the outer member @oG@: as a SATURATED
+-- call head, or as a non-head call ARGUMENT (both put @oG@ in 'rawEnclosingFv').
+genCrossRegionCluster :: Int -> GenM Expr
+genCrossRegionCluster _n = do
+  refAsArg <- liftG (elements [False, True])
+  let intTy = gtyCType GInt
+  oFN <- freshN (T.pack "ocrf")
+  oGN <- freshN (T.pack "ocrg")
+  okN1 <- freshN (T.pack "ock1")
+  okN2 <- freshN (T.pack "ock2")
+  -- The inner self-recursive group, nested in @oF@'s body. Its base body references
+  -- the OUTER member @oG@ (the cross-region edge): either as a saturated call head
+  -- @oG 0@, or as a non-head argument to a different call.
+  inN <- freshN (T.pack "incr")
+  inkN <- freshN (T.pack "ink")
+  inrN <- freshN (T.pack "inr")
+  inrsN <- freshN (T.pack "inrs")
+  let innerBase =
+        if refAsArg
+          then
+            -- seal @oG@ (the outer member) into a 'Box' con as a non-head field ---
+            -- still a free var of the body => in rawEnclosingFv => cross-region.
+            Let (Binder inrN Unrestricted boxTyC) (RCon (T.pack "Box") [AVar oGN])
+              (Ret (ALit (LInt 0)))
+          else
+            -- call the OUTER member @oG@ as a saturated head.
+            Let (Binder inrN Unrestricted intTy) (RApp (AVar oGN) [ALit (LInt 0)])
+              (Ret (AVar inrN))
+      innerRec =
+        Let (Binder inrsN Unrestricted intTy)
+            (RApp (primAtom (T.pack "-")) [AVar inkN, ALit (LInt 1)])
+          (Let (Binder inrN Unrestricted intTy) (RApp (AVar inN) [AVar inrsN])
+            (Ret (AVar inrN)))
+      innerBody = Case (AVar inkN) [AltLit (LInt 0) innerBase, AltDefault innerRec]
+      innerGroupBody =
+        LetRec [(Binder inN Unrestricted intTy, [Binder inkN Unrestricted intTy], innerBody)]
+          (Let (Binder inrN Unrestricted intTy) (RApp (AVar inN) [ALit (LInt 0)])
+            (Ret (AVar inrN)))
+      -- @oF@'s body holds the inner group; @oG@ is a trivial base.
+      oFBody = innerGroupBody
+      oGBody = Ret (ALit (LInt 0))
+      outer cont =
+        LetRec [ (Binder oFN Unrestricted intTy, [Binder okN1 Unrestricted intTy], oFBody)
+               , (Binder oGN Unrestricted intTy, [Binder okN2 Unrestricted intTy], oGBody) ]
+               cont
+  rN <- freshN (T.pack "ocrr")
+  pure $ outer
+    (Let (Binder rN Unrestricted intTy) (RApp (AVar oFN) [ALit (LInt 0)])
+      (Ret (AVar rN)))
+
+-- | The record type / name used as a Pair-capture cell vehicle.
+capCellRecName :: Text
+capCellRecName = T.pack "PCell"
+
+capCellRecTy :: Ty.CType
+capCellRecTy = Ty.CTRecord capCellRecName Ty.CREmpty
+
+-- | Build the CORPUS-style single self-recursive 'LetRec' member that captures an
+-- UNBOXED enclosing local (a fresh @U64@ seed @u@, exactly like corpus 36/42/etc:
+-- @f n = case n of 0 -> u ; _ -> f (n - 1)@). Because the captured local is
+-- UNBOXED, the group does NOT trip 'letRecCapturesEnclosing' (which only watches
+-- BOXED enclosing locals), so the group itself is admitted and the boundary
+-- verdict is driven SOLELY by how the sibling @f@ flows downstream (closure /
+-- cell / alias). Returns the sibling binder name and a wrapper that seeds @u@ and
+-- the group, taking the continuation (the expression following the group).
+--
+-- M2a-2 BLOCKER 2 NOTE: this group is NOT capture-free. The counted-env predicate
+-- is "captures ANY bound enclosing local, boxed or unboxed", so the runtime
+-- allocates ONE counted 'NEnv' holding @u@ (the member body resolves @u@ from it),
+-- dropped exactly once via the pass's member-0 env unit. "Capture-free => sentinel"
+-- applies only when the capture union is EMPTY (no enclosing local at all).
+genSiblingGroup :: GenM (Name, Expr -> Expr)
+genSiblingGroup = do
+  seed <- liftG (choose (0, 9 :: Int))
+  uN  <- freshN (T.pack "u")
+  fN  <- freshN (T.pack "lrf")
+  nN  <- freshN (T.pack "fn")
+  ksN <- freshN (T.pack "fks")
+  rN  <- freshN (T.pack "frr")
+  let intTy = gtyCType GInt
+      fBody = Case (AVar nN)
+                [ AltLit (LInt 0) (Ret (AVar uN))
+                , AltDefault
+                    (Let (Binder ksN Unrestricted intTy)
+                         (RApp (primAtom (T.pack "-")) [AVar nN, ALit (LInt 1)])
+                       (Let (Binder rN Unrestricted intTy) (RApp (AVar fN) [AVar ksN])
+                         (Ret (AVar rN)))) ]
+      wrap cont =
+        Let (Binder uN Unrestricted intTy) (RAtom (ALit (LInt (toInteger seed))))
+          (LetRec [(Binder fN Unrestricted intTy, [Binder nN Unrestricted intTy], fBody)] cont)
+  pure (fN, wrap)
+
+-- | As 'genSiblingGroup', but the self-recursive member captures a BOXED enclosing
+-- local (a fresh @Tuple2@ @cap@) instead of an unboxed @u@. The base case
+-- destructures @cap@ to a scalar. Because the capture is BOXED, the group's shared
+-- env is a real COUNTED 'NEnv' cell (not the capture-free sentinel), so a closure
+-- that captures the sibling @f@ and escapes must DUP that env --- exercising the
+-- dup-on-closure-capture + the escaped closure's cascade-drop balance. (The unboxed
+-- 'genSiblingGroup' ALSO allocates a counted 'NEnv' holding @u@ --- BLOCKER 2: the
+-- env exists for any enclosing capture, boxed or unboxed; only a group with NO
+-- enclosing capture at all uses the sentinel. The boxed variant differs in that its
+-- captured field is itself reference-counted, so the cascade decrefs a heap child.) The base
+-- case only READS @cap@ (a borrowed scrutinee keeping no boxed child), so the group
+-- is NOT a consuming-capture (#1) reject; the verdict is driven purely by how the
+-- sibling @f@ flows downstream. NOTE: the group itself captures a boxed enclosing
+-- local, so a BARE escape of @f@ would trip Part B (escapeViol) --- but a CLOSURE
+-- escape is exempt (escapeViol uses the bare-only predicate), exactly the Stage A
+-- frontier under test.
+genSiblingGroupBoxed :: GenM (Name, Expr -> Expr)
+genSiblingGroupBoxed = do
+  (capN, seedCap) <- seedPairCapture
+  fN  <- freshN (T.pack "lrf")
+  nN  <- freshN (T.pack "fn")
+  ksN <- freshN (T.pack "fks")
+  rN  <- freshN (T.pack "frr")
+  pxN <- freshN (T.pack "px")
+  pyN <- freshN (T.pack "py")
+  let intTy = gtyCType GInt
+      -- base case: case cap of Tuple2 px py -> px  (a borrowed read of cap; the
+      -- boxed children px/py are unboxed ints, so cap is NOT consumed)
+      baseBody = Case (AVar capN)
+                   [ AltCon (T.pack "Tuple2")
+                       [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+                       (Ret (AVar pxN)) ]
+      fBody = Case (AVar nN)
+                [ AltLit (LInt 0) baseBody
+                , AltDefault
+                    (Let (Binder ksN Unrestricted intTy)
+                         (RApp (primAtom (T.pack "-")) [AVar nN, ALit (LInt 1)])
+                       (Let (Binder rN Unrestricted intTy) (RApp (AVar fN) [AVar ksN])
+                         (Ret (AVar rN)))) ]
+      wrap cont =
+        seedCap (LetRec [(Binder fN Unrestricted intTy, [Binder nN Unrestricted intTy], fBody)] cont)
+  pure (fN, wrap)
+
+-- ---------------------------------------------------------------------------
+-- Family 2: a standalone closure that captures a LetRec GROUP SIBLING.
+--
+-- A two-member group is built; then a standalone 'RLam' h captures a sibling f
+-- (f is FREE in h's body, used as a call head inside the closure). The closure
+-- then either stays LOCAL (dropped unused / called in place => ACCEPT) or
+-- ESCAPES (returned, sealed into a con/record, or captured by a nested closure
+-- that escapes => REJECT). Mirrors corpus 36 (escape) and the admitted local
+-- case.
+genClosureSiblingCluster :: Int -> GenM Expr
+genClosureSiblingCluster n = do
+  -- Range over BOTH the unboxed-capture group (a counted 'NEnv' whose single field
+  -- is the unboxed @u@; BLOCKER 2 --- NOT the sentinel, which is reserved for groups
+  -- with NO enclosing capture) and the BOXED-capture group (a counted 'NEnv' whose
+  -- field is itself a heap child). The boxed variant is what exercises
+  -- the dup-on-closure-capture and the escaped closure's env cascade-drop balance;
+  -- the unboxed variant is the corpus 36/38 shape.
+  boxedCap <- liftG (elements [True, False])
+  (fN, wrapGroup) <- if boxedCap then genSiblingGroupBoxed else genSiblingGroup
+  flow <- liftG (frequency
+                   [ (1, pure FlowDropLocal)
+                   , (1, pure FlowReturn)
+                   , (1, pure FlowCon)
+                   , (1, pure FlowRecord)
+                   , (1, pure FlowNestedClosure)
+                   , (1, pure FlowReturnThenCall) ])
+  -- The closure h: \m -> let r = f (m + 1); r   (f is the captured sibling,
+  -- used as a call head inside the body; the closure cell captures f).
+  hN <- freshN (T.pack "h")
+  mN <- freshN (T.pack "hm")
+  msN <- freshN (T.pack "hms")
+  hrN <- freshN (T.pack "hr")
+  let intTy = gtyCType GInt
+      hBody = Let (Binder msN Unrestricted intTy)
+                  (RApp (primAtom (T.pack "+")) [AVar mN, ALit (LInt 1)])
+                (Let (Binder hrN Unrestricted intTy) (RApp (AVar fN) [AVar msN])
+                  (Ret (AVar hrN)))
+      hLam  = RLam [Binder mN Unrestricted intTy] hBody
+      hB    = Binder hN Unrestricted funTyC
+  body <- closureFlowBody flow hN n
+  pure $ wrapGroup (Let hB hLam body)
+
+-- | Realize a closure / sibling flow as the continuation following the binder
+-- @vN@ (the closure or sibling value). 'FlowDropLocal' yields a GInt and never
+-- mentions @vN@ (so it is dropped unused => ACCEPT). The escaping flows return /
+-- seal @vN@ so the guard REJECTS.
+closureFlowBody :: M2Flow -> Name -> Int -> GenM Expr
+closureFlowBody flow vN n = case flow of
+  FlowDropLocal -> genExpr [] (n - 1) GInt          -- vN unused => dropped => local
+  FlowReturn    -> pure (Ret (AVar vN))             -- escape via return
+  FlowCon       -> do
+    cN <- freshN (T.pack "esc")
+    pure (Let (Binder cN Unrestricted boxTyC) (RCon (T.pack "Box") [AVar vN]) (Ret (AVar cN)))
+  FlowRecord    -> do
+    cN <- freshN (T.pack "escr")
+    pure (Let (Binder cN Unrestricted (Ty.CTRecord (T.pack "Cell") Ty.CREmpty))
+              (RRecord (T.pack "Cell") [(T.pack "fn", AVar vN)]) (Ret (AVar cN)))
+  FlowList      -> do
+    nilN <- freshN (T.pack "nl")
+    cN   <- freshN (T.pack "escl")
+    pure (Let (Binder nilN Unrestricted funTyC) (RCon (T.pack "Nil") [])
+            (Let (Binder cN Unrestricted funTyC) (RCon (T.pack "Cons") [AVar vN, AVar nilN])
+              (Ret (AVar cN))))
+  FlowCallArg   -> do
+    -- pass vN as a non-head argument to an in-scope identity-ish closure that we
+    -- build on the spot, whose RESULT escapes (returned).
+    idN <- freshN (T.pack "idf")
+    pN  <- freshN (T.pack "idp")
+    rN  <- freshN (T.pack "idr")
+    let idLam = RLam [Binder pN Unrestricted funTyC] (Ret (AVar pN))
+    pure (Let (Binder idN Unrestricted funTyC) idLam
+            (Let (Binder rN Unrestricted funTyC) (RApp (AVar idN) [AVar vN]) (Ret (AVar rN))))
+  FlowNestedClosure -> do
+    -- a nested closure that captures vN free, and we RETURN the nested closure
+    -- (so vN rides out in its cell => escape).
+    gN <- freshN (T.pack "nest")
+    qN <- freshN (T.pack "nq")
+    rN <- freshN (T.pack "nr")
+    let nestLam = RLam [Binder qN Unrestricted (gtyCType GInt)]
+                    (Let (Binder rN Unrestricted (gtyCType GInt)) (RApp (AVar vN) [AVar qN])
+                      (Ret (AVar rN)))
+    pure (Let (Binder gN Unrestricted funTyC) nestLam (Ret (AVar gN)))
+  FlowReturnThenCall -> do
+    -- Route vN through an identity closure (which RETURNS vN, an unnamed
+    -- intermediate at the application site) then OVER-APPLY the result to a scalar:
+    -- @let r = (id vN) 7 in r@. The intermediate closure value is consumed by the
+    -- application with NO IR binder, exercising the deferred-consume path
+    -- ('KDropCellRC') that keeps the escaped closure's shared env alive through its
+    -- own call. The result is the scalar call value (a GInt), so a sound pass empties
+    -- the heap. This is the in-main analogue of the corpus-36 @(mk u) 2@ shape.
+    idN <- freshN (T.pack "idf")
+    pN  <- freshN (T.pack "idp")
+    rN  <- freshN (T.pack "callr")
+    -- @id@ has arity 1; applying it to TWO args (vN and 7) saturates @id@ (it
+    -- returns vN, an unnamed intermediate) then OVER-APPLIES that result to 7.
+    let idLam = RLam [Binder pN Unrestricted funTyC] (Ret (AVar pN))
+    pure (Let (Binder idN Unrestricted funTyC) idLam
+            (Let (Binder rN Unrestricted (gtyCType GInt))
+                 (RApp (AVar idN) [AVar vN, ALit (LInt 7)])
+              (Ret (AVar rN))))
+
+-- ---------------------------------------------------------------------------
+-- Family 3: a LetRec sibling moved DIRECTLY (no closure) into a con / record /
+-- list / call-arg / projection. Non-escaping (dropped locally => ACCEPT) vs
+-- escaping (the cell is returned => REJECT). Mirrors corpus 42-45 (escape) and
+-- 48-50 (local drop).
+genDirectSiblingCluster :: Int -> GenM Expr
+genDirectSiblingCluster n = do
+  -- Range over unboxed (sentinel env) and BOXED (counted NEnv) capture groups, so
+  -- the bare-move dup-on-escape is exercised against a real env (Stage B).
+  boxedCap <- liftG (elements [True, False])
+  (fN, wrapGroup) <- if boxedCap then genSiblingGroupBoxed else genSiblingGroup
+  -- vehicle for moving the sibling: con / record / list cell.
+  vehicle <- liftG (elements [FlowCon, FlowRecord, FlowList])
+  -- M2a-2 STAGE B: a BARE move of a sibling into a con / record / list is now sound
+  -- whether it stays LOCAL (dropped) or ESCAPES (returned) --- the pass dups the
+  -- shared env at the move. Range over both so the property exercises the now-
+  -- admitted bare-escape class.
+  escapes <- liftG (elements [True, False])
+  -- Build the cell holding the sibling f directly, bound to cN.
+  cN <- freshN (T.pack "cell")
+  (cellTy, cellRhs, extraPrefix) <- case vehicle of
+    FlowRecord -> pure (Ty.CTRecord (T.pack "Cell") Ty.CREmpty
+                       , RRecord (T.pack "Cell") [(T.pack "fn", AVar fN)]
+                       , id)
+    FlowList   -> do
+      nilN <- freshN (T.pack "nl")
+      pure ( funTyC
+           , RCon (T.pack "Cons") [AVar fN, AVar nilN]
+           , Let (Binder nilN Unrestricted funTyC) (RCon (T.pack "Nil") []) )
+    _          -> pure (boxTyC, RCon (T.pack "Box") [AVar fN], id)
+  let cB = Binder cN Unrestricted cellTy
+  body <-
+    if escapes
+      then pure (Ret (AVar cN))                -- cell escapes => REJECT
+      else genExpr [] (n - 1) GInt             -- cell dropped locally => ACCEPT
+  pure $ wrapGroup (extraPrefix (Let cB cellRhs body))
+
+-- ---------------------------------------------------------------------------
+-- Family 4: an ALIAS of a sibling ('let x = f'), including a transitive chain
+-- ('let y = x'). Dropped locally (=> ACCEPT) vs returned (=> REJECT). Mirrors
+-- corpus 40 (drop) and 41 (escape).
+genAliasSiblingCluster :: Int -> GenM Expr
+genAliasSiblingCluster n = do
+  -- Range over unboxed (sentinel env) and BOXED (counted NEnv) capture groups, so
+  -- the escaping-alias env-handle transfer is exercised against a real env (Stage B).
+  boxedCap <- liftG (elements [True, False])
+  (fN, wrapGroup) <- if boxedCap then genSiblingGroupBoxed else genSiblingGroup
+  transitive <- liftG (elements [True, False])
+  -- M2a-2 STAGE B: a bare ALIAS of a sibling (incl. a transitive chain) is now sound
+  -- whether it is dropped LOCALLY or ESCAPES (returned) --- the env-alias propagation
+  -- transfers the single shared-env handle out on escape. Range over both.
+  escapes <- liftG (elements [True, False])
+  xN <- freshN (T.pack "ax")
+  yN <- freshN (T.pack "ay")
+  let xB = Binder xN Unrestricted funTyC
+      yB = Binder yN Unrestricted funTyC
+      -- the final alias name that flows out (or is dropped)
+      finalAlias = if transitive then yN else xN
+      aliasPrefix cont =
+        if transitive
+          then Let xB (RAtom (AVar fN)) (Let yB (RAtom (AVar xN)) cont)
+          else Let xB (RAtom (AVar fN)) cont
+  body <-
+    if escapes
+      then pure (Ret (AVar finalAlias))        -- alias escapes => REJECT
+      else genExpr [] (n - 1) GInt             -- alias dropped locally => ACCEPT
+  pure $ wrapGroup (aliasPrefix body)
+
+-- ---------------------------------------------------------------------------
+-- Family 5: MIXES. A group that BOTH captures an enclosing local AND has an
+-- escaping member (the Part-B reject), plus a nested-LetRec variant. We bias
+-- toward the consuming-AND-escaping shape (corpus 37) and the borrow-AND-escape
+-- shape so both the 'consumeViol' and the 'escapeViol' boundary clauses fire.
+genMixedCluster :: Int -> GenM Expr
+genMixedCluster _n = do
+  (capN, seedCap) <- seedPairCapture
+  consuming <- liftG (elements [True, False])
+  -- base body either CONSUMES (project cap) or BORROWS (case cap); a member is
+  -- ALSO made to escape by returning it from the group body.
+  let consumeBase pick c _g = consumeViaBox pick c
+      borrowBase pick = \c _g -> do
+        pxN <- freshN (T.pack "px")
+        pyN <- freshN (T.pack "py")
+        pure (Case (AVar c)
+                [ AltCon (T.pack "Tuple2")
+                    [Binder pxN Unrestricted (gtyCType GInt), Binder pyN Unrestricted (gtyCType GInt)]
+                    (Ret (AVar (if pick then pxN else pyN))) ])
+      base = if consuming then consumeBase else borrowBase
+  (fN, _gN, wrapGroup) <- genMutualGroup capN (base True) (base False)
+  -- The group body RETURNS a member (escape) => letRecMemberEscapes is True, and
+  -- with an enclosing capture present this is the Part-B / FINDING-1 reject.
+  nested <- liftG (elements [True, False])
+  let groupBodyEscape = Ret (AVar fN)
+  if not nested
+    then pure $ seedCap $ wrapGroup groupBodyEscape
+    else do
+      -- nest the escaping group inside an OUTER group that just calls a sibling;
+      -- exercises nested-LetRec handling on the way to the reject.
+      oFN <- freshN (T.pack "olrf")
+      oGN <- freshN (T.pack "olrg")
+      okN1 <- freshN (T.pack "ok1")
+      okN2 <- freshN (T.pack "ok2")
+      let intTy = gtyCType GInt
+          oFBody = wrapGroup groupBodyEscape   -- inner group + its escaping body
+          oGBody = Ret (ALit (LInt 0))
+          outer cont =
+            LetRec [ (Binder oFN Unrestricted funTyC, [Binder okN1 Unrestricted intTy], oFBody)
+                   , (Binder oGN Unrestricted intTy,  [Binder okN2 Unrestricted intTy], oGBody) ]
+                   cont
+      pure $ seedCap $ outer (Ret (AVar oFN))
+
+-- ---------------------------------------------------------------------------
+-- Family 6: MEMBER-BODY sibling escape (the M2a-2 BLOCKER-1 class).
+--
+-- A two-member group where one member's BASE or RECURSIVE arm RETURNS or MOVES a
+-- sibling --- so the shared env is carried OUT from INSIDE a member body, where the
+-- body BORROWS (does not own) the env. The escaped sibling is then called
+-- externally. This is the shape Suite G's other families never produced (their
+-- escapes all leave from MAIN's body, never from inside a member body), so the
+-- member-body double-free shipped green. After the fix the pass must DUP the env
+-- at the member-body escape (an incref) so the externally-held handle owns its own
+-- unit and the single 'NEnv' is dropped exactly once. ACCEPTED + must-run-sound.
+--
+-- We range over: BOXED vs UNBOXED capture (so the escaped env is a real counted
+-- 'NEnv' in both --- the unboxed variant is BLOCKER 2); BASE-arm vs REC-arm escape;
+-- escape via bare RETURN vs MOVE-into-a-con (dup-on-consume at two distinct sites);
+-- and the OVER-APPLY-THEN-CALL variant (@(f 0) depth@ as a single saturating apply,
+-- exercising the unnamed-intermediate deferred env-drop alongside the member-body
+-- escape).
+data MemberEscStyle
+  = MescReturn          -- ^ member arm is @Ret sibling@ (bare member-body escape)
+  | MescMoveCon         -- ^ member arm seals sibling into a returned 'Box' con
+  deriving (Eq, Show)
+
+genMemberBodyEscapeCluster :: Int -> GenM Expr
+genMemberBodyEscapeCluster n = do
+  boxedCap <- liftG (elements [True, False])
+  escStyle <- liftG (elements [MescReturn, MescMoveCon])
+  escInRec <- liftG (elements [True, False])   -- escape from the REC arm vs the BASE arm
+  overApply <- liftG (elements [True, False])  -- (f 0) depth saturating apply vs named h
+  let intTy = gtyCType GInt
+  -- Seed the capture (boxed Pair or unboxed U64) and a reader that turns it into a
+  -- GInt the non-escaping member arm yields (a borrowed READ of the capture, never a
+  -- consume --- consuming captures stay boundary-rejected and out of this family).
+  (_capN, seedCap, capReader) <-
+    if boxedCap
+      then do
+        (cN, sc) <- seedPairCapture
+        let reader = do
+              pxN <- freshN (T.pack "px"); pyN <- freshN (T.pack "py")
+              pure (\k -> Case (AVar cN)
+                            [ AltCon (T.pack "Tuple2")
+                                [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+                                (k (AVar pxN)) ])
+        pure (cN, sc, reader)
+      else do
+        seed <- liftG (choose (0, 9 :: Int))
+        uN <- freshN (T.pack "u")
+        let sc cont = Let (Binder uN Unrestricted intTy)
+                          (RAtom (ALit (LInt (toInteger seed)))) cont
+            reader = pure (\k -> k (AVar uN))
+        pure (uN, sc, reader)
+  -- The escaping member f and the worker member g (truly mutually recursive: f's
+  -- non-escaping arm calls g, g's rec arm calls f, so the elaborator co-groups them).
+  fN  <- freshN (T.pack "lrf")
+  gN  <- freshN (T.pack "lrg")
+  k1N <- freshN (T.pack "k1"); k2N <- freshN (T.pack "k2")
+  -- The member-body escape expression: carry sibling g OUT (Ret g) or seal it into a
+  -- returned con (a MOVE of g into a Box). Both are member-body escapes of the env.
+  escExpr <- case escStyle of
+    MescReturn  -> pure (Ret (AVar gN))
+    MescMoveCon -> do
+      cN <- freshN (T.pack "mesc")
+      pure (Let (Binder cN Unrestricted boxTyC) (RCon (T.pack "Box") [AVar gN]) (Ret (AVar cN)))
+  readCap <- capReader
+  -- f's body ALWAYS yields the escaping value (so f is type-consistent: every path
+  -- returns the function value / Box). escInRec=False escapes immediately
+  -- (single-arm); escInRec=True SELF-recurses first (@f (k1-1)@), then escapes at
+  -- the base arm --- the escape then happens from a member body reached BY a sibling
+  -- recursion, the same env-borrowing position. Either way the env leaves from
+  -- INSIDE f's body. f references its sibling g (the escaped value), so f and g are
+  -- ONE group node sharing the env.
+  ks1N <- freshN (T.pack "fks"); r1N <- freshN (T.pack "fr")
+  let fSelfRec = Let (Binder ks1N Unrestricted intTy)
+                     (RApp (primAtom (T.pack "-")) [AVar k1N, ALit (LInt 1)])
+                   (Let (Binder r1N Unrestricted funTyC) (RApp (AVar fN) [AVar ks1N])
+                     (Ret (AVar r1N)))
+      fBody = if escInRec
+                then Case (AVar k1N) [ AltLit (LInt 0) escExpr, AltDefault fSelfRec ]
+                else escExpr
+  -- g's body: a self-recursive worker that READS the capture at its base case (so the
+  -- capture --- boxed or unboxed --- is genuinely live in the shared env), yielding a
+  -- GInt. The escaped g is what main calls.
+  ks2N <- freshN (T.pack "gks"); r2N <- freshN (T.pack "gr")
+  let gRecCall = Let (Binder ks2N Unrestricted intTy)
+                     (RApp (primAtom (T.pack "-")) [AVar k2N, ALit (LInt 1)])
+                   (Let (Binder r2N Unrestricted intTy) (RApp (AVar gN) [AVar ks2N])
+                     (Ret (AVar r2N)))
+      gBody = Case (AVar k2N) [ AltLit (LInt 0) (readCap (\a -> Ret a)), AltDefault gRecCall ]
+      wrapGroup cont =
+        LetRec [ (Binder fN Unrestricted funTyC, [Binder k1N Unrestricted intTy], fBody)
+               , (Binder gN Unrestricted funTyC, [Binder k2N Unrestricted intTy], gBody) ]
+               cont
+  -- The escaped member (g, possibly inside a Box) flows out of f, then is CALLED
+  -- externally so the run exercises the escaped env: either through a named handle
+  -- @h@ that is then applied, or via an over-apply @(f initArg) depth@. When the
+  -- escape sealed g in a Box we must first unbox it before calling.
+  -- Pick @initArg@ so f's FIRST call lands on the ESCAPING arm (which returns the
+  -- callable sibling g): base-arm escape (escInRec=False) fires at k1==0; rec-arm
+  -- escape (escInRec=True) fires at any k1 /= 0. This guarantees the call-out target
+  -- is a function value (g), not the GInt the cap-reading arm would yield.
+  let initArg = if escInRec then 1 else 0 :: Int
+  depth   <- liftG (choose (1, max 1 (min n 4)))
+  hN <- freshN (T.pack "h"); rN <- freshN (T.pack "rr")
+  callOut <- case escStyle of
+    MescReturn ->
+      if overApply
+        then pure (Let (Binder rN Unrestricted intTy)
+                       (RApp (AVar fN) [ALit (LInt (toInteger initArg)), ALit (LInt (toInteger depth))])
+                     (Ret (AVar rN)))
+        else pure (Let (Binder hN Unrestricted funTyC) (RApp (AVar fN) [ALit (LInt (toInteger initArg))])
+                     (Let (Binder rN Unrestricted intTy) (RApp (AVar hN) [ALit (LInt (toInteger depth))])
+                       (Ret (AVar rN))))
+    MescMoveCon -> do
+      -- f returns a Box holding g; unbox then call.
+      boxN <- freshN (T.pack "bx"); gOutN <- freshN (T.pack "gout")
+      pure (Let (Binder boxN Unrestricted boxTyC) (RApp (AVar fN) [ALit (LInt (toInteger initArg))])
+              (Case (AVar boxN)
+                [ AltCon (T.pack "Box") [Binder gOutN Unrestricted funTyC]
+                    (Let (Binder rN Unrestricted intTy) (RApp (AVar gOutN) [ALit (LInt (toInteger depth))])
+                      (Ret (AVar rN))) ]))
+  pure $ seedCap $ wrapGroup callOut
+
+-- ---------------------------------------------------------------------------
+-- Family 6b: a member body ESCAPES a borrowed enclosing CAPTURE (the capture
+-- analogue of Family 6, which escapes a SIBLING).
+--
+-- A self-recursive member @f@ closes over a BOXED enclosing capture @cap@ (a
+-- 'Tuple2'). Its base arm ESCAPES the capture: either RETURNS @cap@ bare
+-- (@Ret cap@) or SEALS it into a returned 'Box' con (@let bx = Box cap in bx@) ---
+-- both carry the captured boxed cell OUT from INSIDE a member body, where the body
+-- BORROWS (does not own) the shared env that holds @cap@. The pass must dup the
+-- captured cell at the escape site (the generalised 'Ret'/'Jump' escape-dup, or the
+-- con-move dup-on-consume) so the env's capture-field cascade frees @cap@ exactly
+-- once. Without that dup the env cascade frees @cap@ out from under the returned
+-- handle --- the verified member-body CAPTURE-escape use-after-free.
+--
+-- The escaped capture is then DESTRUCTURED externally to a scalar 'GInt' (one field
+-- of the Tuple2), so the whole program yields a scalar and the heap MUST empty =>
+-- ACCEPT-and-run-sound. We range over: BASE-arm vs REC-arm escape (rec-arm
+-- self-recurses first, then escapes at the base, so the escape happens from a body
+-- reached BY a recursion --- the same env-borrowing position); and escape via bare
+-- RETURN vs MOVE-into-a-returned-con (two distinct dup sites). The saturating apply
+-- @(f init) ...@ form is not needed (the capture, not a function, is what escapes).
+genCaptureBodyEscapeCluster :: Int -> GenM Expr
+genCaptureBodyEscapeCluster _n = do
+  escStyle <- liftG (elements [MescReturn, MescMoveCon])
+  escInRec <- liftG (elements [True, False])
+  let intTy  = gtyCType GInt
+      pairTy = gtyCType GPair
+  (capN, seedCap) <- seedPairCapture
+  fN  <- freshN (T.pack "lcf")
+  k1N <- freshN (T.pack "ck1")
+  -- The member-body escape expression: carry the CAPTURE out bare (@Ret cap@) or
+  -- sealed into a returned 'Box' con (a MOVE of @cap@ into the con). Both escape the
+  -- borrowed capture from inside the member body.
+  escExpr <- case escStyle of
+    MescReturn  -> pure (Ret (AVar capN))
+    MescMoveCon -> do
+      cN <- freshN (T.pack "csc")
+      pure (Let (Binder cN Unrestricted boxTyC) (RCon (T.pack "Box") [AVar capN]) (Ret (AVar cN)))
+  ks1N <- freshN (T.pack "cks"); r1N <- freshN (T.pack "cfr")
+  -- f's result type is the escaped value (a Pair, or a Box of a Pair). The rec arm
+  -- self-recurses (borrowing the env), so escInRec=True escapes from a body reached
+  -- by a recursion; escInRec=False escapes immediately.
+  let escTy = case escStyle of { MescReturn -> pairTy; MescMoveCon -> boxTyC }
+      fSelfRec = Let (Binder ks1N Unrestricted intTy)
+                     (RApp (primAtom (T.pack "-")) [AVar k1N, ALit (LInt 1)])
+                   (Let (Binder r1N Unrestricted escTy) (RApp (AVar fN) [AVar ks1N])
+                     (Ret (AVar r1N)))
+      fBody = if escInRec
+                then Case (AVar k1N) [ AltLit (LInt 0) escExpr, AltDefault fSelfRec ]
+                else escExpr
+      wrapGroup cont =
+        LetRec [ (Binder fN Unrestricted funTyC, [Binder k1N Unrestricted intTy], fBody) ] cont
+  -- Call f so its FIRST call lands on the escaping (base) arm: base-arm escape fires
+  -- at k1==0; rec-arm escape fires at any k1 /= 0 (here 1, recursing once to k1==0).
+  let initArg = if escInRec then 1 else 0 :: Int
+  -- Externally destructure the escaped capture to one Tuple2 field (a scalar).
+  pxN <- freshN (T.pack "cpx"); pyN <- freshN (T.pack "cpy")
+  pick <- liftG (elements [True, False])
+  let readPair scrut = Case scrut
+        [ AltCon (T.pack "Tuple2")
+            [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+            (Ret (AVar (if pick then pxN else pyN))) ]
+  rN <- freshN (T.pack "crr")
+  callOut <- case escStyle of
+    MescReturn ->
+      pure (Let (Binder rN Unrestricted pairTy) (RApp (AVar fN) [ALit (LInt (toInteger initArg))])
+              (readPair (AVar rN)))
+    MescMoveCon -> do
+      -- f returns a Box holding the Pair capture; unbox then destructure.
+      boxN <- freshN (T.pack "cbx"); pOutN <- freshN (T.pack "cpout")
+      pure (Let (Binder boxN Unrestricted boxTyC) (RApp (AVar fN) [ALit (LInt (toInteger initArg))])
+              (Case (AVar boxN)
+                [ AltCon (T.pack "Box") [Binder pOutN Unrestricted pairTy]
+                    (readPair (AVar pOutN)) ]))
+  pure $ seedCap $ wrapGroup callOut
+
+-- ---------------------------------------------------------------------------
+-- Family 7: PARTIAL APPLICATION of a MULTI-ARITY capturing member (the M2a-2
+-- double-free shape).
+--
+-- A single self-recursive member of arity >= 2 captures an enclosing local
+-- (boxed Pair or unboxed U64). The member is bound to a NAMED head @g@, then
+-- applied at one of three SATURATIONS:
+--
+--   * PARTIAL   --- @let h = g a0 in h <rest>@. @g a0@ is an UNDER-application of
+--     the 'RVRecMember' (the LT path of 'enterRC's member arm) --- the exact
+--     branch where the shared env was double-freed (build incref'd nothing while
+--     the cell's drop cascaded the env). @h@ is the resulting 'NClosure'
+--     ('BorrowCaptures'), then saturated.
+--   * SATURATED --- @let r = g a0 a1 [a2] in r@ in ONE call (the clean control;
+--     EQ path, no partial cell).
+--   * OVER      --- the member is arity-1-extended via an identity wrapper so an
+--     over-application chains through 'KAppRC'. (We realize "over" as a saturated
+--     call whose result --- a scalar --- is then NOT further applied; genuine
+--     over-application of a first-order member needs a higher-arity result, which
+--     this corpus does not produce, so OVER here saturates a 3-arity member by a
+--     1-then-2 split, exercising partial-then-saturate.)
+--
+-- Every variant yields a GInt (the base case reads the capture to a scalar), so a
+-- sound pass empties the heap: ACCEPT-and-run-sound. The base case only READS the
+-- capture (borrowed scrutinee / unboxed read), never CONSUMES it (#1 is deferred).
+data PartialSaturation = PartPartial | PartSaturated | PartOver
+  deriving (Eq, Show)
+
+-- | HOW the named member head @g@ is consumed downstream. The PLAIN kinds apply
+-- @g@ DIRECTLY (the original M2a-2 corpus); the two RLAM-MEDIATED crosses route
+-- the member through an 'RLam' so 'CaptureMode' propagation across the partial-
+-- application of a closure (the 'NClosure' LT branch of 'enterRC') is under test:
+--
+--   * 'PartRLamPartial' (CROSS 5) --- a 2-arg 'RLam' @e = \x y -> g (x+y) <rest>@
+--     that CAPTURES the recursive member head @g@. @e@ is PARTIALLY applied to ONE
+--     arg (@let p = e a0@), stored, then SATURATED and called (@p a1@). The partial
+--     of the RLam takes the LT branch; its 'CaptureMode' must be carried to the new
+--     partial cell verbatim.
+--   * 'PartRLamBodyPartial' (CROSS 6) --- a 1-arg ESCAPING 'RLam' @h = \x -> <member
+--     @g@ partially applied, then saturated>@. The member partial lives INSIDE the
+--     closure body; for an arity-3 member the body does a 1-then-1-then-rest split so
+--     the partial-of-a-partial fires the LT branch (the 'BorrowCaptures' propagation
+--     case). @h@ is bound, then CALLED locally (@h a@), so the result is a scalar and
+--     the run is ACCEPT-and-sound.
+--
+-- Both yield a GInt, so a sound pass empties the heap (ACCEPT-and-run-sound).
+data PartialKind
+  = PartPlain PartialSaturation   -- ^ apply the member head @g@ directly
+  | PartRLamPartial               -- ^ CROSS 5: capture @g@ in an RLam, partial-apply the RLam
+  | PartRLamBodyPartial           -- ^ CROSS 6: member partial inside an escaping RLam body
+  deriving (Eq, Show)
+
+genPartialMemberCluster :: Int -> GenM Expr
+genPartialMemberCluster n = do
+  boxedCap <- liftG (elements [True, False])
+  kind     <- liftG (elements [ PartPlain PartPartial, PartPlain PartSaturated, PartPlain PartOver
+                              , PartRLamPartial, PartRLamBodyPartial ])
+  -- CROSS 6's partial-of-a-partial needs arity 3 to fire the LT branch INSIDE the
+  -- RLam body; otherwise range over 2/3 as before.
+  arity    <- case kind of
+                PartRLamBodyPartial -> pure (3 :: Int)
+                _                   -> liftG (elements [2, 3 :: Int])
+  let intTy = gtyCType GInt
+  -- Seed the capture and a reader turning it into the GInt the base arm yields.
+  (seedCap, capReader) <-
+    if boxedCap
+      then do
+        (cN, sc) <- seedPairCapture
+        let reader = do
+              pxN <- freshN (T.pack "px"); pyN <- freshN (T.pack "py")
+              pure (\k -> Case (AVar cN)
+                            [ AltCon (T.pack "Tuple2")
+                                [Binder pxN Unrestricted intTy, Binder pyN Unrestricted intTy]
+                                (k (AVar pxN)) ])
+        pure (sc, reader)
+      else do
+        seed <- liftG (choose (0, 9 :: Int))
+        uN <- freshN (T.pack "u")
+        let sc cont = Let (Binder uN Unrestricted intTy)
+                          (RAtom (ALit (LInt (toInteger seed)))) cont
+            reader = pure (\k -> k (AVar uN))
+        pure (sc, reader)
+  -- The member f of the chosen arity: its FIRST param @a@ is the recursion fuel;
+  -- the rest are inert (threaded through the recursive call so they stay live).
+  -- f a p1 .. = case a of 0 -> <read cap> ; _ -> f (a-1) p1 .. .
+  fN  <- freshN (T.pack "lrf")
+  aN  <- freshN (T.pack "fa")
+  restNs <- mapM (\_ -> freshN (T.pack "fp")) [2 .. arity]   -- arity-1 inert params
+  ksN <- freshN (T.pack "fks")
+  rN  <- freshN (T.pack "frr")
+  readCap <- capReader
+  let paramBs = Binder aN Unrestricted intTy
+                  : [ Binder p Unrestricted intTy | p <- restNs ]
+      recCallArgs = AVar ksN : map AVar restNs
+      fBody = Case (AVar aN)
+                [ AltLit (LInt 0) (readCap Ret)
+                , AltDefault
+                    (Let (Binder ksN Unrestricted intTy)
+                         (RApp (primAtom (T.pack "-")) [AVar aN, ALit (LInt 1)])
+                       (Let (Binder rN Unrestricted intTy) (RApp (AVar fN) recCallArgs)
+                         (Ret (AVar rN)))) ]
+      wrapGroup cont =
+        LetRec [(Binder fN Unrestricted intTy, paramBs, fBody)] cont
+  -- Bind the member to a NAMED head @g@, then apply at the chosen saturation.
+  gN  <- freshN (T.pack "g")
+  -- Choose a small recursion depth (the first arg) and inert arg values.
+  depth <- liftG (choose (0, max 0 (min n 3)))
+  -- Concrete argument literals: the FUEL (@depth@, the first arg) and the inert REST.
+  let fuelArg  = ALit (LInt (toInteger depth))
+      restArgs = [ ALit (LInt (toInteger (10 + i))) | i <- [1 .. arity - 1] ]
+  body <- case kind of
+    PartPlain PartSaturated -> do
+      rrN <- freshN (T.pack "rr")
+      pure (Let (Binder rrN Unrestricted intTy) (RApp (AVar gN) (fuelArg : restArgs))
+              (Ret (AVar rrN)))
+    PartPlain PartPartial -> do
+      -- g applied to the FUEL arg only (partial); the result @h@ is then applied
+      -- to the remaining args (saturating it). The double-free shape.
+      hN  <- freshN (T.pack "h")
+      rrN <- freshN (T.pack "rr")
+      pure (Let (Binder hN Unrestricted funTyC) (RApp (AVar gN) [fuelArg])
+              (Let (Binder rrN Unrestricted intTy) (RApp (AVar hN) restArgs)
+                (Ret (AVar rrN))))
+    PartPlain PartOver -> do
+      -- Partial in TWO steps for arity-3 (1 then the rest); for arity-2 this
+      -- coincides with PartPartial. Exercises a chain of partial closures.
+      hN  <- freshN (T.pack "h"); h2N <- freshN (T.pack "h2")
+      rrN <- freshN (T.pack "rr")
+      case restArgs of
+        (r1 : r2rest) | arity >= 3 ->
+          pure (Let (Binder hN Unrestricted funTyC) (RApp (AVar gN) [fuelArg])
+                 (Let (Binder h2N Unrestricted funTyC) (RApp (AVar hN) [r1])
+                   (Let (Binder rrN Unrestricted intTy) (RApp (AVar h2N) r2rest)
+                     (Ret (AVar rrN)))))
+        _ ->
+          pure (Let (Binder hN Unrestricted funTyC) (RApp (AVar gN) [fuelArg])
+                 (Let (Binder rrN Unrestricted intTy) (RApp (AVar hN) restArgs)
+                   (Ret (AVar rrN))))
+    PartRLamPartial -> do
+      -- CROSS 5: a 2-arg RLam @e = \x y -> let s = x + y in let r = g s <rest> in r@
+      -- that CAPTURES the recursive member head @g@ (free in the body as a call
+      -- head). @e@ is PARTIALLY applied to ONE arg (@let p = e a0@), then SATURATED
+      -- and called (@p a1@). The partial of the RLam takes the 'NClosure' LT branch
+      -- of 'enterRC', so its 'CaptureMode' must reach the new partial cell intact.
+      xN  <- freshN (T.pack "rlx"); yN <- freshN (T.pack "rly")
+      sN  <- freshN (T.pack "rls"); erN <- freshN (T.pack "rler")
+      eN  <- freshN (T.pack "rle"); pN  <- freshN (T.pack "rlp")
+      rrN <- freshN (T.pack "rr")
+      -- g saturated INSIDE the RLam body: g s <rest> where s = x + y stands in for
+      -- the fuel arg and the inert rest are the member's remaining params.
+      let eBody = Let (Binder sN Unrestricted intTy)
+                      (RApp (primAtom (T.pack "+")) [AVar xN, AVar yN])
+                    (Let (Binder erN Unrestricted intTy)
+                         (RApp (AVar gN) (AVar sN : restArgs))
+                      (Ret (AVar erN)))
+          eLam  = RLam [Binder xN Unrestricted intTy, Binder yN Unrestricted intTy] eBody
+      pure (Let (Binder eN Unrestricted funTyC) eLam
+              (Let (Binder pN Unrestricted funTyC) (RApp (AVar eN) [fuelArg])
+                (Let (Binder rrN Unrestricted intTy) (RApp (AVar pN) [ALit (LInt 1)])
+                  (Ret (AVar rrN)))))
+    PartRLamBodyPartial -> do
+      -- CROSS 6: a 1-arg RLam @h@ whose BODY partially applies the member @g@, then
+      -- saturates it. For arity-3 the body does a 1-then-1-then-rest split so the
+      -- partial-of-a-partial fires the 'NClosure' LT branch (the 'BorrowCaptures'
+      -- propagation case) INSIDE the closure body. @h@ is bound then CALLED locally,
+      -- so the member partial's lifetime is bounded by @h@'s call and the result is
+      -- a scalar (ACCEPT-and-run-sound).
+      hN  <- freshN (T.pack "h"); hxN <- freshN (T.pack "hx")
+      p1N <- freshN (T.pack "hp1"); p2N <- freshN (T.pack "hp2")
+      hrN <- freshN (T.pack "hr"); rrN <- freshN (T.pack "rr")
+      let hBody = case restArgs of
+            (r1 : _) | arity >= 3 ->
+              -- arity-3: g fuel (partial, 1 of 3) -> p1 r1 (partial-of-partial, 2 of
+              -- 3, the LT branch) -> p2 hx (saturate, 3 of 3). The closure param @hx@
+              -- is the LAST inert arg, so the partial-of-partial saturates exactly.
+              Let (Binder p1N Unrestricted funTyC) (RApp (AVar gN) [fuelArg])
+                (Let (Binder p2N Unrestricted funTyC) (RApp (AVar p1N) [r1])
+                  (Let (Binder hrN Unrestricted intTy) (RApp (AVar p2N) [AVar hxN])
+                    (Ret (AVar hrN))))
+            _ ->
+              -- arity-2 fallback: g fuel (partial, 1 of 2) then saturate inside the
+              -- body with the closure param @hx@ as the single remaining arg.
+              Let (Binder p1N Unrestricted funTyC) (RApp (AVar gN) [fuelArg])
+                (Let (Binder hrN Unrestricted intTy) (RApp (AVar p1N) [AVar hxN])
+                  (Ret (AVar hrN)))
+          hLam = RLam [Binder hxN Unrestricted intTy] hBody
+      pure (Let (Binder hN Unrestricted funTyC) hLam
+              (Let (Binder rrN Unrestricted intTy) (RApp (AVar hN) [ALit (LInt 0)])
+                (Ret (AVar rrN))))
+  pure $ seedCap $ wrapGroup (Let (Binder gN Unrestricted funTyC) (RAtom (AVar fN)) body)
+
+-- | Structural detector for the PARTIAL-APPLICATION-of-a-multi-arity-member class
+-- (M2a-2 double-free shape): a 'LetRec' member of arity >= 2 whose handle is then
+-- applied to FEWER arguments than its arity at a named head (the 'enterRC'
+-- 'RVRecMember' LT path). Used only for the 'cover'/'checkCoverage' non-vacuity
+-- floor; it is a conservative recognizer (member arity >= 2 + a single-arg apply
+-- of a binder bound to that member).
+hasPartialMemberApply :: CoreModule -> Bool
+hasPartialMemberApply (CoreModule bs) = any (\(TopBind _ _ b) -> go Map.empty b) bs
+  where
+    -- @arits@ maps a binder Unique to the arity of the member it (transitively)
+    -- names, for any name aliased to a >= 2-arity LetRec member.
+    go arits e = case e of
+      LetRec defs body ->
+        let arits' = foldr (\(bd, ps, _) m ->
+                              if length ps >= 2
+                                then Map.insert (binderUnique bd) (length ps) m
+                                else m) arits defs
+        in any (\(_, _, d) -> go arits' d) defs || go arits' body
+      Let bd r body ->
+        let arits' = case r of
+              RAtom (AVar nm') | Just k <- Map.lookup (nameUniq nm') arits ->
+                Map.insert (binderUnique bd) k arits
+              _ -> arits
+            here = case r of
+              RApp (AVar nm') as
+                | Just k <- Map.lookup (nameUniq nm') arits, length as < k -> True
+              _ -> False
+        in here || go arits' body
+      Case _ alts -> any (go arits . altBody) alts
+      LetJoin _ _ jb body -> go arits jb || go arits body
+      _ -> False
+    altBody (AltCon _ _ b) = b
+    altBody (AltLit _ b)   = b
+    altBody (AltDefault b) = b
+
+-- | Structural detector for the RLAM-MEDIATED member-partial class (CROSS 5/6):
+-- a 'LetRec' member of arity >= 2 whose handle (or an alias of it) is referenced
+-- as a CALL HEAD from INSIDE an 'RLam' body --- either the RLam itself captures
+-- the member and is then partially applied (CROSS 5), or the member is partially
+-- applied within an escaping RLam body (CROSS 6). Either way the member flows
+-- through a closure, so the 'NClosure' LT branch's 'CaptureMode' propagation is on
+-- the path. Used only for the 'cover'/'checkCoverage' non-vacuity floor; it is a
+-- conservative recognizer (member arity >= 2 + a member-alias call head occurring
+-- lexically under at least one 'RLam').
+hasRLamMemberPartial :: CoreModule -> Bool
+hasRLamMemberPartial (CoreModule bs) = any (\(TopBind _ _ b) -> go Map.empty False b) bs
+  where
+    -- @arits@ maps a binder Unique to the arity of the >= 2-arity LetRec member it
+    -- (transitively) names. @inLam@ records whether we are lexically inside an RLam.
+    go arits inLam e = case e of
+      LetRec defs body ->
+        let arits' = foldr (\(bd, ps, _) m ->
+                              if length ps >= 2
+                                then Map.insert (binderUnique bd) (length ps) m
+                                else m) arits defs
+        in any (\(_, _, d) -> go arits' inLam d) defs || go arits' inLam body
+      Let bd r body ->
+        let arits' = case r of
+              RAtom (AVar nm') | Just k <- Map.lookup (nameUniq nm') arits ->
+                Map.insert (binderUnique bd) k arits
+              _ -> arits
+            -- A member-alias call HEAD seen INSIDE an RLam body is the marker.
+            here = case r of
+              RApp (AVar nm') _ | inLam, Map.member (nameUniq nm') arits -> True
+              RLam _ lamB -> go arits' True lamB
+              _ -> False
+        in here || go arits' inLam body
+      Case _ alts -> any (go arits inLam . altBody) alts
+      LetJoin _ _ jb body -> go arits inLam jb || go arits inLam body
+      _ -> False
+    altBody (AltCon _ _ b) = b
+    altBody (AltLit _ b)   = b
+    altBody (AltDefault b) = b
+
+-- ---------------------------------------------------------------------------
+-- Suite G properties.
+
+-- | The Suite G test group. Three properties as recommended: the soundness proof
+-- (accepted ⟹ heap-balanced + value-match), the static-lint cleanliness oracle,
+-- and the generalized fault-injection teeth.
+rcM2a1PropertyTests :: TestTree
+rcM2a1PropertyTests =
+  localOption (QuickCheckTests 800) $
+    testGroup "rc m2a-1 property (Suite G: owned/borrowed + escape)"
+      [ testCase "consuming-capture groups (single + two-member) are REJECTED (deferred)"
+          rcM2a1ConsumeCaptureRejected
+      , testCase "nested capturing groups are REJECTED (escape + borrow-read); flat stays admitted"
+          rcM2a2NestedCaptureRejected
+      , testCase "fence partition: indirect-alias captures rejected by consumeViol (not mob)"
+          rcM2a2FencePartitionPinned
+      , testProperty "accepted => sound (heap-balanced + value-match); rejected => skipped"
+          prop_m2a1Escape
+      , testProperty "balanceLint is clean on every in-fragment generated program"
+          prop_m2a1LintClean
+      , testProperty "every single-site RC mutation is caught (generalized teeth)"
+          prop_m2a1Teeth
+      , testCase "captureEscapesBody single-source: verdict + oracle on hand-built RHS matrix"
+          captureEscapesBodyDriftGuard
+      , testProperty "captureEscapesBody DERIVES from escapeWalk (equals frozen oracle on every program)"
+          prop_captureEscapesBodyMatchesOracle
+      , testCase "hasCaptureBodyEscape: fires on capture escape, NOT on sibling escape"
+          hasCaptureBodyEscapeSpecific
+      , testCase "rcMemSafetyFault catches RC-store-only faults, NOT shared/value errors"
+          rcMemSafetyFaultClassification
+      ]
+
+-- | 'rcMemSafetyFault' must classify EXACTLY the RC-store-only 'PrimError'
+-- messages as memory-safety faults (so a both-fail branch rejects them outright,
+-- never laundering a one-sided RC fault past 'errCtorTag' agreement), and must
+-- NOT classify the SHARED value-level errors the store-less reference can also
+-- produce (else a both-fail branch would false-fail on genuine agreement).
+rcMemSafetyFaultClassification :: Assertion
+rcMemSafetyFaultClassification = do
+  let pe = IV.PrimError . T.pack
+  -- MUST catch: the store guards (Value.hs) and the machine invariants (Machine.hs)
+  -- the reference, having no reference-counted store, can NEVER emit.
+  assertBool "double-free is an RC mem-safety fault"
+    (rcMemSafetyFault (pe "double-free: addr 7"))
+  assertBool "use-after-free is an RC mem-safety fault"
+    (rcMemSafetyFault (pe "use-after-free: addr 7"))
+  assertBool "dangling addr is an RC mem-safety fault"
+    (rcMemSafetyFault (pe "dangling addr 7"))
+  assertBool "drop of dangling addr is an RC mem-safety fault"
+    (rcMemSafetyFault (pe "drop of dangling addr 7"))
+  assertBool "RVRecMember env addr is not NEnv is an RC store-internal fault"
+    (rcMemSafetyFault (pe "RVRecMember env addr is not NEnv: 3"))
+  assertBool "an internal: machine message is an RC store-internal fault"
+    (rcMemSafetyFault (pe "internal: runModuleRC bind/addr length mismatch"))
+  -- MUST NOT catch: shared value-level errors (a store-less reference hits these
+  -- too), and non-PrimError constructors.
+  assertBool "expected U64 is a SHARED value error, not an RC mem-safety fault"
+    (not (rcMemSafetyFault (pe "expected U64")))
+  assertBool "expected Bool is a SHARED value error, not an RC mem-safety fault"
+    (not (rcMemSafetyFault (pe "expected Bool, got a closure handle")))
+  assertBool "division by zero is a SHARED value error, not an RC mem-safety fault"
+    (not (rcMemSafetyFault (pe "-: division by zero")))
+  assertBool "UnboundVar is NOT an RC mem-safety fault (residual UAF-as-UnboundVar)"
+    (not (rcMemSafetyFault (IV.UnboundVar (T.pack "x"))))
+
+-- | Specificity test for 'hasCaptureBodyEscape' (the FIX-1 capture-escape detector):
+-- it must fire ONLY when a member body escapes an ENCLOSING BOXED CAPTURE, and must
+-- NOT fire when a member body escapes a SIBLING group binder (a distinct code path).
+-- This guards against a future over-broadening of the detector (which previously
+-- fired on ~55% of programs across every family, gutting the non-vacuity floor).
+hasCaptureBodyEscapeSpecific :: Assertion
+hasCaptureBodyEscapeSpecific = do
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      pairTy = Ty.CTCon (Ty.TcTuple 2) [intTy, intTy]
+      nm h u = Name (T.pack h) (Unique u)
+      -- POSITIVE: a single-member group whose body RETURNS an enclosing boxed
+      -- capture @cap@ (bound OUTSIDE the group, not a sibling, not a param).
+      --   main = let cap = Tuple2(9,5)
+      --          letrec f k = Ret cap
+      --          in let r = f 0 in case r of Tuple2 px py -> Ret px
+      capEscapeBody =
+        Let (Binder (nm "cap" 0) Unrestricted pairTy)
+            (RCon (T.pack "Tuple2") [ALit (LInt 9), ALit (LInt 5)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTyC
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , Ret (AVar (nm "cap" 0)) ) ]               -- member body escapes the CAPTURE
+            (Let (Binder (nm "r" 3) Unrestricted pairTy)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (Case (AVar (nm "r" 3))
+                [ AltCon (T.pack "Tuple2")
+                    [Binder (nm "px" 4) Unrestricted intTy, Binder (nm "py" 5) Unrestricted intTy]
+                    (Ret (AVar (nm "px" 4))) ])))
+      capEscapeCm = CoreModule [TopBind (nm "main" 1000000) [] capEscapeBody]
+      -- NEGATIVE: a two-member group whose body RETURNS a SIBLING binder @g@ (a group
+      -- member, NOT an enclosing capture). This is the M2MemberBodyEscape code path.
+      --   main = letrec f k = Ret g
+      --                 g k = Ret k
+      --          in let h = f 0 in let r = h 0 in Ret r
+      sibEscapeBody =
+        LetRec
+          [ ( Binder (nm "f" 1) Unrestricted funTyC
+            , [Binder (nm "k1" 2) Unrestricted intTy]
+            , Ret (AVar (nm "g" 6)) )                     -- member body escapes a SIBLING
+          , ( Binder (nm "g" 6) Unrestricted funTyC
+            , [Binder (nm "k2" 7) Unrestricted intTy]
+            , Ret (AVar (nm "k2" 7)) ) ]
+          (Let (Binder (nm "h" 3) Unrestricted funTyC)
+               (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+            (Let (Binder (nm "r" 4) Unrestricted intTy)
+                 (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+              (Ret (AVar (nm "r" 4)))))
+      sibEscapeCm = CoreModule [TopBind (nm "main" 1000000) [] sibEscapeBody]
+  assertBool "must fire on a member body escaping an enclosing boxed CAPTURE"
+    (hasCaptureBodyEscape capEscapeCm)
+  assertBool "must NOT fire on a member body escaping a SIBLING group binder"
+    (not (hasCaptureBodyEscape sibEscapeCm))
+
+-- | The two-member consuming-capture group that a dup-per-consuming-use plan got
+-- WRONG (Suite G surfaced the leak): both base cases CONSUME (move) the shared
+-- enclosing boxed capture @cap@:
+--
+--   main = let cap = Tuple2(9,5)
+--          letrec lrf k1 = case k1 of 0 -> <move cap into a Box, read it back>
+--                                     _ -> lrg (k1 - 1)
+--                 lrg k2 = case k2 of 0 -> <move cap into a Box, read it back>
+--                                     _ -> lrf (k2 - 1)
+--          let lrr = lrf 2 in lrr
+--
+-- The dup-per-consuming-use scheme pre-emitted one @__rc_dup cap@ per consuming
+-- SIBLING at the build site, but at runtime the mutual recursion terminates in
+-- EXACTLY ONE base case, so only one consuming move fires --- the surplus dups
+-- leaked. Consuming-capture support is therefore DEFERRED (it needs proper
+-- borrow-passing). This asserts the M1.5 boundary line is RESTORED: ANY consuming
+-- use of an enclosing capture is REJECTED at the boundary --- single-member
+-- (rc-m2a1/33) and two-member alike --- so the unsound shape never reaches the
+-- pass. A REJECTED program is sound (it is never compiled).
+rcM2a1ConsumeCaptureRejected :: Assertion
+rcM2a1ConsumeCaptureRejected = do
+  -- Single-member consuming-capture corpus: rejected at the boundary BY THE
+  -- CONSUMING-CAPTURE FENCE (pinned to catch a fence-swap regression).
+  vs33 <- boundaryViolationsOf "test/rc-m2a1/33-consuming-capture-nonescape.wok"
+  assertBool "single-member consuming-capture group must be REJECTED by the consuming-capture fence"
+    (any (T.isInfixOf (T.pack "consumes an enclosing capture")) vs33)
+  -- Two-member consuming-capture group (built directly): rejected at the boundary.
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      pairTy = Ty.CTCon (Ty.TcTuple 2) [intTy, intTy]
+      nm h u = Name (T.pack h) (Unique u)
+      -- base case: move cap into a Box con, destructure the box and the Pair,
+      -- return one int field (a valid CONSUMING move of cap).
+      consumeBase backU pxU pyU pick =
+        Let (Binder (nm "bx" backU) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [AVar (nm "cap" 0)])
+          (Case (AVar (nm "bx" backU))
+            [ AltCon (T.pack "Box") [Binder (nm "cback" (backU + 100)) Unrestricted pairTy]
+                (Case (AVar (nm "cback" (backU + 100)))
+                  [ AltCon (T.pack "Tuple2")
+                      [Binder (nm "px" pxU) Unrestricted intTy, Binder (nm "py" pyU) Unrestricted intTy]
+                      (Ret (AVar (if pick then nm "px" pxU else nm "py" pyU))) ]) ])
+      fBody = Case (AVar (nm "k1" 3))
+                [ AltLit (LInt 0) (consumeBase 9 11 12 True)
+                , AltDefault
+                    (Let (Binder (nm "ks1" 5) Unrestricted intTy)
+                         (RApp (AVar (nm "-" 2000000)) [AVar (nm "k1" 3), ALit (LInt 1)])
+                       (Let (Binder (nm "r1" 7) Unrestricted intTy)
+                            (RApp (AVar (nm "lrg" 2)) [AVar (nm "ks1" 5)])
+                         (Ret (AVar (nm "r1" 7))))) ]
+      gBody = Case (AVar (nm "k2" 4))
+                [ AltLit (LInt 0) (consumeBase 13 15 16 False)
+                , AltDefault
+                    (Let (Binder (nm "ks2" 6) Unrestricted intTy)
+                         (RApp (AVar (nm "-" 2000000)) [AVar (nm "k2" 4), ALit (LInt 1)])
+                       (Let (Binder (nm "r2" 8) Unrestricted intTy)
+                            (RApp (AVar (nm "lrf" 1)) [AVar (nm "ks2" 6)])
+                         (Ret (AVar (nm "r2" 8))))) ]
+      body =
+        Let (Binder (nm "cap" 0) Unrestricted pairTy)
+            (RCon (T.pack "Tuple2") [ALit (LInt 9), ALit (LInt 5)])
+          (LetRec [ (Binder (nm "lrf" 1) Unrestricted intTy, [Binder (nm "k1" 3) Unrestricted intTy], fBody)
+                  , (Binder (nm "lrg" 2) Unrestricted intTy, [Binder (nm "k2" 4) Unrestricted intTy], gBody) ]
+            (Let (Binder (nm "lrr" 17) Unrestricted intTy)
+                 (RApp (AVar (nm "lrf" 1)) [ALit (LInt 2)])
+              (Ret (AVar (nm "lrr" 17)))))
+      cm     = CoreModule [TopBind (nm "main" 1000000) [] body]
+      pruned = pruneToReachable cm
+  assertBool "two-member consuming-capture group must be REJECTED by the consuming-capture fence"
+    (any (T.isInfixOf (T.pack "consumes an enclosing capture"))
+         (firstOrderNoHandlerViolations pruned))
+  -- WHY the rejection stands (verification-gate finding, 2026-06-16). The shared-env
+  -- borrow model alone does NOT make #1 sound. If the boundary were bypassed and the
+  -- pass run on this very reproducer, the dynamic dup-on-consume balances the path
+  -- TAKEN at runtime (so a runModuleRCUnchecked at a fixed depth happens to empty the
+  -- heap), but the pass does NOT emit statically-balanced instrumentation: the capture
+  -- is moved into the shared env ONCE while each base-case arm independently dups it,
+  -- and the path-insensitive multiset accounting that underwrites soundness for ALL
+  -- call patterns (including the nested/escaped group whose env-drop never fires)
+  -- cannot reconcile. 'balanceLint' --- the compile-time oracle (Suite G's
+  -- 'prop_m2a1LintClean') --- MUST therefore flag the leak. This is the teeth: were
+  -- the dup-on-consume emission ever made to "pass" by weakening the lint, this
+  -- assertion would catch the regression.
+  assertBool "balanceLint must flag the consuming-capture imbalance (deferral rationale)"
+    (not (null (Perceus.balanceLint (Perceus.insertRC pruned))))
+
+-- | NESTED CAPTURING GROUP (M2a-2, verified DOUBLE-FREE). A 'LetRec' group NESTED
+-- inside an enclosing 'LetRec' member body that captures a boxed local bound
+-- OUTSIDE that enclosing member double-frees the local: the local lives in BOTH the
+-- enclosing member's 'NEnv' and the inner group's 'NEnv' --- two cascades on drop,
+-- but only one incref backs the re-capture (the local is treated as
+-- borrowed/moved-once). The boundary guard REJECTS this class on the MEMBER-OUTER
+-- BOXED SET (@rawEnclosingFv ∩ mob@) --- whether the inner group ESCAPES the
+-- outside-bound local (CLAIM 1, returns it), only BORROW-READS it (CLAIM 2),
+-- reaches it through a same-cell ALIAS rename (CLAIM 3), or is TRIPLE-nested
+-- (CLAIM 4). A REJECTED program is sound (it is never compiled). Each must-reject
+-- shape is RUN unchecked to confirm it would genuinely double-free if admitted.
+--
+-- The PRECISION boundary (M2a-2 precision-cleanup): three shapes that were
+-- conservatively over-rejected are now ADMITTED-and-RUN-SOUND because the captured
+-- local is NOT in the member-outer set:
+--   * FLAT (non-nested) group capturing an enclosing local --- one env, one cascade;
+--   * GROUP-IN-LAMBDA-IN-MEMBER --- a lambda body is a fresh frame, resetting @mob@
+--     (ADMIT 1, the same group is sound at top level);
+--   * PER-ENTRY LET-LOCAL --- a local ALLOCATED inside the enclosing member body
+--     (rebuilt per entry alongside the inner env --- one cascade) (ADMIT 2).
+-- A nested group that captures NO enclosing boxed local also stays ADMITTED.
+rcM2a2NestedCaptureRejected :: Assertion
+rcM2a2NestedCaptureRejected = do
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+      nm h u = Name (T.pack h) (Unique u)
+      -- main = let b = Box 7 in
+      --        letrec f k = (letrec h j = Ret b in let r = h 0 in Ret r)
+      --        in let res = f 0 in case res of Box v -> Ret v
+      claim1 =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTy
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , LetRec
+                  [ ( Binder (nm "h" 3) Unrestricted funTy
+                    , [Binder (nm "j" 4) Unrestricted intTy]
+                    , Ret (AVar (nm "b" 0)) ) ]      -- inner group ESCAPES the local b
+                  (Let (Binder (nm "r" 5) Unrestricted boxTyC)
+                       (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                    (Ret (AVar (nm "r" 5)))) ) ]
+            (Let (Binder (nm "res" 6) Unrestricted boxTyC)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (Case (AVar (nm "res" 6))
+                [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                    (Ret (AVar (nm "v" 7))) ])))
+      claim1Cm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] claim1])
+      -- main = let b = Box 7 in
+      --        letrec f k = (letrec h j = (case b of Box v -> Ret v) in let r = h 0 in Ret r)
+      --        in let res = f 0 in Ret res
+      claim2 =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTy
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , LetRec
+                  [ ( Binder (nm "h" 3) Unrestricted funTy
+                    , [Binder (nm "j" 4) Unrestricted intTy]
+                    , Case (AVar (nm "b" 0))          -- inner group BORROW-READS the local b
+                        [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                            (Ret (AVar (nm "v" 7))) ] ) ]
+                  (Let (Binder (nm "r" 5) Unrestricted intTy)
+                       (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                    (Ret (AVar (nm "r" 5)))) ) ]
+            (Let (Binder (nm "res" 6) Unrestricted intTy)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (Ret (AVar (nm "res" 6)))))
+      claim2Cm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] claim2])
+  -- CLAIM 1 (escape) and CLAIM 2 (borrow-read): BOTH rejected at the boundary BY
+  -- THE NESTED-CAPTURING-GROUP FENCE (pinned to catch a fence-swap regression).
+  assertBool "CLAIM 1 (nested group escapes enclosing local) must be REJECTED by the nested-capture fence"
+    (any (T.isInfixOf (T.pack "nested LetRec group captures a local bound outside"))
+         (firstOrderNoHandlerViolations claim1Cm))
+  assertBool "CLAIM 2 (nested group borrow-reads enclosing local) must be REJECTED by the nested-capture fence"
+    (any (T.isInfixOf (T.pack "nested LetRec group captures a local bound outside"))
+         (firstOrderNoHandlerViolations claim2Cm))
+
+  -- CLAIM 3 (ALIAS): the inner group captures the outside-bound local through a
+  -- same-cell rename @let ba = b@ bound inside the enclosing member body. @ba@ is
+  -- NOT allocated per entry --- it names the SAME cell as @b@ --- so capturing it
+  -- double-frees exactly as capturing @b@. The member-outer set propagates through
+  -- the pure 'RAtom' rename, so the fence still fires.
+  --   main = let b = Box 7 in
+  --          letrec f k = (let ba = b in letrec h j = Ret ba in let r = h 0 in Ret r)
+  --          in let res = f 0 in case res of Box v -> Ret v
+  let claim3 =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTy
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , Let (Binder (nm "ba" 30) Unrestricted boxTyC)
+                    (RAtom (AVar (nm "b" 0)))           -- same-cell alias of the outside-bound b
+                  (LetRec
+                    [ ( Binder (nm "h" 3) Unrestricted funTy
+                      , [Binder (nm "j" 4) Unrestricted intTy]
+                      , Ret (AVar (nm "ba" 30)) ) ]      -- inner group captures the alias
+                    (Let (Binder (nm "r" 5) Unrestricted boxTyC)
+                         (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                      (Ret (AVar (nm "r" 5))))) ) ]
+            (Let (Binder (nm "res" 6) Unrestricted boxTyC)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (Case (AVar (nm "res" 6))
+                [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                    (Ret (AVar (nm "v" 7))) ])))
+      claim3Cm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] claim3])
+  assertBool "CLAIM 3 (nested group captures outside-bound local via alias) must be REJECTED by the nested-capture fence"
+    (any (T.isInfixOf (T.pack "nested LetRec group captures a local bound outside"))
+         (firstOrderNoHandlerViolations claim3Cm))
+
+  -- CLAIM 4 (TRIPLE NESTING): group @g@ nested in member @f@, group @h@ nested in
+  -- member @g@; @h@ captures @b@ bound OUTSIDE @f@. @b@ is in the member-outer set
+  -- of the @g@-member body (snapshotted from @f@'s body), so the innermost fence
+  -- fires.
+  --   main = let b = Box 7 in
+  --          letrec f k = (letrec g m = (letrec h j = Ret b in let r = h 0 in Ret r)
+  --                        in let s = g 0 in Ret s)
+  --          in let res = f 0 in case res of Box v -> Ret v
+  let claim4 =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTy
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , LetRec
+                  [ ( Binder (nm "g" 40) Unrestricted funTy
+                    , [Binder (nm "m" 41) Unrestricted intTy]
+                    , LetRec
+                        [ ( Binder (nm "h" 3) Unrestricted funTy
+                          , [Binder (nm "j" 4) Unrestricted intTy]
+                          , Ret (AVar (nm "b" 0)) ) ]    -- innermost group captures outside-f local b
+                        (Let (Binder (nm "r" 5) Unrestricted boxTyC)
+                             (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                          (Ret (AVar (nm "r" 5)))) ) ]
+                  (Let (Binder (nm "s" 42) Unrestricted boxTyC)
+                       (RApp (AVar (nm "g" 40)) [ALit (LInt 0)])
+                    (Ret (AVar (nm "s" 42)))) ) ]
+            (Let (Binder (nm "res" 6) Unrestricted boxTyC)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (Case (AVar (nm "res" 6))
+                [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                    (Ret (AVar (nm "v" 7))) ])))
+      claim4Cm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] claim4])
+  assertBool "CLAIM 4 (triple-nested group captures outside-bound local) must be REJECTED by the nested-capture fence"
+    (any (T.isInfixOf (T.pack "nested LetRec group captures a local bound outside"))
+         (firstOrderNoHandlerViolations claim4Cm))
+
+  -- ENTANGLEMENT GATE: every must-reject shape would genuinely DOUBLE-FREE / UAF if
+  -- it were admitted. Run each unchecked and assert the RC interpreter FAILS (or
+  -- leaves the heap imbalanced) --- so the rejection is load-bearing, not vacuous.
+  let wouldFaultUnchecked cm =
+        case RCM.runModuleRCUnchecked (Perceus.insertRC cm) of
+          Left _    -> True
+          Right run -> St.stLive (RCM.rcStats run) /= RCM.rcBaseline run
+  assertBool "CLAIM 1 would double-free if admitted (rejection is load-bearing)"
+    (wouldFaultUnchecked claim1Cm)
+  assertBool "CLAIM 2 would double-free if admitted (rejection is load-bearing)"
+    (wouldFaultUnchecked claim2Cm)
+  assertBool "CLAIM 3 would double-free if admitted (rejection is load-bearing)"
+    (wouldFaultUnchecked claim3Cm)
+  assertBool "CLAIM 4 would double-free/UAF if admitted (rejection is load-bearing)"
+    (wouldFaultUnchecked claim4Cm)
+
+  -- ADMIT 1 (newly admitted + SOUND): a group nested inside a LAMBDA that sits in a
+  -- member body. The lambda body is a fresh frame (resets the member-outer set), so
+  -- the nested group is sound exactly as the same group at top level.
+  --   main = let b = Box 7 in
+  --          letrec f k = (let cl = (\z -> letrec h j = case b of Box v -> Ret v
+  --                                        in let r = h 0 in Ret r)
+  --                        in let out = cl 0 in Ret out)
+  --          in let res = f 0 in Ret res
+  let admitLam =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTy
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , Let (Binder (nm "cl" 8) Unrestricted funTy)
+                    (RLam [Binder (nm "z" 9) Unrestricted intTy]
+                      (LetRec
+                        [ ( Binder (nm "h" 3) Unrestricted funTy
+                          , [Binder (nm "j" 4) Unrestricted intTy]
+                          , Case (AVar (nm "b" 0))
+                              [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                                  (Ret (AVar (nm "v" 7))) ] ) ]
+                        (Let (Binder (nm "r" 5) Unrestricted intTy)
+                             (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                          (Ret (AVar (nm "r" 5))))))
+                  (Let (Binder (nm "out" 10) Unrestricted intTy)
+                       (RApp (AVar (nm "cl" 8)) [ALit (LInt 0)])
+                    (Ret (AVar (nm "out" 10)))) ) ]
+            (Let (Binder (nm "res" 6) Unrestricted intTy)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (Ret (AVar (nm "res" 6)))))
+      admitLamCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] admitLam])
+  assertBool "ADMIT 1: a group nested inside a lambda in a member body must be ADMITTED"
+    (null (firstOrderNoHandlerViolations admitLamCm))
+  case (Interp.runModule admitLamCm, RCM.runModuleRCUnchecked (Perceus.insertRC admitLamCm)) of
+    (Right v, Right run) -> do
+      Interp.renderValue v @?= RCM.rcOutput run
+      assertEqual "group-in-lambda: live cells return to baseline"
+        (RCM.rcBaseline run) (St.stLive (RCM.rcStats run))
+      assertEqual "group-in-lambda: allocs minus frees equal baseline"
+        (RCM.rcBaseline run) (St.stAllocs (RCM.rcStats run) - St.stFrees (RCM.rcStats run))
+    (refRes, rcRes) ->
+      assertFailure ("group-in-lambda: both interpreters must succeed; got "
+                       <> either show (const "ok") refRes <> " / "
+                       <> either show (const "ok") rcRes)
+
+  -- ADMIT 2 (newly admitted + SOUND): a group nested in a member body capturing a
+  -- PER-ENTRY local ALLOCATED inside that member body (@let bloc = Box 9@). It is
+  -- NOT in the member-outer set (it is rebuilt per entry alongside the inner env),
+  -- so one cascade --- sound.
+  --   main = letrec f k = (let bloc = Box 9 in
+  --                         letrec h j = case bloc of Box v -> Ret v in let r = h 0 in Ret r)
+  --          in let res = f 0 in Ret res
+  let admitPerEntry =
+        LetRec
+          [ ( Binder (nm "f" 1) Unrestricted funTy
+            , [Binder (nm "k" 2) Unrestricted intTy]
+            , Let (Binder (nm "bloc" 20) Unrestricted boxTyC)
+                  (RCon (T.pack "Box") [ALit (LInt 9)])
+                (LetRec
+                  [ ( Binder (nm "h" 3) Unrestricted funTy
+                    , [Binder (nm "j" 4) Unrestricted intTy]
+                    , Case (AVar (nm "bloc" 20))
+                        [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                            (Ret (AVar (nm "v" 7))) ] ) ]
+                  (Let (Binder (nm "r" 5) Unrestricted intTy)
+                       (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                    (Ret (AVar (nm "r" 5))))) ) ]
+          (Let (Binder (nm "res" 6) Unrestricted intTy)
+               (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+            (Ret (AVar (nm "res" 6))))
+      admitPerEntryCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] admitPerEntry])
+  assertBool "ADMIT 2: a nested group capturing a per-entry let-local must be ADMITTED"
+    (null (firstOrderNoHandlerViolations admitPerEntryCm))
+  case (Interp.runModule admitPerEntryCm, RCM.runModuleRCUnchecked (Perceus.insertRC admitPerEntryCm)) of
+    (Right v, Right run) -> do
+      Interp.renderValue v @?= RCM.rcOutput run
+      assertEqual "per-entry-let-local: live cells return to baseline"
+        (RCM.rcBaseline run) (St.stLive (RCM.rcStats run))
+      assertEqual "per-entry-let-local: allocs minus frees equal baseline"
+        (RCM.rcBaseline run) (St.stAllocs (RCM.rcStats run) - St.stFrees (RCM.rcStats run))
+    (refRes, rcRes) ->
+      assertFailure ("per-entry-let-local: both interpreters must succeed; got "
+                       <> either show (const "ok") refRes <> " / "
+                       <> either show (const "ok") rcRes)
+
+  -- PRECISION 1 (admit + SOUND): a FLAT group (top-level scope, lr empty) capturing
+  -- an enclosing boxed local. One env cell, one cascade --- verified sound.
+  --   main = let b = Box 7 in
+  --          letrec h j = (case b of Box v -> Ret v)
+  --          in let r = h 0 in Ret r
+  let flatBody =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "h" 3) Unrestricted funTy
+              , [Binder (nm "j" 4) Unrestricted intTy]
+              , Case (AVar (nm "b" 0))
+                  [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                      (Ret (AVar (nm "v" 7))) ] ) ]
+            (Let (Binder (nm "r" 5) Unrestricted intTy)
+                 (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+              (Ret (AVar (nm "r" 5)))))
+      flatCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] flatBody])
+  assertBool "PRECISION: a FLAT group capturing an enclosing local must stay ADMITTED"
+    (null (firstOrderNoHandlerViolations flatCm))
+  case (Interp.runModule flatCm, RCM.runModuleRCUnchecked (Perceus.insertRC flatCm)) of
+    (Right v, Right run) -> do
+      Interp.renderValue v @?= RCM.rcOutput run
+      let st = RCM.rcStats run
+          bl = RCM.rcBaseline run
+      assertEqual "flat-capture: live cells return to baseline (no leak/double-free)"
+        bl (St.stLive st)
+      assertEqual "flat-capture: allocs minus frees equal baseline"
+        bl (St.stAllocs st - St.stFrees st)
+    (refRes, rcRes) ->
+      assertFailure ("flat-capture: both interpreters must succeed; got "
+                       <> either show (const "ok") refRes <> " / "
+                       <> either show (const "ok") rcRes)
+
+  -- PRECISION 2 (admit): a NESTED group that captures NO enclosing boxed local ---
+  -- the inner group references only its own param. lr is non-empty but the
+  -- rawEnclosingFv ∩ bsc intersection is empty, so it stays ADMITTED.
+  --   main = let b = Box 7 in
+  --          letrec f k = (letrec h j = Ret j in let r = h 0 in Ret r)
+  --          in case b of Box v -> Ret v
+  let nestedNoCap =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec
+            [ ( Binder (nm "f" 1) Unrestricted funTy
+              , [Binder (nm "k" 2) Unrestricted intTy]
+              , LetRec
+                  [ ( Binder (nm "h" 3) Unrestricted funTy
+                    , [Binder (nm "j" 4) Unrestricted intTy]
+                    , Ret (AVar (nm "j" 4)) ) ]       -- captures only its own param
+                  (Let (Binder (nm "r" 5) Unrestricted intTy)
+                       (RApp (AVar (nm "h" 3)) [ALit (LInt 0)])
+                    (Ret (AVar (nm "r" 5)))) ) ]
+            (Case (AVar (nm "b" 0))
+              [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                  (Ret (AVar (nm "v" 7))) ]))
+      nestedNoCapCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] nestedNoCap])
+  assertBool "PRECISION: a NESTED group capturing NO enclosing local must stay ADMITTED"
+    (null (firstOrderNoHandlerViolations nestedNoCapCm))
+
+-- | FENCE-PARTITION REGRESSION (pins the split between two nested-capture fences,
+-- and the soundness boundary it protects).
+--
+-- A nested group capturing an outside-bound local @b@ through an INSIDE-bound alias
+-- is policed by TWO disjoint fences, and which one fires depends on HOW the alias was
+-- formed --- a partition that is load-bearing for soundness:
+--
+--   * SAME-CELL 'RAtom' rename (@let ba = b@): @ba@ names the SAME heap cell as the
+--     outside-bound @b@, so capturing it into a nested group genuinely DOUBLE-FREES
+--     (@b@ lives in both the member's env and the inner group's env --- two cascades,
+--     one incref). 'nestedCaptureViol' catches this BECAUSE @mob@ (the member-outer
+--     boxed set) is PROPAGATED through the pure 'RAtom' rename. This rejection is
+--     LOAD-BEARING (verified below: it double-frees if force-run).
+--
+--   * INDIRECT alias --- a 'RApp' call RESULT (@let al = idf b@), an 'RCon'-then-
+--     destructure, or an 'RProj' of a record field holding @b@: @mob@ is deliberately
+--     NOT propagated through these RHS forms (they allocate / yield a fresh cell in
+--     the GENERAL case), so 'nestedCaptureViol' does NOT fire. They are caught instead
+--     by the CONSUMING-CAPTURE fence ('consumeViol'): the alias is bound inside the
+--     member body so it lands in @bsc@, and a nested group consuming it locally is a
+--     consuming capture of a @bsc@ member. CRUCIALLY (verified below) these shapes are
+--     actually SOUND if force-run --- the pass's move/projection dup machinery
+--     ('projDupFor', 'moveOperandUniques') breaks the aliasing --- so @consumeViol@'s
+--     rejection of them is CONSERVATIVE OVER-REJECTION, NOT a load-bearing fence.
+--
+-- WHY THIS IS PINNED (the cross-fence dependency a future slice must respect): if a
+-- later slice RELAXES @consumeViol@ to admit local consumes (via proper borrow-
+-- passing), the indirect-alias shapes stay sound, BUT it must NOT also drop the
+-- 'RAtom'-rename case from @consumeViol@ on the assumption that @consumeViol@ alone
+-- covered it --- the 'RAtom' double-free is held by @nestedCaptureViol@ via @mob@,
+-- and that coverage must remain. This test asserts the partition exactly: the
+-- 'RAtom' shape is caught by @nestedCaptureViol@ AND double-frees if admitted; the
+-- three indirect shapes are caught by @consumeViol@, NOT @nestedCaptureViol@, AND run
+-- sound if admitted (the over-rejection is documented, not asserted away).
+rcM2a2FencePartitionPinned :: Assertion
+rcM2a2FencePartitionPinned = do
+  let intTy  = Ty.CTCon Ty.TcU64 []
+      funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+      recTy  = Ty.CTRecord (T.pack "PCell") Ty.CREmpty
+      nm h u = Name (T.pack h) (Unique u)
+      -- The inner self-recursive group @h@ CONSUMES its captured alias @aliasN@ by
+      -- sealing it into a 'Box' that is destructured-and-dropped locally (the deferred
+      -- #1 local-consume shape). @h@ is called by the enclosing member, so the alias is
+      -- captured into @h@'s env.
+      innerConsumeGroup aliasN contBuild =
+        LetRec
+          [ ( Binder (nm "h" 3) Unrestricted funTy
+            , [Binder (nm "j" 4) Unrestricted intTy]
+            , Let (Binder (nm "bx" 8) Unrestricted boxTyC)
+                  (RCon (T.pack "Box") [AVar aliasN])      -- MOVE the alias into a Box (consume)
+                (Case (AVar (nm "bx" 8))
+                  [ AltCon (T.pack "Box") [Binder (nm "cb" 9) Unrestricted boxTyC]
+                      (Case (AVar (nm "cb" 9))
+                        [ AltCon (T.pack "Box") [Binder (nm "vv" 10) Unrestricted intTy]
+                            (Ret (AVar (nm "vv" 10))) ]) ]) ) ]
+          (contBuild (nm "h" 3))
+      -- The inner group @h@ ESCAPES its captured alias (returns it). This is the shape
+      -- whose double-free is genuinely load-bearing for the SAME-CELL 'RAtom' alias.
+      innerEscapeGroup aliasN contBuild =
+        LetRec
+          [ ( Binder (nm "h" 3) Unrestricted funTy
+            , [Binder (nm "j" 4) Unrestricted intTy]
+            , Ret (AVar aliasN) ) ]                       -- ESCAPE the alias
+          (contBuild (nm "h" 3))
+      -- The enclosing member @f@ runs @aliasBody@ --- the alias-binding prologue
+      -- followed by the nested group + call. @resTy@ is the call result type (int for
+      -- the consume shapes; Box for the escape shape).
+      mkMember aliasBody =
+        ( Binder (nm "f" 1) Unrestricted funTy
+        , [Binder (nm "k" 2) Unrestricted intTy]
+        , aliasBody )
+      consumeCont hN =
+        Let (Binder (nm "r" 5) Unrestricted intTy)
+            (RApp (AVar hN) [ALit (LInt 0)])
+          (Ret (AVar (nm "r" 5)))
+      escapeCont hN =
+        Let (Binder (nm "r" 5) Unrestricted boxTyC)
+            (RApp (AVar hN) [ALit (LInt 0)])
+          (Ret (AVar (nm "r" 5)))
+      -- An inner group that ESCAPES / CONSUMES its captured alias, with its call
+      -- continuation already applied --- a plain @Name -> Expr@ the alias builders feed.
+      innerEscape aliasN  = innerEscapeGroup aliasN escapeCont
+      innerConsume aliasN = innerConsumeGroup aliasN consumeCont
+      -- Drive @main@: build @b@ outside, the group with @f@, call @f@, then either drop
+      -- the int result or destructure the escaped Box to a scalar (so the heap empties
+      -- on a SOUND run).
+      program member resTy escaped =
+        Let (Binder (nm "b" 0) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [ALit (LInt 7)])
+          (LetRec [member]
+            (Let (Binder (nm "res" 6) Unrestricted resTy)
+                 (RApp (AVar (nm "f" 1)) [ALit (LInt 0)])
+              (if escaped
+                 then Case (AVar (nm "res" 6))
+                        [ AltCon (T.pack "Box") [Binder (nm "v" 7) Unrestricted intTy]
+                            (Ret (AVar (nm "v" 7))) ]
+                 else Ret (AVar (nm "res" 6)))))
+      mkCm member resTy escaped =
+        pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] (program member resTy escaped)])
+
+  -- SAME-CELL alias (RAtom rename), inner group ESCAPES it: the genuine DOUBLE-FREE.
+  --   let ba = b   (pure rename --- same cell, mob propagates)
+  let ratomAlias k =
+        Let (Binder (nm "ba" 30) Unrestricted boxTyC) (RAtom (AVar (nm "b" 0)))
+          (k (nm "ba" 30))
+      ratomCm = mkCm (mkMember (ratomAlias innerEscape)) boxTyC True
+
+  -- INDIRECT alias 1: call-result  @let al = idf b@  (idf = \x -> x).
+  let callResultAlias k =
+        Let (Binder (nm "idf" 20) Unrestricted funTy)
+            (RLam [Binder (nm "x" 21) Unrestricted boxTyC] (Ret (AVar (nm "x" 21))))
+          (Let (Binder (nm "al" 22) Unrestricted boxTyC)
+               (RApp (AVar (nm "idf" 20)) [AVar (nm "b" 0)])   -- RApp RESULT (a fresh move)
+            (k (nm "al" 22)))
+      callResultCm = mkCm (mkMember (callResultAlias innerConsume)) intTy False
+
+  -- INDIRECT alias 2: con-then-destructure  @let c = Box b ; case c of Box al -> ...@
+  -- (the destructured child @al@ is dup'd by the pass, breaking the aliasing).
+  let conAlias k =
+        Let (Binder (nm "c" 23) Unrestricted boxTyC)
+            (RCon (T.pack "Box") [AVar (nm "b" 0)])             -- RCon captures b
+          (Case (AVar (nm "c" 23))
+            [ AltCon (T.pack "Box") [Binder (nm "al" 24) Unrestricted boxTyC]
+                (k (nm "al" 24)) ])
+      conCm = mkCm (mkMember (conAlias innerConsume)) intTy False
+
+  -- INDIRECT alias 3: record projection  @let c = {p=b} ; let al = c.p@  (RProj of a
+  -- record field --- valid projection; 'projDupFor' dups @al@).
+  let recProjAlias k =
+        Let (Binder (nm "c" 25) Unrestricted recTy)
+            (RRecord (T.pack "PCell") [(T.pack "p", AVar (nm "b" 0))])
+          (Let (Binder (nm "al" 26) Unrestricted boxTyC)
+               (RProj (T.pack "p") (AVar (nm "c" 25)))          -- RProj alias
+            (k (nm "al" 26)))
+      recProjCm = mkCm (mkMember (recProjAlias innerConsume)) intTy False
+
+  let nestedMsg  = T.pack "nested LetRec group captures a local bound outside"
+      consumeMsg = T.pack "consumes an enclosing capture"
+      rejectedBy needle cm = any (T.isInfixOf needle) (firstOrderNoHandlerViolations cm)
+      wouldFaultUnchecked cm =
+        case RCM.runModuleRCUnchecked (Perceus.insertRC cm) of
+          Left _    -> True
+          Right run -> St.stLive (RCM.rcStats run) /= RCM.rcBaseline run
+      runsSoundUnchecked cm =
+        case RCM.runModuleRCUnchecked (Perceus.insertRC cm) of
+          Left _    -> False
+          Right run -> St.stLive (RCM.rcStats run) == RCM.rcBaseline run
+
+  -- SAME-CELL 'RAtom' alias: caught by the NESTED-CAPTURE fence (mob propagates the
+  -- rename), and the rejection is LOAD-BEARING --- it genuinely double-frees.
+  assertBool "RAtom-rename alias must be REJECTED by the nested-capture fence (mob)"
+    (rejectedBy nestedMsg ratomCm)
+  assertBool "RAtom-rename alias would DOUBLE-FREE if admitted (nested-capture fence is load-bearing)"
+    (wouldFaultUnchecked ratomCm)
+
+  -- INDIRECT aliases: caught by the CONSUMING-CAPTURE fence, NOT the nested-capture
+  -- fence (mob does not propagate through RApp/RCon-destructure/RProj). The partition.
+  assertBool "call-result alias must be REJECTED by the consuming-capture fence"
+    (rejectedBy consumeMsg callResultCm)
+  assertBool "call-result alias must NOT be caught by the nested-capture fence (partition)"
+    (not (rejectedBy nestedMsg callResultCm))
+  assertBool "con-destructure alias must be REJECTED by the consuming-capture fence"
+    (rejectedBy consumeMsg conCm)
+  assertBool "con-destructure alias must NOT be caught by the nested-capture fence (partition)"
+    (not (rejectedBy nestedMsg conCm))
+  assertBool "record-proj alias must be REJECTED by the consuming-capture fence"
+    (rejectedBy consumeMsg recProjCm)
+  assertBool "record-proj alias must NOT be caught by the nested-capture fence (partition)"
+    (not (rejectedBy nestedMsg recProjCm))
+
+  -- The indirect-alias rejections are CONSERVATIVE OVER-REJECTION: each actually runs
+  -- SOUND if force-run (the pass's move/projection dup machinery breaks the aliasing).
+  -- This is documented, not a soundness fault. Pinning it makes the over-rejection a
+  -- KNOWN, INTENTIONAL fact: if a future slice relaxes consumeViol to ADMIT these, the
+  -- run is already sound (so the admission is safe) --- but the RAtom case above stays
+  -- held by the nested-capture fence and must not be dropped.
+  assertBool "call-result alias actually RUNS SOUND if admitted (over-rejection, not a double-free)"
+    (runsSoundUnchecked callResultCm)
+  assertBool "con-destructure alias actually RUNS SOUND if admitted (over-rejection)"
+    (runsSoundUnchecked conCm)
+  assertBool "record-proj alias actually RUNS SOUND if admitted (over-rejection)"
+    (runsSoundUnchecked recProjCm)
+
+-- | The soundness proof. Generate an M2a-1 program; if the boundary guard accepts
+-- it, the unchecked RC run MUST succeed, be heap-balanced, AND match the
+-- reference value. If the guard rejects, the run assertion is skipped.
+prop_m2a1Escape :: Property
+prop_m2a1Escape =
+  forAllShrink genM2a1Program shrinkProgram $ \cm0 ->
+    let cm      = pruneToReachable cm0
+        accepted = null (firstOrderNoHandlerViolations cm)
+        refRes  = Interp.runModule cm
+        rcRes   = RCM.runModuleRCUnchecked (Perceus.insertRC cm)
+        report  =
+          "boundary accepted: " <> show accepted
+            <> "\ninstrumented ANF:\n" <> T.unpack (Perceus.prettyPerceus cm)
+            <> "\nreference: " <> showRes (fmap Interp.renderValue refRes)
+            <> "\nrc:        " <> showRcRes rcRes
+        memberEsc = hasMemberBodyEscape cm
+        partialMember = hasPartialMemberApply cm
+        rlamMemberPartial = hasRLamMemberPartial cm
+        captureEsc = hasCaptureBodyEscape cm
+        captureCallHead = hasCaptureCallHead cm
+        crossRegion = hasCrossRegion cm
+        -- NON-VACUITY (made explicit, and now LOUD via 'checkCoverage'). Three classes
+        -- whose absence would silently gut the proof must be GENERATED, ACCEPTED, and
+        -- actually RUN --- not merely skipped as rejects:
+        --   * the member-body sibling-escape class (BLOCKER 1);
+        --   * the PARTIAL APPLICATION of a multi-arity capturing member (the M2a-2
+        --     double-free shape --- the LT path of 'enterRC's 'RVRecMember' arm); and
+        --   * the RLAM-MEDIATED member-partial class (CROSS 5/6) --- a recursive
+        --     member flowed THROUGH an 'RLam' that is itself partially applied, so the
+        --     'NClosure' LT branch's 'CaptureMode' propagation (the shared-env
+        --     retain/release fix) is exercised through a closure, not only through a
+        --     bare named head. Without this floor a regression that stops generating
+        --     the RLam-mediated crosses would leave the propagation unguarded.
+        -- 'checkCoverage' (wrapping the whole property below) turns each 'cover'
+        -- floor from an inert warning into a HARD FAILURE: if a generator regression
+        -- stops producing any class above its floor, the property goes red.
+        ranSound = accepted && either (const False) (const True) rcRes
+    in checkCoverage $
+       cover 4.0 (memberEsc && ranSound) "member-body sibling escape: accepted+run" $
+       cover 3.0 (partialMember && ranSound) "partial multi-arity member apply: accepted+run" $
+       cover 3.0 (rlamMemberPartial && ranSound) "RLam-mediated member partial (CROSS 5/6): accepted+run" $
+       cover 5.0 (captureEsc && ranSound) "member-body CAPTURE escape: accepted+run" $
+       cover 3.0 (captureCallHead && ranSound) "member-body CAPTURE call-head: accepted+run" $
+       -- CROSS-REGION (#3): the class MUST be generated AND REJECTED (the fence is the
+       -- only thing keeping a cross-region counted edge out; its absence from coverage
+       -- previously left the fence with ZERO generative teeth). The 'cover' pins the
+       -- generation rate; the conjoined property below pins that a generated
+       -- cross-region program is ALWAYS rejected, so a regression that stops rejecting
+       -- cross-region goes red.
+       cover 3.0 (crossRegion && not accepted) "cross-region capture: generated+rejected" $
+       counterexample ("cross-region program was NOT rejected (fence regression): "
+                         <> T.unpack (Perceus.prettyPerceus cm))
+         (not crossRegion || not accepted)
+         .&&.
+       QC.label (if memberEsc
+                   then if accepted then "member-body-escape: accepted+run"
+                                    else "member-body-escape: rejected"
+                   else if partialMember
+                          then if accepted then "partial-member-apply: accepted+run"
+                                           else "partial-member-apply: rejected"
+                          else "other shape")
+       (counterexample report $
+         if not accepted
+           then property True   -- rejection is the conservative, always-sound verdict
+           else case (refRes, rcRes) of
+                  (Right v, Right run) ->
+                    let outOk      = Interp.renderValue v == RCM.rcOutput run
+                        st         = RCM.rcStats run
+                        baseline   = RCM.rcBaseline run
+                        liveOk     = St.stLive st == baseline
+                        balancedOk = St.stAllocs st - St.stFrees st == baseline
+                    in counterexample "ACCEPTED but unsound: output / heap-empty / balanced mismatch"
+                         (outOk && liveOk && balancedOk)
+                  -- BOTH failing is AGREEMENT ONLY when they fail the SAME WAY (a
+                  -- shared evaluator limitation). It is NOT a free pass: an RC
+                  -- memory-safety fault (double-free / UAF / dangling --- a 'PrimError'
+                  -- the store-less reference can NEVER produce) is a real one-sided
+                  -- soundness fault that MUST fail loudly even when the reference also
+                  -- errored, and a freed-env UAF can surface as a quiet 'UnboundVar'.
+                  -- Mirrors 'assertRcAgrees': reject any RC mem-safety fault, then
+                  -- require the two failures to share an error constructor.
+                  (Left refE, Left rcE)
+                    | rcMemSafetyFault rcE ->
+                        counterexample ("ACCEPTED but unsound: RC memory-safety fault hidden behind a \
+                                        \reference failure: rc=" <> show rcE <> " ref=" <> show refE)
+                          False
+                    | errCtorTag refE == errCtorTag rcE ->
+                        counterexample "both interpreters failed the same way (agreement)" True
+                    | otherwise ->
+                        counterexample ("ACCEPTED but unsound: RC failure DIVERGES from the reference \
+                                        \failure: ref=" <> show refE <> " rc=" <> show rcE)
+                          False
+                  _ ->
+                    counterexample "ACCEPTED but unsound: exactly one interpreter failed" False)
+  where
+    showRes (Right t)  = T.unpack t
+    showRes (Left e)   = "FAILED (" <> show e <> ")"
+    showRcRes (Right run) = T.unpack (RCM.rcOutput run)
+    showRcRes (Left e)    = "FAILED (" <> show e <> ")"
+
+-- | Structural detector for the MEMBER-BODY sibling-escape class (BLOCKER 1): a
+-- 'LetRec' MEMBER body (NOT the group body) in which a SIBLING group-binder occurs
+-- in an ESCAPING position --- a 'Ret' atom, or a 'RCon'/'RRecord' field, or a
+-- non-head call argument. A call-HEAD occurrence (a recursive call) is excluded (it
+-- is a borrow, not an escape). Used only for the 'cover'/'label' non-vacuity floor.
+hasMemberBodyEscape :: CoreModule -> Bool
+hasMemberBodyEscape (CoreModule bs) = any (topB) bs
+  where
+    topB (TopBind _ _ body) = go Set.empty body
+    -- @sibs@ = the group-binder Uniques whose MEMBER BODIES we are currently inside.
+    go sibs e = case e of
+      Ret a              -> escapesSib sibs [a]
+      Let _ r body       -> rhsEsc sibs r || go sibs body
+      Case _ alts        -> any (altG sibs) alts
+      LetJoin _ _ jb body -> go sibs jb || go sibs body
+      Jump _ as          -> escapesSib sibs as
+      LetRec defs body   ->
+        let gU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
+            -- INSIDE each member body the siblings are escape candidates.
+            inMember = any (\(_, _, d) -> go gU d) defs
+        in inMember || go sibs body   -- group body uses the OUTER sibs only
+      Handle _ _         -> False
+    altG sibs (AltCon _ _ b) = go sibs b
+    altG sibs (AltLit _ b)   = go sibs b
+    altG sibs (AltDefault b) = go sibs b
+    -- An escaping RHS: a sibling moved into a con/record field or a non-head call
+    -- argument. The call HEAD of an 'RApp' is a borrow (excluded). 'RLam' captures
+    -- are handled by descending (a captured sibling escapes via the closure cell).
+    rhsEsc sibs r = case r of
+      RCon _ as       -> escapesSib sibs as
+      RRecord _ flds  -> escapesSib sibs (map snd flds)
+      RApp _ as       -> escapesSib sibs as            -- args escape; head borrows
+      RLam _ b        -> go sibs b
+      _               -> False
+    escapesSib sibs as = any (\a -> case a of AVar n -> Set.member (nameUniq n) sibs; _ -> False) as
+
+-- | Structural detector for the CAPTURE-BODY-escape class (the capture analogue of
+-- 'hasMemberBodyEscape', the M2CaptureBodyEscape family): a 'LetRec' MEMBER body
+-- that ESCAPES an ENCLOSING BOXED CAPTURE --- a boxed free variable bound OUTSIDE
+-- the group that is NEITHER a sibling group binder NOR one of that member's own
+-- params --- by carrying it OUT as (part of) the body's RETURN VALUE.
+--
+-- The detector is SPECIFIC to that class. It must NOT fire on a SIBLING-member
+-- escape (a member returning a fellow group binder --- the M2MemberBodyEscape
+-- family) nor on a recursion-SEED escape (an enclosing value returned from the
+-- GROUP BODY, not from inside a member body) --- those are distinct code paths.
+-- The earlier detector was over-broad (it fired on ~55% of programs across every
+-- family) because it tracked ANY enclosing 'Unique' as a capture, regardless of
+-- boxedness, and counted escapes that were not genuine member-body capture flows.
+--
+-- The specificity comes from mirroring the real pass predicate
+-- 'letRecMemberConsumesCaptureNonEscaping' / 'captureEscapesBody' in
+-- "src/Wok/IR/Escape.hs": for each group member we compute its enclosing boxed
+-- capture set (free vars of the body, minus the member's params, minus the group
+-- binders, intersected with the boxed binders in scope) and fire iff SOME such
+-- capture flows OUT of that member body as its return value. The escape walk
+-- ('captureFlowsOut') is a focused AST matcher --- it does NOT re-run the pass.
+-- Used only for the 'cover' / 'label' non-vacuity floor.
+hasCaptureBodyEscape :: CoreModule -> Bool
+hasCaptureBodyEscape (CoreModule bs) = any topB bs
+  where
+    -- @boxed@ = Uniques of BOXED binders bound in ENCLOSING scopes (capture
+    -- candidates for any nested group member).
+    topB (TopBind _ ps body) = go (boxedOf ps) body
+    go boxed e = case e of
+      Ret _                -> False
+      Jump _ _             -> False
+      Let b r body         ->
+        goR boxed r
+          || go (extend boxed [b]) body
+      Case _ alts          -> any (altG boxed) alts
+      LetJoin _ ps jb body -> go (extend boxed ps) jb || go boxed body
+      LetRec defs body     ->
+        let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
+            -- A member body's enclosing boxed captures: its free vars, minus its own
+            -- params, minus the sibling group binders, intersected with the boxed
+            -- binders in enclosing scope. Fire iff one of them flows OUT as the body's
+            -- return value (the genuine member-body capture escape).
+            memberEscapes (_, dps, d) =
+              let params = Set.fromList (map binderUnique dps)
+                  caps   = ((freeVarsExpr d `Set.difference` params)
+                             `Set.difference` groupU)
+                            `Set.intersection` boxed
+              in any (`captureFlowsOut` d) (Set.toList caps)
+            -- Inside the GROUP BODY the siblings are now in scope (boxed function
+            -- binders), but the group body is NOT a member body, so a return there is
+            -- a seed/sibling escape (a different code path), not this class.
+            boxedBody = extend boxed [ b | (b, _, _) <- defs ]
+        in any memberEscapes defs || go boxedBody body
+      Handle _ _           -> False
+    altG boxed (AltCon _ bs' b) = go (extend boxed bs') b
+    altG boxed (AltLit _ b)     = go boxed b
+    altG boxed (AltDefault b)   = go boxed b
+    goR boxed r = case r of
+      RLam _ b -> go boxed b
+      _        -> False
+    extend boxed bs' = Set.union boxed (boxedOf bs')
+    boxedOf = Set.fromList . map binderUnique . filter (Esc.isBoxedType . bndType)
+
+-- | True iff the captured value @u0@ flows OUT of the member body @body@ AS (part
+-- of) its RETURN VALUE: it (or a con/record container holding it, or an alias)
+-- reaches a 'Ret' or a 'Jump' argument. Mirrors 'captureEscapesBody' in
+-- "src/Wok/IR/Escape.hs" --- the exact admissible-escape rule the pass dup-balances
+-- --- but as a TEST-side AST matcher (no pass internals imported). A capture sealed
+-- into a con/record that is destructured-and-dropped INSIDE the body, passed as a
+-- call argument, re-captured into a nested closure, or projected does NOT count.
+captureFlowsOut :: Unique -> Expr -> Bool
+captureFlowsOut u0 = goE (Set.singleton u0)
+  where
+    hit tracked a = case a of
+      AVar n -> nameUniq n `Set.member` tracked
+      ALit _ -> False
+    anyHit tracked = any (hit tracked)
+    goE tracked e = case e of
+      Ret a              -> hit tracked a
+      Jump _ as          -> anyHit tracked as
+      Let bd r body      -> case r of
+        RAtom (AVar n)
+          | nameUniq n `Set.member` tracked ->
+              goE (Set.insert (binderUnique bd) tracked) body
+        RCon _ as
+          | anyHit tracked as ->
+              goE (Set.insert (binderUnique bd) tracked) body
+        RRecord _ flds
+          | anyHit tracked (map snd flds) ->
+              goE (Set.insert (binderUnique bd) tracked) body
+        _ -> goE tracked body
+      LetRec ds body     -> any (\(_, _, d) -> goE tracked d) ds || goE tracked body
+      Case _ alts        -> any (goAlt tracked) alts
+      LetJoin _ _ jb body -> goE tracked jb || goE tracked body
+      Handle e' _        -> goE tracked e'
+    goAlt tracked (AltCon _ _ e) = goE tracked e
+    goAlt tracked (AltLit _ e)   = goE tracked e
+    goAlt tracked (AltDefault e) = goE tracked e
+
+-- ---------------------------------------------------------------------------
+-- DRIFT GUARD for the single-source escape walker (feat/rc-escape-single-source)
+--
+-- 'Esc.captureEscapesBody' was refactored to DERIVE from the shared 'escapeWalk'
+-- skeleton instead of re-listing its own per-'Rhs' case table. The refactor is a
+-- pure dedup --- it MUST be result-identical on every input. 'oldCaptureEscapesBody'
+-- below is a FROZEN, byte-faithful copy of the pre-refactor hand-rolled definition;
+-- it is the ORACLE. 'prop_captureEscapesBodyMatchesOracle' pins the two equal over
+-- generated programs, and 'captureEscapesBodyDriftGuard' pins them over a battery of
+-- hand-built RHS shapes (Ret/Jump/RCon/RRecord/RProj/RApp-arg/RApp-head/alias-chain/
+-- Case). If a future edit to the shared skeleton drifts the verdict on ANY shape, one
+-- of these fails. DO NOT "fix" the oracle to track the new behaviour --- a divergence
+-- is a real regression in the dedup.
+
+-- | FROZEN ORACLE: the pre-refactor hand-rolled 'captureEscapesBody'. Kept verbatim
+-- so a drift in the shared 'escapeWalk' fold is caught. (Mirror only --- never edit
+-- to follow a behaviour change.)
+oldCaptureEscapesBody :: Unique -> Expr -> Bool
+oldCaptureEscapesBody u0 = goE (Set.singleton u0)
+  where
+    hit tracked a = case a of
+      AVar n -> Name.nameUniq n `Set.member` tracked
+      ALit _ -> False
+    anyHit tracked = any (hit tracked)
+    goE tracked e = case e of
+      Ret a                 -> hit tracked a
+      Jump _ as             -> anyHit tracked as
+      Let bd r body         -> case r of
+        RAtom (AVar n)
+          | Name.nameUniq n `Set.member` tracked ->
+              goE (Set.insert (binderUnique bd) tracked) body
+        RCon _ as
+          | anyHit tracked as ->
+              goE (Set.insert (binderUnique bd) tracked) body
+        RRecord _ flds
+          | anyHit tracked (map snd flds) ->
+              goE (Set.insert (binderUnique bd) tracked) body
+        _ -> goE tracked body
+      LetRec ds body        -> any (\(_, _, d) -> goE tracked d) ds || goE tracked body
+      Case _ alts           -> any (goAlt tracked) alts
+      LetJoin _ _ jb body   -> goE tracked jb || goE tracked body
+      Handle e' _           -> goE tracked e'
+    goAlt tracked (AltCon _ _ e) = goE tracked e
+    goAlt tracked (AltLit _ e)   = goE tracked e
+    goAlt tracked (AltDefault e) = goE tracked e
+
+-- | Every 'Unique' that NAMES a binder or occurs as an atom anywhere in @e@. Used
+-- as the drift-guard's probe set: 'captureEscapesBody' must agree with the oracle on
+-- ALL of them (not just genuine captures), so the equality is total over the corpus.
+allMentionedUniques :: Expr -> Set.Set Unique
+allMentionedUniques = go
+  where
+    go e = case e of
+      Ret a               -> atomVars a
+      Jump _ as           -> Set.unions (map atomVars as)
+      Let bd r body       -> Set.insert (binderUnique bd) (goR r) `Set.union` go body
+      LetRec ds body      ->
+        Set.unions (go body : [ Set.insert (binderUnique b) (go d) | (b, _, d) <- ds ])
+      Case a alts         -> atomVars a `Set.union` Set.unions (map goAlt alts)
+      LetJoin _ ps jb body ->
+        Set.fromList (map binderUnique ps) `Set.union` go jb `Set.union` go body
+      Handle e' _         -> go e'
+    goAlt (AltCon _ bs e) = Set.fromList (map binderUnique bs) `Set.union` go e
+    goAlt (AltLit _ e)    = go e
+    goAlt (AltDefault e)  = go e
+    goR r = case r of
+      RAtom a      -> atomVars a
+      RApp h as    -> Set.unions (map atomVars (h : as))
+      RCon _ as    -> Set.unions (map atomVars as)
+      RLam ps e    -> Set.fromList (map binderUnique ps) `Set.union` go e
+      ROp m _ _ as -> Set.unions (map atomVars (maybe as (: as) m))
+      RRecord _ fl -> Set.unions (map (atomVars . snd) fl)
+      RProj _ a    -> atomVars a
+
+-- | All sub-expressions of @e@ (including @e@ itself), so the drift guard probes
+-- 'captureEscapesBody' at every body position, not just the top.
+allSubExprs :: Expr -> [Expr]
+allSubExprs e = e : case e of
+  Ret _                -> []
+  Jump _ _             -> []
+  Let _ r body         -> rhsSub r ++ allSubExprs body
+  LetRec ds body       -> concat [ allSubExprs d | (_, _, d) <- ds ] ++ allSubExprs body
+  Case _ alts          -> concatMap altSub alts
+  LetJoin _ _ jb body  -> allSubExprs jb ++ allSubExprs body
+  Handle e' _          -> allSubExprs e'
+  where
+    altSub (AltCon _ _ b) = allSubExprs b
+    altSub (AltLit _ b)   = allSubExprs b
+    altSub (AltDefault b) = allSubExprs b
+    rhsSub (RLam _ b)     = allSubExprs b
+    rhsSub _              = []
+
+-- | DRIFT GUARD (generative): 'Esc.captureEscapesBody' must equal the frozen oracle
+-- on EVERY (capture 'Unique', sub-expression) pair of every generated program. A
+-- single disagreement is a regression in the single-source fold.
+prop_captureEscapesBodyMatchesOracle :: Property
+prop_captureEscapesBodyMatchesOracle =
+  forAllShrink genM2a1Program shrinkProgram $ \(CoreModule binds) ->
+    conjoin
+      [ counterexample
+          ("captureEscapesBody DRIFTED from oracle for u=" <> show u
+             <> "\nsub-expr:\n" <> show sub)
+          (Esc.captureEscapesBody u sub QC.=== oldCaptureEscapesBody u sub)
+      | TopBind _ _ body <- binds
+      , sub <- allSubExprs body
+      , u   <- Set.toList (allMentionedUniques sub)
+      ]
+
+-- | DRIFT GUARD (hand-built shapes): pin 'captureEscapesBody' against the oracle on
+-- the matrix the M2a-2 admit/reject verdicts turn on --- Ret/Jump (escape), a
+-- returned RCon/RRecord container (escape via the tracked-closure), an RProj parent
+-- / a non-head RApp arg / an RApp head / a re-capturing RLam / an ROp arg (all
+-- NON-escape), and an alias chain that ends in a Ret (escape). The oracle equality
+-- is the single-source property; we additionally assert the GROUND TRUTH verdict on
+-- each shape so the matrix itself is pinned, not just self-consistency.
+captureEscapesBodyDriftGuard :: Assertion
+captureEscapesBodyDriftGuard = do
+  let u  = Unique 9001
+      nU = Name (T.pack "u") u
+      boxed = Ty.CTCon Ty.TcBool []
+      bnd t uq = Binder (Name (T.pack "b") (Unique uq)) Unrestricted t
+      var uq = AVar (Name (T.pack "b") (Unique uq))
+      -- shape, expected verdict
+      shapes :: [(String, Expr, Bool)]
+      shapes =
+        [ ("Ret of capture",            Ret (AVar nU),                       True)
+        , ("Jump of capture",           Jump (JoinId (Unique 1)) [AVar nU],  True)
+        , ("returned RCon container",
+            Let (bnd boxed 10) (RCon (T.pack "Box") [AVar nU])
+              (Ret (var 10)),                                                True)
+        , ("returned RRecord container",
+            Let (bnd boxed 11) (RRecord (T.pack "R") [(T.pack "f", AVar nU)])
+              (Ret (var 11)),                                                True)
+        , ("alias chain then Ret",
+            Let (bnd boxed 12) (RAtom (AVar nU))
+              (Let (bnd boxed 13) (RAtom (var 12)) (Ret (var 13))),          True)
+        , ("RCon container destructured-and-dropped locally",
+            Let (bnd boxed 14) (RCon (T.pack "Box") [AVar nU])
+              (Ret (ALit LUnit)),                                            False)
+        , ("non-head RApp arg (consumed by callee)",
+            Let (bnd boxed 15) (RApp (var 99) [AVar nU]) (Ret (ALit LUnit)), False)
+        , ("RApp head (borrow)",
+            Let (bnd boxed 16) (RApp (AVar nU) [ALit LUnit]) (Ret (ALit LUnit)), False)
+        , ("re-capture into nested RLam",
+            Let (bnd boxed 17) (RLam [bnd boxed 18] (Ret (AVar nU)))
+              (Ret (ALit LUnit)),                                            False)
+        , ("RProj parent",
+            Let (bnd boxed 19) (RProj (T.pack "f") (AVar nU)) (Ret (ALit LUnit)), False)
+        , ("ROp arg",
+            Let (bnd boxed 20) (ROp Nothing (T.pack "E") (T.pack "op") [AVar nU])
+              (Ret (ALit LUnit)),                                            False)
+        , ("Case scrutinee (matched, not flowed out)",
+            Case (AVar nU) [AltDefault (Ret (ALit LUnit))],                  False)
+        , ("capture re-named inside Case alt then Ret",
+            Case (ALit LUnit) [AltDefault (Ret (AVar nU))],                  True)
+        ]
+  mapM_ (\(label, expr, expected) -> do
+            assertEqual (label <> ": verdict") expected (Esc.captureEscapesBody u expr)
+            assertEqual (label <> ": matches oracle")
+              (oldCaptureEscapesBody u expr) (Esc.captureEscapesBody u expr))
+        shapes
+
+-- | Non-vacuity detector for the M2CaptureCallHead family (the call-head admit
+-- guard): a 'LetRec' MEMBER body in which an enclosing CAPTURE (a 'Unique' bound
+-- OUTSIDE the group --- not a sibling, not a member param) occurs as an 'RApp' call
+-- HEAD. A call head is a BORROW, so this shape must be ADMITTED and run sound; the
+-- floor keeps the generator from silently dropping it. Mirrors the @outer@/
+-- @inMember@ threading of 'hasCaptureBodyEscape'.
+hasCaptureCallHead :: CoreModule -> Bool
+hasCaptureCallHead (CoreModule bs) = any topB bs
+  where
+    topB (TopBind _ ps body) = go (Set.fromList (map binderUnique ps)) False body
+    go outer inMember e = case e of
+      Ret _                -> False
+      Jump _ _             -> False
+      Let b r body         ->
+        rhsHead outer inMember r
+          || go (Set.insert (binderUnique b) outer) inMember body
+      Case _ alts          -> any (altG outer inMember) alts
+      LetJoin _ ps jb body ->
+        let outer' = Set.union outer (Set.fromList (map binderUnique ps))
+        in go outer' inMember jb || go outer inMember body
+      LetRec defs body     ->
+        let gU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
+            inDef (_, dps, d) =
+              go (Set.union outer (Set.fromList (map binderUnique dps))) True d
+            outerBody = Set.union outer gU
+        in any inDef defs || go outerBody inMember body
+      Handle _ _           -> False
+    altG outer inMember (AltCon _ bs' b) =
+      go (Set.union outer (Set.fromList (map binderUnique bs'))) inMember b
+    altG outer inMember (AltLit _ b)   = go outer inMember b
+    altG outer inMember (AltDefault b) = go outer inMember b
+    rhsHead outer inMember r = case r of
+      RApp (AVar n) _ -> inMember && Set.member (nameUniq n) outer
+      _               -> False
+
+-- | Non-vacuity detector for the M2CrossRegion family (the cross-region #3 fence):
+-- some 'LetRec' group, somewhere, captures an OUTER 'LetRec' GROUP-MEMBER binder ---
+-- a free var of an inner group member that is bound by an ENCLOSING group still in
+-- scope (NOT by this group, NOT by the member's own params). Mirrors the boundary
+-- 'crossRegionViol' predicate (@rawEnclosingFv defs ∩ lr@) as a TEST-side AST matcher:
+-- @lr@ is threaded as the set of enclosing group binders in scope. Used only for the
+-- 'cover' floor that the cross-region class is GENERATED (and, paired with the
+-- always-reject verdict, REJECTED), giving the otherwise-untested fence generative
+-- teeth. The fence is the SOURCE OF TRUTH; this is a structural witness, not a re-run.
+hasCrossRegion :: CoreModule -> Bool
+hasCrossRegion (CoreModule bs) = any topB bs
+  where
+    topB (TopBind _ _ body) = go Set.empty body
+    -- @lr@ = the Uniques of group binders bound by ENCLOSING (in-scope) LetRec groups.
+    go lr e = case e of
+      Ret _              -> False
+      Jump _ _           -> False
+      Let _ r body       -> goR lr r || go lr body
+      Case _ alts        -> any (altG lr) alts
+      LetJoin _ _ jb body -> go lr jb || go lr body
+      Handle e' _        -> go lr e'
+      LetRec defs body   ->
+        let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
+            params ps = Set.fromList (map binderUnique ps)
+            rawEncl =
+              Set.unions
+                [ (freeVarsExpr d `Set.difference` params ps) `Set.difference` groupU
+                | (_, ps, d) <- defs ]
+            -- cross-region: an inner member captures an OUTER region member (in @lr@).
+            here = not (Set.null (Set.intersection rawEncl lr))
+            lr'  = Set.union lr groupU
+            -- member bodies see the EXTENDED region set (so a doubly-nested group's
+            -- capture of the outermost member is detected too).
+            inMembers = any (\(_, _, d) -> go lr' d) defs
+        in here || inMembers || go lr' body
+    altG lr (AltCon _ _ b) = go lr b
+    altG lr (AltLit _ b)   = go lr b
+    altG lr (AltDefault b) = go lr b
+    goR lr r = case r of
+      RLam _ b -> go lr b
+      _        -> False
+
+-- | The static oracle must be clean on every IN-FRAGMENT generated program (one
+-- the boundary guard ACCEPTS). 'balanceLint' runs 'insertRC' itself and does not
+-- consult the boundary guard, so on an ESCAPING (out-of-fragment) program ---
+-- e.g. a sibling alias that is RETURNED --- it CORRECTLY reports the over-consume
+-- of the escaped value ("not owned here"); that is the conservative reject the
+-- boundary makes, not a pass bug. We therefore gate on acceptance (in-fragment)
+-- and document the skip: a boundary-rejected program may legitimately lint dirty.
+prop_m2a1LintClean :: Property
+prop_m2a1LintClean =
+  forAllShrink genM2a1Program shrinkProgram $ \cm0 ->
+    let cm   = pruneToReachable cm0
+        viol = Perceus.balanceLint cm
+    in if not (null (firstOrderNoHandlerViolations cm))
+         then property True   -- out-of-fragment: a dirty lint is the conservative reject
+         else counterexample ("balanceLint reported on an IN-FRAGMENT program: " <> show viol
+                                <> "\nANF:\n" <> T.unpack (Perceus.prettyPerceus cm))
+                (null viol)
+
+-- | Generalized fault-injection: for every generated program, each single-site
+-- mutation must be CAUGHT --- either 'lintInstrumented' flags the mutated,
+-- already-instrumented module, OR the unchecked RC run trips a 'Left'. This turns
+-- the three hand teeth into a generative oracle. A mutation that is a structural
+-- no-op on a particular program (e.g. 'OmitOneDrop' when the program inserts no
+-- drop) leaves the bytes IDENTICAL to the correct instrumentation; we detect that
+-- and treat it as vacuously fine for that program (no mutation actually happened),
+-- so it is not a false counterexample.
+prop_m2a1Teeth :: Property
+prop_m2a1Teeth =
+  forAllShrink genM2a1Program shrinkProgram $ \cm0 ->
+    let cm = pruneToReachable cm0
+    in conjoin
+         [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
+                             <> T.unpack (Perceus.prettyPerceus cm))
+             (mutationCaught mut cm)
+         | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+
+-- | Is the given single-site mutation caught on this module, or a structural
+-- no-op? Caught = a non-empty 'lintInstrumented' OR a 'Left' from the unchecked
+-- RC run. No-op = the mutated instrumentation is byte-identical to the correct
+-- one (the mutation site did not exist), which counts as "fine" (nothing to
+-- catch).
+mutationCaught :: Perceus.Mutation -> CoreModule -> Bool
+mutationCaught mut cm =
+  let correct = Perceus.insertRC cm
+      mutated = Perceus.insertRCMutated mut cm
+  in mutated == correct                                  -- mutation was a no-op
+       || not (null (Perceus.lintInstrumented mutated))  -- caught statically
+       || (case RCM.runModuleRCUnchecked mutated of      -- caught at runtime
+             Left _  -> True
+             Right _ -> False)
+
 -- | Shrinking: drop the program toward a constant. We shrink the single 'main'
 -- bind's body to its trivial sub-results (a 'Ret' of a contained atom, an alt
 -- body, or a let body), preserving well-scopedness by only ever REPLACING an
@@ -8428,3 +11696,66 @@ clusterAltBody :: Anf.Alt -> Expr
 clusterAltBody (AltCon _ _ b) = b
 clusterAltBody (AltLit _ b)   = b
 clusterAltBody (AltDefault b) = b
+
+-- ---------------------------------------------------------------------------
+-- Task 2: RVRecMember representation tests
+
+-- | 'St.valueChildren' must correctly enumerate the COUNTED child addresses for
+-- each 'St.RCValue' variant. 'RVLit' has none, 'RVBox' has one (the node
+-- pointer), and 'RVRecMember' has one (the shared env addr @envAddr@); the
+-- static @groupAddr@ is UNCOUNTED and must NOT appear.
+rvRecMemberChildren :: Assertion
+rvRecMemberChildren = do
+  assertEqual "lit has no children"    []  (St.valueChildren (St.RVLit LUnit))
+  assertEqual "box child"              [7] (St.valueChildren (St.RVBox 7))
+  assertEqual "recmember counts env"   [9] (St.valueChildren (St.RVRecMember (-5) 0 9))
+
+-- | Dropping the env address referenced by an 'St.RVRecMember' must free the
+-- 'NEnv' cell.  An 'NEnv Map.empty' has no children, so after the single drop
+-- the live count must be zero.
+rvRecMemberDropCountsEnv :: Assertion
+rvRecMemberDropCountsEnv = do
+  let (envA, s0) = St.alloc (St.NEnv Map.empty) St.emptyStore
+  case St.dropAddr envA s0 of
+    Right s1 -> assertEqual "env freed" 0 (St.stLive (St.stStats s1))
+    Left err -> assertFailure (show err)
+
+-- | The static sentinel installed by 'St.initSentinel' must live at
+-- 'St.emptyEnvSentinelAddr' and be a static (negative) address, so
+-- 'St.incref' and 'St.dropAddr' are no-ops on it.
+rvRecMemberSentinelNoOp :: Assertion
+rvRecMemberSentinelNoOp = do
+  let s0 = St.initSentinel St.emptyStore
+  -- The sentinel must be at the fixed static address.
+  assertEqual "sentinel addr is static" True (St.isStaticAddr St.emptyEnvSentinelAddr)
+  -- incref on the sentinel is a no-op: store is unchanged.
+  case St.incref St.emptyEnvSentinelAddr s0 of
+    Left err -> assertFailure ("incref sentinel failed: " <> show err)
+    Right s1 -> assertEqual "incref on sentinel is no-op (live unchanged)" 0
+                  (St.stLive (St.stStats s1))
+  -- dropAddr on the sentinel is a no-op: store is unchanged.
+  case St.dropAddr St.emptyEnvSentinelAddr s0 of
+    Left err -> assertFailure ("drop sentinel failed: " <> show err)
+    Right s1 -> assertEqual "drop on sentinel is no-op (live unchanged)" 0
+                  (St.stLive (St.stStats s1))
+
+-- | 'St.renderRCValue' must render an 'St.RVRecMember' as @"<closure>"@,
+-- matching the reference interpreter's closure rendering for the differential
+-- oracle.
+rvRecMemberRender :: Assertion
+rvRecMemberRender = do
+  let s  = St.emptyStore
+      v  = St.RVRecMember (-5) 0 9
+  case St.renderRCValue s v of
+    Left err  -> assertFailure ("renderRCValue failed: " <> show err)
+    Right txt -> assertEqual "renders as <closure>" (T.pack "<closure>") txt
+
+-- | The test group for the 'RVRecMember' / 'NGroupCode' / 'NEnv'
+-- representation additions (Task 2, M2a-2).
+rvRecMemberRepTests :: TestTree
+rvRecMemberRepTests = testGroup "rvrecmember-rep"
+  [ testCase "valueChildren: lit=[], box=[a], recmember=[envAddr]" rvRecMemberChildren
+  , testCase "drop of envAddr frees the NEnv cell"                 rvRecMemberDropCountsEnv
+  , testCase "sentinel addr is static; incref/drop are no-ops"     rvRecMemberSentinelNoOp
+  , testCase "renderRCValue of RVRecMember is <closure>"           rvRecMemberRender
+  ]

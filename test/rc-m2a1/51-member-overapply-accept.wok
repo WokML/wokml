@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- M2a-2 Stage B reproducer #21 (over-applied DIRECT member, ACCEPTED and sound):
+-- 'mk' RETURNS the LetRec group member 'f' DIRECTLY (no closure, no cell), and
+-- 'main' OVER-APPLIES the result: '(mk 7) 2'. The returned member is an UNNAMED
+-- INTERMEDIATE at the application site (no IR binder), so Perceus cannot place its
+-- drop, and a member call never consumes the handle (borrow-on-call). Before the
+-- interpreter's deferred env-drop ('KDropCellRC' on the unnamed-intermediate
+-- 'RVRecMember' path) the shared env LEAKED (live > baseline). The fix drops the
+-- env after the body returns, so the run is heap-balanced and agrees with the
+-- reference value.
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in f
+
+main = (mk 7) 2

@@ -28,8 +28,8 @@ import qualified Data.Text as Tx
 import qualified Wok.IR.Anf as Anf
 import qualified Wok.IR.Name as Name
 import Wok.IR.Name (Unique)
-import Wok.IR.Perceus
-  ( isBoxedType, letRecEnclosingCaptureEscapes, letRecMemberConsumesCapture
+import Wok.IR.Escape
+  ( isBoxedType, letRecMemberConsumesCaptureNonEscaping
   , rawEnclosingFv )
 
 -- | Semantics-preserving dead-bind elimination: keep only the binds reachable
@@ -126,47 +126,42 @@ firstOrderNoHandlerViolations cm =
         <> Tx.pack "' uses " <> feature
 
 -- | Out-of-scope features used directly in an expression: 'Handle' (effect
--- handler), 'ROp' (effect operation), and one closure/region interaction (see
--- the loud TODO below). Returns a de-duplicated list of feature names. An
--- ordinary 'RLam' (first-class closure) is in scope as of M1.5 and is no longer
--- reported; its body is still recursed into so a 'Handle'/'ROp' nested inside a
--- lambda body is still surfaced.
+-- handler), 'ROp' (effect operation), and the two residual 'LetRec' deferrals
+-- (consuming captures #1, cross-region #3; see the block below). Returns a
+-- de-duplicated list of feature names. An ordinary 'RLam' (first-class closure) is
+-- in scope as of M1.5 and is no longer reported; its body is still recursed into so
+-- a 'Handle'/'ROp' nested inside a lambda body is still surfaced.
 --
--- ============================ TODO(M1.5 Phase 2) ============================
--- A STANDALONE 'RLam' that captures a 'LetRec' GROUP SIBLING is REJECTED here
--- rather than miscompiled. The hazard (found by the Phase 1 full-branch review,
--- verified double-free):
+-- =================== M2a-2 (LetRec escape now ADMITTED) =====================
+-- A 'LetRec' group member that ESCAPES its scope --- captured into a standalone
+-- closure ('RLam'), moved into a constructor/record/list, passed as a non-head
+-- call argument, aliased, or returned directly --- is now ADMITTED and soundly
+-- instrumented, EVEN when the group also captures an enclosing boxed local. The
+-- group is one shared 'NEnv' cell plus inline @RVRecMember@ handles (M2a-2 runtime,
+-- 'Wok.Interp.RC.{Value,Machine}'); the Perceus pass dup-balances EVERY escaping
+-- member occurrence (a build-site @__rc_dup@ of the shared env on a move into a
+-- cell/closure; a single-handle transfer-out on a bare alias / direct return, via
+-- env-alias propagation), and the interpreter keeps an unnamed-intermediate handle
+-- alive through its own call (deferred env-drop, 'KDropCellRC'). So the captured
+-- enclosing local is freed exactly once via the env cascade when the last escaped
+-- reference drops --- no leak, no double-free. The earlier M1.5/M2a-1 sibling-escape
+-- and Part-B enclosing-capture-escape rejections are therefore RETIRED.
 --
---   * the Perceus pass treats a sibling capture as EXEMPT (the uncounted region
---     owns it; the group drop releases it once), so it moves nothing into the
---     closure cell; but
---   * the RC interpreter captures the sibling's region handle into the closure's
---     env, so the cell's drop-cascade ALSO decrefs it. 'enterRC's incref-on-call
---     cancels that cascade ONLY when the closure is actually CALLED; on the
---     drop-without-call path there is no incref, so the sibling is freed twice
---     (cell cascade + group drop) => double-free.
---
--- A correct fix needs the closure representation to distinguish OWNED captures
--- (cascade-free) from BORROWED region-sibling captures (do not), AND must handle
--- the ESCAPING case (a closure that outlives its 'LetRec' scope forces the
--- sibling to leave the uncounted region and become genuinely counted). That is
--- region/closure co-design --- Phase 2 (LetRec enclosing-capture) territory and
--- beyond. Until then we REFUSE (sound) rather than compile it wrong. See
--- docs/superpowers/specs/2026-06-14-m1.5-closures-perceus-design.md (Phase 2).
---
--- ============================ TODO(M1.5 Phase 2) ============================
--- PART B (the ESCAPING enclosing-capture). A 'LetRec' group that BOTH captures an
--- enclosing BOXED LOCAL and has a member that ESCAPES the group body (its binder
--- flows out as a VALUE --- the result, or a field/arg/closure-capture that escapes)
--- is REJECTED here rather than miscompiled. The Perceus pass's borrow-model
--- accounting (spec 5.2) balances only when the group drops as a UNIT at scope exit;
--- an escaped member is NOT dropped at scope exit, so its captured enclosing local
--- LEAKS (and a sibling dropped at scope exit dangles under the escaped member's
--- still-live knot). Proper support (region-lifetime extension past scope exit) is
--- deferred with the 5.7 representation work. The escape predicate is SHARED with
--- the pass's coverage condition ('Wok.IR.Perceus.letRecEnclosingCaptureEscapes'),
--- so the boundary refuses EXACTLY the groups the pass excludes from coverage. See
--- spec sections 5.1 and 5.7.
+-- The ONLY 'LetRec' rejections that remain are the genuinely-deferred classes:
+--   * CONSUMING captures (#1, 'letRecMemberConsumesCaptureNonEscaping'): a member that MOVES
+--     (rather than borrows) an enclosing capture --- still needs borrow-passing.
+--   * CROSS-REGION (#3, 'rawEnclosingFv' ∩ outer group): a member that captures an
+--     OUTER 'LetRec' group's member.
+--   * NESTED CAPTURING GROUP: a group nested inside an enclosing 'LetRec' member
+--     body that captures a boxed local bound OUTSIDE that enclosing member (the
+--     "member-outer boxed set", 'rawEnclosingFv' ∩ @mob@). That local then lives in
+--     BOTH the outer member's 'NEnv' and the inner group's 'NEnv' --- two cascades,
+--     one incref --- a double-free. A FLAT (non-nested) group capturing an enclosing
+--     local is sound (one env, one cascade) and stays admitted; so are a nested group
+--     that captures only a PER-ENTRY local bound inside the enclosing member body, and
+--     a nested group sitting inside a lambda body (a fresh frame). See @mob@ below.
+-- Both are checked at the 'LetRec' node ('go' below); see the design doc
+-- docs/superpowers/specs/2026-06-15-m2a-2-shared-env-recursive-closures-design.md.
 -- ===========================================================================
 exprScopeFeatures :: Anf.Expr -> [Text]
 exprScopeFeatures = exprScopeFeaturesWith Set.empty
@@ -175,46 +170,90 @@ exprScopeFeatures = exprScopeFeaturesWith Set.empty
 -- in scope on entry (the bind's boxed params) so a 'LetRec' capturing-and-escaping
 -- a top-level param is also caught (Part B).
 exprScopeFeaturesWith :: Set.Set Unique -> Anf.Expr -> [Text]
-exprScopeFeaturesWith bsc0 = nub . go Set.empty bsc0
+exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
   where
     boxedBs bs = [ Anf.binderUnique b | b <- bs, isBoxedType (Anf.bndType b) ]
-    -- @lr@  = the 'LetRec' group-binder Uniques currently in scope (sibling-capture
-    --         rejection, Part A precedent).
-    -- @bsc@ = the enclosing BOXED-LOCAL Uniques in scope (Part B escape check).
-    rhs lr bsc r = case r of
-      Anf.RLam ps b ->
-        let caps = Anf.freeVarsExpr b
-                     `Set.difference` Set.fromList (map Anf.binderUnique ps)
-        in (if Set.null (Set.intersection caps lr)
-              then []
-              else [Tx.pack "RLam capturing a LetRec sibling \
-                            \(closure-over-local-recursive-group RC deferred to M1.5 Phase 2)"])
-           ++ go lr bsc b
+    -- @mob@ = the MEMBER-OUTER BOXED SET: a SNAPSHOT of the boxed locals that were
+    --         in scope at the boundary of the enclosing 'LetRec' MEMBER BODY we are
+    --         currently inside --- i.e. the boxed locals bound OUTSIDE that member.
+    --         A group nested in the member body that captures one of these locals
+    --         double-frees it: the local then lives in BOTH the outer member's 'NEnv'
+    --         and the inner group's 'NEnv' (two cascades, one incref). @mob@ is set to
+    --         the then-current @bsc@ when descending into a def RHS, and is EMPTY
+    --         outside any member body. Boxed locals bound INSIDE the member body
+    --         (subsequent 'Let's, alt binders, join-point params) are added to @bsc@
+    --         but NOT to @mob@, so capturing a PER-ENTRY local does not trip the guard
+    --         (it is rebuilt per entry alongside the inner env --- one cascade, sound).
+    --         Crossing an 'RLam' body RESETS @mob@ to empty: a lambda body is a fresh
+    --         frame (like a call frame), so a group nested inside a lambda that sits in
+    --         a member body is sound (the same group is sound at top level).
+    -- @lr@  = the 'LetRec' group-binder Uniques currently in scope.
+    -- @bsc@ = the enclosing BOXED-LOCAL Uniques in scope (kept threaded for the
+    --         cross-region / consuming-capture / nested-capture checks at the
+    --         'LetRec' node).
+    -- M2a-2 Stage B retired the sibling-escape / Part-B enclosing-capture-escape
+    -- rejections (every escaping member occurrence is now dup-balanced by the pass),
+    -- so the 'Let' case carries no sibling-escape violation; only the 'LetRec' node's
+    -- cross-region (#3), consuming-capture (#1), and nested-capture rejections remain.
+    rhs _mob lr bsc r = case r of
+      -- A lambda body is a fresh frame: reset the member-outer set to empty so a
+      -- nested group inside it is treated like one at top level (it is sound).
+      Anf.RLam _ b         -> go Set.empty lr bsc b
       Anf.ROp{}            -> [Tx.pack "ROp (effect operation)"]
       Anf.RApp _ _         -> []
       Anf.RAtom _          -> []
       Anf.RCon _ _         -> []
       Anf.RRecord _ _      -> []
       Anf.RProj _ _        -> []
-    alt lr bsc a = case a of
-      Anf.AltCon _ bs b -> go lr (Set.union bsc (Set.fromList (boxedBs bs))) b
-      Anf.AltLit _ b    -> go lr bsc b
-      Anf.AltDefault b  -> go lr bsc b
-    go lr bsc x = case x of
+    alt mob lr bsc a = case a of
+      Anf.AltCon _ bs b -> go mob lr (Set.union bsc (Set.fromList (boxedBs bs))) b
+      Anf.AltLit _ b    -> go mob lr bsc b
+      Anf.AltDefault b  -> go mob lr bsc b
+    go mob lr bsc x = case x of
       Anf.Ret _               -> []
       Anf.Let b r body        ->
         let bsc' = if isBoxedType (Anf.bndType b)
                      then Set.insert (Anf.binderUnique b) bsc else bsc
-        in rhs lr bsc r ++ go lr bsc' body
+            -- ALIAS-RENAME of a member-outer local is STILL member-outer. A pure
+            -- rename @let ba = b@ does NOT allocate a fresh cell --- @ba@ names the
+            -- SAME cell as the outside-bound @b@. A nested group capturing @ba@ would
+            -- double-free exactly as one capturing @b@. So the new binder JOINS @mob@
+            -- whenever its RHS aliases a name already in @mob@. (A 'RCon'/'RProj'/
+            -- 'RApp' RHS allocates / yields a fresh per-entry cell --- sound --- so it
+            -- does NOT propagate @mob@; only the same-cell 'RAtom' rename does.)
+            mob' = case r of
+              Anf.RAtom (Anf.AVar n)
+                | Name.nameUniq n `Set.member` mob ->
+                    Set.insert (Anf.binderUnique b) mob
+              _ -> mob
+            -- M2a-2 STAGE B (widened): a 'Let'-RHS that captures a 'LetRec' group
+            -- sibling in an escaping position --- a standalone closure ('RLam'), a
+            -- constructor/record/list field, a non-head call argument, a projection
+            -- parent, or a bare alias --- is now ADMITTED whether it escapes or stays
+            -- local. The pass dup-balances EVERY escaping member occurrence: a
+            -- closure/con/record/list/call-arg move emits a build-site @__rc_dup@ of
+            -- the shared env (dup-on-consume), and an escaping bare alias / direct
+            -- member return transfers the single env handle out (the scope's env-alive
+            -- handle is then NOT also dropped; env-alias propagation, 'Wok.IR.Perceus').
+            -- The interpreter keeps an unnamed-intermediate handle's env alive through
+            -- its own call (deferred env-drop, 'KDropCellRC'). So a sibling-capture
+            -- escape is sound regardless of mechanism, and the 'Let' case raises no
+            -- violation. Only CONSUMING captures (#1) and CROSS-REGION (#3) remain
+            -- rejected, at the 'LetRec' node below.
+        in rhs mob lr bsc r ++ go mob' lr bsc' body
       Anf.LetRec defs body    ->
         let lr' = Set.union lr (Set.fromList [ Anf.binderUnique b | (b, _, _) <- defs ])
-            -- PART B: refuse a group that captures an enclosing boxed local AND has
-            -- an escaping member (shared predicate with the pass's coverage).
-            escapeViol
-              | letRecEnclosingCaptureEscapes defs body bsc =
-                  [Tx.pack "LetRec member captures an enclosing local AND escapes \
-                           \(region-lifetime extension deferred to M1.5 Phase 2)"]
-              | otherwise = []
+            -- PART B retired (M2a-2 Stage B). A group that captures an enclosing
+            -- boxed local AND has an escaping member --- by ANY mechanism (closure,
+            -- con/record/list, call argument, bare alias, or direct return) --- is now
+            -- ADMITTED. The pass dup-balances every escaping member occurrence against
+            -- the shared env (dup-on-consume for moves into cells/closures; single-
+            -- handle transfer for bare returns), and the interpreter keeps an
+            -- unnamed-intermediate handle's env alive through its own call. The escape
+            -- is therefore sound; the group's captured enclosing local is freed exactly
+            -- once via the env cascade when the last escaped reference drops. The ONLY
+            -- residual 'LetRec' rejections are CONSUMING captures (#1, 'consumeViol')
+            -- and CROSS-REGION (#3, 'crossRegionViol') below.
             -- FINDING 2 (Phase 2 review, verified LEAK): a member that captures an
             -- OUTER LetRec region member (cross-region counted edge) is EXCLUDED
             -- from coverage by the pass ('capturesRegion', spec 5.5) but was passed
@@ -225,23 +264,66 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty bsc0
                   [Tx.pack "LetRec member captures an outer LetRec region member \
                            \(cross-region, spec 5.5, deferred to a later slice)"]
               | otherwise = []
-            -- FINDING 1 (Phase 2 review, verified DOUBLE-FREE): a member that
-            -- CONSUMES (moves) an enclosing capture is EXCLUDED from coverage by the
-            -- pass ('consumes', spec 5.3) but was passed through un-instrumented and
-            -- double-freed at the group drop. Reject it (only borrowed reads are
-            -- supported). Shared predicate with the pass's coverage condition.
-            consumeViol
-              | letRecMemberConsumesCapture defs bsc =
-                  [Tx.pack "LetRec member consumes (moves) an enclosing capture; only \
-                           \borrowed reads are supported (dup-per-consuming-use \
-                           \deferred to a later slice)"]
+            -- NESTED CAPTURING GROUP (M2a-2, verified DOUBLE-FREE). A 'LetRec'
+            -- group that is NESTED inside an enclosing 'LetRec' MEMBER BODY AND
+            -- captures a boxed local bound OUTSIDE that enclosing member --- a boxed
+            -- free var in the MEMBER-OUTER BOXED SET @mob@ (@rawEnclosingFv defs ∩
+            -- mob@, NOT @∩ lr@ which is the cross-region #3 check above, and NOT @∩
+            -- bsc@ which would also catch SOUND per-entry locals bound inside the
+            -- member). Such a local lives in BOTH the enclosing member's 'NEnv' and
+            -- the inner group's 'NEnv' --- two cascades on drop, but only one incref
+            -- backing the capture (it is treated as borrowed/moved-once), so it is
+            -- freed twice. THREE shapes are correctly ADMITTED because they are NOT
+            -- in @mob@: a FLAT group (top-level / non-member scope, @mob@ empty)
+            -- capturing an enclosing local (one env, one cascade); a nested group
+            -- capturing only a PER-ENTRY local bound INSIDE the enclosing member body
+            -- (rebuilt per entry alongside the inner env --- one cascade); and a
+            -- nested group inside a lambda body (a fresh frame resets @mob@).
+            nestedCaptureViol
+              | not (Set.null (Set.intersection (rawEnclosingFv defs) mob)) =
+                  [Tx.pack "nested LetRec group captures a local bound outside the \
+                           \enclosing LetRec member; the local lives in both the \
+                           \member's env and the inner group's env (two cascades, one \
+                           \incref) --- nested capturing groups deferred"]
               | otherwise = []
-        in escapeViol ++ crossRegionViol ++ consumeViol
-             ++ concat [ go lr' bsc d | (_, _, d) <- defs ]
-             ++ go lr' bsc body
-      Anf.Case _ alts         -> concatMap (alt lr bsc) alts
+            -- CONSUMING captures (M2a-2 capture-escape generalised). The pass now
+            -- DUP-BALANCES every move of a borrowed enclosing capture: a build-site
+            -- @__rc_dup@ on a move into a con/record/list field, a non-head call
+            -- argument, or a closure cell ('moveOperandUniques'), AND a @__rc_dup@ on
+            -- a return / jump that ESCAPES the capture (the generalised 'Ret'/'Jump'
+            -- escape-dup, 'Wok.IR.Perceus'). So a member body that ESCAPES a borrowed
+            -- capture (returns it, seals it into a con/record/list, or passes it as a
+            -- non-head call argument) is ADMITTED and sound --- the escaped handle
+            -- increfs the captured cell, and the env's capture-field cascade frees the
+            -- env-owned unit exactly once at scope exit.
+            --
+            -- The residual consuming-capture rejection is a capture consumed LOCALLY
+            -- ('letRecMemberConsumesCaptureNonEscaping'): sealed into a con/record that
+            -- is destructured-and-dropped within the body, projected, or matched by a
+            -- child-keeping 'Case'. That is the genuinely-deferred #1 class (the
+            -- two-member-both-base-consume counterexample); the broader borrow-passing
+            -- that admits it for all call patterns is deferred. A capture used only as a
+            -- borrowed read or a call head (saturated OR partial --- a borrow under
+            -- uniform borrow-on-call) is unaffected (it was never unsound).
+            consumeViol
+              | letRecMemberConsumesCaptureNonEscaping defs bsc =
+                  [Tx.pack "LetRec member consumes an enclosing capture LOCALLY (sealed \
+                           \into a destructured-and-dropped cell, projected, or matched \
+                           \by a child-keeping case); only borrowed reads and escapes are \
+                           \supported (local consume deferred --- needs borrow-passing)"]
+              | otherwise = []
+        in crossRegionViol ++ consumeViol ++ nestedCaptureViol
+             -- A def RHS is a MEMBER BODY: SNAPSHOT the current @bsc@ as the
+             -- member-outer boxed set so a 'LetRec' nested inside it that captures a
+             -- local bound OUTSIDE this member is rejected. Locals bound INSIDE the
+             -- member body extend @bsc@ but not this snapshot, so a per-entry capture
+             -- is sound. The continuation BODY is NOT a member body: it inherits @mob@
+             -- unchanged (a group there runs once, so a re-capture is sound).
+             ++ concat [ go bsc lr' bsc d | (_, _, d) <- defs ]
+             ++ go mob lr' bsc body
+      Anf.Case _ alts         -> concatMap (alt mob lr bsc) alts
       Anf.LetJoin _ ps jb body ->
         let bsc' = Set.union bsc (Set.fromList (boxedBs ps))
-        in go lr bsc' jb ++ go lr bsc body
+        in go mob lr bsc' jb ++ go mob lr bsc body
       Anf.Jump _ _            -> []
       Anf.Handle _ _          -> [Tx.pack "Handle (effect handler)"]

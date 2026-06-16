@@ -1,0 +1,28 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #18 (DIRECT sibling-into-constructor LOCAL DROP, ACCEPTED):
+-- the LetRec group sibling 'f' flows into a constructor field ('Box f') whose
+-- cell is then DROPPED LOCALLY (it does NOT escape; the result is the scalar 0).
+-- Local mirror of #12 (42-sibling-con-escape): the sibling stays inside its
+-- enclosing region, so the program is sound and must be ACCEPTED + heap-balanced.
+--
+-- Before the cascade fix, dropping the ordinary 'Box' cell cascaded into its
+-- boxed child 'f' (a region member owned by the LetRec group), and the group's
+-- own unit-drop freed 'f' again --- a verified DOUBLE-FREE ('double-free: addr 0')
+-- under 'runModuleRCUnchecked', while the boundary guard correctly ACCEPTED the
+-- program (no escape). The fix makes 'countedChildren' skip any region-member /
+-- static child for a containing cell of ANY kind (not just closures), so the
+-- ordinary 'Box' cell no longer cascade-frees the sibling.
+data Box = Box (U64 -> U64)
+
+mk : U64 -> U64
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let z = Box f
+  in 0
+
+main = mk 7

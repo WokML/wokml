@@ -95,6 +95,7 @@ dict$Eq$Option$m0 d$Eq$0 x y =
               let _dup.3 = __rc_dup(f.1)
               let _drop.11 = __rc_drop(d$Eq$0)
               let t.4 = f.1(a, b)
+              let _drop.12 = __rc_drop(f.1)
               t.4
 
 dict$Eq$Option$m1 d$Eq$0 x y =
@@ -465,6 +466,7 @@ raceSpawn ch fs =
       let _drop.3 = __rc_drop(fs)
       let _dup.3 = __rc_dup(ch)
       let t.4 = \_ -> let t.2 = f(())
+      let _drop.4 = __rc_drop(f)
       let t.3 = send(ch, t.2)
       t.3
       let t.5 = spawn(t.4)

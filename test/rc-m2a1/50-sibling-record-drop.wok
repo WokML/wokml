@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #20 (DIRECT sibling-into-record-field LOCAL DROP, ACCEPTED):
+-- the LetRec group sibling 'f' is stored into a record field ('Cell { fn = f }')
+-- whose cell is DROPPED LOCALLY (bound to a dead local; the result is the scalar
+-- 0). Local mirror of #15 (45-sibling-record-escape) via 'RRecord'. Same
+-- double-free class as #18: before the cascade fix, dropping the record cell
+-- cascaded into the region member 'f', which the group's unit-drop freed again.
+data Cell = Cell { fn : U64 -> U64 }
+
+mk : U64 -> U64
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let z = Cell { fn = f }
+  in 0
+
+main = mk 7

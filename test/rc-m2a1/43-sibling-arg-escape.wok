@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #13 (DIRECT sibling-into-call-argument escape, must be REJECTED):
+-- the LetRec group sibling 'f' is passed DIRECTLY as a NON-HEAD argument of a call
+-- ('idf f') whose result escapes, so the borrowed member leaves the enclosing
+-- LetRec region (region-lifetime extension = M2a-2). Verified use-after-free at
+-- runtime ('addr 0') before the guard fix: a sibling in an 'RApp' non-head
+-- argument position was not covered by the 'RLam'/alias gates.
+idf : (U64 -> U64) -> (U64 -> U64)
+idf g = g
+
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in idf f
+
+main = (mk 7) 2

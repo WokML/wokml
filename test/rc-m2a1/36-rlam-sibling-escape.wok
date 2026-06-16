@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #6 (ESCAPING variant of #4, must STAY rejected):
+-- a standalone closure ('RLam') 'h' captures a LetRec GROUP SIBLING 'f', and
+-- the function RETURNS 'h' (instead of the scalar 0).  The closure therefore
+-- OUTLIVES the enclosing 'let' that introduced the LetRec region: it escapes.
+--
+-- Because the borrowed sibling 'f' would have to leave the uncounted region and
+-- become genuinely counted (region-lifetime extension past scope exit), this is
+-- M2a-2 territory.  'rlamSiblingCaptureEscapes' must report ESCAPE here, and the
+-- boundary guard must REJECT.
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let h = \m -> f (m + 1)
+  in h
+
+main = (mk 7) 2

@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #9 (Route 5, CONSUMING-capture twin of #8):
+-- a LetRec group 'go' BOTH CONSUMES (moves) an enclosing boxed capture 'b' AND has
+-- its member captured into a NESTED closure 'g' that ESCAPES (it is returned).
+--
+-- This exercises the 'letRecMemberEscapes' / 'nonHeadOccsRhs' twin of the Route-5
+-- fix: a group member captured into a nested 'RLam' cell must count as an ESCAPE
+-- (the cell can outlive the group region), NOT recurse into the nested body.
+--
+-- (The #4 consuming-capture backstop in the boundary guard may also fire here ---
+-- either guard rejecting is correct.  The test asserts rejection regardless.)
+data Box = Box U64
+
+peek : Box -> U64
+peek box = case box of
+  Box v -> v
+
+mk : U64 -> (U64 -> U64)
+mk seed =
+  let b = Box seed in
+  let
+    go k = case k of
+      0 -> peek b
+      _ -> 1 + go (k - 1)
+  in let g = \j -> go (j + 1)
+  in g
+
+main = (mk 6) 3

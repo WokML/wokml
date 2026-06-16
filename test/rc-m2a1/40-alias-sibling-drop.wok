@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #10 (bare ALIAS of a LetRec sibling, NON-escaping; the FIX):
+-- 'let x = f' aliases the LetRec group sibling 'f' (a borrowed/uncounted-region
+-- member) into a fresh local 'x', then DISCARDS it ('x' is dead, the result is the
+-- scalar 0).
+--
+-- The Perceus pass treats 'f' (an exempt sibling) as borrowed --- no '__rc_dup' at
+-- the alias site --- but the NEW binder 'x' would otherwise enter the OWNED set and
+-- be dropped at its dead point. At runtime 'x' carries the same region member as
+-- 'f', so an '__rc_drop x' double-frees the member (cell-drop + group-drop). The fix
+-- propagates exempt-ness THROUGH the alias: 'x' is itself exempt (a borrow of the
+-- same member), so the pass emits NO dup and NO drop for it and does NOT count it as
+-- owned. The non-escaping alias is therefore ACCEPTED and runs heap-balanced.
+mk : U64 -> U64
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let x = f
+  in 0
+
+main = mk 7

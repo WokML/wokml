@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #15 (DIRECT sibling-into-record-field escape, REJECTED):
+-- the LetRec group sibling 'f' is stored DIRECTLY into a record field
+-- ('Cell { fn = f }') whose value escapes. Same UAF class as #12 via 'RRecord'
+-- rather than 'RCon'.
+data Cell = Cell { fn : U64 -> U64 }
+
+mk : U64 -> Cell
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in Cell { fn = f }
+
+main =
+  let
+    c = mk 7
+    g = c.fn
+  in g 2

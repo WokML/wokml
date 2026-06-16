@@ -93,6 +93,7 @@ library
         Wok.TypeChecking.Carrier
         Wok.IR.Name
         Wok.IR.Anf
+        Wok.IR.Escape
         Wok.IR.Elaborate
         Wok.IR.Match
         Wok.IR.Multiplicity

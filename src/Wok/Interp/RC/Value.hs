@@ -4,6 +4,8 @@ module Wok.Interp.RC.Value
     -- * Runtime values
   , RCValue (..)
   , REnv
+  , valueChildren
+  , countedRefs
     -- * Lexical scope
   , RCScope (..)
   , emptyRCScope
@@ -12,6 +14,7 @@ module Wok.Interp.RC.Value
   , RCKont (..)
     -- * Heap nodes
   , Node (..)
+  , CaptureMode (..)
     -- * Store cells
   , Cell (..)
     -- * Allocation statistics
@@ -23,10 +26,12 @@ module Wok.Interp.RC.Value
   , allocStatic
   , writeStatic
   , isStaticAddr
-  , allocLetRecGroup
-  , writeRegionCell
   , deref
-  , isRegionAddr
+  , mkClosure
+  , closureOwnedBoxed
+    -- * Static sentinel
+  , emptyEnvSentinelAddr
+  , initSentinel
     -- * Reference-count operations
   , incref
   , dropAddr
@@ -60,12 +65,42 @@ import Wok.IR.Name (JoinId, Unique, nameHint, nameUniq)
 -- | A heap address: a monotonically-assigned integer index into the 'Store'.
 type Addr = Int
 
--- | Runtime values in the RC interpreter. Either an unboxed literal or a
--- boxed pointer to a heap 'Node'.
+-- | Runtime values in the RC interpreter. Either an unboxed literal, a
+-- boxed pointer to a heap 'Node', or a member handle into a shared-env
+-- recursive closure group.
+--
+-- 'RVRecMember' @groupAddr@ @index@ @envAddr@:
+--   * @groupAddr@  — a STATIC (negative, immortal, uncounted) address holding
+--     the group's 'NGroupCode' node.  It is never increfed or dropped.
+--   * @index@      — which member of the group this handle names.
+--   * @envAddr@    — a DYNAMIC address holding the shared 'NEnv' cell.  This
+--     is the ONLY counted child of an 'RVRecMember'; see 'valueChildren'.
 data RCValue
   = RVLit Lit
   | RVBox Addr
+  | RVRecMember Addr Int Addr
+    -- ^ groupAddr (static, uncounted), index, envAddr (counted)
   deriving (Eq, Show)
+
+-- | The counted heap addresses reachable from an 'RCValue'. This is the single
+-- source of truth used by dup and drop cascades.
+--
+--   * 'RVLit'       — no boxed children.
+--   * 'RVBox'       — one counted address: the node pointer.
+--   * 'RVRecMember' — one counted address: the shared env cell (@envAddr@).
+--     The @groupAddr@ is static/immortal and therefore UNCOUNTED; it is
+--     deliberately excluded.
+valueChildren :: RCValue -> [Addr]
+valueChildren (RVLit _)          = []
+valueChildren (RVBox a)          = [a]
+valueChildren (RVRecMember _ _ e) = [e]
+
+-- | The counted addresses a set of values references (skip static). The SINGLE
+-- unit of both capture-incref and free-cascade, via 'valueChildren' --- so every
+-- value shape ('RVBox', 'RVRecMember', and any future variant) is retained
+-- EXACTLY as it is released. There is no parallel borrowed-set to drift.
+countedRefs :: [RCValue] -> [Addr]
+countedRefs = concatMap (filter (not . isStaticAddr) . valueChildren)
 
 -- | Variable environment: identity (Unique) -> RC runtime value.
 type REnv = Map Unique RCValue
@@ -99,31 +134,73 @@ data RCKont
     -- ^ bind the produced value to the 'Binder', then run the 'Expr' in scope.
   | KAppRC [RCValue] RCKont
     -- ^ over-application: apply the produced value to these extra args.
+  | KDropCellRC Addr RCKont
+    -- ^ DEFERRED CONSUME of an unnamed-intermediate closure cell (M2a-2). When an
+    -- application CONSUMES an anonymous function value (an over-application
+    -- intermediate, or a 'PRApply'/'KAppRC' result with no IR binder), the cell's
+    -- drop must run AFTER its body returns, not before: the body BORROWS the cell's
+    -- captures (a 'LetRec' member's shared env is reached through an 'RVRecMember'
+    -- capture and is cascade-eligible on the cell's drop), so dropping the cell up
+    -- front would free the env mid-call --- a use-after-free. This frame holds the
+    -- cell address; when the body's result returns it runs 'dropAddr' on the cell
+    -- (cascading the cell's OWN owned captures, now that the body is done borrowing
+    -- them) and threads the value onward. The cell is alive throughout its own call,
+    -- exactly as the named-head borrow case keeps it alive via its binder.
 
 -- ---------------------------------------------------------------------------
 -- Heap nodes
 
--- | A heap-allocated node. Each constructor corresponds to one of the three
--- kinds of storable wok value: a data constructor application, a record, or a
--- captured closure.
+-- | A heap-allocated node. Each constructor corresponds to one of the
+-- storable wok value kinds.
 data Node
   = NCon Text [RCValue]
   | NRecord Text (Map Text RCValue)
-  | NClosure REnv [Binder] Expr
+  | NClosure REnv [Binder] Expr CaptureMode
   -- ^ The 'REnv' captures live RC values. Compare 'VClosure' in
   -- "Wok.Interp.Value" which uses a lazy @~Env@. We keep a strict counted
-  -- env here; a future LetRec pass (Task 4) plans to handle recursive knots
-  -- via an uncounted region rather than introducing a lazy field.
+  -- env here; recursive groups share their captured env via a single 'NEnv'
+  -- cell rather than introducing a lazy field.
+  --
+  -- RETAIN/RELEASE. The cell OWNS one counted ref to each of its DYNAMIC captures,
+  -- acquired where the capture enters the cell and released by the drop cascade
+  -- ('countedRefs' over the env) exactly once --- one source of truth for the free.
+  -- The 'CaptureMode' records the SEPARATE question of whether the closure BODY
+  -- receives ownership of its captures on entry (see 'closureOwnedBoxed' and
+  -- @enterRC@'s @increfOwned@); it does NOT affect the drop cascade.
+  | NGroupCode [(Binder, [Binder], Expr)]
+  -- ^ The code table for a shared-env recursive closure group. Installed at a
+  -- STATIC (negative, immortal) address via 'allocStatic'; it is never
+  -- reference-counted, dropped, or cascaded. Each element is
+  -- @(selfBinder, params, body)@ for one member of the group.
+  | NEnv (Map Unique RCValue)
+  -- ^ The shared captured-environment cell for a recursive closure group.
+  -- Allocated on the DYNAMIC heap (counted). All members of the group share a
+  -- single 'NEnv' node; when the last member handle is dropped the env cell
+  -- is freed and its owned children are cascaded via 'nodeValues'.
+  deriving (Eq, Show)
+
+-- | Whether a closure BODY receives ownership of its captures on entry. This is
+-- about the BODY's Perceus instrumentation, NOT the cell's drop (which always
+-- cascades the cell's counted captures via 'countedRefs').
+--
+--   * 'OwnCaptures' --- an ordinary 'RLam' body (or a partial application of an
+--     ordinary closure). Perceus seeds each boxed capture at @+1@ in the body and
+--     drops it at its last use, so @enterRC@ must hand the body that ownership
+--     (incref the body-owned 'RVBox' captures on entry; see 'closureOwnedBoxed').
+--   * 'BorrowCaptures' --- a partial application of a shared-env recursive MEMBER
+--     ('RVRecMember'). The cell's body is the member body, which BORROWS its
+--     siblings and captured locals (a member never CONSUMES a capture --- #1 is
+--     deferred/boundary-rejected) and emits no drops for them. So @enterRC@ must
+--     incref NOTHING on entry; the cell already owns one ref to each capture
+--     (acquired at the partial-application build) which its drop cascade releases.
+--     Increfing on entry here would leak the shared env (the unmatched-incref bug).
+data CaptureMode = OwnCaptures | BorrowCaptures
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
 -- Store cells
 
 -- | A single heap cell: a reference count and the node payload.
---
--- Region membership (the LetRec uncounted region, design invariant 4) is NOT
--- stored here but in the store-level 'stRegionOf' map, so it survives a cell's
--- free (a freed sibling's region must still be discoverable; see 'dropAddr').
 data Cell = Cell { cRc :: Int, cNode :: Node }
   deriving (Eq, Show)
 
@@ -159,36 +236,51 @@ data Store = Store
   { stCells      :: IntMap Cell
   , stNext       :: Addr        -- ^ next dynamic address (>= 0), counts upward
   , stNextStatic :: Addr        -- ^ next static address (< 0), counts downward
-  , stNextRegion :: Int         -- ^ next LetRec region id (>= 1)
-  , stRegionOf   :: IntMap Int
-    -- ^ address -> LetRec region id, for every region member. PERSISTENT: an
-    -- entry is never removed (not even on free), because 'dropAddr' must still
-    -- recognise an already-freed sibling as same-region to avoid double-freeing
-    -- it. An address absent from this map belongs to no region.
   , stDead       :: IntSet
   , stStats      :: Stats
   }
 
+-- ---------------------------------------------------------------------------
+-- Static empty-env sentinel
+
+-- | The fixed static address that holds the empty-env sentinel cell. This is a
+-- well-known NEGATIVE address (static, immortal, uncounted). A capture-free
+-- recursive group can use this as its @envAddr@; dup and drop on it are
+-- no-ops because 'incref'/'dropAddr' skip static addresses.
+--
+-- The address -1 is reserved at definition time; 'emptyStore' installs
+-- the sentinel there via 'initSentinel'. Any subsequent 'allocStatic' call
+-- starts from -2, so the sentinel address is stable.
+emptyEnvSentinelAddr :: Addr
+emptyEnvSentinelAddr = -1
+
+-- | Install the empty-env sentinel into a store. Call this on 'emptyStore'
+-- before use (e.g. in @runModuleRC@). Writes 'NEnv Map.empty' at
+-- 'emptyEnvSentinelAddr' using 'allocStatic'; the resulting store's
+-- 'stNextStatic' is then -2.
+initSentinel :: Store -> Store
+initSentinel s =
+  let (a, s') = allocStatic (NEnv Map.empty) s
+  in if a == emptyEnvSentinelAddr
+       then s'
+       else error ("initSentinel: expected sentinel at " <> show emptyEnvSentinelAddr
+                     <> " but got " <> show a)
+
 -- | The empty store: no cells allocated, all counters at zero. Dynamic
--- addresses start at 0 (upward); static addresses start at -1 (downward);
--- region ids start at 1.
+-- addresses start at 0 (upward); static addresses start at -1 (downward).
+--
+-- Note: the SENTINEL for the empty env is installed separately by
+-- 'initSentinel', because 'emptyStore' is also used in unit tests that do
+-- not need or expect the sentinel to be present. Tests that exercise
+-- 'RVRecMember'/'NEnv' should call @initSentinel emptyStore@ instead.
 emptyStore :: Store
-emptyStore = Store IM.empty 0 (-1) 1 IM.empty IS.empty (Stats 0 0 0 0)
+emptyStore = Store IM.empty 0 (-1) IS.empty (Stats 0 0 0 0)
 
 -- | True for a static (immortal, uncounted) address. Static cells are
 -- allocated by 'allocStatic' at negative addresses; the dynamic heap uses
 -- non-negative addresses.
 isStaticAddr :: Addr -> Bool
 isStaticAddr a = a < 0
-
--- | True for an address that belongs to a 'LetRec' uncounted region. Such a cell
--- is owned by its group and released only by the group's single drop at scope
--- exit (see 'dropAddr' and the 'ctxExempt' note in "Wok.IR.Perceus"); it must
--- therefore NOT be consumed by application (a reference to a group member is
--- never a counted move). Region membership is read from the PERSISTENT
--- 'stRegionOf', so an already-freed sibling is still recognised.
-isRegionAddr :: Addr -> Store -> Bool
-isRegionAddr a s = IM.member a (stRegionOf s)
 
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
@@ -235,59 +327,40 @@ writeStatic :: Addr -> Node -> Store -> Store
 writeStatic a n s = s { stCells = IM.insert a (Cell 1 n) (stCells s) }
 
 -- ---------------------------------------------------------------------------
--- LetRec uncounted region (design invariant 4)
+-- Closure construction
 
--- | Allocate a local 'LetRec' group of @n@ mutually-recursive cells as one
--- UNCOUNTED REGION. Returns the @n@ reserved addresses (in order) and the
--- updated 'Store'. Each cell is allocated counted (rc = 1, bumps
--- 'stAllocs'/'stLive'/'stPeak' -- region members ARE part of the dynamic heap)
--- and tagged with a single fresh, shared, non-zero region id.
+-- | Build an ordinary 'NClosure' node (an 'RLam', or a partial application of an
+-- ordinary closure): its body OWNS its captures ('OwnCaptures'). The member-body
+-- partial-application closure ('BorrowCaptures') is constructed directly in
+-- @enterRC@. No precomputed borrowed-set is stored: the cell's drop cascade and
+-- the body-seed both derive from the env at use time ('countedRefs' /
+-- 'closureOwnedBoxed'), so there is nothing to drift.
+mkClosure :: REnv -> [Binder] -> Expr -> Node
+mkClosure env ps body = NClosure env ps body OwnCaptures
+
+-- | The BODY-OWNED boxed-capture addresses of an 'NClosure' (empty for any other
+-- node): the DYNAMIC 'RVBox' env handles. These are the captures whose ownership
+-- the closure BODY receives on entry (the Perceus body-seed) and releases at its
+-- own last use --- the @increfOwned@ set in @enterRC@.
 --
--- Two-phase by necessity: the closure ENVS of a mutually-recursive group
--- reference each other's addresses (the knot), which do not exist until the
--- cells are allocated. The caller therefore reserves the addresses here (with
--- placeholder nodes), builds each member's real node referencing the reserved
--- addresses, then installs them with 'writeRegionCell'. Because the intra-group
--- edges all point inside the shared region, 'dropAddr' never traverses them, so
--- the knot is uncounted and the group is dropped as a unit.
---
--- The placeholder node is overwritten by 'writeRegionCell' before the group is
--- ever observed; it exists only so 'deref' on a reserved address is well-formed.
-allocLetRecGroup :: Int -> Store -> ([Addr], Store)
-allocLetRecGroup n s0 =
-  let region = stNextRegion s0
-      s1     = s0 { stNextRegion = region + 1 }
-  in go region n [] s1
-  where
-    go _      0 addrs s = (reverse addrs, s)
-    go region k addrs s =
-      let a    = stNext s
-          st   = stStats s
-          live = stLive st + 1
-          st'  = st { stAllocs = stAllocs st + 1
-                    , stLive   = live
-                    , stPeak   = max (stPeak st) live }
-          s'   = s { stCells    = IM.insert a (Cell 1 regionPlaceholder) (stCells s)
-                   , stRegionOf = IM.insert a region (stRegionOf s)
-                   , stNext     = a + 1
-                   , stStats    = st' }
-      in go region (k - 1) (a : addrs) s'
-
--- | A never-observed placeholder for a reserved region cell, overwritten by
--- 'writeRegionCell' before the group runs.
-regionPlaceholder :: Node
-regionPlaceholder = NCon (Tx.pack "<uninstalled-letrec>") []
-
--- | Overwrite the node at a reserved region address, PRESERVING the cell's
--- reference count (and, implicitly, its 'stRegionOf' membership). Used to
--- install a group member's real closure node after the group's addresses were
--- reserved. It is a programmer error to call this on an address not produced by
--- 'allocLetRecGroup'; doing so would clobber an ordinary cell's rc.
-writeRegionCell :: Addr -> Node -> Store -> Store
-writeRegionCell a n s =
-  case IM.lookup a (stCells s) of
-    Just c  -> s { stCells = IM.insert a c { cNode = n } (stCells s) }
-    Nothing -> s   -- unreachable for a freshly-reserved region addr; leave intact
+-- This is INTENTIONALLY NARROWER than the cell's drop cascade
+-- ('countedRefs' over the env). A captured 'RVRecMember' (a borrowed group
+-- sibling, or a member captured by an escaping closure) is BORROWED BY THE BODY:
+-- the body reads/calls it without an incref and emits no drop for it (the LetRec
+-- member-body / RLam @capsBorrow@ rule in "Wok.IR.Perceus"). So the body-seed must
+-- NOT incref it --- otherwise the unmatched incref leaks the shared env. The CELL
+-- nonetheless OWNS one counted ref to that 'RVRecMember' env, acquired where the
+-- capture ENTERS the cell (a Perceus @__rc_dup@ at an escaping capture, or the
+-- build-time incref in @enterRC@'s 'RVRecMember' partial-application branch) and
+-- released by the cascade ('countedRefs') on the cell's drop. Acquire-on-entry to
+-- the cell and release-on-drop are the matched pair; the body-seed is a SEPARATE
+-- matched pair (incref here, body last-use drop) that covers only body-owned
+-- 'RVBox' captures.
+closureOwnedBoxed :: Node -> [Addr]
+closureOwnedBoxed (NClosure env _ _ OwnCaptures) =
+  [ a | RVBox a <- Map.elems env, not (isStaticAddr a) ]
+closureOwnedBoxed (NClosure _ _ _ BorrowCaptures) = []
+closureOwnedBoxed _ = []
 
 -- | Dereference an address. Returns 'Left' if the address has been freed
 -- (use-after-free) or was never allocated (dangling pointer).
@@ -333,14 +406,7 @@ dropAddr a0 s0 = go [a0] s0
             Nothing -> Left (PrimError (Tx.pack ("drop of dangling addr " <> show a)))
             Just c
               | cRc c <= 1 ->  -- rc about to reach 0 -> free
-                  -- Intra-region edges are UNCOUNTED: when freeing a LetRec
-                  -- group member, do NOT enqueue a boxed child that points at a
-                  -- sibling in the SAME region. That sibling is freed by its own
-                  -- external drop (the group is dropped as a unit); traversing
-                  -- the edge here would double-free it. Region membership is read
-                  -- from the persistent 'stRegionOf', so an already-freed sibling
-                  -- is still recognised.
-                  let kids = countedChildren a (cNode c) s
+                  let kids = countedRefs (nodeValues (cNode c))
                       st   = stStats s
                       s'   = s { stCells = IM.delete a (stCells s)
                                , stDead  = IS.insert a (stDead s)
@@ -350,36 +416,16 @@ dropAddr a0 s0 = go [a0] s0
               | otherwise ->
                   go rest s { stCells = IM.insert a c { cRc = cRc c - 1 } (stCells s) }
 
--- | The boxed children to recurse into when freeing the cell at @parent@. A
--- child edge is skipped (uncounted) when @parent@ is a region member AND the
--- child's target is in the SAME region: that is an intra-group recursive
--- reference (the closure-env knot). All other edges (to a non-region cell, a
--- different region, a static cell, or a literal) are counted and recursed into
--- as usual.
---
--- Region membership is read from the PERSISTENT 'stRegionOf', so an
--- already-freed sibling is still recognised as same-region and correctly
--- skipped (its cell is gone, but its region entry remains). A child whose target
--- is not a same-region sibling is left in the list, so an absent/dead non-region
--- target still surfaces the dangling/double-free trap rather than being silently
--- dropped.
-countedChildren :: Addr -> Node -> Store -> [Addr]
-countedChildren parent n s =
-  case IM.lookup parent (stRegionOf s) of
-    Nothing     -> boxedChildren n   -- parent belongs to no region: count all edges
-    Just region -> filter (not . sameRegionSibling region) (boxedChildren n)
-  where
-    sameRegionSibling region a = IM.lookup a (stRegionOf s) == Just region
-
--- | Collect all 'Addr' values directly reachable from a 'Node' via 'RVBox'.
-boxedChildren :: Node -> [Addr]
-boxedChildren n = [ a | RVBox a <- nodeValues n ]
-
--- | Flatten all 'RCValue' fields of a 'Node' into a list.
+-- | Flatten all 'RCValue' fields of a 'Node' into a list. The drop cascade
+-- ('dropAddr') and the capture-incref ('closureOwnedBoxed') both route through
+-- 'countedRefs' over these values, so the static-skip is applied identically on
+-- release and acquire --- no container-kind special cases and no borrowed-set.
 nodeValues :: Node -> [RCValue]
-nodeValues (NCon _ vs)        = vs
-nodeValues (NRecord _ m)      = Map.elems m
-nodeValues (NClosure env _ _) = Map.elems env
+nodeValues (NCon _ vs)          = vs
+nodeValues (NRecord _ m)        = Map.elems m
+nodeValues (NClosure env _ _ _) = Map.elems env
+nodeValues (NGroupCode _)       = []
+nodeValues (NEnv m)             = Map.elems m
 
 -- ---------------------------------------------------------------------------
 -- Primitives
@@ -442,10 +488,11 @@ bindRCBinders bs vs env = foldl' (\e (b, v) -> bindRCBinder b v e) env (zip bs v
 -- surfaces as a 'Left' rather than silently rendering garbage.
 
 renderRCValue :: Store -> RCValue -> Either RuntimeError Text
-renderRCValue _ (RVLit l) = Right (renderLit l)
-renderRCValue s (RVBox a) = do
+renderRCValue _ (RVLit l)           = Right (renderLit l)
+renderRCValue s (RVBox a)           = do
   c <- deref a s
   renderNode s (cNode c)
+renderRCValue _ RVRecMember{} = Right (Tx.pack "<closure>")
 
 renderNode :: Store -> Node -> Either RuntimeError Text
 renderNode _ (NCon t []) | t == Tx.pack "Nil" = Right (Tx.pack "[]")
@@ -462,7 +509,9 @@ renderNode s (NRecord t m) = do
   parts <- mapM (\(l, fv) -> do tv <- renderRCValue s fv
                                 Right (l <> Tx.pack " = " <> tv)) (Map.toList m)
   Right (t <> Tx.pack " { " <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack " }")
-renderNode _ NClosure{} = Right (Tx.pack "<closure>")
+renderNode _ NClosure{}      = Right (Tx.pack "<closure>")
+renderNode _ (NGroupCode _)  = Right (Tx.pack "<closure>")
+renderNode _ (NEnv _)        = Right (Tx.pack "<env>")
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)
@@ -488,7 +537,8 @@ renderList s h0 tl0 = do
             hd <- renderRCValue s h
             go (hd : acc) tl
           _ -> improper acc v
-      RVLit _ -> improper acc v
+      RVLit _           -> improper acc v
+      RVRecMember{} -> improper acc v
     improper acc v = do
       rest <- renderRCValue s v
       Right (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc)

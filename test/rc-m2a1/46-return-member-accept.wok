@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- M2a-1 POSITIVE guard (mirror of rc-examples/23): a LetRec body that DIRECTLY
+-- RETURNS a group member ('Ret (AVar f)'). Direct return-of-member is historically
+-- ADMITTED at the RC boundary (its use-site behaviour is a separate M2a-2 concern);
+-- the generalized sibling-escape guard must NOT over-reject it. Must stay ACCEPTED.
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in f
+
+main =
+  let g = mk 7
+  in 0

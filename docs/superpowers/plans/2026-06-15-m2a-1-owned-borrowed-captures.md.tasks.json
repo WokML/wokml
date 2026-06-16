@@ -1,0 +1,47 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-15-m2a-1-owned-borrowed-captures.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 1: Reproducer corpus + current-rejection baseline",
+      "status": "completed",
+      "description": "**Goal:** Land the #1 and #4 non-escaping reproducers as corpus files and assert they are currently rejected at the RC boundary.\n\n**Files:** Create test/rc-examples/NN-consuming-capture-nonescape.wok, test/rc-examples/NN-rlam-sibling-nonescape.wok; Modify test/Spec.hs\n\n```json:metadata\n{\"files\":[\"test/rc-examples/NN-consuming-capture-nonescape.wok\",\"test/rc-examples/NN-rlam-sibling-nonescape.wok\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test wok-tests --test-show-details=direct -k \\\"m2a-1 baseline\\\"\",\"acceptanceCriteria\":[\"both .wok load+elaborate\",\"firstOrderNoHandlerViolations non-empty for both\",\"baseline test pins current rejection\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 2: Owned/borrowed capture representation in RC store",
+      "status": "completed",
+      "blockedBy": [0],
+      "description": "**Goal:** NClosure carries borrowed (region-sibling) captures; drop cascade skips them; enterRC increfs only owned captures.\n\n**Files:** Modify src/Wok/Interp/RC/Value.hs (NClosure:112, countedChildren:366), src/Wok/Interp/RC/Machine.hs (enterRC:194-250, LetRec build:94-126); test/Spec.hs\n\n```json:metadata\n{\"files\":[\"src/Wok/Interp/RC/Value.hs\",\"src/Wok/Interp/RC/Machine.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test wok-tests --test-show-details=direct -k \\\"closure owned-borrowed store\\\"\",\"acceptanceCriteria\":[\"NClosure carries borrowed set\",\"cascade skips borrowed, keeps owned\",\"enterRC increfs only owned\",\"direct-store unit test passes\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 3: Pass-side classification + dup-per-consuming-use",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Perceus tags region-sibling captures as borrowed on the emitted closure and emits __rc_dup per consuming use of an enclosing capture by a LetRec member.\n\n**Files:** Modify src/Wok/IR/Perceus.hs (ownRhs RLam:1038, ownedOccs:997, moveAtoms:1590, LetRec dup plan:836-895); test/Spec.hs\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Perceus.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test wok-tests --test-show-details=direct -k \\\"m2a-1 lint\\\"\",\"acceptanceCriteria\":[\"closure carries borrowed set from ctxExempt\",\"dup per consuming use at build site\",\"balanceLint clean on #1/#4 shapes\",\"Suite C teeth still bite\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 4: balanceLint owned/borrowed split",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** balanceLint seeds only owned captures at +1; no false leak for borrowed survivors; over-consume of a borrowed capture is caught.\n\n**Files:** Modify src/Wok/IR/Perceus.hs (closure lint:1456-1472, LetRec lint:1475-1511); test/Spec.hs\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Perceus.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test wok-tests --test-show-details=direct -k \\\"m2a-1 lint\\\"\",\"acceptanceCriteria\":[\"lint seeds only owned captures +1\",\"DuplicateOneDrop on borrowed caught\",\"no false leak for borrowed survivor\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 5: Escape detector + narrow #1/#4 guards to escapes",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** Accept non-escaping #1/#4 (run under full oracle), still reject escaping sub-cases. Conservative escape predicate exported for M2a-2 reuse.\n\n**Files:** Modify src/Wok/IR/Perceus.hs (escape predicate near :281), src/Wok/IR/Reachable.hs (:188, :234); test/Spec.hs; Create test/rc-examples/NN-rlam-sibling-escape.wok; goldens.\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Perceus.hs\",\"src/Wok/IR/Reachable.hs\",\"test/Spec.hs\",\"test/rc-examples/NN-rlam-sibling-escape.wok\",\"test/rc-perceus-golden/\",\"test/rc-stats-golden/\"],\"verifyCommand\":\"cabal test wok-tests --test-show-details=direct -k \\\"rc\\\"\",\"acceptanceCriteria\":[\"#4 rejected only if closure escapes\",\"#1 rejected only if member escapes\",\"non-escaping reproducers accepted\",\"escaping variant still rejected\",\"Suites A/B/D green, accounting balances\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 6: Full-suite regression + slice wrap-up",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** Whole suite green, hlint clean on touched modules, guard statuses documented, request full-branch review before merge.\n\n**Files:** none (verification)\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"cabal test wok-tests --test-show-details=direct\",\"acceptanceCriteria\":[\"full suite green (~1019 + new)\",\"hlint clean on touched modules\",\"guard statuses documented\",\"full-branch review requested before merge\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-15T00:00:02Z"
+}

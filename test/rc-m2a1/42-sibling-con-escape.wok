@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #12 (DIRECT sibling-into-constructor escape, must be REJECTED):
+-- the LetRec group sibling 'f' flows DIRECTLY into a constructor field ('Box f')
+-- whose value is returned, so the borrowed/uncounted-region member leaves the
+-- enclosing LetRec region inside the escaping cell (region-lifetime extension =
+-- M2a-2). Verified use-after-free at runtime ('addr 0') before the guard fix:
+-- the sibling-escape check was gated on the Let-RHS being an 'RLam' or a bare
+-- alias, so a sibling appearing directly in an 'RCon' field slipped through.
+data Box = Box (U64 -> U64)
+
+mk : U64 -> Box
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in Box f
+
+main = case mk 7 of Box g -> g 2

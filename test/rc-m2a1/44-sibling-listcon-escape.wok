@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #14 (DIRECT sibling-into-list-constructor escape, REJECTED):
+-- the LetRec group sibling 'f' is stored DIRECTLY into a 'Cons' cell whose spine
+-- escapes ('Cons f Nil'). Same UAF class as #12: a sibling in any 'RCon' field,
+-- not only a single-field 'Box', must be rejected.
+data FList = Nil | Cons (U64 -> U64) FList
+
+mk : U64 -> FList
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in Cons f Nil
+
+main = case mk 7 of
+  Nil      -> 0
+  Cons g _ -> g 2

@@ -5,6 +5,7 @@ module Wok.Interp.RC.Machine
   , runRC
   , runExprRC
   , runModuleRC
+  , runModuleRCUnchecked
   , RCRun (..)
   , renderRcStats
   ) where
@@ -53,7 +54,18 @@ returnToRC :: RCPrimTable -> RCValue -> RCKont -> Store -> Either RuntimeError R
 returnToRC _     _ KDoneRC                _ = Left (PrimError (Tx.pack "internal: returnToRC KDoneRC"))
 returnToRC _     v (KLetRC b body sc k)   s =
   Right (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s)
-returnToRC prims v (KAppRC args k)        s = enterRC prims v args k s
+-- OWNED: a 'KAppRC' over-application continuation holds an ANONYMOUS intermediate
+-- function value (the result of saturating the previous application) with no IR
+-- binder. The application is its sole owner, so it CONSUMES it (no Perceus drop
+-- can reach an unnamed intermediate). See 'enterRC'.
+returnToRC prims v (KAppRC args k)        s = enterRC False prims v args k s
+-- DEFERRED CONSUME (M2a-2): the unnamed-intermediate closure cell whose body just
+-- produced @v@ is now dropped --- its captures are no longer borrowed by the
+-- (completed) body, so the cascade is safe. Thread @v@ onward to the saved
+-- continuation. (See 'KDropCellRC' and the deferred-consume note in 'enterRC'.)
+returnToRC _     v (KDropCellRC addr k)   s = do
+  s' <- dropAddr addr s
+  Right (RReturn v k s')
 
 -- ---------------------------------------------------------------------------
 -- Eval
@@ -92,38 +104,63 @@ evalExprRC prims expr sc k s = case expr of
             Right (REval jbody jsc { rscEnv = bindRCBinders ps vs (rscEnv jsc) } jk s)
 
   LetRec defs body ->
-    -- LetRec = an UNCOUNTED REGION (design invariant 4). A local group of
-    -- mutually-recursive closures must tie a knot (even's env references odd,
-    -- and vice versa) WITHOUT that intra-group edge becoming a counted cycle.
+    -- SHARED-ENV + CODE-POINTER representation (M2a-2 Task 3). A local group of
+    -- mutually-recursive closures is evaluated as ONE static code label (the
+    -- 'NGroupCode' table, installed at an immortal negative address, never
+    -- counted) plus AT MOST ONE shared dynamic 'NEnv' cell holding the group's
+    -- enclosing captures. Each group binder maps to an 'RVRecMember groupAddr i
+    -- envAddr': a member handle that names its code by index and shares the one
+    -- env. The intra-group knot is implicit --- a sibling call reconstructs the
+    -- sibling handles inline at entry (see the 'RVRecMember' arm of 'enterRC') ---
+    -- so there is no counted cycle to break and no per-member region cell.
     --
-    -- We allocate the whole group as one region (counted dynamic cells sharing a
-    -- fresh region id), build the knotted env that maps every group binder's
-    -- Unique to its reserved handle, install each closure node over that knotted
-    -- env, then evaluate the body in the scope extended with the group bindings.
-    -- 'dropAddr' skips intra-region sibling edges, so the group is dropped as a
-    -- unit (each member freed once by its own external drop -- typically a
-    -- Perceus-inserted drop at scope exit, or the result drop).
-    let n            = length defs
-        (addrs, s')  = allocLetRecGroup n s
-        -- The knotted env: every group binder -> its reserved region handle.
-        -- Built before any closure node is installed, so each closure captures
-        -- references to all siblings (including itself).
-        groupEnv     = foldl' (\e ((b, _, _), a) -> bindRCBinder b (RVBox a) e)
-                              (rscEnv sc) (zip defs addrs)
-        -- Install each member's real closure node. Each member captures only the
-        -- free variables of its body (minus its own parameters); the knot still
-        -- ties because siblings ARE free vars of a body that calls them, so they
-        -- remain in each member's captured env. Enclosing owned locals that NO
-        -- member references are excluded, so the group drop's cascade does not
-        -- decref cells the group does not own.
-        s''          = foldl' (\st ((_, ps, bdy), a) ->
-                                 let fvs  = freeVarsExpr bdy
-                                              `Set.difference`
-                                              Set.fromList (map binderUnique ps)
-                                     cenv = Map.restrictKeys groupEnv fvs
-                                 in writeRegionCell a (NClosure cenv ps bdy) st)
-                              s' (zip defs addrs)
-    in Right (REval body sc { rscEnv = groupEnv } k s'')
+    --   * CAPTURES are the union of each member-body's free vars, minus the
+    --     members' own parameters and minus the group's own binders (siblings are
+    --     NOT captured; they are reconstructed at entry).
+    --   * A CAPTURE-FREE group uses the static empty-env sentinel as its envAddr
+    --     and allocates NO dynamic cell.
+    --   * A CAPTURING group allocates exactly ONE 'NEnv' cell (counted); the
+    --     single counted child of every member handle, freed once when the last
+    --     member handle is dropped (see 'valueChildren'/'countedChildren').
+    let (gAddr, sg) = allocStatic (NGroupCode defs) s
+        groupU      = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
+        -- Captures = the union of each member body's free vars, minus the members'
+        -- own parameters and the group's own binders (siblings are reconstructed,
+        -- not captured). Restricted to names actually BOUND in the enclosing scope:
+        -- a free 'Unique' that is a prim/global name resolved at the call head (not
+        -- present in 'rscEnv') is NOT a capture and must not seed an 'NEnv' field.
+        --
+        -- COUNTED-ENV PREDICATE (M2a-2 BLOCKER 2). The shared 'NEnv' exists (counted)
+        -- iff the group captures ANY bound enclosing local --- BOXED OR UNBOXED. An
+        -- unboxed capture (e.g. corpus 36's @u : U64@) must be STORED in the env so
+        -- the member body can resolve it (the body reads it from 'envFields'), and a
+        -- single counted 'NEnv' cell then holds it; the cell needs exactly one drop
+        -- regardless of field boxedness. The pass agrees through the SAME plumbing,
+        -- NOT a duplicated predicate: it represents the env by the group's member-0
+        -- unit and unconditionally inserts one @__rc_dup@/@__rc_drop@ of it per
+        -- escape/scope-exit; the runtime resolves those to @incref@/@dropAddr envAddr@,
+        -- which are NO-OPS on the static empty-env sentinel (capture-free) and exactly
+        -- one ref op on a real cell. So "capture-free => zero cells, sentinel" and
+        -- "any capture => one counted cell" hold identically on both sides without the
+        -- pass re-deriving boxedness. (The pass's boxed-only 'memberCaps' filter is for
+        -- the capture-MOVE accounting --- which enclosing owned units are moved into
+        -- the env and dup-planned --- NOT for env existence; unboxed locals are not
+        -- reference-counted, so they need no move/dup, only storage for evaluation.)
+        caps        = Set.unions
+                        [ (freeVarsExpr bdy `Set.difference`
+                            Set.fromList (map binderUnique ps)) `Set.difference` groupU
+                        | (_, ps, bdy) <- defs ]
+        capList     = [ u | u <- Set.toList caps, Map.member u (rscEnv sc) ]
+        (envAddr, sEnv)
+          | null capList = (emptyEnvSentinelAddr, sg)
+          | otherwise    =
+              let fields = Map.fromList
+                    [ (u, v) | u <- capList, Just v <- [Map.lookup u (rscEnv sc)] ]
+              in alloc (NEnv fields) sg
+        groupEnv = foldl' (\e ((b, _, _), i) ->
+                             bindRCBinder b (RVRecMember gAddr i envAddr) e)
+                          (rscEnv sc) (zip defs [0 ..])
+    in Right (REval body sc { rscEnv = groupEnv } k sEnv)
 
   Handle _ _ ->
     Left (PrimError (Tx.pack "rc M1: effects not supported (no-handler fragment)"))
@@ -149,7 +186,7 @@ evalRhsRC prims b rhs body sc k s = case rhs of
     let fvs     = freeVarsExpr e `Set.difference`
                     Set.fromList (map binderUnique ps)
         cenv    = Map.restrictKeys (rscEnv sc) fvs
-        (a, s') = alloc (NClosure cenv ps e) s
+        (a, s') = alloc (mkClosure cenv ps e) s
     in cont (RVBox a) s'
 
   RProj l a -> do
@@ -160,7 +197,8 @@ evalRhsRC prims b rhs body sc k s = case rhs of
         case cNode c of
           NRecord _ m | Just fv <- Map.lookup l m -> cont fv s
           _ -> Left (BadProjection l)
-      RVLit _ -> Left (BadProjection l)
+      RVLit _           -> Left (BadProjection l)
+      RVRecMember{} -> Left (BadProjection l)
 
   RApp f as -> do
     vs <- mapM (resolveRCAtom sc) as
@@ -185,7 +223,9 @@ callFn prims sc f args k s = case f of
   ALit _ -> Left (NotAFunction (Tx.pack "literal"))
   AVar n ->
     case Map.lookup (nameUniq n) (rscEnv sc) of
-      Just fv -> enterRC prims fv args k s
+      -- BORROW: the function value sits at a NAMED call head, owned by its binder;
+      -- the application reads it and Perceus drops it at its last use.
+      Just fv -> enterRC True prims fv args k s
       Nothing ->
         case Map.lookup (nameHint n) prims of
           Just p  -> enterPrim prims p args k s
@@ -195,61 +235,204 @@ callFn prims sc f args k s = case f of
 -- Handles currying and over-application (over-application chains via 'KAppRC').
 -- A prim handle never reaches here as a value in M1 (prims are resolved by name
 -- at 'callFn'); the only first-class function values are 'NClosure' cells.
-enterRC :: RCPrimTable -> RCValue -> [RCValue] -> RCKont -> Store
+-- The 'Bool' is @borrowHead@: 'True' when the function value sits at a NAMED call
+-- head (from 'callFn'), where the application BORROWS it and Perceus drops it at
+-- its last use; 'False' when it is an ANONYMOUS runtime intermediate (a 'KAppRC'
+-- over-application continuation, a prim's over-application result, or a 'PRApply'
+-- function value) that the application OWNS and must consume, since no IR binder
+-- (and therefore no Perceus drop) can reach it.
+enterRC :: Bool -> RCPrimTable -> RCValue -> [RCValue] -> RCKont -> Store
         -> Either RuntimeError RCConfig
-enterRC _ fv args k s = case fv of
+enterRC borrowHead _ fv args k s = case fv of
   RVBox addr -> do
     c <- deref addr s
     case cNode c of
-      NClosure cenv ps body -> do
-        -- CONSUME the closure cell. The Perceus pass treats the head @f@ of an
-        -- @RApp f as@ as a MOVE (it emits no caller @__rc_drop f@; see
-        -- 'ownedOccs'/'moveAtoms' in "Wok.IR.Perceus"), so application owns @f@'s
-        -- reference and must release it exactly once. Without this, every
-        -- dynamically-allocated closure (a partial application, the LT branch
-        -- below) leaks (F4).
+      cl@(NClosure cenv ps body capMode) -> do
+        -- BORROW-ON-CALL (M2a-2 Task 1). Applying a function value at a NAMED call
+        -- head BORROWS it: the call is a pure READ of the closure cell and NEVER
+        -- drops it. The Perceus pass treats the head @f@ of an @RApp f as@ as a
+        -- BORROW (see 'ownedOccs' / 'moveAtoms' in "Wok.IR.Perceus"): @f@ stays
+        -- owned by its binder and is dropped at its real LAST USE by the standard
+        -- last-use machinery, exactly like any other value. A closure called N times
+        -- is therefore dup'd 0 times and dropped exactly once (at last use), when
+        -- its cell's drop cascades into the owned captures (see 'countedChildren').
         --
-        -- The captured env is BORROWED through the new scope by the body / the new
-        -- partial closure. To keep refcounts balanced regardless of whether this
-        -- closure is shared (rc > 1, dup'd) or unique (rc == 1), we INCREF each
-        -- boxed captured handle (handing the body / new closure its OWN ownership
-        -- of the captures) and then DROP the closure cell with the normal cascade:
-        --   * unique: incref (+1) then dropAddr frees the cell and cascades (-1) ->
-        --     net zero on captures, ownership transferred to the consumer;
-        --   * shared: incref (+1) then dropAddr only decrements the shell ->
-        --     captures gain the consumer's owning ref, the aliases keep theirs.
+        -- The closure/region representation is UNCHANGED here (the shared-env
+        -- representation is a later task): the cell still OWNS its boxed captures,
+        -- and the body is still instrumented as a scope that OWNS those captures on
+        -- entry (see 'ownRhs'). To keep that body model valid we INCREF each owned
+        -- boxed capture on entry (handing the body its own ownership, which the body
+        -- consumes/drops). On a BORROWED head we do NOT drop the cell --- it keeps
+        -- its own ref to each capture, released once by the cascade when the cell is
+        -- finally dropped at the caller's last use.
         --
-        -- BORROW-ONLY closures are NEVER consumed (they are not counted moves in
-        -- the pass): a static (global) closure and a 'LetRec' region member are
-        -- released by the static lifetime / the group drop respectively. For those
-        -- we neither incref the captures nor drop the cell.
+        -- An ANONYMOUS runtime intermediate (@borrowHead == False@: a 'KAppRC' over-
+        -- application continuation, a prim over-application result, or a 'PRApply'
+        -- value) has NO IR binder, so Perceus cannot place its drop. The application
+        -- is its sole owner and CONSUMES it: after increfing the captures (the body
+        -- still owns its copies) we DROP the cell, whose cascade releases its own
+        -- capture refs --- exactly the historical consume-on-call accounting, now
+        -- confined to the unnamed-intermediate case.
+        --
+        -- A captured handle is either OWNED (this closure holds a counted ref) or
+        -- BORROWED (it points at a static cell, owned by its static lifetime). The
+        -- SAME 'countedRefs' enumeration ('closureOwnedBoxed' here, the drop cascade
+        -- on free) skips static (borrowed) captures and retains dynamic (owned) ones,
+        -- so a capture is increfed on application EXACTLY iff it is released on drop
+        -- --- one source of truth, no parallel borrowed-set.
         let np = length ps; na = length args
-            captured = [ a | RVBox a <- Map.elems cenv ]
-            consume st
-              | isStaticAddr addr     = Right st
-              | isRegionAddr addr st  = Right st
-              | otherwise = do
-                  st' <- foldM (flip incref) st captured
-                  dropAddr addr st'
+            ownedCaptured = closureOwnedBoxed cl
+            -- BORROW-ONLY cells are a static (global) closure: their captures are
+            -- owned by the static lifetime, so a call neither increfs them (as
+            -- before) nor cascades them, and they are never consumed by the call.
+            borrowOnly      = isStaticAddr addr
+            increfOwned st  = if borrowOnly then Right st
+                              else foldM (flip incref) st ownedCaptured
+            -- This call CONSUMES the cell iff it is an unnamed intermediate (not a
+            -- borrowed named head) and not a borrow-only cell.
+            consumes        = not borrowHead && not borrowOnly
+            -- IMMEDIATE consume: drop the cell now. Used ONLY where the cell's body
+            -- does NOT run on this step (the LT partial-application path), so the
+            -- cascade cannot race a still-borrowing body.
+            consumeCellNow st = if consumes then dropAddr addr st else Right st
+            -- DEFERRED consume: keep the cell alive THROUGH its own call, dropping it
+            -- only when the body's result returns. The body borrows the cell's
+            -- captures (an 'RVRecMember' capture's shared env is cascade-eligible on
+            -- the cell's drop), so an eager drop would free the env mid-call --- a
+            -- use-after-free. 'KDropCellRC' threads the drop past the body. A
+            -- borrowed/borrow-only head is left alive (its binder / lifetime owns it).
+            deferConsume kont = if consumes then KDropCellRC addr kont else kont
         case compare na np of
           EQ -> do
-            s' <- consume s
-            Right (REval body (RCScope (bindRCBinders ps args cenv) Map.empty) k s')
+            s'  <- increfOwned s
+            Right (REval body (RCScope (bindRCBinders ps args cenv) Map.empty) (deferConsume k) s')
           LT -> do
-            -- Partial application: allocate a fresh closure that SHARES the
-            -- captured handles (increfed by 'consume') plus the supplied args
-            -- (moved in from the caller). Then consume the original. (No cell
-            -- reuse: M1 has no FBIP.)
+            -- Partial application: allocate a fresh closure that SHARES the original's
+            -- captures plus the supplied args (moved in from the caller). It keeps the
+            -- original's 'CaptureMode' (the body --- and so its borrow-vs-own capture
+            -- discipline --- is unchanged), so a partial-of-a-partial of a member
+            -- closure stays 'BorrowCaptures'.
+            --
+            -- ACQUIRE/RELEASE (uniform). The new cell OWNS one ref to each capture it
+            -- SHARES with the original --- ALL of them, 'RVBox' and 'RVRecMember'-env
+            -- alike, via 'countedRefs' over the original's @cenv@ (the same enumeration
+            -- its drop cascade releases). So we ALWAYS incref the shared captures here,
+            -- handing the new cell its own ownership. The supplied @args@ are MOVED in
+            -- (no incref; consumed by the new cell's drop). Independently, if the
+            -- original is an UNNAMED intermediate we CONSUME it ('consumeCellNow'),
+            -- which releases the ORIGINAL's refs to those captures --- leaving the
+            -- new cell's freshly-acquired refs as the surviving owners. A borrowed
+            -- named head is left alive (dropped at its last use by the pass), keeping
+            -- its own refs. Either way the new cell's acquire is matched by its own
+            -- drop, and the original's refs are matched by the original's drop --- two
+            -- balanced pairs, no transfer-by-omission. The body does NOT run here, so
+            -- an IMMEDIATE consume is safe.
             let cenv' = bindRCBinders (take na ps) args cenv
-                (a', s') = alloc (NClosure cenv' (drop na ps) body) s
-            s'' <- consume s'
-            Right (RReturn (RVBox a') k s'')
+                (a', s') = alloc (NClosure cenv' (drop na ps) body capMode) s
+                sharedCaptureRefs = countedRefs (Map.elems cenv)
+            s''  <- foldM (flip incref) s' sharedCaptureRefs
+            s''' <- consumeCellNow s''
+            Right (RReturn (RVBox a') k s''')
           GT -> do
             let (use, over) = splitAt np args
-            s' <- consume s
-            Right (REval body (RCScope (bindRCBinders ps use cenv) Map.empty) (KAppRC over k) s')
+            s'  <- increfOwned s
+            Right (REval body (RCScope (bindRCBinders ps use cenv) Map.empty)
+                     (KAppRC over (deferConsume k)) s')
       _ -> Left (NotAFunction (Tx.pack "applied a non-closure heap node"))
   RVLit _ -> Left (NotAFunction (Tx.pack "applied a literal"))
+  RVRecMember gAddr i envAddr -> do
+    -- BORROW-ON-CALL of a shared-env recursive member (M2a-2 Task 3). Calling an
+    -- 'RVRecMember' is a pure READ: the member handle is never consumed and its
+    -- shared 'NEnv' is never increfed/dropped by the call (it is owned by the
+    -- handle's lifetime, released once when the last handle is dropped). The
+    -- sibling scope is reconstructed INLINE at entry --- every group binder maps
+    -- to its own 'RVRecMember' over the SAME group code label and env --- so the
+    -- mutual-recursion knot is re-tied without a counted cycle.
+    gc <- deref gAddr s
+    case cNode gc of
+      NGroupCode defs -> do
+        let (_, ps, body) = defs !! i
+            np = length ps; na = length args
+        -- The shared captured env. A capture-free group points at the static
+        -- empty-env sentinel, which legitimately degrades to the empty env (it is
+        -- uncounted and always reconstructible). A NON-sentinel env addr that fails
+        -- to deref is a genuine use-after-free / dangling pointer: surface it as a
+        -- 'Left' rather than laundering it into 'Map.empty' (which would turn a
+        -- freed-env UAF into a silent wrong value via a spurious 'UnboundVar').
+        envFields <- case deref envAddr s of
+                       Right c | NEnv m <- cNode c -> Right m
+                       _ | envAddr == emptyEnvSentinelAddr -> Right Map.empty
+                       Left e                              -> Left e
+                       Right _ -> Left (PrimError (Tx.pack
+                                    ("RVRecMember env addr is not NEnv: " <> show envAddr)))
+        let -- Reconstruct the sibling handles (all members of THIS group, over the
+            -- same code label and env). These are BORROWS --- no incref.
+            sibs = Map.fromList
+                     [ (binderUnique b, RVRecMember gAddr j envAddr)
+                     | ((b, _, _), j) <- zip defs [0 ..] ]
+            -- The full call environment: bound params (left-to-right), then the
+            -- siblings, then the shared captures. Earlier maps win on key clash.
+            callEnv extra =
+              Map.unions [ Map.fromList (zip (map binderUnique ps) extra), sibs, envFields ]
+            -- DEFERRED ENV-DROP (M2a-2 Stage B). When an 'RVRecMember' is applied as
+            -- an UNNAMED INTERMEDIATE (@borrowHead == False@: the result of an
+            -- over-applied call, e.g. @(mk 0) 2@ where @mk 0@ returned the member),
+            -- there is no IR binder for the member handle, so Perceus cannot place
+            -- its drop, and the shared env it carries out would LEAK. Calling a member
+            -- never consumes it (borrow-on-call), so we drop its env AFTER the body
+            -- returns via 'KDropCellRC' (a no-op on the static empty-env sentinel;
+            -- one decref of a real 'NEnv'). A NAMED head is a borrow whose env is
+            -- owned by its binder and dropped at its last use by the pass, so it is
+            -- left untouched here.
+            deferEnv kont = if borrowHead then kont else KDropCellRC envAddr kont
+        case compare na np of
+          EQ -> Right (REval body (RCScope (callEnv args) Map.empty) (deferEnv k) s)
+          GT -> let (use, over) = splitAt np args
+                in Right (REval body (RCScope (callEnv use) Map.empty) (KAppRC over (deferEnv k)) s)
+          LT -> do
+            -- Partial application: allocate an ordinary closure that captures the
+            -- already-supplied args (bound to the consumed params), the siblings,
+            -- and the shared captures. Its body is the member body; its remaining
+            -- params are the unsupplied ones. A later full application re-enters
+            -- the member through the standard 'NClosure' path, so the recursion is
+            -- preserved.
+            --
+            -- RETAIN/RELEASE SYMMETRY (the M2a-2 fix). The new cell OWNS one ref to
+            -- each of its CAPTURES --- the sibling handles (each carrying the shared
+            -- @envAddr@) and the captured locals @envFields@ --- so we INCREF those
+            -- captures here, exactly the set the cell's eventual drop releases via
+            -- 'countedRefs' over the cell's env. The supplied @args@ are MOVED in
+            -- (their ref transfers from the caller); they are NOT increfed on build
+            -- but ARE released by the cell's drop, which is how the move is consumed.
+            --
+            -- The cell is built 'BorrowCaptures': its body is the member body, which
+            -- BORROWS its siblings and captured locals (a member never consumes a
+            -- capture --- #1 is deferred). So when this cell is later re-entered (the
+            -- standard 'NClosure' path), @increfOwned@ must hand the body NOTHING
+            -- ('closureOwnedBoxed' is empty for 'BorrowCaptures'); the cell's single
+            -- acquired ref is released only by its drop. Increfing on re-entry would
+            -- leak the shared env --- the unmatched-incref half of the original bug.
+            --
+            -- FLOATING ENV-HANDLE RELEASE. When the member handle is an UNNAMED
+            -- INTERMEDIATE (@borrowHead == False@: e.g. @mk 0@ returned the member,
+            -- which is then under-applied), there is no IR binder for it, so Perceus
+            -- cannot place its drop and the @envAddr@ it carried out would LEAK
+            -- (a NAMED head's env is owned by its binder and dropped at its last use
+            -- by the pass). Calling a member never consumes it, so we drop that
+            -- floating env ref here --- a no-op on the static empty-env sentinel, one
+            -- decref of a real 'NEnv'. The body does NOT run on this step, so an
+            -- IMMEDIATE drop is safe (no still-borrowing body to race). ORDER: incref
+            -- the captures FIRST, then drop the floating ref, so the cell's own
+            -- env ownership is established before the member handle's is released.
+            let cenv = Map.unions
+                         [ Map.fromList (zip (map binderUnique (take na ps)) args)
+                         , sibs, envFields ]
+                (a', s') = alloc (NClosure cenv (drop na ps) body BorrowCaptures) s
+                capRefs  = countedRefs (Map.elems sibs ++ Map.elems envFields)
+            s''  <- foldM (flip incref) s' capRefs
+            s''' <- if borrowHead then Right s'' else dropAddr envAddr s''
+            Right (RReturn (RVBox a') k s''')
+      _ -> Left (NotAFunction (Tx.pack "RVRecMember group addr is not NGroupCode"))
 
 -- | Apply a primitive to args, accumulating for currying and threading the
 -- store. Mirrors the reference 'enter' prim branch, sans the 'PRDrive'
@@ -271,11 +454,14 @@ enterPrim prims p args k s =
       case r of
         PRDone v
           | null over -> Right (RReturn v k s')
-          | otherwise -> enterRC prims v over k s'
+          -- OWNED: the prim returned a function value we now over-apply; it is an
+          -- anonymous intermediate the application consumes (no Perceus drop).
+          | otherwise -> enterRC False prims v over k s'
         PRApply g gargs ->
-          -- The function being applied (e.g. ($)'s first arg) is a value
-          -- handle, not a prim name, so dispatch via 'enterRC'.
-          enterRC prims g (gargs ++ over) k s'
+          -- The function being applied (e.g. ($)'s first arg) is a value handle,
+          -- not a prim name, so dispatch via 'enterRC'. It is an OWNED intermediate
+          -- delivered by the prim, consumed by the application.
+          enterRC False prims g (gargs ++ over) k s'
 
 -- ---------------------------------------------------------------------------
 -- Case matching (deref the scrutinee handle, match over the NCon node)
@@ -287,6 +473,7 @@ matchAltsRC v alts sc k s = case v of
     c <- deref addr s
     goNode (cNode c)
   RVLit l -> goLit l
+  RVRecMember{} -> Left (NonExhaustiveCase (Tx.pack "<closure>"))
   where
     -- Boxed scrutinee: match constructor alts against the NCon node; literal
     -- alts and default still apply (a literal alt simply never matches a node).
@@ -314,6 +501,8 @@ nodeTag :: Node -> Text
 nodeTag (NCon t _)    = t
 nodeTag (NRecord t _) = t
 nodeTag NClosure{}    = Tx.pack "<closure>"
+nodeTag (NGroupCode _) = Tx.pack "<closure>"
+nodeTag (NEnv _)       = Tx.pack "<env>"
 
 litText :: Lit -> Text
 litText (LInt n)  = Tx.pack (show n)
@@ -392,7 +581,7 @@ data RCRun = RCRun
 -- bind order; a CAF may reference earlier globals and any function). 'main'
 -- itself is a 0-arity bind but is run explicitly below, not at load time.
 runModuleRC :: CoreModule -> Either RuntimeError RCRun
-runModuleRC cm@(CoreModule binds) = do
+runModuleRC cm = do
   -- 0. Boundary guard. The RC interpreter supports the handler-free fragment
   --    (closures/'RLam' are admitted as of M1.5; 'Handle'/'ROp' effect features
   --    remain out of scope, as does a standalone closure capturing a 'LetRec'
@@ -409,6 +598,19 @@ runModuleRC cm@(CoreModule binds) = do
            "RC interpreter: code reachable from 'main' uses an unsupported \
            \feature:\n"
           <> Tx.intercalate (Tx.pack "\n") violations))
+  runModuleRCUnchecked cm
+
+-- | The post-guard whole-module runner: identical to 'runModuleRC' but WITHOUT
+-- the 'firstOrderNoHandlerViolations' boundary guard. 'runModuleRC' is exactly
+-- @guard >> runModuleRCUnchecked@, so the two share one implementation and can
+-- never drift. This is exposed so a TEST can drive an already-instrumented
+-- module --- e.g. a consuming-capture group still refused by the boundary until
+-- the escape-narrowing slice --- through the RC store and assert runtime
+-- accounting (heap-empty oracle) directly. It is NOT a production entry point;
+-- nothing in the compiler calls it. Callers are responsible for ensuring the
+-- module is in the supported fragment.
+runModuleRCUnchecked :: CoreModule -> Either RuntimeError RCRun
+runModuleRCUnchecked (CoreModule binds) = do
   -- 1. Reserve a static address for every top-level bind, building the knotted
   --    static env (every global maps to its handle before any body runs) and a
   --    store pre-loaded with placeholder static cells.
@@ -426,11 +628,12 @@ runModuleRC cm@(CoreModule binds) = do
     (TopBind _ [] body : _) -> do
       (v, s2) <- runExprRC rcPrimTable staticEnv s1 body
       txt <- renderRCValue s2 v
-      -- 5. Drop the result if it is a (dynamic) boxed value; a static handle and
-      --    a literal need no drop. Then read the final dynamic-heap stats.
-      s3 <- case v of
-        RVBox a | not (isStaticAddr a) -> dropAddr a s2
-        _                              -> Right s2
+      -- 5. Drop the result via its COUNTED children ('valueChildren'): an 'RVBox'
+      --    releases its node, an 'RVRecMember' releases its shared 'NEnv', and a
+      --    literal has none. 'dropAddr' no-ops on static/immortal addresses, so a
+      --    static handle and a value-CAF result need no special-casing. Then read
+      --    the final dynamic-heap stats.
+      s3 <- foldM (flip dropAddr) s2 (valueChildren v)
       Right (RCRun txt (stStats s3) baseline)
     (TopBind{} : _) -> Left (ArityError (Tx.pack "main must take no arguments"))
     []              -> Left (UnboundVar (Tx.pack "main"))
@@ -441,7 +644,7 @@ runModuleRC cm@(CoreModule binds) = do
 -- per bind. The placeholders are overwritten by 'installBinds' before 'main'
 -- runs, so they are never observed.
 reserveStatic :: [TopBind] -> (REnv, [Addr], Store)
-reserveStatic = go emptyStore Map.empty []
+reserveStatic = go (initSentinel emptyStore) Map.empty []
   where
     go s env addrs [] = (env, reverse addrs, s)
     go s env addrs (TopBind n _ _ : rest) =
@@ -470,7 +673,7 @@ installBinds prims knotEnv = go
   where
     go (TopBind n ps body : bs) s env (a : as)
       | not (null ps) =
-          let s' = writeStatic a (NClosure knotEnv ps body) s
+          let s' = writeStatic a (mkClosure knotEnv ps body) s
           in go bs s' env as
       | nameHint n == Tx.pack "main" =
           go bs s env as

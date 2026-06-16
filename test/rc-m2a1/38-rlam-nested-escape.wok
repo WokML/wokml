@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #8 (Route 5: NESTED capture, VERIFIED use-after-free):
+-- a standalone closure 'h' captures a LetRec GROUP SIBLING 'f' (borrowed from the
+-- uncounted region).  A SECOND closure 'g' then captures 'h' into ITS OWN cell and
+-- ESCAPES (it is returned).  Because 'g' carries 'h' --- and therefore the borrowed
+-- sibling 'f' --- out of the enclosing 'let' / LetRec region, the borrowed sibling
+-- outlives the region.
+--
+-- The escape detector must treat the capture of a tracked closure into a NESTED
+-- 'RLam' cell as an ESCAPE (the cell can outlive the region), NOT recurse asking
+-- whether the tracked var escapes within the nested body.  'h' is used only as a
+-- call head inside 'g', which is why the old "recurse-for-in-body-escape" RLam
+-- clause wrongly ACCEPTED this --- a use-after-free (reference interpreter returns
+-- 7; the buggy RC run errored 'use-after-free: addr 0').
+--
+-- 'rlamSiblingCaptureEscapes' must report ESCAPE here, and the boundary guard must
+-- REJECT.  Region-lifetime extension past scope exit is M2a-2 territory.
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let h = \m -> f (m + 1)
+  in let g = \k -> h (k + 1)
+  in g
+
+main = (mk 7) 2

@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #4: a standalone closure ('RLam') that captures a LetRec
+-- GROUP SIBLING.  The closure 'h' is never called; the overall result is the
+-- scalar 0.
+--
+-- The boundary guard detects this in the 'RLam' case of 'exprScopeFeaturesWith':
+-- 'f' is in the LetRec group binder set ('lr'), and 'f' is free in the body
+-- of 'h'.  'firstOrderNoHandlerViolations' must return a non-empty list
+-- (currently rejected).  Task M2a-1 Task 3 will distinguish OWNED vs BORROWED
+-- captures and lift this restriction for the non-escaping case.
+mk : U64 -> U64
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let h = \m -> f (m + 1)
+  in 0
+
+main = mk 7

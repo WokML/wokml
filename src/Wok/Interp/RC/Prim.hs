@@ -52,6 +52,10 @@ rcDup :: RCPrim
 rcDup = RCPrim (Tx.pack "__rc_dup") 1 [] $ \args s -> case args of
   [v@(RVBox a)] -> do s' <- incref a s; Right (PRDone v, s')
   [v@(RVLit _)] -> Right (PRDone v, s)
+  -- A shared-env recursive member: its single counted child is the env cell
+  -- ('valueChildren'). Dup increfs the env (a no-op on the static empty-env
+  -- sentinel); the group code label is static and never counted.
+  [v@(RVRecMember _ _ e)] -> do s' <- incref e s; Right (PRDone v, s')
   _             -> Left (ArityError (Tx.pack "__rc_dup"))
 
 -- | @__rc_drop x@ decrefs the handle (freeing at zero, recursively) and returns
@@ -60,6 +64,9 @@ rcDrop :: RCPrim
 rcDrop = RCPrim (Tx.pack "__rc_drop") 1 [] $ \args s -> case args of
   [RVBox a]   -> do s' <- dropAddr a s; Right (PRDone (RVLit LUnit), s')
   [RVLit _]   -> Right (PRDone (RVLit LUnit), s)
+  -- A shared-env recursive member: drop decrefs the env (a no-op on the static
+  -- empty-env sentinel), freeing it at zero and cascading its owned captures.
+  [RVRecMember _ _ e] -> do s' <- dropAddr e s; Right (PRDone (RVLit LUnit), s')
   _           -> Left (ArityError (Tx.pack "__rc_drop"))
 
 -- ---------------------------------------------------------------------------
@@ -118,7 +125,8 @@ asBool (RVBox a) s = do
     NCon t [] | t == Tx.pack "True"  -> Right True
               | t == Tx.pack "False" -> Right False
     _ -> Left (PrimError (Tx.pack "expected Bool"))
-asBool (RVLit _) _ = Left (PrimError (Tx.pack "expected Bool, got a literal"))
+asBool (RVLit _)           _ = Left (PrimError (Tx.pack "expected Bool, got a literal"))
+asBool RVRecMember{} _ = Left (PrimError (Tx.pack "expected Bool, got a closure handle"))
 
 -- | Allocate a boxed boolean constructor and return its handle.
 allocBool :: Bool -> Store -> (RCValue, Store)
@@ -156,5 +164,6 @@ boolOp name op = RCPrim name 2 [] $ \args s -> case args of
 -- | Drop a moved-in operand: decref a boxed handle (freeing recursively at
 -- zero); a no-op on a literal (literals are never counted). Threads the store.
 dropBoxed :: RCValue -> Store -> Either RuntimeError Store
-dropBoxed (RVBox a) s = dropAddr a s
-dropBoxed (RVLit _) s = Right s
+dropBoxed (RVBox a)          s = dropAddr a s
+dropBoxed (RVLit _)          s = Right s
+dropBoxed (RVRecMember _ _ e) s = dropAddr e s

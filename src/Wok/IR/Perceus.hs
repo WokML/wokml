@@ -66,11 +66,14 @@ module Wok.IR.Perceus
     -- * Names of the RC intrinsics (exported for tests / the RC prim table)
   , dupHint
   , dropHint
-    -- * Boxed-ness predicate (exported for tests)
+    -- * Boxed-ness predicate (re-exported from "Wok.IR.Escape" for tests)
   , isBoxedType
-    -- * LetRec enclosing-capture predicates (shared with the boundary guard)
+    -- * LetRec enclosing-capture predicates (re-exported from "Wok.IR.Escape";
+    -- the single source of truth lives there, shared with the boundary guard)
   , letRecEnclosingCaptureEscapes
-  , letRecMemberConsumesCapture
+  , letRecMemberEscapes
+  , rlamSiblingCaptureEscapes
+  , nonHeadOccsRhs
   , rawEnclosingFv
     -- * Fault injection (Suite C --- oracle-has-teeth; TESTS ONLY)
   , Mutation (..)
@@ -88,6 +91,12 @@ import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Mult (..)
   , Rhs (..), TopBind (..), prettyModule
   , freeVarsExpr, freeVarsAlt, atomVars, binderUnique )
+import Wok.IR.Escape
+  ( isBoxedType, boxedBinder
+  , nonHeadOccsRhs
+  , rlamSiblingCaptureEscapes, letRecEnclosingCaptureEscapes
+  , letRecMemberEscapes
+  , rawEnclosingFv )
 import Wok.IR.Name (JoinId, Name (..), Unique (..))
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
 
@@ -160,33 +169,8 @@ atomMaxU (ALit _) = -1
 -- ---------------------------------------------------------------------------
 -- Boxed-ness
 --
--- A value is reference-counted iff its type is BOXED. Unboxed scalars live
--- inline and are never counted.
-
--- | True iff a value of this type is heap-allocated (and so reference-counted).
-isBoxedType :: CType -> Bool
--- UNBOXED iff the value is an 'RVLit' in the RC interpreter -- i.e. exactly the
--- literal types: U64/U32/Char/Unit/String/Never. These live inline and are
--- never reference-counted (a literal resolves to 'RVLit', and __rc_dup/__rc_drop
--- are no-ops on it).
-isBoxedType (CTCon TcU64    []) = False
-isBoxedType (CTCon TcU32    []) = False
-isBoxedType (CTCon TcChar   []) = False
-isBoxedType (CTCon TcUnit   []) = False
-isBoxedType (CTCon TcString []) = False
-isBoxedType (CTCon TcNever  []) = False
--- Bool is BOXED: the RC interpreter has no scalar boolean -- it allocates a
--- nullary constructor cell (NCon True/False, an RVBox) for every Bool (see
--- 'Wok.Interp.RC.Prim' allocBool/cmp/boolOp). The pass MUST agree with that
--- value rep, so a Bool is reference-counted like any other constructor.
-isBoxedType (CTCon TcBool   []) = True
--- Lists, tuples, user constructors/records, functions/closures, and type
--- variables are all boxed.
-isBoxedType _                   = True
-
--- | True iff this binder names a boxed (reference-counted) value.
-boxedBinder :: Binder -> Bool
-boxedBinder = isBoxedType . bndType
+-- 'isBoxedType' / 'boxedBinder' are defined in "Wok.IR.Escape" (the escape rules
+-- need them) and imported here.
 
 -- ---------------------------------------------------------------------------
 -- Free variables (Unique sets) over ANF
@@ -224,211 +208,15 @@ jumpTargets (LetRec _ e)       = jumpTargets e   -- def bodies are own scopes
 jumpTargets (Handle e _)       = jumpTargets e
 
 -- ---------------------------------------------------------------------------
--- The 'LetRec' enclosing-capture ESCAPE predicate (M1.5 Phase 2)
+-- Escape / borrowership predicates
 --
--- SHARED single source of truth, used in BOTH places that must agree:
---   * the Perceus pass coverage condition ('coveredExpr (LetRec ...)'), and
---   * the RC boundary guard ('Wok.IR.Reachable.exprScopeFeatures').
---
--- Spec sections 5.1/5.7: the borrow-model multiset accounting (5.2) balances ONLY
--- when the group drops as a UNIT at scope exit, firing each member's cascade
--- exactly once. A member that ESCAPES the 'LetRec' body (its binder flows out as a
--- VALUE --- returned in the result, or moved into a constructor/record/closure/
--- call ARGUMENT that escapes) is NOT dropped at scope exit, so its captured
--- enclosing local leaks (and, symmetrically, a sibling dropped at scope exit
--- dangles under the escaped member's still-live knot). We cannot instrument that
--- soundly yet (it needs region-lifetime extension, deferred per 5.7). So a group
--- that BOTH captures an enclosing boxed local AND has an escaping member must be
--- REFUSED (Part B), never instrumented (excluded from coverage, Part A).
---
--- A group that captures NO enclosing boxed local is UNAFFECTED by this predicate
--- (e.g. a group that merely returns a member: the existing
--- '23-letrec-return-member' shape stays covered exactly as before).
-
--- | True iff some member of the group captures an enclosing BOXED local (a free
--- var of a member body, minus the member's params and the group binders, that is
--- in @bsc@ --- the in-scope boxed-local Uniques).
-letRecCapturesEnclosing :: [(Binder, [Binder], Expr)] -> Set Unique -> Bool
-letRecCapturesEnclosing defs bsc =
-  not (Set.null (letRecEnclosingCaptures defs bsc))
-
--- | The set of enclosing boxed locals captured by ANY member of the group: the
--- union over members of @(freeVarsExpr body \\ params \\ groupBinders) ∩ bsc@.
-letRecEnclosingCaptures :: [(Binder, [Binder], Expr)] -> Set Unique -> Set Unique
-letRecEnclosingCaptures defs bsc =
-  let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-  in Set.unions
-       [ ((freeVarsExpr body `Set.difference` Set.fromList (map binderUnique ps))
-            `Set.difference` groupU)
-           `Set.intersection` bsc
-       | (_, ps, body) <- defs ]
-
--- | True iff some group member BINDER escapes the 'LetRec' body: it appears
--- anywhere in @body@ as an atom in a NON-CALL-HEAD position --- i.e. anything
--- except the head @f@ of an @RApp f as@. A member used ONLY as the head of
--- saturated calls does NOT escape. This is a conservative SOUND over-approximation
--- (over-rejecting is safe; under-rejecting is a soundness hole).
-letRecMemberEscapes :: [(Binder, [Binder], Expr)] -> Expr -> Bool
-letRecMemberEscapes defs body =
-  let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-  in not (Set.null (nonHeadOccs groupU body `Set.intersection` groupU))
-
--- | The shared ESCAPE predicate (Part A coverage condition AND Part B boundary
--- reject): True iff some member captures an enclosing boxed local (in @bsc@) AND
--- some group member binder escapes @body@. When False, either the group captures
--- nothing enclosing (the unit-scope accounting is unaffected) or no member escapes
--- (the group drops as a unit and the borrow model balances).
-letRecEnclosingCaptureEscapes :: [(Binder, [Binder], Expr)] -> Expr -> Set Unique -> Bool
-letRecEnclosingCaptureEscapes defs body bsc =
-  letRecCapturesEnclosing defs bsc && letRecMemberEscapes defs body
-
--- ============================ TODO(M1.5 Phase 2+) ============================
--- FINDING 1 (Phase 2 full-branch review, verified DOUBLE-FREE). The borrow model
--- (spec 5.3) exempts a member's enclosing captures: it neither moves them into the
--- member cell nor drops them inside the body. That is sound ONLY when every use of
--- a capture is a BORROWED READ. But a member can reference a capture in a CONSUMING
--- position --- pass it by value to a call, store it in a constructor/record, return
--- it, alias it, capture it into a nested lambda, or project it. At runtime that is a
--- MOVE (the callee / cell takes ownership and drops it), AND the group-drop cascade
--- ALSO frees the (still region-owned) capture --- a double-free. Reproducer:
---
---   peek p = 0
---   main = let b = Box 6
---          in letrec go k = case k of 0 -> peek b ; _ -> 1 + go (k-1)
---          in go 3                                  -- peek b MOVES b => double-free
---
--- Proper support (dup the capture at the build site, once per consuming use, so the
--- region keeps its owning unit) is deferred with the spec 5.7 representation work.
--- Until then a group with a consuming capture stays UNCOVERED (pass) and is REJECTED
--- at the boundary --- never miscompiled.
---
--- BORROW-SAFE vs CONSUMING (the precise rule). An occurrence of a capture @u@ in a
--- member body is BORROW-SAFE iff it is the SCRUTINEE of a 'Case' that keeps no boxed
--- child of @u@ (no boxed 'AltCon' binder of that 'Case' is free in its alt body ---
--- so @case b of Box v -> v@ keeps only the unboxed @v@: SAFE). EVERY OTHER occurrence
--- is CONSUMING: an 'RApp' head or argument, an 'RCon'/'RRecord' field, a 'Ret'/'Jump'
--- atom, an 'RAtom' alias, a free var inside a nested 'RLam', an 'RProj' parent. When
--- in doubt, treat as CONSUMING --- over-rejection is sound, under-rejection is a hole.
--- =============================================================================
-
--- | True iff SOME member of the group references SOME enclosing BOXED capture (a
--- free var of that member body minus its params and the group binders, intersected
--- with @bsc@) in a CONSUMING position within that member's body. The ONLY
--- non-consuming position is "a 'Case' scrutinee keeping no boxed child of the
--- capture"; every other occurrence consumes (moves) the capture. See the loud
--- TODO above (FINDING 1, spec 5.3/5.7).
-letRecMemberConsumesCapture :: [(Binder, [Binder], Expr)] -> Set Unique -> Bool
-letRecMemberConsumesCapture defs bsc = any memberConsumes defs
-  where
-    groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-    memberConsumes (_, ps, body) =
-      let params = Set.fromList (map binderUnique ps)
-          caps   = ((freeVarsExpr body `Set.difference` params)
-                      `Set.difference` groupU)
-                     `Set.intersection` bsc
-      in not (Set.null (consumingOccs caps body))
-
--- | The subset of the watched capture set @caps@ that appears in a CONSUMING
--- position anywhere in @e@. A 'Case' scrutinee @AVar u@ with @u ∈ caps@ is exempt
--- (borrowed read) WHEN no boxed 'AltCon' binder of that 'Case' is free in its alt
--- body; every other atom occurrence of a watched capture is consuming. (Conservative:
--- when in doubt, consuming.)
-consumingOccs :: Set Unique -> Expr -> Set Unique
-consumingOccs caps = goE
-  where
-    watched a = atomVars a `Set.intersection` caps
-    goE (Ret a)              = watched a
-    goE (Let _ r e)          = goR r `Set.union` goE e
-    goE (LetRec ds e)        =
-      Set.unions (goE e : [ goE d | (_, _, d) <- ds ])
-    goE (Case a alts)        =
-      let altOccs = Set.unions (map goAlt alts)
-          -- The scrutinee is a BORROWED READ only when it is a bare captured var
-          -- and the Case keeps no boxed child of it. Otherwise the scrutinee atom
-          -- is a consuming occurrence.
-          scrutOcc
-            | scrutineeBorrowed a alts = Set.empty
-            | otherwise                = watched a
-      in scrutOcc `Set.union` altOccs
-    goE (LetJoin _ _ jb e)   = goE jb `Set.union` goE e
-    goE (Jump _ as)          = Set.unions (map watched as)
-    goE (Handle e _)         = goE e
-
-    goAlt (AltCon _ _ e) = goE e
-    goAlt (AltLit _ e)   = goE e
-    goAlt (AltDefault e) = goE e
-
-    goR (RAtom a)        = watched a
-    goR (RApp f as)      = Set.unions (map watched (f : as))   -- head AND args consume
-    goR (RCon _ as)      = Set.unions (map watched as)
-    goR (RRecord _ flds) = Set.unions (map (watched . snd) flds)
-    goR (RProj _ a)      = watched a                           -- projected parent moves
-    goR (ROp m _ _ as)   = Set.unions (map watched (maybe as (: as) m))
-    goR (RLam ps e)      =
-      -- A capture referenced inside a nested lambda body is moved into that
-      -- closure cell (it outlives the build) --- consuming. The lambda's own
-      -- params shadow nothing of the watched captures (fresh Uniques).
-      consumingOccs (caps `Set.difference` Set.fromList (map binderUnique ps)) e
-
-    -- A 'Case' scrutinee is a borrowed read iff it is a bare @AVar@ AND no alt
-    -- keeps a boxed child binder live (none of its boxed 'AltCon' binders is free
-    -- in that alt's body).
-    scrutineeBorrowed (AVar _) alts = all altKeepsNoBoxedChild alts
-    scrutineeBorrowed _        _    = False
-    altKeepsNoBoxedChild (AltCon _ bs e) =
-      let fvs = freeVarsExpr e
-      in not (any (\b -> boxedBinder b && binderUnique b `Set.member` fvs) bs)
-    altKeepsNoBoxedChild _ = True
-
--- | The 'Unique's that appear as an atom in a NON-CALL-HEAD position anywhere in
--- an expression --- every operand/field/result/scrutinee/argument occurrence, but
--- NOT the head @f@ of an @RApp f as@. (A member binder appearing only as a call
--- head is a recursive/dispatch call, which does not move the value out; any other
--- occurrence conservatively escapes.) @ignore@ are binders LOCAL to a nested scope
--- (a nested lambda's params, a nested LetRec's own binders) whose shadowing
--- references are not the outer group members --- but since group member Uniques
--- are globally distinct from fresh nested binders, @ignore@ only prunes the walk;
--- the final '∩ groupU' is what selects escapes.
-nonHeadOccs :: Set Unique -> Expr -> Set Unique
-nonHeadOccs _ (Ret a)              = atomVars a
-nonHeadOccs g (Let _ r e)          = nonHeadOccsRhs g r `Set.union` nonHeadOccs g e
-nonHeadOccs g (LetRec defs e)      =
-  Set.unions (nonHeadOccs g e : [ nonHeadOccs g d | (_, _, d) <- defs ])
-nonHeadOccs g (Case a alts)        =
-  atomVars a `Set.union` Set.unions (map (nonHeadOccsAlt g) alts)
-nonHeadOccs g (LetJoin _ _ jb e)   = nonHeadOccs g jb `Set.union` nonHeadOccs g e
-nonHeadOccs _ (Jump _ as)          = Set.unions (map atomVars as)
-nonHeadOccs g (Handle e _)         = nonHeadOccs g e
-
-nonHeadOccsAlt :: Set Unique -> Alt -> Set Unique
-nonHeadOccsAlt g (AltCon _ _ e) = nonHeadOccs g e
-nonHeadOccsAlt g (AltLit _ e)   = nonHeadOccs g e
-nonHeadOccsAlt g (AltDefault e) = nonHeadOccs g e
-
--- | Non-call-head atom occurrences in a RHS. The head @f@ of @RApp f as@ is the
--- ONLY exempt position (a saturated call does not escape the callee); every other
--- operand/field/capture/lambda-body occurrence escapes.
---
--- ONE exception: an inserted RC intrinsic call (@__rc_dup x@ / @__rc_drop x@)
--- contributes NO escape. The predicate may be evaluated on an ALREADY-instrumented
--- module ('runModuleRC' gates on the instrumented IR), where the group's scope-exit
--- @__rc_drop f@ would otherwise read the member @f@ as an RApp argument and falsely
--- flag it as escaping --- but that drop is exactly the unit-scope release that
--- proves the group does NOT escape. So an RC-intrinsic argument is exempt.
-nonHeadOccsRhs :: Set Unique -> Rhs -> Set Unique
-nonHeadOccsRhs _ (RAtom a)        = atomVars a
-nonHeadOccsRhs _ (RApp (AVar h) _)
-  | nameHint h == dupHint || nameHint h == dropHint = Set.empty
-nonHeadOccsRhs _ (RApp _ as)      = Set.unions (map atomVars as)   -- head EXEMPT
-nonHeadOccsRhs _ (RCon _ as)      = Set.unions (map atomVars as)
-nonHeadOccsRhs _ (RRecord _ flds) = Set.unions (map (atomVars . snd) flds)
-nonHeadOccsRhs _ (RProj _ a)      = atomVars a
-nonHeadOccsRhs _ (ROp m _ _ as)   = Set.unions (map atomVars (maybe as (: as) m))
-nonHeadOccsRhs g (RLam ps e)      =
-  -- A member captured into a nested lambda ESCAPES (it outlives the build site
-  -- inside the closure cell). The lambda's own params shadow nothing of the group
-  -- (fresh Uniques), so we simply union its body's non-head occurrences.
-  nonHeadOccs g e `Set.difference` Set.fromList (map binderUnique ps)
+-- The LetRec/closure escape + consume predicate family ('nonHeadOccs',
+-- 'nonHeadOccsRhs', 'escapesFrom', 'rlamSiblingCaptureEscapes',
+-- 'letRecMemberEscapes', 'letRecMemberConsumesCaptureNonEscaping', 'consumingOccs',
+-- 'letRecCapturesEnclosing', 'letRecEnclosingCaptureEscapes', 'rawEnclosingFv')
+-- lives in "Wok.IR.Escape" --- the single source of truth for escaping
+-- positions ('escapingAtomsRhs'), shared with the boundary guard
+-- ('Wok.IR.Reachable'). Imported above; not redefined here.
 
 -- ---------------------------------------------------------------------------
 -- The covered-fragment predicate
@@ -451,93 +239,37 @@ nonHeadOccsRhs g (RLam ps e)      =
 -- The prelude's ordinary closures ('raceSpawn'/'runConc'/...) are therefore now
 -- instrumented and certified balanced by 'balanceLint'.
 --
--- A 'LetRec' group's closures DO appear in coverage --- but only when the group
--- captures NO enclosing dynamic boxed local. This is the SAME unmodelled-capture
--- hazard as the standalone 'RLam', sharpened by an interpreter detail: the RC
--- machine captures the WHOLE enclosing scope into each group closure cell and, on
--- drop, recursively frees every captured non-sibling boxed cell (see
--- 'Wok.Interp.RC.Value.countedChildren'). So if any boxed local is live in the
--- enclosing scope at the 'LetRec', dropping the group at scope exit would free
--- that local a SECOND time (the body already consumed it) --- a double-free. A
--- group whose enclosing scope holds only unboxed locals, globals, and its own
--- siblings is cascade-safe and is instrumented; otherwise the whole enclosing
--- bind is passed through. 'boxedScope' threads the enclosing BOXED local Uniques
--- so this guard can be checked; a top-level bind seeds it with its boxed params.
+-- A 'LetRec' group's closures appear in coverage as ORDINARY acyclic RC (M2a-2):
+-- the group is one shared 'NEnv' cell plus per-member inline @RVRecMember@ handles
+-- (Task 3 runtime), so a group whose member bodies and body are themselves covered
+-- is covered --- no region bookkeeping. The escape / cross-region / consuming-capture
+-- shapes are NOT rejected HERE; they are gated by the boundary guard ('Reachable',
+-- @letRecEnclosingCaptureEscapes@ et al.) BEFORE the pass runs, so a program that
+-- reaches 'insertRC' is already non-escaping / non-consuming and is soundly
+-- instrumented as a DAG.
+coveredExpr :: Expr -> Bool
+coveredExpr (Let _ r e)         = coveredRhs r && coveredExpr e
+coveredExpr (Ret _)             = True
+coveredExpr (Case _ alts)       = all coveredAlt alts
+coveredExpr (LetJoin _ _ jb e)  = coveredExpr jb && coveredExpr e
+coveredExpr Jump{}              = True
+coveredExpr (LetRec defs e)     =
+  all (\(_, _, body) -> coveredExpr body) defs && coveredExpr e
+coveredExpr Handle{}            = False
 
--- @region@ threads the 'Unique's of ENCLOSING 'LetRec' GROUP BINDERS (uncounted
--- region members). They are tracked SEPARATELY from @bsc@ (ordinary boxed locals)
--- so the LetRec case can reject a nested group that captures one of them: a
--- region-to-region counted edge is the §5.5 deferral (the cascade would have to
--- decref an outer region member across a region boundary, which 'countedChildren'
--- does not skip). Ordinary enclosing boxed locals (in @bsc@) ARE brought into
--- coverage (Phase 2, non-escaping case); region members (in @region@) are not.
-coveredExpr :: Set Unique -> Set Unique -> Expr -> Bool
-coveredExpr region bsc (Let b r e) =
-  let bsc' = if boxedBinder b then Set.insert (binderUnique b) bsc else bsc
-  in coveredRhsIn region bsc r && coveredExpr region bsc' e
-coveredExpr _      _   (Ret _)        = True
-coveredExpr region bsc (Case _ alts)  = all (coveredAlt region bsc) alts
-coveredExpr region bsc (LetJoin _ ps jb e) =
-  let bsc' = foldr (\p -> if boxedBinder p then Set.insert (binderUnique p) else id) bsc ps
-  in coveredExpr region bsc' jb && coveredExpr region bsc e
-coveredExpr _      _   Jump{}         = True
-coveredExpr region bsc (LetRec defs e) =
-  -- Phase 2 (M1.5): a group may capture ENCLOSING boxed locals (in @bsc@) so long
-  -- as no member ESCAPES the body (the borrow-model accounting balances only when
-  -- the group drops as a unit; see 'letRecEnclosingCaptureEscapes', spec 5.1/5.7).
-  -- STILL REJECTED (passed through): a group capturing an enclosing REGION member
-  -- (in @region@ --- a binder of a DIFFERENT, outer group): a region-to-region
-  -- counted cascade edge is deferred (spec 5.5). Each def body is its own scope,
-  -- seeded with its own boxed params (siblings are exempt). The group binders are
-  -- added to @region@ for @e@ (so a nested inner group capturing them is caught),
-  -- NOT to @bsc@ (a member is never a counted enclosing capture of a sibling/body).
-  let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-      -- The enclosing captures (in @bsc@) of this group; if any is a region member
-      -- (in @region@) this is the deferred cross-region case (rejected below). By
-      -- construction @bsc@ and @region@ are disjoint, so a captured region member is
-      -- never in @bsc@ --- instead detect it directly against the raw member fvs.
-      capturesRegion =
-        not (Set.null (Set.intersection region (rawEnclosingFv defs)))
-      escapes = letRecEnclosingCaptureEscapes defs e bsc
-      -- FINDING 1 (Phase 2 review): a member that CONSUMES (moves) an enclosing
-      -- capture is NOT covered by the borrow model (it would double-free at the
-      -- group drop). Stays uncovered (pass) and is rejected at the boundary.
-      consumes = letRecMemberConsumesCapture defs bsc
-      defOK (_, ps, body) =
-        coveredExpr region (Set.fromList [ binderUnique p | p <- ps, boxedBinder p ]) body
-  in not capturesRegion
-       && not escapes
-       && not consumes
-       && all defOK defs
-       && coveredExpr (region `Set.union` groupU) bsc e
-coveredExpr _      _   Handle{}       = False
+coveredAlt :: Alt -> Bool
+coveredAlt (AltCon _ _ e) = coveredExpr e
+coveredAlt (AltLit _ e)   = coveredExpr e
+coveredAlt (AltDefault e) = coveredExpr e
 
--- | The raw enclosing free vars of a group: the union over members of
--- @freeVarsExpr body \\ params \\ groupBinders@ (NOT yet intersected with any
--- scope). Used to detect a captured outer REGION member (cross-region deferral).
-rawEnclosingFv :: [(Binder, [Binder], Expr)] -> Set Unique
-rawEnclosingFv defs =
-  let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-  in Set.unions
-       [ (freeVarsExpr body `Set.difference` Set.fromList (map binderUnique ps))
-           `Set.difference` groupU
-       | (_, ps, body) <- defs ]
-
-coveredAlt :: Set Unique -> Set Unique -> Alt -> Bool
-coveredAlt region bsc (AltCon _ bs e) =
-  coveredExpr region (foldr (\b -> if boxedBinder b then Set.insert (binderUnique b) else id) bsc bs) e
-coveredAlt region bsc (AltLit _ e)    = coveredExpr region bsc e
-coveredAlt region bsc (AltDefault e)  = coveredExpr region bsc e
-
--- | Scope-aware RHS coverage. A standalone 'RLam' is covered iff its body is
--- covered under the lambda's own boxed param scope (its captures are counted as
--- moves at the build site --- see 'ownedOccs' --- and the body is instrumented
--- as its own owned scope --- see 'ownRhs'). An 'ROp' is never covered.
-coveredRhsIn :: Set Unique -> Set Unique -> Rhs -> Bool
-coveredRhsIn region bsc (RLam ps e) =
-  coveredExpr region (foldr (\p -> if boxedBinder p then Set.insert (binderUnique p) else id) bsc ps) e
-coveredRhsIn _      _   ROp{} = False
-coveredRhsIn _      _   _     = True
+-- | RHS coverage. A standalone 'RLam' is covered iff its body is covered (its
+-- captures are moved into the closure cell at the build site --- see 'ownedOccs' /
+-- 'moveOperandUniques' --- and the body is instrumented as its own owned scope ---
+-- see 'ownRhs'). An 'ROp' is never covered (effects, M2b).
+coveredRhs :: Rhs -> Bool
+coveredRhs (RLam _ e) = coveredExpr e
+coveredRhs ROp{}      = False
+coveredRhs _          = True
 
 -- ---------------------------------------------------------------------------
 -- The pass
@@ -568,7 +300,7 @@ insertRC cm@(CoreModule bs) =
 
 onBind :: Supply -> TopBind -> (Supply, TopBind)
 onBind sup tb@(TopBind _ ps body)
-  | coveredExpr Set.empty (Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]) body =
+  | coveredExpr body =
       let delta0      = Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]
           env0        = Map.fromList [ (binderUnique b, b) | b <- ps ]
           (sup', body') = ownExpr (ctx0 env0) sup delta0 body
@@ -592,16 +324,66 @@ data Ctx = Ctx
   { ctxEnv    :: Map Unique Binder
   , ctxJoins  :: Map JoinId (Set Unique, Set JoinId)
   , ctxExempt :: Set Unique
+    -- | M2a-2 (Task 4) --- BORROWED values: 'LetRec' group members (each a borrow
+    -- of the shared env via @RVRecMember@) and borrowed captures bound into a
+    -- member body. A borrowed var is NOT owned: a call-head occurrence emits
+    -- nothing (a known/borrow call), and a CONSUMING occurrence (a move into a
+    -- con/record/arg/result) emits a @__rc_dup@ at that use --- DUP-ON-CONSUME ---
+    -- so the consumer gets an independent owned unit (an @incref@ of the env), while
+    -- the borrow keeps owning nothing. This subsumes the old per-member region
+    -- treatment (members no longer own a counted cell; the shared env does) and sets
+    -- up #1 consuming-captures (latent here: only borrow-reads occur for now).
+  , ctxBorrow :: Set Unique
+    -- | M2a-2 (Task 4) --- SYNTHETIC owned env values kept ALIVE to every path leaf.
+    -- The shared 'NEnv' of a 'LetRec' group is one owned value, represented by the
+    -- group's representative member binder (member 0): it is in @delta@ but is never
+    -- free in the body (members are borrows), so the standard last-use machinery
+    -- would drop it too early. Membership here suppresses the 'Let'-case prompt-drop
+    -- so the env survives until each leaf ('Ret'/'Jump'/'Case' arm), where the
+    -- ordinary @delta@-drop fires it exactly once per path --- a single @__rc_drop@
+    -- of member 0, which the runtime resolves to @dropAddr envAddr@.
+  , ctxEnvAlive :: Set Unique
+    -- | M2a-2 (Task 4) --- maps each 'LetRec' group member's 'Unique' to its group's
+    -- shared-env owning unit (member 0). Used by the 'Ret' rule: RETURNING a member
+    -- transfers that env handle out, so the env unit (member 0) MOVES out rather than
+    -- being dropped. (Mirrors the lint's 'leEnvAlias'.)
+  , ctxEnvAlias :: Map Unique Unique
   }
 
 ctx0 :: Map Unique Binder -> Ctx
-ctx0 env = Ctx env Map.empty Set.empty
+ctx0 env = Ctx env Map.empty Set.empty Set.empty Set.empty Map.empty
 
 ctxBind :: Binder -> Ctx -> Ctx
 ctxBind b c = c { ctxEnv = Map.insert (binderUnique b) b (ctxEnv c) }
 
 ctxBinds :: [Binder] -> Ctx -> Ctx
 ctxBinds bs c = foldr ctxBind c bs
+
+-- | ALIAS-OF-EXEMPT (M2a-1 hardening). True iff @rhs@ is @RAtom (AVar n)@ where
+-- @n@ is in the supplied exempt set (an uncounted-region sibling). Such a binding
+-- is a BORROW of the same region member, not an independent owned cell: it must
+-- not enter the owned set, must not be dup'd/dropped, and stays exempt for the
+-- rest of the scope. Shared by the pass ('ownExpr', exempt = 'ctxExempt') and the
+-- balance lint ('checkExpr', exempt = 'leExempt'), which take different exempt
+-- sets but the same shape.
+aliasesExemptIn :: Set Unique -> Rhs -> Bool
+aliasesExemptIn exempt (RAtom (AVar n)) = nameUniq n `Set.member` exempt
+aliasesExemptIn _       _               = False
+
+-- | ALIAS-OF-BORROW (M2a-2). True iff @rhs@ is @RAtom (AVar n)@ where @n@ is a
+-- BORROWED value (a 'LetRec' member captured as an inline @RVRecMember@, in
+-- @ctxBorrow@). Such a binding is a pure RENAME of a borrow, not an independent
+-- owned cell: it owns nothing, so it must NOT enter the owned set, must NOT be
+-- dup'd or dropped at the alias site, and stays BORROWED for the rest of the
+-- scope (a consuming use of the alias dup-on-consumes the shared env at THAT use;
+-- a read / call-head emits nothing). Without this an alias of an escaping member
+-- (E4 @let a = f ; h = \\m -> a (m+1)@) is treated as owned, seeded and dropped
+-- inside the escaping closure body, and the closure's cascade-drop then
+-- double-frees the shared env. The lint mirror is 'aliasesBorrowIn' over
+-- 'leBorrow'. Shared shape with 'aliasesExemptIn'; distinct set.
+aliasesBorrowIn :: Set Unique -> Rhs -> Bool
+aliasesBorrowIn borrow (RAtom (AVar n)) = nameUniq n `Set.member` borrow
+aliasesBorrowIn _       _               = False
 
 -- | Rewrite @e@ so every Unique in @delta@ is consumed exactly once.
 ownExpr :: Ctx -> Supply -> Set Unique -> Expr -> (Supply, Expr)
@@ -624,8 +406,43 @@ ownExpr ctx sup delta (Ret a) =
       -- forms are identical, so the intermediate 'moved' binding is dropped.) The
       -- F5 protection is preserved: every owned var the returned atom names is
       -- excluded from 'dead', so a returned LetRec-group member is never dropped.
-      dead     = delta `Set.difference` owned
-  in dropsFor (ctxEnv ctx) sup dead (Ret a)
+      -- ESCAPE-BY-RETURN (M2a-2 Task 4 + BLOCKER 1, GENERALISED to captures). A
+      -- BORROWED value (in 'ctxBorrow' --- a 'LetRec' member OR a member-body
+      -- borrowed enclosing CAPTURE) named by the returned atom carries a shared cell
+      -- OUT to the caller: a member carries the shared 'NEnv'; a capture carries the
+      -- captured box itself ('valueChildren' makes @__rc_dup@ incref the right cell
+      -- either way). Two cases, told apart by whether THIS scope OWNS the
+      -- corresponding env handle (a member's env unit, member 0, is in 'ctxEnvAlive'):
+      --
+      --   * TRANSFER (group body): the scope holds the env's single owning handle
+      --     (env0 in 'ctxEnvAlive'). Returning a member MOVES that one handle out ---
+      --     it must NOT be dropped (a drop would free the env the caller still holds
+      --     => UAF) and needs NO dup (the handle simply transfers). Its env unit
+      --     joins 'retEnvs' (protected from 'dead'). Only a member with an env-alias
+      --     mapping into 'ctxEnvAlive' is a transfer.
+      --   * ESCAPE (member body): the body BORROWS the value (no owned scope handle ---
+      --     'ctxEnvAlive' is empty here). Returning a sibling creates a NEW counted
+      --     reference to the env that escapes; returning a borrowed capture creates a
+      --     new counted reference to the captured box that escapes. EITHER must
+      --     dup-on-consume (an @incref@), exactly as the 'Let'/'Jump' move-into-operand
+      --     paths already do for a moved borrow. Without this dup the escaped handle is
+      --     released by the env cascade (a member) / the env's capture-field cascade (a
+      --     capture) at scope exit while the caller still holds it --- the verified
+      --     member-body sibling-escape double-free, and its CAPTURE analogue (a
+      --     member body returning a borrowed capture => use-after-free of that
+      --     capture). A returned capture has no env-alias, so it never joins 'retEnvs'.
+      retBorrows = [ u | u <- Set.toList (atomVars a), u `Set.member` ctxBorrow ctx ]
+      isTransfer u = case Map.lookup u (ctxEnvAlias ctx) of
+                       Just e  -> e `Set.member` ctxEnvAlive ctx
+                       Nothing -> False
+      retEnvs  = Set.fromList [ e | u <- retBorrows, isTransfer u
+                                  , Just e <- [Map.lookup u (ctxEnvAlias ctx)] ]
+      escBorrows = [ u | u <- retBorrows, not (isTransfer u) ]
+      borrowDup  = Map.toList (Map.fromListWith (+) [ (u, 1 :: Int) | u <- escBorrows ])
+      dead     = delta `Set.difference` owned `Set.difference` retEnvs
+      (sup1, dups)    = mkDupsForVars sup (ctxEnv ctx) borrowDup
+      (sup2, dropped) = dropsFor (ctxEnv ctx) sup1 dead (Ret a)
+  in (sup2, foldr ($) dropped dups)
 
 ownExpr ctx sup0 delta (Let b rhs body) =
   let -- Instrument an 'RLam' body as its own owned scope FIRST (no-op for every
@@ -637,6 +454,22 @@ ownExpr ctx sup0 delta (Let b rhs body) =
       later     = freeVarsExpr body
       rhsOcc    = ownedOccs ctx delta rhs           -- multiset of owned operands
       rhsSet    = Map.keysSet rhsOcc
+      -- DUP-ON-CONSUME (M2a-2 Task 4): a BORROWED value (a 'LetRec' member or a
+      -- borrowed capture, in 'ctxBorrow') moved into a con/record/non-head arg gets
+      -- ONE @__rc_dup@ at this use (an @incref@ of the env it names), so the new
+      -- cell owns an independent unit; the borrow keeps owning nothing. A call-head
+      -- occurrence is NOT a move (it is excluded by 'moveOperandUniques'), so a
+      -- recursive call emits nothing. The dup'd unit is released by the consuming
+      -- cell's own drop --- ordinary acyclic accounting.
+      -- ALIAS-OF-BORROW (M2a-2): @let a = f@ where @f@ is a borrowed member is a
+      -- pure RENAME, NOT a consuming move --- it owns nothing, so emit no
+      -- dup-on-consume here (the real escape, e.g. the closure that captures @a@,
+      -- dups the shared env at its own use). 'a' is made borrowed in 'ctx'' below.
+      aliasesBorrow = aliasesBorrowIn (ctxBorrow ctx) rhs
+      borrowMoves
+        | aliasesBorrow = []
+        | otherwise     = [ u | u <- moveOperandUniques rhs, u `Set.member` ctxBorrow ctx ]
+      borrowDup   = Map.toList (Map.fromListWith (+) [ (u, 1 :: Int) | u <- borrowMoves ])
       -- A var "survives" this binding iff it is free later in 'body' OR reserved
       -- for a join the body forwards to (delivered IMPLICITLY through the join
       -- 'cap', so NOT syntactically free in 'body'). The reserved set must count
@@ -657,7 +490,23 @@ ownExpr ctx sup0 delta (Let b rhs body) =
       -- (kept alive by an extra dup). Borrowed RProj parents are never in
       -- rhsSet, so they are not consumed here.
       consumedHere = Set.filter (`Set.notMember` neededLater) rhsSet
-      bAdded    = if boxedBinder b then Set.singleton (binderUnique b) else Set.empty
+      -- ALIAS-OF-EXEMPT (M2a-1 hardening): @let b = AVar s@ where @s@ is an
+      -- uncounted-region sibling (in 'ctxExempt'). 'b' is a BORROW of the same
+      -- region member, not an independent owned cell: the group drop already
+      -- releases the member once. So 'b' must NOT enter the owned set ('bAdded'
+      -- empty here) and must be made exempt for the rest of the scope (see
+      -- 'ctx''), so the pass emits NO '__rc_dup' (none needed --- 's' is exempt,
+      -- already absent from 'rhsOcc') and NO '__rc_drop' (a drop of 'b' would
+      -- double-free the member: cell-drop + group-drop). Exempt-ness is
+      -- transitive: an alias of an alias is itself exempt, because 'ctx'' carries
+      -- 'b' in 'ctxExempt' for 'body'. An ordinary (non-exempt) alias is
+      -- unaffected and keeps owning 'b' exactly as before.
+      aliasesExempt = aliasesExemptIn (ctxExempt ctx) rhs
+      bAdded
+        | aliasesExempt          = Set.empty
+        | aliasesBorrow          = Set.empty   -- a borrow-alias owns nothing
+        | boxedBinder b          = Set.singleton (binderUnique b)
+        | otherwise              = Set.empty
       -- Owned set just after the binding installs b and the rhs has consumed
       -- its moved operands.
       afterBind = (delta `Set.difference` consumedHere) `Set.union` bAdded
@@ -682,11 +531,40 @@ ownExpr ctx sup0 delta (Let b rhs body) =
       keepInBody v = v `Set.member` later
                        || v `Set.member` ctxExempt ctx
                        || v `Set.member` bodyReservedCap
+                       -- A synthetic shared-env value (member 0 of an enclosing
+                       -- 'LetRec') is kept alive past every prompt-drop: it is never
+                       -- free in 'body' (members are borrows) but must survive to the
+                       -- path leaf, where the ordinary 'delta'-drop releases it once.
+                       || v `Set.member` ctxEnvAlive ctx
       deadNow   = afterBind `Set.difference` deltaBody
-      ctx'      = ctxBind b ctx
+      ctx'      | aliasesExempt =
+                    (ctxBind b ctx) { ctxExempt = Set.insert (binderUnique b) (ctxExempt ctx) }
+               | aliasesBorrow =
+                    -- ALIAS-OF-BORROW (M2a-2): @b@ becomes a borrow of the same value.
+                    -- M2a-2 Stage B: PROPAGATE the env-alias too --- if the aliased
+                    -- value @n@ maps to a shared-env owning unit (it is a 'LetRec'
+                    -- member or a transitive alias of one), then @b@ aliases the SAME
+                    -- env unit. This lets the 'Ret' rule recognise an escaping
+                    -- ALIAS-of-a-member (e.g. @let ax = f ; let ay = ax ; ay@) as
+                    -- carrying the env out, so the scope's env-alive handle is NOT
+                    -- ALSO dropped (which double-freed the env the escaped alias
+                    -- still holds). Without this the alias's env unit was invisible
+                    -- to 'retEnvs'.
+                    let inheritedEnv =
+                          case rhs of
+                            RAtom (AVar n) ->
+                              maybe Map.empty
+                                    (Map.singleton (binderUnique b))
+                                    (Map.lookup (nameUniq n) (ctxEnvAlias ctx))
+                            _ -> Map.empty
+                    in (ctxBind b ctx)
+                         { ctxBorrow   = Set.insert (binderUnique b) (ctxBorrow ctx)
+                         , ctxEnvAlias = inheritedEnv `Map.union` ctxEnvAlias ctx }
+               | otherwise     = ctxBind b ctx
   in
-    -- 1. emit the dups the rhs needs (before the rhs runs);
-    let (sup1, dups) = mkDupsForVars sup env dupPlan'
+    -- 1. emit the dups the rhs needs (before the rhs runs): the owned-operand dups
+    --    AND the borrowed-value dup-on-consume (an env incref per moved borrow);
+    let (sup1, dups)    = mkDupsForVars sup env (dupPlan' ++ borrowDup)
     -- 2. an RProj of a BOXED field shares that field with the still-live parent,
     --    so the projected result must be dup'd to own an independent unit;
         (sup2, projDup) = projDupFor sup1 b rhs
@@ -805,92 +683,121 @@ ownExpr ctx sup delta (Jump j as) =
                 [ c | k <- Set.toList reachable
                     , Just (c, _) <- [Map.lookup k (ctxJoins ctx)] ]
       dead  = (delta `Set.difference` moved) `Set.difference` cap
-  in dropsFor (ctxEnv ctx) sup dead (Jump j as)
+      -- DUP-ON-CONSUME (M2a-2 Task 4): a borrowed value (a 'LetRec' member / borrowed
+      -- capture) passed as a jump arg is a move into the join param --- one env
+      -- incref per such arg. Its env-alive owning unit (member 0), if seeded into
+      -- this delta, is dead here (never free in the join body) and dropped by the
+      -- 'dead' set above; the dup'd unit flows into the join and is dropped there.
+      borrowArgs = [ u | u <- atomUniques as, u `Set.member` ctxBorrow ctx ]
+      borrowDup  = [ (u, 1 :: Int) | u <- borrowArgs ]
+      (sup1, dups)    = mkDupsForVars sup (ctxEnv ctx) borrowDup
+      (sup2, dropped) = dropsFor (ctxEnv ctx) sup1 dead (Jump j as)
+  in (sup2, foldr ($) dropped dups)
 
--- LetRec (Task 7 + M1.5 Phase 2): the group is one uncounted region. Sibling
--- references emit no dup/drop (added to 'ctxExempt'); the group binders are owned
--- and dropped, one each, at the LetRec scope exit.
+-- LetRec (M2a-2 Task 4): a group is ONE shared environment cell ('NEnv') plus
+-- per-member inline @RVRecMember@ handles --- ordinary acyclic refcounting, no
+-- region special-casing.
 --
--- M1.5 PHASE 2 --- BORROW MODEL for enclosing captures. A group may now close over
--- ENCLOSING owned boxed locals (coverage relaxed; the ESCAPING case is rejected at
--- the boundary, 'letRecEnclosingCaptureEscapes'). A member BORROWS its captures
--- (referenced freely, never moved/dropped inside the body --- matching 'enterRC's
--- region-exempt branch which neither increfs the captures nor drops the shell on a
--- recursive call), and the REGION owns them: the single owning unit per
--- (member, capture) pair is released by that member's drop cascade at scope exit
--- (each member's 'NClosure' is restricted to its free vars, so a freed member
--- decrefs exactly the enclosing captures its body referenced --- siblings stay
--- same-region and are skipped by 'countedChildren').
+-- THE SHARED ENV is a SYNTHETIC owned value (the runtime allocates exactly one
+-- 'NEnv' at @rc = 1@, or reuses the static empty-env sentinel when the group
+-- captures nothing). It has a single owner: the scope. We represent it by the
+-- group's REPRESENTATIVE member binder --- member 0 --- because a @__rc_drop@ of
+-- any member resolves to @dropAddr envAddr@ (the env is the member's only counted
+-- child). So member 0's 'Unique' rides in @delta@ as the env's owning unit and is
+-- dropped EXACTLY ONCE at the group's combined last use: it is added to
+-- 'ctxEnvAlive' so it survives every 'Let' prompt-drop and is released by the
+-- ordinary @delta@-drop at each path leaf ('Ret'/'Jump'/'Case' arm) --- one
+-- @__rc_drop member0@ per path, never N. For a capture-free group @envAddr@ is the
+-- static sentinel, so that drop is a runtime no-op (harmless, uniform).
 --
--- MULTISET capture accounting (spec 5.2). A capture @u@ reachable from @k@ members
--- is held by @k@ member cells, so the group drop decrefs @u@ exactly @k@ times. The
--- build must provide @k@ owning units (plus one more if @u@ survives into the body):
---   capOcc[u] = #members whose boxed owned non-exempt captures include @u@
---   need(u)   = capOcc[u] + (1 if u is free in the LetRec body)
---   dups(u)   = need(u) - 1     -- u already carries one owned unit from @delta@
--- Each capture is relinquished from @delta@ (moved into the region) UNLESS it
--- survives into the body. The 'capOcc[u] == #cascades that decref u' equality holds
--- BY CONSTRUCTION: a member's cenv keeps @u@ iff @u@ is free in its body, the same
--- condition that puts @u@ in that member's capture set here.
+-- MEMBERS ARE BORROWED ('ctxBorrow'): a call-head occurrence emits nothing (a
+-- known/borrow call); a CONSUMING occurrence (a member moved into a con/record/arg
+-- or returned --- an escape) gets a @__rc_dup@ at that use (an @incref@ of the env)
+-- so the consumer owns an independent unit, while the borrow keeps owning nothing.
+-- This is ordinary Perceus on a DAG; member references are no longer a special
+-- uncounted region.
+--
+-- CAPTURES are the enclosing boxed owned locals the group closes over (member-body
+-- free vars minus params minus group binders, restricted to currently-owned boxed
+-- non-borrowed locals). Each DISTINCT capture is MOVED into the env ONCE at build
+-- (the env owns it, freed once via the 'NEnv' cascade); a capture that also
+-- survives into the body keeps one extra unit, so it is dup'd exactly ONCE --- NOT
+-- once per member. Inside each member body a capture is BORROWED ('ctxBorrow'):
+-- a read emits nothing; a consuming use gets dup-on-consume (the #1 mechanism;
+-- latent here --- consuming captures are still boundary-rejected, so only
+-- borrow-reads occur, but the wiring is in place for Task 6).
 ownExpr ctx sup delta (LetRec defs body) =
   let groupU     = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-      -- A LetRec member is ALWAYS a boxed closure cell (the interpreter allocates
-      -- each member as an 'NClosure' with @rc = 1@), regardless of the member
-      -- binder's 'bndType' (elaboration records the member's RESULT type there,
-      -- not its arrow type). So the whole group enters the owned set and each
-      -- member is dropped, one each, at scope exit.
-      groupBoxed = groupU
+      -- The representative member (member 0) IS the shared-env owning unit.
+      env0       = case defs of
+        ((b, _, _) : _) -> binderUnique b
+        []              -> error "ownExpr: empty LetRec group"
       env        = ctxEnv ctx
-      -- One member's boxed owned non-exempt enclosing captures (borrowed in its
-      -- body; moved into the region at build). Boxed-ness is read from the binder
-      -- in scope, matching 'ownRhs's 'capsBoxed'.
+      -- One member's boxed owned non-borrowed enclosing captures (free vars of its
+      -- body minus its params and the group binders, restricted to currently-owned
+      -- boxed locals). Borrowed-ness is read from 'ctxBorrow'/'ctxExempt' (an
+      -- enclosing capture that is itself a borrow stays a borrow, never moved into
+      -- the env). Boxed-ness is read from the binder in scope.
       memberCaps (_, ps, dbody) =
         let params = Set.fromList (map binderUnique ps)
         in Set.fromList
              [ u
              | u <- Set.toList (freeVarsExpr dbody `Set.difference` params
                                   `Set.difference` groupU)
-             , u `Set.member` delta, u `Set.notMember` ctxExempt ctx
+             , u `Set.member` delta
+             , u `Set.notMember` ctxExempt ctx, u `Set.notMember` ctxBorrow ctx
              , Just b <- [Map.lookup u env], boxedBinder b ]
-      memberCapSets = [ (d, memberCaps d) | d <- defs ]
-      -- capOcc[u] = number of members capturing u (the multiset count).
-      capOcc     = Map.fromListWith (+)
-                     [ (u, 1 :: Int)
-                     | (_, cs) <- memberCapSets, u <- Set.toList cs ]
-      allCaps    = Map.keysSet capOcc
+      -- The DISTINCT captures of the whole group: each is moved into the single
+      -- shared env ONCE (the env's 'NEnv' holds one field per distinct capture, so
+      -- the env cascade decrefs each exactly once). No multiset --- one env, not N.
+      allCaps    = Set.unions [ memberCaps d | d <- defs ]
       laterBody  = freeVarsExpr body
-      -- dups(u) = need(u) - 1, emitted only when positive.
-      dupPlan    = [ (u, k - 1 + (if u `Set.member` laterBody then 1 else 0))
-                   | (u, k) <- Map.toList capOcc ]
-      dupPlan'   = [ (u, d) | (u, d) <- dupPlan, d > 0 ]
-      -- A capture is relinquished from @delta@ (moved into the region) unless it
-      -- survives into the LetRec body (where it keeps its extra owned unit).
+      -- A surviving capture (still free in the body) needs ONE dup: one unit moved
+      -- into the env, one kept for the body. A capture not used in the body is moved
+      -- in with its existing owned unit (no dup).
+      dupPlan'   = [ (u, 1) | u <- Set.toList allCaps, u `Set.member` laterBody ]
+      -- A capture is relinquished from @delta@ (moved into the env) unless it
+      -- survives into the body (then it keeps its extra owned unit there).
       consumedCaps = Set.filter (`Set.notMember` laterBody) allCaps
-      ctxIn      = ctx { ctxEnv    = foldr (\(b, _, _) -> Map.insert (binderUnique b) b)
-                                           (ctxEnv ctx) defs
-                       , ctxExempt = ctxExempt ctx `Set.union` groupU }
-      -- Instrument each closure body in isolation: a fresh top-level-like context
-      -- (params owned), siblings exempt, AND this member's enclosing captures
-      -- exempt (BORROWED --- never moved or dropped inside the body), joins reset
-      -- (joins do not cross a lambda).
-      onDef sp ((b, ps, dbody), caps) =
-        let dEnv   = Map.fromList [ (binderUnique p, p) | p <- ps ]
+      ctxIn      = ctx { ctxEnv      = foldr (\(b, _, _) -> Map.insert (binderUnique b) b)
+                                             (ctxEnv ctx) defs
+                       , ctxBorrow   = ctxBorrow ctx `Set.union` groupU
+                       , ctxEnvAlive = Set.insert env0 (ctxEnvAlive ctx)
+                       , ctxEnvAlias = ctxEnvAlias ctx `Map.union` groupEnvAlias defs }
+      -- Instrument each member body in isolation: a fresh scope (its boxed params
+      -- owned), siblings borrowed (a recursive call emits nothing), AND this
+      -- member's enclosing captures borrowed (a read emits nothing; a consuming use
+      -- dups). Joins / env-alive / alias reset (they do not cross a closure boundary).
+      onDef sp (b, ps, dbody) =
+        let caps   = memberCaps (b, ps, dbody)
+            dEnv   = Map.fromList [ (binderUnique p, p) | p <- ps ]
                        `Map.union` Map.fromList [ (binderUnique g, g) | (g, _, _) <- defs ]
                        `Map.union` ctxEnv ctx
-            dCtx   = Ctx dEnv Map.empty
-                         (ctxExempt ctx `Set.union` groupU `Set.union` caps)
+            -- MEMBER-BODY SIBLING ESCAPE (M2a-2 BLOCKER 1). A member body that
+            -- RETURNS / JUMPS / moves a sibling carries the shared env OUT, but the
+            -- member body does NOT own the scope's env-alive handle (the env is
+            -- BORROWED here --- it stays alive because the member value being called
+            -- is borrowed by its caller for the body's duration). So we propagate the
+            -- group env-alias ('groupEnvAlias') --- so 'Ret'/'Jump' can recognise an
+            -- escaping sibling and dup-on-consume its env --- but leave 'ctxEnvAlive'
+            -- EMPTY: there is no owned env handle to transfer here. The 'Ret' rule
+            -- then treats a returned sibling as an ESCAPE (dup the env), not a
+            -- transfer (which would skip the dup and double-free the single 'NEnv').
+            dCtx   = Ctx dEnv Map.empty (ctxExempt ctx)
+                         (ctxBorrow ctx `Set.union` groupU `Set.union` caps)
+                         Set.empty (groupEnvAlias defs)
             dDelta = Set.fromList [ binderUnique p | p <- ps, boxedBinder p ]
             (sp', dbody') = ownExpr dCtx sp dDelta dbody
         in (sp', (b, ps, dbody'))
-      (sup1, defs') = mapAccumLPairs onDef sup memberCapSets
-      -- Instrument the body; the group binders are owned (so they get dropped at
-      -- scope exit) but exempt from moves/dups. A capture moved into the region
-      -- leaves the body's delta; a surviving capture stays (its extra dup feeds it).
-      bodyDelta     = (delta `Set.difference` consumedCaps) `Set.union` groupBoxed
+      (sup1, defs') = mapAccumLPairs onDef sup defs
+      -- Instrument the body. The shared env (member 0) is owned and kept alive to
+      -- the leaves (in 'ctxEnvAlive'); the group binders are borrowed (a recursive
+      -- call emits nothing). A capture moved into the env leaves the body's delta;
+      -- a surviving capture stays (its extra dup feeds it).
+      bodyDelta     = (delta `Set.difference` consumedCaps) `Set.union` Set.singleton env0
       (sup2, body') = ownExpr ctxIn sup1 bodyDelta body
-      -- Emit the multiset dups BEFORE the LetRec, so each capture carries need(u)
-      -- units at the build: capturing-member cascades decref one each at group
-      -- drop, and a surviving capture keeps its extra unit for the body.
+      -- Emit the surviving-capture dups BEFORE the LetRec, so each carries its extra
+      -- unit at build: one moves into the env, one stays for the body.
       (sup3, dups)  = mkDupsForVars sup2 env dupPlan'
   in (sup3, foldr ($) (LetRec defs' body') dups)
 
@@ -997,7 +904,12 @@ dropParentThen sup env (Just p) = case Map.lookup p env of
 ownedOccs :: Ctx -> Set Unique -> Rhs -> Map Unique Int
 ownedOccs ctx delta rhs = case rhs of
   RAtom a        -> count [a]
-  RApp f as      -> count (f : as)
+  -- BORROW-ON-CALL (M2a-2 Task 1): applying a function value READS the head @f@
+  -- (the call does not move @f@ out of the callee --- 'enterRC' no longer consumes
+  -- the closure cell). So the head is NOT a move here; it stays owned by its binder
+  -- and is dropped at its real last use by the 'Let'/'Ret' last-use machinery,
+  -- exactly like any other value. Only the ARGUMENTS are moves.
+  RApp _ as      -> count as
   RCon _ as      -> count as
   RRecord _ flds -> count (map snd flds)
   RProj _ _      -> Map.empty                 -- borrow, not a move
@@ -1011,14 +923,41 @@ ownedOccs ctx delta rhs = case rhs of
     in Map.fromListWith (+)
          [ (u, 1)
          | u <- Set.toList caps
-         , u `Set.member` delta, u `Set.notMember` ctxExempt ctx ]
+         , u `Set.member` delta
+         , u `Set.notMember` ctxExempt ctx, u `Set.notMember` ctxBorrow ctx ]
   ROp _ _ _ as   -> count as
   where
+    -- A BORROWED operand (a 'LetRec' member / borrowed capture, in 'ctxBorrow') is
+    -- NEVER an owned move --- even when its 'Unique' also names the shared env's
+    -- owning unit (member 0 lives in @delta@ as the env, but a move of member 0 is a
+    -- BORROW with dup-on-consume, not a relinquish of the env's scope handle). So
+    -- exclude 'ctxBorrow' here; the env unit is released only by its leaf-drop.
     count atoms =
       Map.fromListWith (+)
         [ (u, 1)
         | AVar n <- atoms, let u = nameUniq n
-        , u `Set.member` delta, u `Set.notMember` ctxExempt ctx ]
+        , u `Set.member` delta
+        , u `Set.notMember` ctxExempt ctx, u `Set.notMember` ctxBorrow ctx ]
+
+-- | The MOVE-position variable 'Unique's of a RHS, IGNORING ownership (no @delta@
+-- filter): every operand that is COPIED into a heap cell or transferred onward ---
+-- 'RApp' arguments (NOT the borrowed call head), 'RCon'/'RRecord' fields, an
+-- 'RAtom' alias, 'ROp' arguments, and an 'RLam''s free captures. An 'RProj' borrows
+-- (no move). Used to find BORROWED values (members / borrowed captures) in a
+-- consuming position so the 'Let' rule can emit dup-on-consume; the owned-operand
+-- accounting is 'ownedOccs', which filters to @delta@.
+moveOperandUniques :: Rhs -> [Unique]
+moveOperandUniques rhs = case rhs of
+  RAtom a        -> atomUs [a]
+  RApp _ as      -> atomUs as
+  RCon _ as      -> atomUs as
+  RRecord _ flds -> atomUs (map snd flds)
+  RProj _ _      -> []
+  RLam ps e      ->
+    Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps))
+  ROp _ _ _ as   -> atomUs as
+  where
+    atomUs atoms = [ nameUniq n | AVar n <- atoms ]
 
 -- | A RHS that PROJECTS a boxed field needs a @__rc_dup@ of the result binder
 -- (the field is shared with the still-live parent record). Returns a body
@@ -1038,14 +977,34 @@ projDupFor sup _ _ = (sup, id)
 ownRhs :: Ctx -> Supply -> Set Unique -> Rhs -> (Supply, Rhs)
 ownRhs ctx sup delta (RLam ps e) =
   let params    = Set.fromList (map binderUnique ps)
+      -- A captured BORROWED value --- a 'LetRec' member (in 'ctxBorrow', captured as
+      -- an inline @RVRecMember@) or an uncounted-region sibling (in 'ctxExempt') ---
+      -- is owned by its group's shared env / its region, NOT by this closure. The
+      -- runtime application binds it from the closure env WITHOUT an incref
+      -- ('closureOwnedBoxed' enumerates only boxed @RVBox@ captures, so a captured
+      -- @RVRecMember@ is neither increfed on entry nor consumed by the body), and the
+      -- closure's own drop cascades into its counted child (the shared env) exactly
+      -- once via 'valueChildren'. So a borrowed capture must NOT be seeded at +1 in
+      -- the body and must NOT be dropped there: the body BORROWS it. A read / a
+      -- recursive call-head emits nothing; a CONSUMING use dup-on-consumes (the env
+      -- incref), the same dup-on-consume rule the LetRec member-body scope uses
+      -- ('onDef'). Without this the body's last-use machinery would drop the borrowed
+      -- member (an extra unbalanced @__rc_drop@ of the shared env), and the closure's
+      -- cascade-drop would then double-free it --- the M2a-2 escape-then-call bug.
+      borrowed  = ctxBorrow ctx `Set.union` ctxExempt ctx
       capsBoxed = Set.fromList
                     [ u | u <- Set.toList (freeVarsExpr e `Set.difference` params)
-                        , u `Set.member` delta, u `Set.notMember` ctxExempt ctx
+                        , u `Set.member` delta, u `Set.notMember` borrowed
                         , Just b <- [Map.lookup u (ctxEnv ctx)], boxedBinder b ]
+      -- The borrowed values still free in the lambda body: kept borrowed in the body
+      -- scope so a consuming use dup-on-consumes and a read/call emits nothing.
+      capsBorrow = (freeVarsExpr e `Set.difference` params) `Set.intersection` borrowed
       psBoxed   = Set.fromList [ binderUnique p | p <- ps, boxedBinder p ]
       dDelta    = psBoxed `Set.union` capsBoxed
       dEnv      = foldr (\p -> Map.insert (binderUnique p) p) (ctxEnv ctx) ps
-      dCtx      = Ctx dEnv Map.empty Set.empty
+      dCtx      = Ctx dEnv Map.empty (ctxExempt ctx `Set.intersection` capsBorrow)
+                      (ctxBorrow ctx `Set.intersection` capsBorrow)
+                      Set.empty Map.empty
       (sup', e') = ownExpr dCtx sup dDelta e
   in (sup', RLam ps e')
 ownRhs _ sup _ r = (sup, r)
@@ -1305,8 +1264,7 @@ lintInstrumented (CoreModule bs) = concatMap lintBind bs
 
 lintBind :: TopBind -> [Text]
 lintBind (TopBind n ps body)
-  | not (coveredExpr Set.empty (Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]) body) = []
-                                         -- not instrumented; nothing to audit
+  | not (coveredExpr body) = []          -- not instrumented; nothing to audit
   | otherwise =
       let cnt0 = Map.fromList [ (binderUnique b, 1) | b <- ps, boxedBinder b ]
       in lintScope n Set.empty ps body cnt0
@@ -1315,19 +1273,29 @@ lintBind (TopBind n ps body)
 -- build the tracked + exempt sets from the scope's parameters and body, then walk
 -- it forward. @exempt0@ carries the enclosing uncounted-region siblings.
 lintScope :: Name -> Set Unique -> [Binder] -> Expr -> Counts -> [Text]
-lintScope fn = lintScope' fn Set.empty
+lintScope fn exempt0 = lintScope' fn Set.empty exempt0 exempt0
 
 -- | As 'lintScope', but with an EXTRA tracked set @owned0@ for owned vars that are
 -- live on entry but are not introduced by a binder in @body@ --- namely a closure's
 -- CAPTURES, which 'enterRC' increfs into the lambda body scope and which the body
 -- consumes (drops) inside itself. They must be tracked so those consumes count.
-lintScope' :: Name -> Set Unique -> Set Unique -> [Binder] -> Expr -> Counts -> [Text]
-lintScope' fn owned0 exempt0 ps body cnt0 =
+-- @borrow0@ carries the borrowed values in scope ('LetRec' members / borrowed
+-- captures) so a closure body audited from here does not seed a captured borrow.
+lintScope' :: Name -> Set Unique -> Set Unique -> Set Unique -> [Binder] -> Expr -> Counts -> [Text]
+lintScope' fn owned0 exempt0 borrow0 ps body cnt0 =
   let tracked = Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]
                   `Set.union` trackedBinders body
                   `Set.union` owned0
-      env     = LintEnv fn tracked exempt0 (collectJoins body)
+      env     = LintEnv fn tracked exempt0 (collectJoins body) borrow0 Map.empty
   in checkExpr env cnt0 body
+
+-- | The shared-env owning unit (member 0) for each member of @defs@: every member's
+-- 'Unique' maps to member 0's, so the audit counts all members' env operations
+-- against the single 'NEnv' cell. A singleton group maps member 0 to itself.
+groupEnvAlias :: [(Binder, [Binder], Expr)] -> Map Unique Unique
+groupEnvAlias defs = case defs of
+  ((b0, _, _) : _) -> Map.fromList [ (binderUnique b, binderUnique b0) | (b, _, _) <- defs ]
+  []               -> Map.empty
 
 -- | The lint environment threaded through 'checkExpr'.
 --
@@ -1337,12 +1305,29 @@ lintScope' fn owned0 exempt0 ps body cnt0 =
 --   * 'leJoins'   --- each join's @(params, body)@, so a 'Jump' can audit the join
 --     body INLINE at the jump site (modelling the runtime tail transfer; the join
 --     runs in its definition scope, so this is the faithful per-site check).
+--   * 'leBorrow'  --- M2a-2 (Task 4) BORROWED values in scope ('LetRec' members
+--     and borrowed captures). A borrowed value captured by a standalone closure is
+--     borrowed INSIDE the lambda body too (a call-head read), so it must NOT be
+--     seeded as an owned capture there (it would never be consumed -> false leak).
+--   * 'leEnvAlias' --- M2a-2 (Task 4) maps each group member's 'Unique' to its
+--     group's shared-env owning unit (member 0). Every member's @__rc_dup@/
+--     @__rc_drop@ and every member move operates on the SAME 'NEnv' cell at
+--     runtime, so the audit CANONICALISES a member's 'Unique' to its env's before
+--     counting --- the env's single owned unit then balances across all members.
 data LintEnv = LintEnv
-  { leFn      :: Name
-  , leTracked :: Set Unique
-  , leExempt  :: Set Unique
-  , leJoins   :: Map JoinId ([Binder], Expr)
+  { leFn       :: Name
+  , leTracked  :: Set Unique
+  , leExempt   :: Set Unique
+  , leJoins    :: Map JoinId ([Binder], Expr)
+  , leBorrow   :: Set Unique
+  , leEnvAlias :: Map Unique Unique
   }
+
+-- | Canonicalise a 'Unique' to its group's shared-env owning unit (member 0) when
+-- it is a 'LetRec' member; identity otherwise. The audit counts every member
+-- @__rc_dup@/@__rc_drop@/move against this single env unit.
+canonU :: LintEnv -> Unique -> Unique
+canonU env u = Map.findWithDefault u u (leEnvAlias env)
 
 -- | Collect every join definition reachable in the scope's body (joins are
 -- lexically nested and non-recursive, so a flat map suffices for inline audit).
@@ -1415,7 +1400,7 @@ relDrop :: LintEnv -> Unique -> Counts -> ([Text], Counts)
 relDrop env = relAny env (Tx.pack "drop")
 
 relAny :: LintEnv -> Text -> Unique -> Counts -> ([Text], Counts)
-relAny env what v cnt
+relAny env what v0 cnt
   | not (v `Set.member` leTracked env) = ([], cnt)
   | Map.findWithDefault 0 v cnt > 0    = ([], Map.adjust (subtract 1) v cnt)
   | otherwise =
@@ -1423,6 +1408,7 @@ relAny env what v cnt
             <> Tx.pack (show (uInt v))
             <> Tx.pack " via " <> what <> Tx.pack " (value not owned here)" ]
       , cnt )
+  where v = canonU env v0   -- a member's env op counts against its env unit
 
 uInt :: Unique -> Int
 uInt (Unique i) = i
@@ -1442,72 +1428,140 @@ checkExpr env cnt (Let b rhs body) =
     -- An inserted dup/drop: the result binder aliases the handle, so it does NOT
     -- enter the owned set; only the refcount of the operand changes.
     Just (h, v)
-      | h == dupHint  -> checkExpr env (bumpC v cnt) body
+      | h == dupHint  -> checkExpr env (bumpC (canonU env v) cnt) body
       | h == dropHint -> let (vs, cnt') = relDrop env v cnt
                          in vs ++ checkExpr env cnt' body
     _ ->
-      let moves          = [ nameUniq m | AVar m <- moveAtoms rhs ]
+      let -- ALIAS-OF-BORROW (M2a-2): @let b = AVar s@ where @s@ is a borrowed
+          -- 'LetRec' member (in 'leBorrow'). Mirror the pass ('aliasesBorrowIn'):
+          -- 'b' is a pure RENAME of a borrow, owns nothing, and the alias site is
+          -- NOT a consuming move (so do not relinquish 's' here), 'b' does NOT
+          -- enter the owned set, and 'b' stays BORROWED in 'body' (a consuming use
+          -- dup-on-consumes at THAT use; a read/call-head emits nothing). The pass
+          -- emits no '__rc_dup'/'__rc_drop' at the alias site, so the lint must not
+          -- relinquish, seed, or expect a drop here.
+          aliasesBorrow  = aliasesBorrowIn (leBorrow env) rhs
+          -- The alias-of-borrow site moves nothing (a borrow rename); every other
+          -- form relinquishes its moved operands as usual.
+          moves          = if aliasesBorrow then []
+                             else [ nameUniq m | AVar m <- moveAtoms rhs ]
           (vs, cntMoved) = relAtoms env (Tx.pack "operand move") moves cnt
+          -- ALIAS-OF-EXEMPT (M2a-1 hardening): @let b = AVar s@ where @s@ is an
+          -- uncounted-region sibling (in 'leExempt'). Mirror the pass: 'b' is a
+          -- BORROW of the same member, so it does NOT enter the owned set and stays
+          -- EXEMPT inside 'body' (a use is not a move; the group drop releases the
+          -- member once). The pass emits no '__rc_dup'/'__rc_drop' for it, so the
+          -- lint must not seed 'b' at +1 (that would be a false leak) and must not
+          -- treat a later move/drop of 'b' as a counted relinquish.
+          aliasesExempt  = aliasesExemptIn (leExempt env) rhs
           -- A boxed let result enters the owned set with one unit --- UNLESS it is
-          -- an 'RProj', which BORROWS the parent: the projected binder owns nothing
+          -- an 'RProj', which BORROWS the parent (the projected binder owns nothing
           -- on its own and is instead given ownership by the @__rc_dup@ the pass
-          -- inserts right after it.
+          -- inserts right after it), or an ALIAS-OF-EXEMPT / ALIAS-OF-BORROW (a
+          -- borrow of a region sibling / a 'LetRec' member; see above).
           enters         = boxedBinder b && not (isProj rhs)
+                             && not aliasesExempt && not aliasesBorrow
           cnt'           = if enters then bumpC (binderUnique b) cntMoved else cntMoved
+          envBody
+            | aliasesExempt = env { leExempt = Set.insert (binderUnique b) (leExempt env) }
+            | aliasesBorrow =
+                -- Mirror the pass (M2a-2 Stage B): an alias of a borrow that maps to
+                -- a shared-env owning unit inherits that env unit, so an escaping
+                -- ALIAS-of-a-member return relinquishes the SAME env unit ('relRets'
+                -- canonicalises via 'leEnvAlias'), matching the pass's 'retEnvs'
+                -- protection (the env-alive handle is not also dropped).
+                let inheritedEnv =
+                      case rhs of
+                        RAtom (AVar n) ->
+                          maybe Map.empty
+                                (Map.singleton (binderUnique b))
+                                (Map.lookup (nameUniq n) (leEnvAlias env))
+                        _ -> Map.empty
+                in env { leBorrow   = Set.insert (binderUnique b) (leBorrow env)
+                       , leEnvAlias = inheritedEnv `Map.union` leEnvAlias env }
+            | otherwise     = env
           -- A closure build also audits its lambda body as its OWN ownership
-          -- scope: the boxed params and the boxed captures are owned on entry
-          -- (the runtime's 'enterRC' increfs the captures and binds them with the
-          -- params), so seed each at +1 and re-walk via 'lintScope'.
+          -- scope: the boxed params and the boxed OWNED captures are owned on entry
+          -- (the runtime's 'enterRC' increfs the OWNED captures --- see Task 2's
+          -- incref-only-owned behaviour --- and binds them with the params), so seed
+          -- each at +1 and re-walk via 'lintScope'.
+          --
+          -- M2a-1 Task 4 (owned/borrowed split). A BORROWED capture --- a 'LetRec'
+          -- region sibling (in 'leExempt') or a static cell --- is NOT increfed by
+          -- 'enterRC' and NOT cascaded on the closure drop; the owning region / static
+          -- lifetime releases it. So a borrowed capture must NOT be seeded at +1 here
+          -- (seeding it would leave an unconsumed unit at the body leaf => a false
+          -- leak), and it stays EXEMPT inside the body scope (a use is not a move).
+          -- This matches the runtime: case #4's @h = \\m -> f (m+1)@ borrows the
+          -- sibling @f@, so @f@ is neither seeded nor counted in @h@'s body.
           lamViols       = case rhs of
             RLam ps e ->
               let caps  = freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps)
-                  -- The boxed owned captures. Filtering on 'leTracked' agrees with
-                  -- 'ownRhs's 'capsBoxed' by the M1 invariant that every boxed owned
-                  -- local is tracked (no borrow inference yet); revisit if that changes.
-                  capsB = Set.filter (`Set.member` leTracked env) caps
+                  -- BORROWED captures stay exempt inside the body scope: a 'LetRec'
+                  -- region sibling / static cell (in 'leExempt') OR a borrowed value
+                  -- (a 'LetRec' member / borrowed capture, in 'leBorrow'). The pass's
+                  -- 'enterRC' does not incref them and the closure drop does not
+                  -- cascade them, so seeding them would leave an unconsumed unit at
+                  -- the body leaf => a false leak. A captured MEMBER is borrowed (a
+                  -- call-head read) inside the lambda --- case #4's @\\m -> f (m+1)@.
+                  borrowed     = leExempt env `Set.union` leBorrow env
+                  -- OWNED boxed captures: tracked AND not borrowed. Agrees with
+                  -- 'ownRhs's 'capsBoxed' and the runtime's owned-capture set.
+                  capsOwned = Set.filter (`Set.member` leTracked env)
+                                (caps `Set.difference` borrowed)
+                  capsBorrowed = caps `Set.intersection` borrowed
                   cnt0  = Map.fromList $
                             [ (binderUnique p, 1) | p <- ps, boxedBinder p ] ++
-                            [ (u, 1) | u <- Set.toList capsB ]
-              in lintScope' (leFn env) capsB Set.empty ps e cnt0
+                            [ (u, 1) | u <- Set.toList capsOwned ]
+              in lintScope' (leFn env) capsOwned capsBorrowed capsBorrowed ps e cnt0
             _ -> []
-      in vs ++ lamViols ++ checkExpr env cnt' body
+      in vs ++ lamViols ++ checkExpr envBody cnt' body
 checkExpr env cnt (Case _ alts) = concatMap (checkAlt env cnt) alts
 checkExpr env cnt (LetRec defs body) =
-  -- Each closure body is a SEPARATE ownership scope (its own params owned,
-  -- siblings AND this member's enclosing captures exempt); audit each
-  -- independently. Then audit the LetRec body with the group binders entering the
-  -- owned set (+1 boxed each), to be dropped at scope exit.
+  -- M2a-2 (Task 4) SHARED-ENV model. A group is ONE shared 'NEnv' cell plus
+  -- per-member inline @RVRecMember@ handles --- ordinary acyclic RC. The audit:
   --
-  -- M1.5 PHASE 2 BORROW MODEL (spec 5.6). A member may capture an ENCLOSING boxed
-  -- owned local; it BORROWS it inside its body (exempt) and the REGION owns it. At
-  -- the build the capture is RELINQUISHED 'capOcc[y]' times (one MOVE into the
-  -- region per capturing member), mirroring the pass: the build-site @__rc_dup@s
-  -- (walked just BEFORE this node) bumped each capture by 'dups(y)', so a capture
-  -- carries 'need(y) = capOcc[y] + (1 if free in body)' units here; relinquishing
-  -- 'capOcc[y]' of them leaves the body's surviving unit (or zero). The structural
-  -- release of the capture by each member's drop-cascade is thus accounted at the
-  -- build (like a constructor field move), not re-counted at the scope-exit drop.
+  --   * The shared env is represented by member 0: it ENTERS the owned set (+1, the
+  --     scope's handle) and is relinquished by the single @__rc_drop member0@ the
+  --     pass emits at each path leaf.
+  --   * Members 1..n are BORROWED, NOT owned: they do not enter the owned set. A
+  --     recursive call-head is not a move ('moveAtoms' excludes the head, so no
+  --     relinquish). A CONSUMING occurrence (a member moved into a con/record/arg/
+  --     result) is preceded by a @__rc_dup@ the pass inserts (DUP-ON-CONSUME): the
+  --     dup bumps the member's count by +1 and the move relinquishes it back to 0,
+  --     so the dup/move pair balances and never over-consumes. Members are therefore
+  --     TRACKED (so the pair is checked) but NOT exempt and NOT seeded at +1.
+  --   * Each DISTINCT enclosing capture is MOVED into the env ONCE (relinquished once
+  --     here); the build-site @__rc_dup@ (walked just before this node) supplies the
+  --     extra unit for a capture that also survives into the body.
+  --
+  -- Each member body is a separate ownership scope (its params owned, siblings AND
+  -- its captures borrowed), audited independently by 'lintDef'.
   let groupU      = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
-      defViols    = concatMap (lintDef env groupU) defs
-      -- One member's boxed owned non-exempt enclosing captures (tracked locals free
-      -- in its body, minus its params and the group binders). Agrees with the pass's
-      -- 'memberCaps' by the M1 invariant that every boxed owned local is tracked.
+      env0        = case defs of
+        ((b, _, _) : _) -> binderUnique b
+        []              -> error "checkExpr: empty LetRec group"
+      defViols    = concatMap (lintDef env groupU defs) defs
+      -- The DISTINCT enclosing captures of the whole group (tracked boxed locals free
+      -- in some member body, minus params and group binders, non-borrowed). One move
+      -- into the single shared env each. Agrees with the pass's 'memberCaps' union.
       memberCaps (_, ps, dbody) =
         Set.fromList
           [ u
           | u <- Set.toList (freeVarsExpr dbody
                                `Set.difference` Set.fromList (map binderUnique ps)
                                `Set.difference` groupU)
-          , u `Set.member` leTracked env, u `Set.notMember` leExempt env ]
-      -- The multiset of region-moves: each capturing member contributes one move of
-      -- its captures into the region.
-      capMoves    = concat [ Set.toList (memberCaps d) | d <- defs ]
+          , u `Set.member` leTracked env
+          , u `Set.notMember` leExempt env, u `Set.notMember` leBorrow env ]
+      capMoves    = Set.toList (Set.unions [ memberCaps d | d <- defs ])
       (capVs, cnt1) = relAtoms env (Tx.pack "letrec capture move") capMoves cnt
-      -- Every group member is a boxed closure cell; each enters the owned set.
-      cntGroup    = foldr (\(b, _, _) c -> bumpC (binderUnique b) c) cnt1 defs
-      -- In the body, a sibling reference (a recursive call head) is NOT a move:
-      -- mark the group exempt so only the explicit scope-exit drop relinquishes it.
-      envBody     = env { leExempt = leExempt env `Set.union` groupU }
+      -- Only member 0 (the shared-env handle) enters the owned set.
+      cntGroup    = bumpC env0 cnt1
+      -- In the body: members are BORROWED (a call-head is not a move) and every
+      -- member's env op counts against member 0 (the alias); they are NOT exempt
+      -- (a consuming move IS counted, against the env unit, balanced by its dup).
+      envBody     = env { leBorrow   = leBorrow env `Set.union` groupU
+                        , leEnvAlias = leEnvAlias env `Map.union` groupEnvAlias defs }
   in capVs ++ defViols ++ checkExpr envBody cntGroup body
 checkExpr env cnt (LetJoin _ _ _ body) =
   -- The join body itself is audited INLINE at each 'Jump' site (see 'leJoins'),
@@ -1526,20 +1580,53 @@ checkExpr env cnt (Jump j as) =
 checkExpr _ _ Handle{} = []   -- out of coverage
 
 -- | Audit one 'LetRec' closure body as a fresh scope. Its params are owned; its
--- siblings, any enclosing siblings carried in @env@, AND this member's enclosing
--- captures (M1.5 Phase 2: BORROWED inside the body, owned by the region) are
--- exempt --- never moved or dropped inside the body, matching the pass.
-lintDef :: LintEnv -> Set Unique -> (Binder, [Binder], Expr) -> [Text]
-lintDef env groupU (_, ps, dbody) =
+-- enclosing siblings carried in @env@ AND this member's enclosing captures
+-- (M1.5 Phase 2: BORROWED inside the body, owned by the region) are exempt ---
+-- never moved or dropped inside the body, matching the pass.
+--
+-- M2a-2 BLOCKER 1: the group's OWN siblings (@groupU@) are BORROWED (not exempt)
+-- and env-aliased to member 0 ('groupEnvAlias'), mirroring the pass's 'onDef'. A
+-- member body that RETURNS / JUMPS / moves a sibling carries the shared env out
+-- and the pass emits a dup-on-consume (@__rc_dup sibling@ = env incref) at that
+-- use; that dup bumps the env unit (member 0, via 'canonU') and the escape
+-- relinquishes it back, so the pair balances. The env unit is therefore TRACKED
+-- in this scope (so the dup/escape pair is audited) but NOT seeded at +1 (the
+-- member body does not own the scope's env handle --- 'ctxEnvAlive' is empty in
+-- 'onDef' too). Without this the dup-on-escape was an unbalanced +1 => false leak.
+lintDef :: LintEnv -> Set Unique -> [(Binder, [Binder], Expr)]
+        -> (Binder, [Binder], Expr) -> [Text]
+lintDef env groupU defs (_, ps, dbody) =
   let caps   = Set.fromList
                  [ u
                  | u <- Set.toList (freeVarsExpr dbody
                                       `Set.difference` Set.fromList (map binderUnique ps)
                                       `Set.difference` groupU)
                  , u `Set.member` leTracked env, u `Set.notMember` leExempt env ]
-      exempt = leExempt env `Set.union` groupU `Set.union` caps
+      -- Member 0 is the shared-env owning unit; every sibling env op counts against
+      -- it via 'canonU'. Tracked here (so the dup/escape pair balances) but not
+      -- seeded (the body borrows the env, it does not own a scope handle).
+      env0   = case defs of
+        ((b0, _, _) : _) -> binderUnique b0
+        []               -> error "lintDef: empty LetRec group"
+      -- A member-body enclosing CAPTURE is BORROWED (mirroring the pass's 'onDef',
+      -- whose 'dCtx' puts 'caps' in 'ctxBorrow', NOT 'ctxExempt'). Borrowed --- not
+      -- exempt --- so an ESCAPING capture (returned, sealed into a con/record/list,
+      -- or passed as a non-head arg) is dup-on-consumed by the pass and that dup/move
+      -- pair is AUDITED (both count against the capture's own 'Unique', which has no
+      -- env-alias, so 'canonU' is identity). A capture used only as a borrowed READ
+      -- (a 'Case' scrutinee keeping no boxed child) is never bumped or relinquished,
+      -- so it stays at 0 and never leaks. Captures are therefore TRACKED + BORROWED
+      -- but NOT seeded (the body borrows the captured cell; the shared env owns it).
+      exempt = leExempt env
+      borrow = groupU `Set.union` caps
+      tracked = Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]
+                  `Set.union` trackedBinders dbody
+                  `Set.union` Set.singleton env0
+                  `Set.union` caps
+      leEnv  = LintEnv (leFn env) tracked exempt (collectJoins dbody)
+                       borrow (groupEnvAlias defs)
       cnt0   = Map.fromList [ (binderUnique b, 1) | b <- ps, boxedBinder b ]
-  in lintScope (leFn env) exempt ps dbody cnt0
+  in checkExpr leEnv cnt0 dbody
 
 atomUniques :: [Atom] -> [Unique]
 atomUniques as = [ nameUniq n | AVar n <- as ]
@@ -1590,7 +1677,11 @@ leaks env cnt =
 moveAtoms :: Rhs -> [Atom]
 moveAtoms rhs = case rhs of
   RAtom a        -> [a]
-  RApp f as      -> f : as
+  -- BORROW-ON-CALL (M2a-2 Task 1): the call head @f@ is READ, not moved (see
+  -- 'ownedOccs'); only the arguments are moves. Keeping it consistent here is what
+  -- lets 'balanceLint' certify a function value dropped at its last use rather
+  -- than flag an over-consume on the (now-borrowed) head.
+  RApp _ as      -> as
   RCon _ as      -> as
   RRecord _ flds -> map snd flds
   RProj _ _      -> []   -- borrow

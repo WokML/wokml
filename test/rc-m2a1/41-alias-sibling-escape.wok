@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+
+-- M2a-1 reproducer #11 (ESCAPING twin of #10, must be REJECTED):
+-- 'let x = f' aliases the LetRec group sibling 'f', then RETURNS 'x'. The alias
+-- carries the borrowed/uncounted-region member OUT of the enclosing 'let' / LetRec
+-- region, so the member would have to outlive the region (region-lifetime extension
+-- = M2a-2).
+--
+-- The fix makes 'x' a BORROW of the sibling; but a borrow that ESCAPES is still
+-- unsound. The boundary guard's escape detection must follow the bare alias rename
+-- and treat the returned alias as the sibling itself escaping. 'mk' returns a
+-- function value (the aliased closure 'f'), so this is rejected at the RC boundary.
+mk : U64 -> (U64 -> U64)
+mk u =
+  let
+    f n = case n of
+      0 -> u
+      _ -> f (n - 1)
+  in let x = f
+  in x
+
+main = (mk 7) 2
