@@ -1,0 +1,37 @@
+module Main
+import Std.Base
+
+-- M2b-2 Task 4A: a Writer runner with a BOXED Pair accumulator parameter.
+-- The tell arm accumulates two U64 values into a boxed Pair; the return arm
+-- pairs the result with the accumulated log.  Exercises two-arg resume (baton
+-- model): old boxed param handed to the arm (dropped), resume installs new one.
+-- Expected: (42, Pair 10 20); heap returns to baseline.
+data Pair = Pair U64 U64
+
+addToLog : Pair -> U64 -> Pair
+addToLog p w = case p of
+  Pair a b -> Pair w b
+
+setSecond : Pair -> U64 -> Pair
+setSecond p w = case p of
+  Pair a b -> Pair a w
+
+effect Writer = { tell1 : U64 -> (), tell2 : U64 -> () }
+
+runWriter : (() -> a with Writer + eff e) -> (a, Pair) with eff e
+runWriter c =
+  with Writer
+    { log = Pair 0 0
+    ; tell1 w k -> let newLog = addToLog log w in k newLog ()
+    ; tell2 w k -> let newLog = setSecond log w in k newLog ()
+    ; v -> (v, log)
+    } c ()
+
+prog : () -> U64 with Writer
+prog u =
+  let x1 = Writer.tell1 10 in
+  let x2 = Writer.tell2 20 in
+  42
+
+main : (U64, Pair)
+main = runWriter prog

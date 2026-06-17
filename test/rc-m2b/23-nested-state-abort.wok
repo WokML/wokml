@@ -1,0 +1,43 @@
+module Main
+import Std.Base
+
+-- M2b-2 Task 4B: the #3 nested-param abort EXPLOIT.
+-- Structurally mirrors 10-nested-handler-prefix.wok but the inner handler
+-- is a BOXED-PARAMETER St (param [U64]) and the OUTER aborting Outer handler
+-- fires while the inner St KHandleRC frame is in the captured prefix.
+--
+-- Attack: body calls i.set [99, 88] (rebinds inner boxed param from [1,2] to
+-- [99,88]), then fires o.oop 1 (outer aborting op).  The outer abort discards
+-- the captured prefix which spans the inner KHandleRC St frame (param [99,88])
+-- AND the set-arm's pending KLetRC frame (env2 still holds old param [1,2]).
+-- Both lists must be freed on abort.
+--
+-- RED-CHECK: revert continuationOwned KHandleRC arm to (go (KHandleRC _ _ _ k) = go k)
+-- and CONFIRM stLive returns 3 (the [99,88] list leaks).
+-- GREEN-CHECK: with the fix (KHandleRC contributes its param) AND the (Unique,Addr)
+-- dedup fix (so the old-param [1,2] entry in env2 is not collapsed with [99,88]),
+-- both lists are freed and stLive returns to baseline.
+-- Expected output: Err 1; heap returns to baseline.
+effect Outer = { oop : U64 -> Never }
+effect St s = { get : s, set : s -> () }
+
+runSt : s -> (St s -> a with St s + eff e) -> (a, s) with eff e
+runSt i c = with self = St { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
+
+runOuter : (Outer -> a with Outer + eff e) -> Result a U64 with eff e
+runOuter c = with self = Outer { oop n k -> Err n ; v -> Ok v } in c self
+
+body : Outer -> St [U64] -> U64 with Outer + St [U64]
+body o i =
+  let x = i.set [99, 88] in
+  let u = o.oop 1 in
+  0
+
+withSt : Outer -> (Outer -> St [U64] -> U64 with Outer + St [U64] + eff e) -> (U64, [U64]) with Outer + eff e
+withSt o f = runSt [1, 2] (\i -> f o i)
+
+prog : Outer -> (U64, [U64]) with Outer
+prog o = withSt o body
+
+main : Result (U64, [U64]) U64
+main = runOuter prog

@@ -1,0 +1,47 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-17-m2b-2-parameterized-handlers.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: #3 fix — nested handler param in NCont child-set",
+      "status": "completed",
+      "description": "**Goal:** continuationOwned frees a nested parameterized handler's parameter on abort; lands BEFORE admission.\n\n**Files:** src/Wok/Interp/RC/Value.hs (continuationOwned KHandleRC arm); test/Spec.hs (unit test).\n\n**Verify:** cabal test wok-tests --test-options='-p \"continuationOwned\"'\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"continuationOwned\\\"'\", \"acceptanceCriteria\": [\"nested param in owned set\", \"no-param contributes nothing\", \"Unique dedup\", \"red-check fails on revert\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Perceus parameter ownership (baton) + admit hParam",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Pass owns the parameter in the running arm (param consumed at Handle, drops compiler-placed); boundary admits hParam (tail). Golden via --dump-perceus.\n\n**Files:** src/Wok/IR/Escape.hs (m2bHandlerInFragment); src/Wok/IR/Reachable.hs (m2bHandlerViolations); src/Wok/IR/Perceus.hs (ownExpr Handle, ownOpArm, return-arm seeding, checkExpr mirror); test goldens.\n\n**Verify:** cabal test wok-tests --test-options='-p \"perceus\"'\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Escape.hs\", \"src/Wok/IR/Reachable.hs\", \"src/Wok/IR/Perceus.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"perceus\\\"'\", \"acceptanceCriteria\": [\"admit hParam tail\", \"Handle consumes param\", \"arm owns param\", \"no M2b-1 golden regression\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Runtime two-arg resume (own-new re-install)",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Parameterized continuation rebinds param slot (own-new) + delivers result; State get/set heap-balanced end-to-end.\n\n**Files:** src/Wok/Interp/RC/Machine.hs (enterRC NCont arm); test/rc-m2b/20-state-tail.wok.\n\n**Verify:** cabal test wok-tests --test-options='-p \"m2b\"'\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Machine.hs\", \"test/rc-m2b/20-state-tail.wok\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"m2b\\\"'\", \"acceptanceCriteria\": [\"two-arg NCont arm\", \"own-new only no drop\", \"arity error\", \"State tail heap-balanced\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: 2a acceptance corpus + generator (CHECKPOINT)",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** 2a sound at scale: Writer, nested State+Reader, #3 nested-abort exploit, carrier-wall reject, generator extended. 2a checkpoint.\n\n**Files:** test/rc-m2b/{21-writer,22-nested-state-reader,23-nested-state-abort}.wok; test/rc-m2b-reject/13-carrier-wall-param-reject.wok; test/Spec.hs (genM2bProgram + cover).\n\n**Verify:** cabal test wok-tests\n\n```json:metadata\n{\"files\": [\"test/rc-m2b/21-writer.wok\", \"test/rc-m2b/22-nested-state-reader.wok\", \"test/rc-m2b/23-nested-state-abort.wok\", \"test/rc-m2b-reject/13-carrier-wall-param-reject.wok\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests\", \"acceptanceCriteria\": [\"Writer balanced\", \"nested State+Reader balanced\", \"#3 abort exploit + red-check\", \"carrier-wall reject + red-check\", \"generator extended non-constant\", \"property green\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: RC-balanced answerRebind + value-position admission",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** Resumed answer delivered to resume call site, RC-balanced; State in value position heap-balanced.\n\n**Files:** src/Wok/Interp/RC/Machine.hs (answerRebindRC + NCont arm); src/Wok/IR/Escape.hs; src/Wok/IR/Reachable.hs; test/rc-m2b/{24-state-value,25-value-abort}.wok.\n\n**Verify:** cabal test wok-tests --test-options='-p \"m2b\"'\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Machine.hs\", \"src/Wok/IR/Escape.hs\", \"src/Wok/IR/Reachable.hs\", \"test/rc-m2b/24-state-value.wok\", \"test/rc-m2b/25-value-abort.wok\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"m2b\\\"'\", \"acceptanceCriteria\": [\"answerRebindRC control-flow only\", \"admit value position\", \"State value-position balanced\", \"value-position abort balanced\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: 2b generative coverage (CHECKPOINT)",
+      "status": "completed",
+      "blockedBy": [5],
+      "description": "**Goal:** Value position sound at scale: generator value-position dimension (+ value-position abort); property + full suite green. 2b checkpoint; then hand off for user full-branch /code-review + merge gate.\n\n**Files:** test/Spec.hs (genM2bProgram value-position dimension + cover).\n\n**Verify:** cabal test wok-tests\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests\", \"acceptanceCriteria\": [\"value-position generator dimension\", \"coverage floors non-vacuous\", \"property green\", \"full suite green\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-17T00:00:00Z"
+}

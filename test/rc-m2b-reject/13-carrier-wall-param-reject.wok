@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+
+-- M2b-2 Task 4C: carrier-wall verification.
+-- An op arm that passes the resume binder as a NON-HEAD argument (here as the
+-- new parameter in a two-arg resume call) escapes the continuation, violating
+-- the one-shot move-out contract.  The M2b fragment guard (m2bResumeEscapes)
+-- rejects any arm where the resume binder appears outside a saturated call head.
+--
+-- Here the set arm of St does  k k ()  -- resume is called with itself as the
+-- new-param argument.  The boundary guard must reject this.
+effect St s = { get : s, set : s -> () }
+
+runSt : s -> (() -> a with St s) -> (a, s)
+runSt i c =
+  with St
+    { s = i
+    ; get -> s
+    ; set x k -> k k ()
+    ; v -> (v, s)
+    } c ()
+
+main : (U64, U64)
+main = runSt 0 (\u -> 42)

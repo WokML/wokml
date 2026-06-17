@@ -227,17 +227,30 @@ continuationOwned = dedup . go
     go (KLetRC r body sc k)   = frameOwned r body sc ++ go k
     go (KAppRC vs k)          = [ (Nothing, a) | a <- countedRefs vs ] ++ go k
     go (KDropCellRC a k)      = [ (Nothing, a) | not (isStaticAddr a) ] ++ go k
-    -- A nested handler frame in the captured prefix: skip its scope. SOUND IN M2b-1
-    -- ONLY because a no-parameter handler whose arms cannot capture an enclosing boxed
-    -- local (rejected by the boundary guard) owns nothing live across the outer op.
+    -- A nested handler frame in the captured prefix owns its PARAMETER value (if
+    -- any).  Only the parameter slot is owned by the frame itself; the rest of
+    -- hsc is the captured enclosing scope, whose binders are owned by their own
+    -- KLetRC frames elsewhere in the prefix (freeing them here would double-free).
     --
-    -- !!! M2b-2 PREREQUISITE (code-review #3): once handler PARAMETERS (hParam) land, a
-    -- nested PARAMETERIZED handler frame OWNS its parameter value (e.g. State's `s`).
-    -- Skipping it here will LEAK that parameter when the outer continuation aborts.
-    -- M2b-2 MUST process this frame's hsc (at least the param slot, drop-old/own-new
-    -- aware) and ship an exploit test (a nested `State` inside an aborting outer
-    -- handler). Do not widen hParam admission without fixing this line.
-    go (KHandleRC _ _ _ k)    = go k
+    -- LOAD-BEARING INVARIANT: a dispatched handler's own KHandleRC frame is OFF
+    -- the live Kont while its arm runs (the arm executes under kBelow, not under
+    -- the handler's own frame). Therefore a KHandleRC frame appearing here is
+    -- always a PASSIVE NESTED handler -- one that is in the captured continuation
+    -- prefix above an op dispatch, not the currently-running handler. The nested
+    -- handler's param is owned exactly once (the frame holds the one live reference),
+    -- and 'dropAddr's 'stDead' guard would catch a violation loudly.
+    --
+    -- The parameter entry is keyed by the Binder's Unique so the dedup logic
+    -- collapses aliased live-across-frames entries to one, matching the refcount.
+    --
+    -- !!! DEFERRED, LATENT (code-review #7): raw-address dedup against named
+    -- entries is not performed here; see the 'dedup' note below.
+    go (KHandleRC h _ hsc k)  =
+      [ (Just (binderUnique pb), a)
+      | Just pb <- [hParam h]
+      , Just v  <- [Map.lookup (binderUnique pb) (rscEnv hsc)]
+      , a       <- countedRefs [v] ]
+      ++ go k
     frameOwned r body sc =
       let owned = (nonHeadOccs Set.empty body `Set.union` dropTargets body)
                     `Set.intersection` freeVarsExpr body
@@ -246,26 +259,31 @@ continuationOwned = dedup . go
          | u <- Set.toList owned'
          , Just v <- [Map.lookup u (rscEnv sc)]
          , a <- countedRefs [v] ]
-    -- Dedup the named-binder entries by Unique (a value live across several frames is
-    -- owned once; two DISTINCT aliasing binders stay separate, matching refcount). The
-    -- raw-address entries (KAppRC over-args, KDropCellRC) carry no Unique and are emitted
-    -- verbatim.
+    -- Dedup the named-binder entries by (Unique, Addr) pair: a value live across
+    -- several frames is owned once (same binder, same address -> single free); two
+    -- DISTINCT aliasing binders stay separate, matching refcount.  Keying on the
+    -- full (Unique, Addr) pair -- rather than Unique alone -- handles the
+    -- parameterized-handler 'set' scenario: after a two-arg resume the param binder
+    -- 'pb' appears in the KHandleRC frame (new value) AND in the KLetRC arm frame
+    -- (old value in env2); both share the same Unique but carry DIFFERENT addresses,
+    -- so both must be freed.  Keying on Unique alone would collapse them and leak
+    -- the older value.
     --
-    -- !!! DEFERRED, LATENT (code-review #7): a (Nothing, a) raw entry is NEVER compared
-    -- against the (Just u, a) named entries, so if the SAME cell is ever reachable both
-    -- through a named frame binder AND through a raw KAppRC/KDropCellRC frame, address `a`
-    -- is freed twice -> double-free. Believed unreachable today (over-application args are
-    -- caller-scope; captured frames are callee-scope; M2a-2 over-applied-member env-shares
-    -- have not been seen to coincide with a live named sibling in a prefix). REVISIT when
-    -- over-application (KAppRC) or an over-applied M2a-2 recursive member (KDropCellRC env)
-    -- can appear inside a captured continuation: either dedup raw addrs against named ones
-    -- (preserving genuine refcount->=2 aliases) or add that generator shape to settle it.
+    -- Raw-address entries (KAppRC over-args, KDropCellRC) carry no Unique and are
+    -- emitted verbatim.
+    --
+    -- !!! DEFERRED, LATENT (code-review #7): a (Nothing, a) raw entry is NEVER
+    -- compared against (Just u, a) named entries, so if the SAME cell is reachable
+    -- both through a named frame binder AND through a raw KAppRC/KDropCellRC frame,
+    -- address 'a' is freed twice -> double-free.  Believed unreachable today.
+    -- REVISIT when over-application (KAppRC) or an over-applied M2a-2 recursive
+    -- member (KDropCellRC env) can appear inside a captured continuation.
     dedup = goD Set.empty
       where
         goD _ [] = []
         goD seen ((Just u, a) : rest)
-          | u `Set.member` seen = goD seen rest
-          | otherwise           = a : goD (Set.insert u seen) rest
+          | (u, a) `Set.member` seen = goD seen rest
+          | otherwise                = a : goD (Set.insert (u, a) seen) rest
         goD seen ((Nothing, a) : rest) = a : goD seen rest
 
 -- | Resume move-out (M2b-1 Task 5; spec §4.3 RESUME, §4.5.0): free the 'NCont'

@@ -49,7 +49,6 @@ module Wok.IR.Escape
   , m2bHandlerInFragment
   ) where
 
-import Data.Maybe (isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -635,12 +634,12 @@ m2bResumeEscapes resume = go
     goAlt (AltLit _ e)   = go e
     goAlt (AltDefault e) = go e
 
--- | True iff a handler is in the M2b-1 RC-supported fragment: no handler
--- parameter, tail position (no answer-join), and no op-arm resume escapes its
--- body. This is the AUTHORITATIVE coverage predicate shared by the boundary
--- guard ('Wok.IR.Reachable') and the Perceus pass.
+-- | True iff a handler is in the M2b RC-supported fragment: no op-arm resume
+-- escapes its body. Handler parameters ('hParam') are admitted as of M2b-2
+-- Task 2 (the baton model). Value-position handlers ('hAnswerJoin = Just')
+-- are admitted as of M2b-2 Task 5 (answerRebindRC). This is the AUTHORITATIVE
+-- coverage predicate shared by the boundary guard ('Wok.IR.Reachable') and
+-- the Perceus pass.
 m2bHandlerInFragment :: Handler -> Bool
 m2bHandlerInFragment h =
-  isNothing (hParam h)
-    && isNothing (hAnswerJoin h)
-    && all (\oa -> not (m2bResumeEscapes (oaResume oa) (oaBody oa))) (hOps h)
+  all (\oa -> not (m2bResumeEscapes (oaResume oa) (oaBody oa))) (hOps h)

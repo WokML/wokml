@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+-- M2b-2 Task 3: parameterized handler runtime (two-arg resume). The 'runState'
+-- runner re-installs the handler with the NEW parameter on each resume (own-new
+-- move; the old slot was handed to the arm at dispatch and is stale). 'prog'
+-- does get/set/get so we exercise both the one-arg 'get' resume and the
+-- two-arg 'set' resume. Expected output: ((5, 105), 105); heap returns to baseline.
+effect State s = { get : s, set : s -> () }
+
+runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
+runState i c = with State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
+
+prog : () -> (U64, U64) with State U64
+prog u =
+  let a = State.get in
+  let u2 = State.set (a + 100) in
+  let b = State.get in
+  (a, b)
+
+main : ((U64, U64), U64)
+main = runState 5 prog

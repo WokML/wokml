@@ -126,16 +126,19 @@ reader e c =
 state i c =
   let s = i
   let t.1 = c(self)
+  let _drop.1 = __rc_drop(c)
   t.1
   with self = {
     return v ->
       let t.3 = Tuple2(v, s)
       t.3
     State.get(resume.1) ->
+      let _dup = __rc_dup(s)
       let res = resume.1(s, s)
       res
     State.set(x, resume.2) ->
       let t.2 = resume.2(x, ())
+      let _drop.2 = __rc_drop(s)
       t.2
   }
 
@@ -143,6 +146,7 @@ writer c =
   let t.5 = Nil
   let log = t.5
   let t.1 = c(self)
+  let _drop = __rc_drop(c)
   t.1
   with self = {
     return v ->

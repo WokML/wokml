@@ -20,6 +20,8 @@ module Wok.IR.Anf
   , freeVarsAlt
   , atomVars
   , binderUnique
+    -- * Handler helpers
+  , hParamBinders
   ) where
 
 import Data.Map.Strict (Map)
@@ -453,10 +455,27 @@ freeVarsExpr (LetJoin _ ps jb e) =
   let psU = Set.fromList (map binderUnique ps)
   in (freeVarsExpr jb `Set.difference` psU) `Set.union` freeVarsExpr e
 freeVarsExpr (Jump _ as)        = Set.unions (map atomVars as)
-freeVarsExpr (Handle e h)       = freeVarsExpr e `Set.union` freeVarsHandler h
+freeVarsExpr (Handle e h)       =
+  freeVarsExpr e `Set.union` freeVarsHandler h
+    -- The handler CONSUMES its parameter from the enclosing scope (baton model,
+    -- M2b-2 Task 2), so hParam is an external free variable of the Handle even
+    -- though freeVarsHandler excludes it from the arm free vars (it is "locally
+    -- bound" inside the arms). Including it here ensures the outer 'Let' rule
+    -- keeps the param live rather than dropping it before the Handle fires.
+    `Set.union` maybe Set.empty (Set.singleton . binderUnique) (hParam h)
 
 -- | Free vars of a handler's arms: the return-arm body minus its binder, plus each
 -- op-arm body minus that arm's args + resume binder; finally minus hParam/hSelf.
+--
+-- DELIBERATE ASYMMETRY vs 'freeVarsExpr (Handle ...)': 'freeVarsHandler' EXCLUDES
+-- hParam and hSelf (they are "locally bound" from the arms' perspective -- each arm
+-- sees the param as an in-scope binding). By contrast, 'freeVarsExpr' INCLUDES hParam
+-- in the outer-scope free-variable set (the Handle CONSUMES its param from the
+-- enclosing scope -- baton model, M2b-2 Task 2 -- so the outer Let must keep it live
+-- until the Handle fires). Collapsing the two would either drop the param before the
+-- Handle (UAF on the abort path) or spuriously reject all parameterized handlers
+-- (param appears free in the handler arms, so the enclosing context's drop-insertion
+-- would see it as double-consumed). Both failure modes were verified by a red-check.
 freeVarsHandler :: Handler -> Set Unique
 freeVarsHandler (Handler (rb, rbody) ops _ mparam mself) =
   let retFv = Set.delete (binderUnique rb) (freeVarsExpr rbody)
@@ -487,3 +506,8 @@ atomVars (ALit _) = Set.empty
 
 binderUnique :: Binder -> Unique
 binderUnique = nameUniq . bndName
+
+-- | Return the handler's parameter binder as a singleton list, or empty if
+-- the handler has no parameter.  Convenience alias for 'maybe [] pure . hParam'.
+hParamBinders :: Handler -> [Binder]
+hParamBinders = maybe [] pure . hParam

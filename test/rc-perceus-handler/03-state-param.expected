@@ -1,10 +1,28 @@
+prog u =
+  let t.2 = Bag(2)
+  let t.3 = Store.store(t.2)
+  let b = t.3
+  let t.1 = Store.load()
+  t.1
+
 main =
-  let t.1 = True
-  let t.2 = False
-  let t.3 = &&(t.1, t.2)
-  let t.4 = True
-  let t.5 = ||(t.3, t.4)
-  t.5
+  let t.4 = Bag(1)
+  let s = t.4
+  let t.1 = prog(())
+  t.1
+  with {
+    return v ->
+      let t.3 = Tuple2(v, s)
+      t.3
+    Store.load(resume.1) ->
+      let _dup = __rc_dup(s)
+      let res = resume.1(s, s)
+      res
+    Store.store(x, resume.2) ->
+      let t.2 = resume.2(x, ())
+      let _drop = __rc_drop(s)
+      t.2
+  }
 
 id x =
   x

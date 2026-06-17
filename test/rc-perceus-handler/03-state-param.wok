@@ -1,0 +1,28 @@
+module Main
+import Std.Base
+
+-- M2b-2 Task 2: handler parameter (baton) ownership with a BOXED parameter.
+-- 'Bag' is a simple boxed wrapper so the handler parameter IS boxed, making
+-- the __rc_drop in the 'store' arm a real counted drop (the meaningful case).
+--
+-- Perceus must:
+--   * NOT drop the parameter 's' in the outer 'main' body before the handler
+--     (the Handle consumes it by subtracting it from deltaE).
+--   * In the 'load' arm: __rc_dup(s) because 's' is used twice (as the value
+--     AND as the baton forwarded to resume).
+--   * In the 'store' arm: __rc_drop(s) because the old bag is replaced by 'x'.
+--   * In the return arm: 's' is consumed into Tuple2(v, s) -- no drop needed.
+
+data Bag = Bag U64
+
+effect Store = { load : Bag, store : Bag -> () }
+
+prog : () -> Bag with Store
+prog u =
+  let b = Store.store (Bag 2) in
+  Store.load
+
+main : (Bag, Bag)
+main =
+  with Store { s = Bag 1 ; load -> s ; store x k -> k x () ; v -> (v, s) }
+  prog ()

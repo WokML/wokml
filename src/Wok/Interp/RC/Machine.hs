@@ -17,7 +17,8 @@ import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
-  , Lit (..), OpArm (..), Rhs (..), TopBind (..), binderUnique, freeVarsExpr )
+  , Lit (..), OpArm (..), Rhs (..), TopBind (..), binderUnique, bndName
+  , freeVarsExpr, hAnswerJoin )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.Interp.RC.Prim (rcPrimTable)
@@ -387,20 +388,40 @@ enterRC borrowHead _ fv args k s = case fv of
       -- the boxed 'NCont' handle (the op-arm @resume@ binder) MOVES the captured
       -- frames back onto the live 'Kont': 'spliceKont' re-prepends the prefix and
       -- re-installs the matching handler ('KHandleRC') over the post-resume
-      -- continuation @k@ (= the reference's @after@), then the resume argument @v@
-      -- is delivered into it. 'moveOutCont' frees the 'NCont' SHELL ONLY (one-shot
+      -- continuation @k@ (= the reference's @after@), then the resume argument is
+      -- delivered into it. 'moveOutCont' frees the 'NCont' SHELL ONLY (one-shot
       -- guarantees rc == 1) WITHOUT cascading its children --- their refcounts are
       -- untouched because ownership transfers to the now-live spliced frames; their
       -- own pending @__rc_drop@/move instructions fire as those frames run. Mirrors
-      -- the reference @enter@ 'VCont' arm: @Return v (kb k)@ with @kb = above .
-      -- KHandle@. M2b-1 resume is ONE-argument (@hParam = Nothing@); the two-arg
-      -- 'VContP'/param resume is M2b-2.
-      NCont{} -> case args of
-        [v] -> do
-          (prefix, (h, hTag, hsc), s') <- moveOutCont addr s
-          let k' = spliceKont prefix (KHandleRC h hTag hsc k)
-          Right (RReturn v k' s')
-        _ -> Left (ArityError (Tx.pack "continuation expects exactly one argument"))
+      -- the reference @enter@ 'VCont'/'VContP' arms.
+      --
+      -- M2b-2 two-arg path (hParam = Just pb): @resume newParam result@ re-installs
+      -- the handler with the parameter slot REBOUND to @newParam@ (own-new: the
+      -- previous slot binding was handed to the arm at dispatch and is stale, so
+      -- NO drop here), and delivers @result@ to the resume call site. Mirrors
+      -- the reference @enter@ 'VContP' arm: @Return result (f newParam k)@.
+      --
+      -- DO NOT add a 'dropAddr' of the old param here. The old @hsc[pb]@ binding is
+      -- overwritten by 'bindRCBinder'; the value was moved to the arm at dispatch and
+      -- is already stale. A drop here would double-free against the arm's Perceus
+      -- compiler-placed drop.
+      --
+      -- M2b-2 Task 5: 'answerRebindRC' re-points the handler's ANSWER JOIN (if any)
+      -- to @k@ (the resume call site) so that a value-position resumed sub-run's
+      -- answer is delivered here, not to the static post-handler continuation. A
+      -- tail-position handler has 'hAnswerJoin = Nothing', making it a no-op.
+      NCont{} -> do
+        (prefix, (h, hTag, hsc), s') <- moveOutCont addr s
+        case (hParam h, args) of
+          (Nothing, [v]) ->
+            let hsc' = answerRebindRC h k hsc
+            in Right (RReturn v (spliceKont prefix (KHandleRC h hTag hsc' k)) s')
+          (Just pb, [newParam, result]) ->
+            let hsc'  = hsc { rscEnv = bindRCBinder pb newParam (rscEnv hsc) }
+                hsc'' = answerRebindRC h k hsc'
+                k'    = spliceKont prefix (KHandleRC h hTag hsc'' k)
+            in Right (RReturn result k' s')
+          _ -> Left (ArityError (Tx.pack "resume arity does not match handler parameter"))
       _ -> Left (NotAFunction (Tx.pack "applied a non-closure heap node"))
   RVLit _ -> Left (NotAFunction (Tx.pack "applied a literal"))
   RVRecMember gAddr i envAddr -> do
@@ -580,6 +601,48 @@ renderJoin :: JoinId -> Text
 renderJoin (JoinId (Unique i)) = Tx.pack "j" <> Tx.pack (show i)
 
 -- ---------------------------------------------------------------------------
+-- Answer-rebind (M2b-2 Task 5): the RC analogue of the reference
+-- 'Wok.Interp.Machine.dispatchOp' 'answerRebind' local function.
+--
+-- When a handler sits in VALUE position ('hAnswerJoin = Just j'), its arms
+-- deliver their results via 'jump j', so 'j' is the STATIC post-handler join.
+-- On RESUME, the sub-run's answer must reach the RESUME CALL SITE (the @after@
+-- continuation), not that static join. 'answerRebindRC' re-points @j@'s entry
+-- so that, when the resumed sub-run completes and its return arm jumps to @j@,
+-- the join body is now @Ret (AVar pb0)@ (identity: forward the single param)
+-- and the join's own continuation is @after@ (the resume call site). The TOP-
+-- LEVEL op arm keeps the ORIGINAL @hsc@ so the real post-handler work runs
+-- once on the final answer.
+--
+-- INVARIANT: an answer-join is the single-result merge join that elaboration
+-- creates for a value-position handler, so @ps@ is exactly one binder. The
+-- @(pb0 : _)@ guard takes that binder; if a future change ever pointed
+-- @hAnswerJoin@ at a many-param join the rebind is silently skipped rather
+-- than misbinding (escape bug returns) --- keep answer-joins single-param.
+--
+-- RC ACCOUNTING: 'answerRebindRC' allocates NOTHING and frees NOTHING. It
+-- only rewrites one 'RCJoin' value in the existing @rscJoins@ map. The new
+-- 'RCJoin sc ...' captures the SAME @sc@ scope by reference (the same as the
+-- original 'LetJoin' install did), so no incref is needed; the values in @sc@
+-- are owned by their binders and released by the Perceus pass at last use.
+answerRebindRC :: Handler -> RCKont -> RCScope -> RCScope
+answerRebindRC h after sc =
+  case hAnswerJoin h of
+    Just j
+      | Just (RCJoin _ ps _ _) <- Map.lookup j (rscJoins sc)
+      , (pb0 : _) <- ps ->
+          sc { rscJoins = Map.insert j
+                 (RCJoin sc ps (Ret (AVar (bndName pb0))) after)
+                 (rscJoins sc) }
+    -- Intentional fallthrough: mirrors the reference 'answerRebind' (same silent
+    -- no-op on hAnswerJoin = Nothing or a missing/empty-ps join). The empty-ps case
+    -- is unreachable in elaborated code (the single-param answer-join invariant),
+    -- and a missing join means the handler is tail-position (hAnswerJoin = Nothing),
+    -- which is a correct no-op. Making this 'error' would diverge from the reference
+    -- and break the differential oracle.
+    _ -> sc
+
+-- ---------------------------------------------------------------------------
 -- Effect dispatch (M2b-1 Task 4): the RC analogue of the reference
 -- 'Wok.Interp.Machine.dispatchOp'/'findHandler', threading the 'Store'.
 
@@ -622,14 +685,15 @@ lookupOpArmRC lbl op h =
 -- continuation above it CONCRETELY into a fresh 'NCont' cell, bind the op args and
 -- the (boxed 'NCont') resume, and run the arm under the handler's below-
 -- continuation. The RC analogue of the reference 'dispatchOp', threading the
--- 'Store'. M2b-1: 'hAnswerJoin = Nothing' and 'hParam = Nothing', so NO answer-
--- rebind and a one-arg resume (Task 5).
+-- 'Store'. Handler parameters and value-position handlers are admitted as of
+-- M2b-2 Tasks 2-5; the answer-rebind for value-position handlers fires at RESUME
+-- time in 'enterRC' ('answerRebindRC'), not here at dispatch.
 --
 -- CAPTURE ACCOUNTING (spec §4.3): the @above@ frames are MOVED into the 'NCont'
 -- (rc = 1); NO incref of their children --- the values stay owned by their binders
 -- inside the captured frames. On ABORT the op arm drops @resume@ and the 'NCont's
--- free runs its owned set ('cascadeChildren'); on RESUME (Task 5) the frames splice
--- back and the shell is discarded WITHOUT freeing the owned set.
+-- free runs its owned set ('cascadeChildren'); on RESUME the frames splice back and
+-- the shell is discarded WITHOUT freeing the owned set.
 rcDispatchOp
   :: Maybe (Unique, Int) -> Text -> Text -> [RCValue] -> RCKont -> Store
   -> Either RuntimeError RCConfig

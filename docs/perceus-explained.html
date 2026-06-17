@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How wok's Perceus Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0f1e; --panel:#121a30; --panel2:#172143; --line:#283355;
+    --ink:#e9ecf5; --mute:#8b95b4; --faint:#5b6480;
+    --amber:#f4b15a; --amber-d:#caa15a; --cyan:#56c6d6; --red:#e8717a;
+    --green:#74d6a0; --violet:#9a8cf0;
+    --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; color:var(--ink); background:var(--bg);
+    font:18px/1.7 "Newsreader",Georgia,serif;
+    background-image:
+      radial-gradient(1100px 540px at 78% -8%, rgba(244,177,90,.10), transparent 60%),
+      radial-gradient(900px 500px at 10% 8%, rgba(86,198,214,.08), transparent 55%),
+      linear-gradient(var(--bg),var(--bg)),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.022) 0 1px, transparent 1px 38px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.022) 0 1px, transparent 1px 38px);
+    background-attachment:fixed;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:72px 26px 130px}
+  .eyebrow{
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.28em;text-transform:uppercase;
+    color:var(--amber);margin:0 0 18px;font-weight:500;
+  }
+  h1{
+    font-family:"Fraunces",serif;font-weight:600;font-size:clamp(2.4rem,6vw,3.7rem);
+    line-height:1.02;letter-spacing:-.02em;margin:0 0 18px;
+  }
+  h1 em{font-style:italic;color:var(--amber)}
+  .deck{font-size:1.18rem;color:var(--mute);max-width:42ch;margin:0}
+  header.title{border-bottom:1px solid var(--line);padding-bottom:40px;margin-bottom:18px}
+  .thesis{
+    font-size:1.16rem;margin:34px 0 0;padding:20px 24px;border-radius:14px;
+    background:linear-gradient(180deg,rgba(244,177,90,.08),rgba(244,177,90,.02));
+    border:1px solid rgba(244,177,90,.22);
+  }
+  .thesis b{color:var(--amber);font-weight:600}
+  h2{
+    font-family:"Fraunces",serif;font-weight:600;font-size:1.7rem;letter-spacing:-.01em;
+    margin:78px 0 6px;display:flex;align-items:baseline;gap:14px;
+  }
+  h2 .n{font-family:var(--mono);font-size:.9rem;color:var(--amber);font-weight:700;
+    border:1px solid rgba(244,177,90,.4);border-radius:8px;padding:3px 9px;line-height:1}
+  p{margin:14px 0}
+  p.sub{color:var(--mute);font-size:1.02rem;margin-top:2px}
+  code{font-family:var(--mono);font-size:.84em;background:rgba(255,255,255,.06);
+    border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:#dfe6ff}
+  em{color:#f1e9da}
+  a{color:var(--cyan);text-decoration:none;border-bottom:1px solid rgba(86,198,214,.35)}
+
+  /* figure scaffolding */
+  figure{margin:30px 0 8px}
+  figcaption{font-family:var(--mono);font-size:.74rem;letter-spacing:.04em;color:var(--mute);
+    text-align:center;margin-top:14px}
+  .board{
+    background:linear-gradient(180deg,rgba(23,33,67,.65),rgba(18,26,48,.65));
+    border:1px solid var(--line);border-radius:18px;padding:30px 26px;
+    box-shadow:0 24px 60px -34px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.03);
+  }
+  svg{display:block;width:100%;height:auto}
+  .svg-scroll{overflow-x:auto}
+
+  /* node card (HTML diagrams) */
+  .node{
+    border:1px solid var(--line);border-radius:12px;background:var(--panel);
+    padding:13px 16px;position:relative;
+  }
+  .node .tag{font-family:var(--mono);font-size:.66rem;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--mute);display:block;margin-bottom:4px}
+  .node .big{font-family:var(--mono);font-size:.96rem;color:var(--ink)}
+  .node.amber{border-color:rgba(244,177,90,.45);box-shadow:0 0 0 1px rgba(244,177,90,.12),0 14px 30px -22px rgba(244,177,90,.5)}
+  .node.amber .tag{color:var(--amber)}
+  .node.cyan{border-color:rgba(86,198,214,.4)} .node.cyan .tag{color:var(--cyan)}
+  .node.red{border-color:rgba(232,113,122,.45)} .node.red .tag{color:var(--red)}
+
+  /* 2 — contract */
+  .contract{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:stretch;position:relative}
+  .col{border-radius:16px;padding:22px;border:1px solid var(--line)}
+  .col.compile{background:linear-gradient(180deg,rgba(244,177,90,.10),rgba(244,177,90,.02));border-color:rgba(244,177,90,.3)}
+  .col.run{background:linear-gradient(180deg,rgba(86,198,214,.08),rgba(86,198,214,.015));border-color:rgba(86,198,214,.26)}
+  .col h3{font-family:var(--mono);font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;margin:0 0 4px}
+  .col.compile h3{color:var(--amber)} .col.run h3{color:var(--cyan)}
+  .col .role{font-size:.96rem;color:var(--mute);margin:0 0 16px}
+  .col ul{list-style:none;margin:0;padding:0}
+  .col li{font-family:var(--mono);font-size:.82rem;line-height:1.5;padding:7px 0 7px 22px;position:relative;border-top:1px dashed var(--line)}
+  .col li:first-child{border-top:0}
+  .col li::before{content:"";position:absolute;left:2px;top:14px;width:7px;height:7px;border-radius:2px}
+  .col.compile li::before{background:var(--amber)} .col.run li::before{background:var(--cyan)}
+  .col .foot{margin-top:14px;font-size:.9rem;color:var(--ink);font-family:"Newsreader",serif}
+  .flowtag{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    background:var(--bg);border:1px solid var(--line);border-radius:999px;
+    font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;color:var(--mute);
+    padding:6px 12px;white-space:nowrap;z-index:2;
+  }
+  .flowtag b{color:var(--amber)}
+
+  /* 4 — refcount timeline */
+  .timeline{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .frame{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:16px 14px;display:flex;flex-direction:column;gap:12px;min-height:172px}
+  .frame .line{font-family:var(--mono);font-size:.72rem;color:var(--cyan);min-height:2.4em}
+  .heap{flex:1;display:flex;flex-wrap:wrap;gap:8px;align-content:center;justify-content:center}
+  .cell{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--panel2)}
+  .cell .name{font-family:var(--mono);font-size:.8rem;color:var(--ink)}
+  .cell .val{font-family:var(--mono);font-size:.7rem;color:var(--mute)}
+  .rc{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);
+    font-size:.78rem;font-weight:700;color:#1a1205;background:var(--amber);box-shadow:0 0 14px -2px var(--amber)}
+  .rc.zero{background:var(--red);color:#27090c;box-shadow:0 0 14px -2px var(--red)}
+  .frame.freed{border-style:dashed;opacity:.86}
+  .frame .note{font-family:var(--mono);font-size:.66rem;color:var(--mute);text-align:center}
+  .frame .note.free{color:var(--red)}
+
+  /* 5 — three kinds of children */
+  .kinds{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  .kind{border:1px solid var(--line);border-radius:16px;padding:18px;background:var(--panel);display:flex;flex-direction:column;gap:10px}
+  .kind h3{font-family:var(--mono);font-size:.72rem;letter-spacing:.06em;margin:0;text-transform:uppercase}
+  .kind.ord{border-color:var(--line)} .kind.ord h3{color:var(--mute)}
+  .kind.cont{border-color:rgba(154,140,240,.4)} .kind.cont h3{color:var(--violet)}
+  .kind.baton{border-color:rgba(244,177,90,.4)} .kind.baton h3{color:var(--amber)}
+  .kind .desc{font-size:.92rem;color:var(--mute);margin:0}
+  .pill{font-family:var(--mono);font-size:.72rem;border-radius:8px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);color:#dfe6ff;line-height:1.45}
+  .pill.lit{color:var(--mute)} .pill.calc{border-color:rgba(154,140,240,.35);color:#e7e1ff}
+  .badge{align-self:flex-start;font-family:var(--mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
+    border-radius:999px;padding:3px 9px}
+  .badge.lit{background:rgba(139,149,180,.14);color:var(--mute)}
+  .badge.calc{background:rgba(154,140,240,.16);color:var(--violet)}
+
+  /* callouts */
+  .aside{margin:30px 0;border-radius:14px;padding:20px 22px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--cyan)}
+  .aside h4{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--cyan);margin:0 0 8px}
+  .aside p{margin:0;font-size:1rem;color:#d7dcec}
+  .takeaway{margin:46px 0 0;border-radius:16px;padding:26px;background:linear-gradient(180deg,rgba(116,214,160,.10),rgba(116,214,160,.02));border:1px solid rgba(116,214,160,.3)}
+  .takeaway h4{font-family:var(--mono);font-size:.74rem;letter-spacing:.1em;text-transform:uppercase;color:var(--green);margin:0 0 8px}
+  .takeaway p{margin:0;font-size:1.1rem}
+  footer{margin-top:60px;padding-top:22px;border-top:1px solid var(--line);color:var(--mute);
+    font-family:var(--mono);font-size:.74rem;letter-spacing:.03em}
+
+  .legend{display:flex;flex-wrap:wrap;gap:16px;margin:18px 0 0;font-family:var(--mono);font-size:.72rem;color:var(--mute)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+  /* reveal */
+  @media (prefers-reduced-motion:no-preference){
+    .reveal{opacity:0;transform:translateY(14px);animation:rise .7s cubic-bezier(.2,.7,.2,1) forwards}
+    @keyframes rise{to{opacity:1;transform:none}}
+  }
+  @media (max-width:680px){
+    .contract,.timeline,.kinds{grid-template-columns:1fr}
+    .flowtag{position:static;transform:none;display:inline-block;margin:4px auto}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="title reveal" style="animation-delay:.02s">
+    <p class="eyebrow">wok compiler &middot; working note &middot; 2026-06-17</p>
+    <h1>How wok's <em>Perceus</em> works</h1>
+    <p class="deck">Precise reference counting, drawn out: the compiler decides every count operation, and the runtime just runs them.</p>
+    <p class="thesis">The whole system in one line: <b>the compiler decides where every reference-count operation goes; the runtime only executes them and frees a cell when its count hits zero.</b> Everything below elaborates that split.</p>
+  </header>
+
+  <!-- 1 — PIPELINE -->
+  <h2 class="reveal"><span class="n">1</span>Where Perceus sits</h2>
+  <p class="sub">The pass runs on ANF, where every value is named &mdash; which is what makes "the last use of <code>x</code>" a precise, decidable thing.</p>
+
+  <figure class="reveal">
+    <div class="board svg-scroll">
+      <svg viewBox="0 0 620 470" role="img" aria-label="Compilation pipeline showing Perceus inserting reference-count operations on ANF">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#7e89ab"/>
+          </marker>
+          <marker id="arA" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#f4b15a"/>
+          </marker>
+        </defs>
+        <!-- spine -->
+        <g font-family="JetBrains Mono, monospace">
+          <!-- stage boxes -->
+          <g>
+            <rect x="120" y="14"  width="220" height="48" rx="11" fill="#172143" stroke="#283355"/>
+            <text x="230" y="43" fill="#e9ecf5" font-size="15" text-anchor="middle">.wok source</text>
+
+            <rect x="120" y="110" width="220" height="48" rx="11" fill="#172143" stroke="#283355"/>
+            <text x="230" y="139" fill="#e9ecf5" font-size="15" text-anchor="middle">Typed Core</text>
+
+            <rect x="120" y="206" width="220" height="48" rx="11" fill="#1c2647" stroke="#f4b15a" stroke-width="1.4"/>
+            <text x="230" y="229" fill="#f4b15a" font-size="15" text-anchor="middle">ANF</text>
+            <text x="230" y="246" fill="#9aa6c8" font-size="10.5" text-anchor="middle">named binders &middot; join points</text>
+
+            <rect x="120" y="302" width="220" height="48" rx="11" fill="#172143" stroke="#283355"/>
+            <text x="230" y="325" fill="#e9ecf5" font-size="15" text-anchor="middle">ANF + rc ops</text>
+            <text x="230" y="342" fill="#9aa6c8" font-size="10.5" text-anchor="middle">__rc_dup / __rc_drop inserted</text>
+
+            <rect x="120" y="398" width="220" height="48" rx="11" fill="#172143" stroke="#283355"/>
+            <text x="230" y="421" fill="#e9ecf5" font-size="15" text-anchor="middle">value</text>
+            <text x="230" y="438" fill="#74d6a0" font-size="10.5" text-anchor="middle">heap balanced (allocs - frees = 0)</text>
+          </g>
+          <!-- arrows + edge labels -->
+          <g stroke-width="1.6">
+            <path d="M230,62 L230,108"  stroke="#7e89ab" marker-end="url(#ar)"/>
+            <path d="M230,158 L230,204" stroke="#7e89ab" marker-end="url(#ar)"/>
+            <path d="M230,254 L230,300" stroke="#f4b15a" marker-end="url(#arA)"/>
+            <path d="M230,350 L230,396" stroke="#7e89ab" marker-end="url(#ar)"/>
+          </g>
+          <g font-size="10.5" fill="#8b95b4">
+            <text x="246" y="89">parse &middot; typecheck &middot; infer rows</text>
+            <text x="246" y="185">elaborate &middot; normalize</text>
+            <text x="246" y="281" fill="#f4b15a">Perceus pass (insertRC)</text>
+            <text x="246" y="377">RC interpreter (CEK + Store)</text>
+          </g>
+          <!-- perceus callout -->
+          <g>
+            <path d="M340,230 C 400,230 410,230 432,230" stroke="#f4b15a" stroke-dasharray="3 4" fill="none"/>
+            <rect x="432" y="198" width="172" height="64" rx="10" fill="#1c2647" stroke="rgba(244,177,90,.45)"/>
+            <text x="518" y="222" fill="#f4b15a" font-size="10.5" text-anchor="middle" letter-spacing="1.5">THE PASS</text>
+            <text x="518" y="240" fill="#cdd5ee" font-size="10.5" text-anchor="middle">reads ANF, places</text>
+            <text x="518" y="254" fill="#cdd5ee" font-size="10.5" text-anchor="middle">dup / drop in place</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>fig 1 &mdash; the pipeline; Perceus is one pass over ANF</figcaption>
+  </figure>
+
+  <!-- 2 — CONTRACT -->
+  <h2 class="reveal"><span class="n">2</span>The contract</h2>
+  <p class="sub">All the thinking is at compile time. The runtime is deliberately dumb: bump counts, allocate, and free a cell when it dies &mdash; cascading to its children.</p>
+
+  <figure class="reveal">
+    <div class="contract">
+      <div class="col compile">
+        <h3>Compile time &middot; Perceus</h3>
+        <p class="role">the thinker &mdash; decides <em>what</em> and <em>where</em></p>
+        <ul>
+          <li>track each boxed binder's lifetime (the "owned set")</li>
+          <li>PLACE __rc_dup / __rc_drop</li>
+          <li>some consumes are implicit in an op (matching a value, applying a one-shot continuation)</li>
+        </ul>
+        <p class="foot">decides what &amp; where &rarr;</p>
+      </div>
+      <div class="col run">
+        <h3>Run time &middot; interpreter</h3>
+        <p class="role">the executor &mdash; never decides a drop</p>
+        <ul>
+          <li>__rc_dup a &nbsp;&rarr;&nbsp; rc[a]++</li>
+          <li>__rc_drop a &rarr; rc[a]-- &nbsp; (if 0: free, then cascade to children)</li>
+          <li>alloc &nbsp;&rarr;&nbsp; fresh cell, rc = 1</li>
+        </ul>
+        <p class="foot">only executes + cascades dead cells</p>
+      </div>
+      <div class="flowtag">rc ops flow&nbsp; <b>&rarr;</b></div>
+    </div>
+    <figcaption>fig 2 &mdash; compiler decides, runtime executes</figcaption>
+  </figure>
+
+  <!-- 3 — DECISION -->
+  <h2 class="reveal"><span class="n">3</span>The per-variable decision</h2>
+  <p class="sub">As it walks the code the pass carries an <em>owned set</em> (called <code>delta</code> in the source). A boxed local joins it when bound, and must be consumed or dropped before the path ends.</p>
+
+  <figure class="reveal">
+    <div class="board svg-scroll">
+      <svg viewBox="0 0 700 430" role="img" aria-label="Decision flowchart for placing dup and drop on a boxed variable">
+        <defs>
+          <marker id="d-ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#7e89ab"/>
+          </marker>
+        </defs>
+        <g font-family="JetBrains Mono, monospace" font-size="12.5">
+          <!-- start -->
+          <rect x="282" y="12" width="136" height="40" rx="10" fill="#172143" stroke="#283355"/>
+          <text x="350" y="37" fill="#e9ecf5" text-anchor="middle">a use of x</text>
+          <!-- decision 1 -->
+          <rect x="258" y="92" width="184" height="44" rx="10" fill="#16203f" stroke="#56c6d6" stroke-width="1.3"/>
+          <text x="350" y="119" fill="#9fe2ec" text-anchor="middle">used again later?</text>
+          <!-- dup branch -->
+          <rect x="44" y="176" width="172" height="44" rx="10" fill="#1c2647" stroke="rgba(244,177,90,.5)"/>
+          <text x="130" y="203" fill="#f4b15a" text-anchor="middle">__rc_dup x</text>
+          <rect x="44" y="252" width="172" height="56" rx="10" fill="#172143" stroke="#283355"/>
+          <text x="130" y="275" fill="#cdd5ee" text-anchor="middle">continue &mdash; x stays</text>
+          <text x="130" y="292" fill="#cdd5ee" text-anchor="middle">owned for that use</text>
+          <!-- decision 2 -->
+          <rect x="262" y="176" width="232" height="44" rx="10" fill="#16203f" stroke="#56c6d6" stroke-width="1.3"/>
+          <text x="378" y="203" fill="#9fe2ec" text-anchor="middle">last use &mdash; which position?</text>
+          <!-- owning -->
+          <rect x="262" y="266" width="190" height="68" rx="10" fill="#1c2647" stroke="rgba(244,177,90,.5)"/>
+          <text x="357" y="290" fill="#f4b15a" text-anchor="middle">OWNING (move)</text>
+          <text x="357" y="308" fill="#cdd5ee" text-anchor="middle">into con / arg / return</text>
+          <text x="357" y="324" fill="#9aa6c8" text-anchor="middle">ownership leaves &middot; no op</text>
+          <!-- borrowing -->
+          <rect x="486" y="266" width="190" height="68" rx="10" fill="#231625" stroke="rgba(232,113,122,.5)"/>
+          <text x="581" y="290" fill="#e8717a" text-anchor="middle">BORROWING (read)</text>
+          <text x="581" y="308" fill="#cdd5ee" text-anchor="middle">a call head</text>
+          <text x="581" y="324" fill="#9aa6c8" text-anchor="middle">&rarr; __rc_drop x at last use</text>
+
+          <!-- edges -->
+          <g stroke="#7e89ab" stroke-width="1.5" fill="none">
+            <path d="M350,52 L350,90" marker-end="url(#d-ar)"/>
+            <path d="M258,116 C 170,116 130,128 130,174" marker-end="url(#d-ar)"/>
+            <path d="M350,136 L350,160 C350,170 366,170 378,174" marker-end="url(#d-ar)"/>
+            <path d="M130,220 L130,250" marker-end="url(#d-ar)"/>
+            <path d="M340,220 C 320,238 300,246 357,264" marker-end="url(#d-ar)"/>
+            <path d="M416,220 C 440,238 540,246 581,264" marker-end="url(#d-ar)"/>
+          </g>
+          <!-- edge labels -->
+          <g font-size="10.5">
+            <text x="150" y="150" fill="#74d6a0">yes &middot; used twice</text>
+            <text x="360" y="156" fill="#8b95b4">no &middot; last use</text>
+            <text x="276" y="250" fill="#f4b15a">move</text>
+            <text x="486" y="250" fill="#e8717a">borrow</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>fig 3 &mdash; dup if reused; at the last use, move (no op) or borrow (drop later)</figcaption>
+  </figure>
+  <p>That borrow-vs-move split is the single source of truth in the codebase (<code>escapingAtomsRhs</code> in <code>Wok.IR.Escape</code>): the <em>head of a saturated call</em> is a borrow; <em>every other position</em> &mdash; constructor field, record field, non-head argument, return value &mdash; moves ownership. And one standing rule: a path that ends with <code>x</code> still owned and unused emits a <code>__rc_drop x</code>.</p>
+
+  <!-- 4 — WORKED EXAMPLE -->
+  <h2 class="reveal"><span class="n">4</span>A worked example</h2>
+  <p class="sub"><code>p</code> is used twice, so the pass inserts one <code>dup</code>; the cascade on free does the rest. Watch the count on cell&nbsp;<b>P</b>.</p>
+
+  <figure class="reveal">
+    <div class="timeline">
+      <div class="frame">
+        <div class="line">let p = Box(7)</div>
+        <div class="heap">
+          <div class="cell"><span class="name">P</span><span class="val">Box 7</span><span class="rc">1</span></div>
+        </div>
+        <div class="note">allocate &middot; rc = 1</div>
+      </div>
+      <div class="frame">
+        <div class="line">__rc_dup(p)</div>
+        <div class="heap">
+          <div class="cell"><span class="name">P</span><span class="val">Box 7</span><span class="rc">2</span></div>
+        </div>
+        <div class="note">p used twice &rarr; dup</div>
+      </div>
+      <div class="frame">
+        <div class="line">let q = Pair(p, p)</div>
+        <div class="heap">
+          <div class="cell"><span class="name">Q</span><span class="val">Pair&rarr;P,P</span><span class="rc">1</span></div>
+          <div class="cell"><span class="name">P</span><span class="val">Box 7</span><span class="rc">2</span></div>
+        </div>
+        <div class="note">Q holds two refs to P</div>
+      </div>
+      <div class="frame freed">
+        <div class="line">__rc_drop(q)</div>
+        <div class="heap">
+          <div class="cell"><span class="name">Q</span><span class="val">freed</span><span class="rc zero">0</span></div>
+          <div class="cell"><span class="name">P</span><span class="val">freed</span><span class="rc zero">0</span></div>
+        </div>
+        <div class="note free">drop Q &rarr; cascade: drop P twice &rarr; 0</div>
+      </div>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--amber)"></i> live refcount</span>
+      <span><i style="background:var(--red)"></i> reached 0 &middot; freed</span>
+      <span><i style="background:var(--cyan)"></i> source line</span>
+    </div>
+    <figcaption>fig 4 &mdash; every alloc matched by a free; the runtime only ran the ops the compiler placed</figcaption>
+  </figure>
+
+  <!-- 5 — EFFECTS TWIST -->
+  <h2 class="reveal"><span class="n">5</span>The twist for effects</h2>
+  <p class="sub">The handler work underway changes none of the above. It only changes <em>what counts as a dead cell's children</em> for one new kind of cell &mdash; a captured continuation.</p>
+
+  <figure class="reveal">
+    <div class="kinds">
+      <div class="kind ord">
+        <span class="badge lit">read off</span>
+        <h3>Ordinary cell</h3>
+        <p class="desc">Children are the literal fields it stores.</p>
+        <div class="pill lit">drop NCon "Cons" [h, t]<br>&rarr; drop h, drop t</div>
+      </div>
+      <div class="kind cont">
+        <span class="badge calc">computed</span>
+        <h3>Continuation (NCont)</h3>
+        <p class="desc">Captured frames mix owned / borrowed / stale / global &mdash; cascading all would double-free. So the child-set is computed.</p>
+        <div class="pill calc">drop NCont<br>&rarr; free continuationOwned(frames)<br><span style="color:#9aa6c8">= exactly the cells its own pending drops would free (deduped by (Unique, Addr))</span></div>
+      </div>
+      <div class="kind baton">
+        <span class="badge lit">no new logic</span>
+        <h3>Handler parameter</h3>
+        <p class="desc">The "baton" &mdash; owned by whichever arm runs.</p>
+        <div class="pill">all drops are ordinary __rc_drop the pass places; resume just does own-new (a pure move)</div>
+      </div>
+    </div>
+    <figcaption>fig 5 &mdash; only the continuation needs a <em>computed</em> child-set; everything else is read off</figcaption>
+  </figure>
+
+  <div class="aside reveal">
+    <h4>Aside &middot; why the owned set deduplicates on (Unique, Addr)</h4>
+    <p>When a continuation is dropped, the same handler-parameter binder can sit in two captured frames at <em>different addresses</em> &mdash; the old parameter value (its drop still queued) and the new one (after a <code>set</code> rebinds the slot). Deduping by binder identity alone collapses them and leaks one. The full <code>(Unique, Addr)</code> key is exact: the <em>address</em> distinguishes physical cells, the <em>Unique</em> distinguishes owners (so two binders aliasing one cell, refcount&nbsp;2, are still freed twice). Reference counting is about cells &mdash; and the address is what names a cell.</p>
+  </div>
+
+  <div class="takeaway reveal">
+    <h4>The takeaway</h4>
+    <p>Keep the runtime dumb &mdash; execute counts, cascade dead cells &mdash; and push all the cleverness into the compiler's static placement. The entire effects-on-RC effort is just making the <em>one</em> place the runtime computes a child-set (the continuation) match exactly what the compiler's pending drops would have done.</p>
+  </div>
+
+  <footer>wok compiler &middot; Perceus reference counting &middot; written as a working note during the M2b milestone</footer>
+
+</div>
+<script>
+  // gentle staggered reveal on load
+  (function(){
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    document.querySelectorAll('.reveal').forEach(function(el,i){
+      el.style.animationDelay = (0.04 + i*0.07).toFixed(2) + 's';
+    });
+  })();
+</script>
+</body>
+</html>

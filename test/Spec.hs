@@ -253,6 +253,7 @@ main = do
     , rcM2bResumeEscapeTests
     , rvRecMemberRepTests
     , rcM2b1FragmentTests
+    , rcM2b2ContinuationOwnedTests
     ]
 
 goldenFor :: FilePath -> FilePath
@@ -7668,6 +7669,19 @@ rcM2bRejectTests = testGroup "m2b-1 boundary (enclosing-capture arms REJECTED)"
       vs <- boundaryViolationsOf "test/rc-m2b-reject/12-resume-alias-reject.wok"
       assertBool "an aliased resume escapes the move-out tracking and must be rejected"
         (not (null vs))
+  , testCase "carrier-wall param (k k ()) is REJECTED at ELABORATION (M2b-2 Task 4C OccursCheck)" $ do
+      -- test/rc-m2b-reject/13-carrier-wall-param-reject.wok does  set x k -> k k ()
+      -- which unifies the resume continuation type with itself applied, causing an
+      -- OccursCheck type error.  It never reaches the boundary guard; pin the rejection
+      -- by asserting the file FAILS TO ELABORATE.
+      result <- Loader.loadProgram "test/rc-m2b-reject/13-carrier-wall-param-reject.wok" []
+      case result of
+        Left lerr -> assertFailure ("loader: " <> show lerr)
+        Right (entryName, ms) ->
+          case Pipeline.elaborateProgramFull entryName ms of
+            Left _  -> pure ()   -- expected: type error (OccursCheck on k k ())
+            Right _ -> assertFailure
+              "expected elaboration failure (OccursCheck on carrier-wall), got Right"
   ]
 
 -- | Direct unit coverage for the M2b-1 resume-escape predicate (code-review #2/#4).
@@ -7686,6 +7700,8 @@ rcM2bResumeEscapeTests = testGroup "m2b-1 resume-escape predicate (code-review #
       Esc.m2bResumeEscapes resumeB aliasBody @?= True
   , testCase "resume stored inside a NESTED handler arm DOES escape (rejected)" $
       Esc.m2bResumeEscapes resumeB nestedArmBody @?= True
+  , testCase "carrier-wall: resume as a non-head arg (k x k) DOES escape (M2b-2 Task 4C)" $
+      Esc.m2bResumeEscapes resumeB carrierWallBody @?= True
   ]
   where
     u64       = Ty.CTCon Ty.TcU64 []
@@ -7713,6 +7729,13 @@ rcM2bResumeEscapeTests = testGroup "m2b-1 resume-escape predicate (code-review #
                           (RCon (T.pack "Cons") [resumeV, ALit LUnit])
                           (Ret (ALit (LInt 0)))) ]
                  Nothing Nothing Nothing)
+    -- Carrier-wall: resume appears as a NON-HEAD argument (M2b-2 Task 4C).
+    -- Models  set x k -> let r = k x k in r  where the SECOND k is a non-head
+    -- argument.  m2bResumeEscapes must detect this and return True (rejected).
+    carrierWallBody =
+      Let (Binder (nm "r" 7008) Unrestricted u64)
+          (RApp resumeV [ALit (LInt 0), resumeV])
+          (Ret (AVar (nm "r" 7008)))
 
 rcM2a1BaselineTests :: TestTree
 rcM2a1BaselineTests = testGroup "m2a-1 boundary (escape-narrowed guards)"
@@ -11849,6 +11872,16 @@ clusterAltBody (AltDefault b) = b
 data M2bHandlerKind
   = M2bAbort        -- ^ op arm returns a value WITHOUT applying resume (abort / no-resume)
   | M2bTailResume   -- ^ op arm tail-applies resume (tail-resume move-out)
+  | M2bTwoArgResume -- ^ PARAMETERIZED handler (hParam = Just sB): op arm does two-arg
+                    --   resume (baton model, M2b-2 Task 4D).  The old boxed param is
+                    --   dropped by the arm's Perceus-inserted __rc_drop; the new param
+                    --   (a fresh Box cell) is owned by the reinstalled KHandleRC frame.
+  | M2bValueResume  -- ^ VALUE-POSITION handler (hAnswerJoin = Just j): the Handle sits
+                    --   inside a LetJoin; arms deliver via Jump j; answerRebindRC re-points
+                    --   j on each resume so the sub-run's answer routes to the resume site.
+  | M2bValueAbort   -- ^ VALUE-POSITION abort: same LetJoin wrapping, op arm aborts
+                    --   (never applies resume), so answerRebindRC is a no-op on the abort
+                    --   path; the outer case on the join result still runs.
   deriving (Eq, Show)
 
 -- | The owned-set dimension the generated computation stresses (spec §4.2 / §7).
@@ -11886,6 +11919,14 @@ m2bLbl, m2bOp :: Text
 m2bLbl = T.pack "Eff"
 m2bOp  = T.pack "op"
 
+-- | A SECOND effect label/op used by the nested-param-abort shape: the OUTER
+-- aborting handler handles 'OuterEff'.'outerOp' while the INNER parameterized
+-- handler handles the original 'm2bLbl'/'m2bOp'. Two distinct labels are needed
+-- so ambient dispatch routes each op to the right (nearest covering) handler.
+m2bOuterLbl, m2bOuterOp :: Text
+m2bOuterLbl = T.pack "OuterEff"
+m2bOuterOp  = T.pack "outerOp"
+
 -- | A binary integer prim atom (resolved by hint at runtime, like 'primAtom').
 m2bPlus :: Atom
 m2bPlus = AVar (primName (T.pack "+"))
@@ -11901,31 +11942,57 @@ data M2bGlobals = M2bGlobals
 -- dimension fires), directly as ANF, mirroring 'genM2a1Program'. The handler kind
 -- (abort / tail-resume) and the owned-set shape are chosen so the §4.2 dimensions are
 -- all reachable; coverage floors in 'prop_m2bEscape' pin that they actually appear.
+--
+-- With weight 1-in-5 the generator instead emits the NESTED-PARAM-ABORT shape
+-- (Task 5 gap): an outer aborting handler wrapping an inner parameterized handler
+-- whose body performs a set then triggers the outer abort. This is the shape that
+-- requires the (Unique, Addr) dedup in 'continuationOwned' (spec §7).
 genM2bProgram :: Gen CoreModule
 genM2bProgram = sized $ \sz -> do
   let fuel = max 1 (min sz 4)
-  -- The aliased shape is only sound on the ABORT path (the pass dup's @let a = x@ and
-  -- both copies are freed); pairing it with a tail-resume would still be in-fragment
-  -- but the move-out semantics make the dimension less pointed, so we keep aliased on
-  -- abort. Every other shape is exercised under BOTH handler kinds.
-  kind  <- elements [M2bAbort, M2bTailResume]
-  shape0 <- elements [minBound .. maxBound :: M2bShape]
-  let shape = if shape0 == M2bAliasedBoxed && kind == M2bTailResume
-                then M2bMovedBeforeOp   -- keep aliased on the abort path
-                else shape0
-  -- How many ops the computation performs (1 or 2): a second op makes the captured
-  -- 'above' prefix multi-frame and, on tail-resume, drives move-out twice.
-  nOps  <- elements [1, 1, 2 :: Int]
-  -- Whether the op fires INSIDE a Case arm (so 'above' is a non-trivial multi-frame
-  -- prefix that includes a Case continuation), versus only under a Let chain.
-  underCase <- elements [False, True]
-  (body, globals, _) <-
-    runStateT3 (genM2bBody kind shape nOps underCase fuel) 1
-  let mainN  = Name (T.pack "main") (Unique 1000000)
-      mainB  = TopBind mainN [] body
-  case m2bgCafName globals of
-    Nothing  -> pure (CoreModule [mainB])
-    Just cN  -> pure (CoreModule [m2bCafBind cN, mainB])
+  let mainN = Name (T.pack "main") (Unique 1000000)
+  useNested <- frequency [(1, pure True), (4, pure False)]
+  if useNested
+    then do
+      -- Nested-param-abort shape: vary the number of inner sets (1 or 2).
+      nSets <- elements [1, 2 :: Int]
+      (body, globals, _) <- runStateT3 (genM2bNestedParamAbort nSets) 1
+      let mainB = TopBind mainN [] body
+      case m2bgCafName globals of
+        Nothing -> pure (CoreModule [mainB])
+        Just cN -> pure (CoreModule [m2bCafBind cN, mainB])
+    else do
+      -- The aliased shape is only sound on the ABORT path (the pass dup's @let a = x@
+      -- and both copies are freed); pairing it with a tail-resume would still be
+      -- in-fragment but the move-out semantics make the dimension less pointed, so we
+      -- keep aliased on abort. Every other shape is exercised under BOTH handler kinds.
+      -- M2bValueResume and M2bValueAbort are value-position variants: the Handle is
+      -- wrapped in a LetJoin and arms deliver via Jump (hAnswerJoin = Just j). These
+      -- are chosen with weight 1 each (same weight as the tail-position kinds) so the
+      -- new cover floors are reachable within 800 tests.
+      kind  <- elements [M2bAbort, M2bTailResume, M2bTwoArgResume, M2bValueResume, M2bValueAbort]
+      shape0 <- elements [minBound .. maxBound :: M2bShape]
+      -- Aliased-boxed only makes sense on the abort path (the pass dup's the alias;
+      -- tail-resume or two-arg-resume would re-enter the same binder scope which is
+      -- not what we want to stress). Value-position kinds are not abort-only, but
+      -- the same reasoning applies: aliased-boxed under value-resume is a fine shape,
+      -- but aliased-boxed under value-abort would be the same dedup stress as plain
+      -- M2bAbort; normalise to M2bMovedBeforeOp to keep aliased pinned to abort.
+      let shape = if shape0 == M2bAliasedBoxed && kind `notElem` [M2bAbort, M2bValueAbort]
+                    then M2bMovedBeforeOp
+                    else shape0
+      -- How many ops the computation performs (1 or 2): a second op makes the captured
+      -- 'above' prefix multi-frame and, on tail-resume, drives move-out twice.
+      nOps  <- elements [1, 1, 2 :: Int]
+      -- Whether the op fires INSIDE a Case arm (so 'above' is a non-trivial multi-frame
+      -- prefix that includes a Case continuation), versus only under a Let chain.
+      underCase <- elements [False, True]
+      (body, globals, _) <-
+        runStateT3 (genM2bBody kind shape nOps underCase fuel) 1
+      let mainB = TopBind mainN [] body
+      case m2bgCafName globals of
+        Nothing  -> pure (CoreModule [mainB])
+        Just cN  -> pure (CoreModule [m2bCafBind cN, mainB])
 
 -- | Run a 'GenM' that also accumulates an 'M2bGlobals', returning the value, the
 -- globals, and the final unique counter. (A thin wrapper over the same 'StateT Int
@@ -11945,6 +12012,11 @@ freshN2b hint = state (\(u, gl) -> (Name hint (Unique u), (u + 1, gl)))
 liftG2b :: Gen a -> GenM2b a
 liftG2b = lift
 
+-- | A fresh 'JoinId' using the same counter as 'freshN2b'. Join IDs occupy a
+-- separate namespace from binder 'Name's, so sharing the counter is safe.
+freshJoinId2b :: GenM2b JoinId
+freshJoinId2b = state (\(u, gl) -> (JoinId (Unique u), (u + 1, gl)))
+
 useCaf :: GenM2b Name
 useCaf = state (\(u, gl) ->
   let cN = Name (T.pack "g_caf") (Unique 800000)
@@ -11962,54 +12034,284 @@ m2bCafBind cN =
            (RCon (T.pack "Cons") [ALit (LInt 9), AVar (Name (T.pack "g_nil") (Unique 800001))])
         (Ret (AVar cN))))
 
--- | Build @Handle progBody handler@ for the chosen kind/shape. The handler is the
--- AMBIENT (no hSelf), no-param, tail-position skeleton; @progBody@ is the
--- op-performing computation varied across the owned-set dimensions.
-genM2bBody :: M2bHandlerKind -> M2bShape -> Int -> Bool -> Int -> GenM2b Expr
-genM2bBody kind shape nOps underCase fuel = do
-  (prog, progTy) <- genM2bProg shape nOps underCase fuel
-  hdlr <- genM2bHandler kind progTy
-  pure (Handle prog hdlr)
-
--- | The handler skeleton. The arm's op-args are one U64 (the op argument); the
--- resume binder is one-arg. ABORT returns a fresh boxed value WITHOUT applying
--- resume; TAIL-RESUME tail-applies resume to a literal and returns the result. The
--- return arm wraps the handled result in 'Some' (a boxed cell, exercising the
--- return-arm's own drop), so the answer type is 'Option progTy'. The whole handler
--- has hParam = Nothing, hAnswerJoin = Nothing, hSelf = Nothing.
-genM2bHandler :: M2bHandlerKind -> Ty.CType -> GenM2b Handler
-genM2bHandler kind progTy = do
+-- | The handler skeleton. The arm's op-args are one U64 (the op argument). For
+-- ABORT and TAIL-RESUME the resume binder is one-arg (no hParam). For
+-- TWO-ARG-RESUME a parameterized handler is built (hParam = Just sB supplied by
+-- the caller); the op arm installs a fresh Box as the new param and resumes with a
+-- unit result, mirroring a State.set arm.  The return arm wraps the result in
+-- 'Some' (a boxed cell), so the answer type is 'Option progTy'. hAnswerJoin is
+-- 'Nothing' for tail-position kinds; for value-position kinds (@mJoinId = Just j@)
+-- every terminal is 'Jump j [x]' and 'hAnswerJoin = Just j'.
+genM2bHandler :: M2bHandlerKind -> Ty.CType -> Maybe Binder -> Maybe JoinId -> GenM2b Handler
+genM2bHandler kind progTy mParamB mJoinId = do
   vN     <- freshN2b (T.pack "v")
   nN     <- freshN2b (T.pack "opn")
   kN     <- freshN2b (T.pack "k")
-  -- return arm: v -> let sv = Some v in sv  (Some is a boxed cell)
   svN    <- freshN2b (T.pack "sv")
+  -- Terminal delivery: Jump to the answer join in value position; Ret in tail position.
+  let terminal x = case mJoinId of
+        Just j  -> Jump j [x]
+        Nothing -> Ret x
+  let retArm =
+        ( Binder vN Unrestricted progTy
+        , Let (Binder svN Unrestricted m2bOptTy) (RCon (T.pack "Some") [AVar vN])
+            (terminal (AVar svN)) )
+  case kind of
+    M2bAbort -> do
+      noneN <- freshN2b (T.pack "none")
+      let armBody = Let (Binder noneN Unrestricted m2bOptTy) (RCon (T.pack "None") [])
+                      (terminal (AVar noneN))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] mJoinId Nothing Nothing)
+    M2bTailResume -> do
+      rN <- freshN2b (T.pack "rr")
+      let armBody = Let (Binder rN Unrestricted progTy) (RApp (AVar kN) [ALit (LInt 1)])
+                      (terminal (AVar rN))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] mJoinId Nothing Nothing)
+    M2bTwoArgResume -> do
+      -- Parameterized handler (baton model, M2b-2 Task 4D).
+      -- hParam = Just sB, where sB is the param binder allocated OUTSIDE the Handle.
+      -- Op arm: op n k -> let np = Box(0) in let r = k(np, ()) in r
+      -- The resume binder k takes TWO args (new-param, result); Perceus will insert
+      -- __rc_drop(s) after the call (drop old param) to balance ownership.
+      npN <- freshN2b (T.pack "np")
+      rN  <- freshN2b (T.pack "rr")
+      let armBody = Let (Binder npN Unrestricted m2bBoxTy)
+                        (RCon (T.pack "Box") [ALit (LInt 0)])
+                      (Let (Binder rN Unrestricted progTy)
+                           (RApp (AVar kN) [AVar npN, ALit LUnit])
+                           (terminal (AVar rN)))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] mJoinId mParamB Nothing)
+    -- Value-position variants: the JoinId is always supplied (mJoinId = Just j),
+    -- so we delegate to the abort / tail-resume cases above (just with mJoinId set).
+    -- These constructors exist to make the generator's intent explicit; they are
+    -- handled in 'genM2bBody' / 'genM2bValueBody', which always pass 'Just j' here.
+    M2bValueResume -> do
+      -- VALUE-POSITION RESUME: calls k (so the sub-run executes), then DISCARDS the
+      -- resume result and always delivers 'None' to the answer join j.
+      --
+      -- Without 'answerRebindRC':
+      --   The sub-run's return arm fires 'Jump j [Some v]' into the ORIGINAL j (not
+      --   the rebind), which runs the 'Some _ -> 1' arm, giving output "1".
+      -- With 'answerRebindRC' working (correct behaviour):
+      --   'Jump j [Some v]' routes to the arm's KLetRC via the rebound j. The arm
+      --   gets r = Some v, drops it, then fires 'Jump j [None]' → j's 'None -> 0'
+      --   arm → output "0".
+      -- This produces a genuine reference-vs-RC MISMATCH ("0" vs "1") when
+      -- 'answerRebindRC' is neutered, making the RED-CHECK go red.
+      --
+      -- Dropping 'r' (the resume result, a boxed Option cell) is inserted by
+      -- Perceus since 'r' is not used for anything other than being consumed.
+      -- 'k' itself is used (called), so Perceus does NOT insert a drop for it.
+      rN    <- freshN2b (T.pack "rr")
+      noneN <- freshN2b (T.pack "none")
+      let armBody = Let (Binder rN Unrestricted m2bOptTy)
+                        (RApp (AVar kN) [ALit (LInt 1)])
+                      (Let (Binder noneN Unrestricted m2bOptTy)
+                           (RCon (T.pack "None") [])
+                        (terminal (AVar noneN)))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] mJoinId Nothing Nothing)
+    M2bValueAbort -> do
+      -- VALUE-POSITION ABORT: never calls k; delivers 'None' to j directly.
+      -- 'answerRebindRC' is a no-op for abort (no resume fires).
+      noneN <- freshN2b (T.pack "none")
+      let armBody = Let (Binder noneN Unrestricted m2bOptTy) (RCon (T.pack "None") [])
+                      (terminal (AVar noneN))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] mJoinId Nothing Nothing)
+
+-- | Build @Handle progBody handler@ for the chosen kind/shape. The handler is the
+-- AMBIENT (no hSelf), tail-position skeleton; @progBody@ is the op-performing
+-- computation varied across the owned-set dimensions. For M2bTwoArgResume the
+-- initial param cell is allocated in a Let OUTSIDE the Handle; the hParam binder IS
+-- that outer Let binder (same Unique) so the runtime finds the value in scope.
+-- For M2bValueResume / M2bValueAbort see 'genM2bValueBody'.
+genM2bBody :: M2bHandlerKind -> M2bShape -> Int -> Bool -> Int -> GenM2b Expr
+genM2bBody kind shape nOps underCase fuel = do
+  (prog, progTy) <- genM2bProg shape nOps underCase fuel
+  case kind of
+    M2bTwoArgResume -> do
+      -- Allocate the initial param cell BEFORE the Handle.
+      -- initB is BOTH the outer Let binder AND the handler's hParam binder (same Unique).
+      initN <- freshN2b (T.pack "sp")
+      let initB = Binder initN Unrestricted m2bBoxTy
+      hdlr <- genM2bHandler kind progTy (Just initB) Nothing
+      pure (Let initB (RCon (T.pack "Box") [ALit (LInt 1)])
+             (Handle prog hdlr))
+    M2bValueResume -> genM2bValueBody M2bValueResume prog progTy
+    M2bValueAbort  -> genM2bValueBody M2bValueAbort  prog progTy
+    _ -> do
+      hdlr <- genM2bHandler kind progTy Nothing Nothing
+      pure (Handle prog hdlr)
+
+-- | Build the VALUE-POSITION handler expression:
+--
+-- > LetJoin j [rb : Option progTy]
+-- >   (case rb of
+-- >     None    -> Ret 0
+-- >     Some _  -> Ret 1)        -- distinct output per constructor
+-- >   (Handle prog (handler with hAnswerJoin = Just j))
+--
+-- The outer 'Case' is the NON-CONSTANT consumer of the join result (the M2b-1
+-- lesson: the join body must not be 'Ret rb' because that is a tail-position
+-- identity and the rebind would be unobservable).  The two arms return DIFFERENT
+-- constants (0 vs 1), so where the resumed sub-run's answer routes is observable.
+--
+-- 'answerRebindRC' is exercised on the RESUME path: when the op arm calls @k 1@,
+-- the handler's answer-join @j@ is re-pointed to deliver the sub-run's final answer
+-- BACK to the op arm's 'Let' bind site (not to the outer 'Case').  The abort path
+-- delivers 'None' via 'Jump j [none]' directly; answerRebindRC is a no-op there.
+genM2bValueBody :: M2bHandlerKind -> Expr -> Ty.CType -> GenM2b Expr
+genM2bValueBody kind prog progTy = do
+  j     <- freshJoinId2b
+  rbN   <- freshN2b (T.pack "rb")
+  someN <- freshN2b (T.pack "sv_ign")
+  hdlr  <- genM2bHandler kind progTy Nothing (Just j)
+  -- Join body: case rb of { None -> 0 ; Some _ -> 1 }
+  --
+  -- 'None' arm FIRST: Perceus inserts __rc_drop(rb) in each arm. 'OmitOneDrop'
+  -- traverses the join body left-to-right, so the None arm's drop is targeted
+  -- first. Both the M2bValueResume arm (which always jumps j[None]) and the
+  -- M2bValueAbort arm (which also jumps j[None]) deliver 'None' to j, so the
+  -- None arm always executes. The first drop is therefore always on the executed
+  -- path, making the mutation detectable via heap imbalance ('mutationCaughtM2b').
+  --
+  -- Non-constant ('None -> 0' vs 'Some _ -> 1'): this is the RED-CHECK key.
+  -- Without 'answerRebindRC', the M2bValueResume arm's sub-run fires
+  -- 'Jump j [Some v]' into the ORIGINAL j, taking the 'Some _ -> 1' arm (output
+  -- "1"). With correct rebind the arm intercepts the result, drops it, and fires
+  -- 'Jump j [None]' into the original j, taking 'None -> 0' (output "0").
+  -- The two outputs differ, making the RED-CHECK go red on a value-position
+  -- resume program.
+  let joinBody =
+        Case (AVar rbN)
+          [ AltCon (T.pack "None") [] (Ret (ALit (LInt 0)))
+          , AltCon (T.pack "Some") [Binder someN Unrestricted progTy]
+              (Ret (ALit (LInt 1))) ]
+  pure (LetJoin j [Binder rbN Unrestricted m2bOptTy] joinBody
+         (Handle prog hdlr))
+
+-- | Generate the NESTED-PARAM-ABORT shape (spec §7 dedup gap):
+--
+-- > let sp = Box(v_init) in
+-- >   Handle (                               -- outer: M2bAbort for OuterEff.outerOp
+-- >     Handle (                             -- inner: param handler (hParam=sp), "Eff"."op"
+-- >       let np1 = Box(v_new) in            -- allocate new param value to pass to op
+-- >       let xr  = op(np1)   in             -- inner op: arm resumes with np1 as new hParam
+-- >       let ur  = outerOp(n) in            -- outer op: aborts, discards captured prefix
+-- >       0
+-- >     ) innerHdlr                          -- hParam = initB, op-arg = Box -> arm resumes
+-- >   ) outerHdlr
+--
+-- The dedup shape arises because the inner-op arm does:
+--   op(newParam, k) -> let rr = k(newParam, ()) in let __rc_drop(sp) in rr
+-- (sp, the OLD hParam, is dead AFTER the resume call, not before). When the two-arg
+-- resume fires and then the outer abort fires, the captured prefix holds BOTH:
+--   * KHandleRC(innerHdlr, env holds newParam at addr A = sp.Unique -> addr A)
+--   * KLetRC(xr, env2 holds sp=old param at addr B = sp.Unique -> addr B)
+-- Both have the SAME Unique (sp) but DIFFERENT addresses; 'continuationOwned' must
+-- free both. Keying on Unique alone collapses them -> one address leaks.
+--
+-- The inner op-arg type is 'm2bBoxTy' (the computation passes a freshly-allocated Box
+-- as the new param). @nSets@ inner ops fire before the outer abort; each set leaves an
+-- old-param entry in the set-arm's KLetRC env2.
+genM2bNestedParamAbort :: Int -> GenM2b Expr
+genM2bNestedParamAbort nSets = do
+  -- Initial inner param: sp = Box(v_init)
+  vInit <- liftG2b (choose (1, 9 :: Integer))
+  spN   <- freshN2b (T.pack "sp")
+  let initB = Binder spN Unrestricted m2bBoxTy
+  -- Inner handler: handles "Eff"."op" with a BOXED op-arg as the new param value.
+  -- Op arm: op(newP : Box, k) -> let rr = k(newP, ()) in rr
+  -- sp (hParam) is dead AFTER the resume call -> Perceus inserts __rc_drop(sp) there.
+  innerHdlr <- genM2bSetStyleHandler initB
+  -- Inner computation body: allocate new param(s) and fire op(s), then outer abort.
+  innerBody <- buildInnerBody nSets
+  -- Outer handler: abort on "OuterEff"."outerOp"
+  outerHdlr <- genM2bOuterAbortHandler m2bOptTy
+  -- Assemble:
+  -- let sp = Box(v_init) in
+  --   Handle (Handle innerBody innerHdlr) outerHdlr
+  pure (Let initB (RCon (T.pack "Box") [ALit (LInt vInit)])
+         (Handle
+           (Handle innerBody innerHdlr)
+           outerHdlr))
+  where
+    -- Build the inner computation: nSets x (let np = Box(v); let xr = op(np)) then outerOp.
+    -- The result type of the op at the call site is Unit (the arm passes ALit LUnit back).
+    -- We bind xr : m2bU64 to keep the type annotation compatible (unit is unboxed, close
+    -- enough for the runtime; the interpreter is untyped).
+    buildInnerBody 0 = do
+      outerArgN <- liftG2b (choose (0, 9 :: Integer))
+      urN <- freshN2b (T.pack "ur")
+      pure (Let (Binder urN Unrestricted m2bU64)
+                (ROp Nothing m2bOuterLbl m2bOuterOp [ALit (LInt outerArgN)])
+              (Ret (ALit (LInt 0))))
+    buildInnerBody k = do
+      vNew  <- liftG2b (choose (1, 9 :: Integer))
+      npN   <- freshN2b (T.pack "np")
+      xrN   <- freshN2b (T.pack "xr")
+      rest  <- buildInnerBody (k - 1)
+      -- let np = Box(v_new) in let xr = op(np) in <rest>
+      -- np is passed as the boxed new-param arg to the inner op
+      pure (Let (Binder npN Unrestricted m2bBoxTy)
+                (RCon (T.pack "Box") [ALit (LInt vNew)])
+              (Let (Binder xrN Unrestricted m2bU64)
+                   (ROp Nothing m2bLbl m2bOp [AVar npN])
+                rest))
+
+-- | Build the inner parameterized handler for the nested-param-abort shape.
+-- Op-arg type is 'm2bBoxTy' (the new param value); the arm does:
+--   op(newP : Box, k) -> let rr = k(newP, ()) in rr
+-- With sp (hParam) dead ONLY AFTER the @k(newP, ())@ resume call, Perceus places
+-- __rc_drop(sp) AFTER the resume. This leaves the old sp in KLetRC env2 when the
+-- two-arg resume fires, creating the (Unique, Addr) dedup scenario on outer abort.
+genM2bSetStyleHandler :: Binder -> GenM2b Handler
+genM2bSetStyleHandler initB = do
+  -- Return arm: wraps computation result in Some
+  vN  <- freshN2b (T.pack "v")
+  svN <- freshN2b (T.pack "sv")
+  let retArm =
+        ( Binder vN Unrestricted m2bU64
+        , Let (Binder svN Unrestricted m2bOptTy) (RCon (T.pack "Some") [AVar vN])
+            (Ret (AVar svN)) )
+  -- Op arm: op(newP : m2bBoxTy, k) -> let rr = k(newP, ()) in rr
+  newPN <- freshN2b (T.pack "newP")
+  kN    <- freshN2b (T.pack "k")
+  rN    <- freshN2b (T.pack "rr")
+  let armBody = Let (Binder rN Unrestricted m2bU64)
+                    (RApp (AVar kN) [AVar newPN, ALit LUnit])
+                  (Ret (AVar rN))
+      arm = OpArm m2bLbl m2bOp [Binder newPN Unrestricted m2bBoxTy]
+              (Binder kN Unrestricted m2bOptTy) armBody
+  pure (Handler retArm [arm] Nothing (Just initB) Nothing)
+
+-- | An aborting handler for 'OuterEff'.'outerOp': op arm returns 'None' without
+-- applying the resume binder. The return arm wraps the computation result in 'Some'.
+-- Used by 'genM2bNestedParamAbort' for the outer aborting handler.
+genM2bOuterAbortHandler :: Ty.CType -> GenM2b Handler
+genM2bOuterAbortHandler progTy = do
+  vN    <- freshN2b (T.pack "ov")
+  nN    <- freshN2b (T.pack "opn2")
+  kN    <- freshN2b (T.pack "k2")
+  svN   <- freshN2b (T.pack "osv")
+  noneN <- freshN2b (T.pack "none2")
   let retArm =
         ( Binder vN Unrestricted progTy
         , Let (Binder svN Unrestricted m2bOptTy) (RCon (T.pack "Some") [AVar vN])
             (Ret (AVar svN)) )
-  armBody <- case kind of
-    M2bAbort -> do
-      -- return a DIFFERENT boxed value (None : Option progTy) without using k.
-      noneN <- freshN2b (T.pack "none")
-      pure (Let (Binder noneN Unrestricted m2bOptTy) (RCon (T.pack "None") [])
-              (Ret (AVar noneN)))
-    M2bTailResume -> do
-      -- tail-apply resume to a literal: let r = k 1 in r
-      rN <- freshN2b (T.pack "rr")
-      pure (Let (Binder rN Unrestricted progTy) (RApp (AVar kN) [ALit (LInt 1)])
-              (Ret (AVar rN)))
-  -- The resume binder MUST carry a BOXED type. The reified continuation is always a
-  -- boxed heap cell (an 'RVBox' -> 'NCont'); Perceus's op-arm own-set only tracks
-  -- BOXED arm binders ('boxedBinder'), so an UNBOXED resume binder would NOT be
-  -- dropped on the abort path and the 'NCont' would LEAK (verified). We give it the
-  -- boxed answer type 'Option', exactly as the corpus does (@resume : Option a0@ in
-  -- 'test/rc-m2b/02-except-abort'). Runtime is untyped, so this only steers
-  -- boxedness; resume is an opaque 'NCont' handle when it runs.
-  let arm = OpArm m2bLbl m2bOp
-              [Binder nN Unrestricted m2bU64]
-              (Binder kN Unrestricted m2bOptTy)
-              armBody
+      armBody = Let (Binder noneN Unrestricted m2bOptTy) (RCon (T.pack "None") [])
+                  (Ret (AVar noneN))
+      arm = OpArm m2bOuterLbl m2bOuterOp [Binder nN Unrestricted m2bU64]
+              (Binder kN Unrestricted m2bOptTy) armBody
   pure (Handler retArm [arm] Nothing Nothing Nothing)
 
 -- | The op-performing computation and its result type. Varied across the owned-set
@@ -12123,18 +12425,35 @@ prop_m2bEscape =
             <> "\nrc:        " <> showRC rcRes
         -- Structural detectors for the owned-set dimensions (used for the coverage
         -- floors). They classify the GENERATED, accepted-and-run program.
-        ranSound  = accepted && either (const False) (const True) rcRes
-        isAbort   = m2bHasAbortArm cm
-        isResume  = m2bHasResumeArm cm
-        movedB    = m2bHasMovedBeforeOp cm
-        boxedAcr  = m2bHasBoxedAcrossOp cm
-        opAbove   = m2bHasOpUnderCase cm
+        ranSound        = accepted && either (const False) (const True) rcRes
+        isAbort         = m2bHasAbortArm cm
+        isResume        = m2bHasResumeArm cm
+        movedB          = m2bHasMovedBeforeOp cm
+        boxedAcr        = m2bHasBoxedAcrossOp cm
+        opAbove         = m2bHasOpUnderCase cm
+        isParam         = m2bHasParamHandler cm
+        nestedParamAbrt = m2bHasNestedParamAbort cm
+        valuePos        = m2bHasValuePosHandler cm
+        valuePosAbrt    = m2bHasValuePosAbort cm
+        -- Split floors: distinguish TAIL-POSITION (M2b-1) from VALUE-POSITION (M2b-2)
+        -- paths so a regression in the M2b-1 tail path cannot hide behind the combined
+        -- floor being satisfied by value-position cases alone.
+        tailResume      = isResume && not valuePos
+        tailAbort       = isAbort && not valuePosAbrt
+        valuePosResume  = isResume && valuePos
     in checkCoverage $
-       cover 25.0 (isAbort && ranSound)  "abort path: accepted+run" $
-       cover 25.0 (isResume && ranSound) "tail-resume path: accepted+run" $
+       cover 25.0 (isAbort && ranSound)  "abort path (any kind): accepted+run" $
+       cover 25.0 (isResume && ranSound) "resume path (any kind): accepted+run" $
+       -- Split floors: tail-position (M2b-1) independently pinned from value-position (M2b-2).
+       cover 20.0 (tailAbort && ranSound)       "tail-position abort: accepted+run" $
+       cover 20.0 (tailResume && ranSound)      "tail-position resume: accepted+run" $
+       cover 10.0 (valuePosResume && ranSound)  "value-position resume: accepted+run" $
+       cover 10.0 (valuePosAbrt && ranSound)    "value-position abort: accepted+run" $
        cover 12.0 (boxedAcr && ranSound) "boxed-value live across op: accepted+run" $
        cover 12.0 (movedB && ranSound)   "moved-before-op (stale binder): accepted+run" $
        cover 12.0 (opAbove && ranSound)  "op under non-trivial above (Case): accepted+run" $
+       cover 12.0 (isParam && ranSound)  "parameterized handler (two-arg resume baton): accepted+run" $
+       cover  4.0 (nestedParamAbrt && ranSound) "nested param handler abort (dedup shape): accepted+run" $
        QC.label (show (m2bClassify cm) <> (if accepted then " accepted" else " rejected")) $
        counterexample report $
          if not accepted
@@ -12182,10 +12501,14 @@ prop_m2bLintClean =
                 (null viol)
 
 -- | Every single-site RC mutation must be CAUGHT on every generated M2b-1 program ---
--- statically ('lintInstrumented') or at runtime (a 'Left'). Mirrors 'prop_m2a1Teeth'
--- via the shared 'mutationCaught'. A mutation that is a structural no-op on a given
--- program (no drop / no dup site) is byte-identical to the correct instrumentation
--- and counts as vacuously fine.
+-- statically ('lintInstrumented'), at runtime (a 'Left'), OR via heap imbalance
+-- ('stLive /= baseline' or 'stAllocs - stFrees /= baseline'). The heap-imbalance
+-- check is necessary for value-position abort arms: omitting @__rc_drop(k)@ there
+-- causes a LEAK (the NCont of the resume is never freed) rather than a crash,
+-- because the 'Jump j [result]' in the arm body crosses the handler boundary to an
+-- outer join that the arm's 'lintInstrumented' does not audit inline.
+--
+-- A mutation that is a structural no-op (the site did not exist) counts as fine.
 prop_m2bTeeth :: Property
 prop_m2bTeeth =
   forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 ->
@@ -12193,8 +12516,28 @@ prop_m2bTeeth =
     in conjoin
          [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
                              <> T.unpack (Perceus.prettyPerceus cm))
-             (mutationCaught mut cm)
+             (mutationCaughtM2b mut cm)
          | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+
+-- | Extended mutation-caught check for the M2b generator: extends the shared
+-- 'mutationCaught' with a heap-imbalance detector. Value-position handler arms
+-- cross a handler boundary when they 'Jump' to the outer answer join, so
+-- 'lintInstrumented' does not audit them inline (it treats the outer join as
+-- unknown). A omitted drop in such an arm causes a leak ('stLive > baseline'),
+-- which is detected here by running the mutated program and checking the stats.
+mutationCaughtM2b :: Perceus.Mutation -> CoreModule -> Bool
+mutationCaughtM2b mut cm =
+  let correct = Perceus.insertRC cm
+      mutated = Perceus.insertRCMutated mut cm
+  in mutated == correct                                    -- mutation was a no-op
+       || not (null (Perceus.lintInstrumented mutated))    -- caught statically
+       || case RCM.runModuleRCUnchecked mutated of
+            Left _    -> True                             -- caught as runtime crash
+            Right run ->
+              let st       = RCM.rcStats run
+                  baseline = RCM.rcBaseline run
+              in St.stLive st /= baseline                 -- detected as a heap leak
+                   || St.stAllocs st - St.stFrees st /= baseline
 
 -- | Shrinker for a generated M2b program. The program is a handler bind (plus an
 -- optional CAF bind), so the generic single-main 'shrinkProgram' does not apply; we
@@ -12325,6 +12668,56 @@ m2bHasOpUnderCase cm = case m2bTheProg cm of
       LetJoin _ _ jb body -> go inCase jb || go inCase body
       _ -> False
 
+-- | The handler has a boxed parameter (hParam = Just _): a parameterized handler
+-- exercising the two-arg resume baton model (M2b-2 Task 4D).
+m2bHasParamHandler :: CoreModule -> Bool
+m2bHasParamHandler cm = case m2bTheHandler cm of
+  Just h  -> Data.Maybe.isJust (hParam h)
+  Nothing -> False
+
+-- | The program has the NESTED-PARAM-ABORT shape: a top-level 'Handle' node
+-- (outer aborting handler) whose inner expression is ALSO a 'Handle' node (inner
+-- parameterized handler with hParam).  This is the (Unique, Addr) dedup shape
+-- generated by 'genM2bNestedParamAbort'.
+m2bHasNestedParamAbort :: CoreModule -> Bool
+m2bHasNestedParamAbort (CoreModule binds) =
+  any (hasNested . tbBody) binds
+  where
+    hasNested e = case e of
+      -- Outer Handle (no hParam): inner expr is also a Handle with hParam
+      Handle (Handle _ innerH) outerH ->
+        Data.Maybe.isJust (hParam innerH)
+          && Data.Maybe.isNothing (hParam outerH)
+          && not (null (hOps outerH))
+          && not (m2bHasResumeArmH outerH)
+      Let _ _ b -> hasNested b
+      _         -> False
+    -- True if the handler has an op arm that tail-applies the resume binder.
+    m2bHasResumeArmH h = any (\oa -> resumeApplied (oaResume oa) (oaBody oa)) (hOps h)
+    resumeApplied k = go
+      where
+        ku = binderUnique k
+        go e = case e of
+          Let _ (RApp (AVar f) _) b -> Name.nameUniq f == ku || go b
+          Let _ _ b                 -> go b
+          Case _ alts               -> any (go . clusterAltBody) alts
+          LetJoin _ _ jb b          -> go jb || go b
+          _                         -> False
+
+-- | The handler is in VALUE POSITION: 'hAnswerJoin = Just _'. The whole 'Handle'
+-- sits inside a 'LetJoin'; arms deliver via 'Jump'; 'answerRebindRC' fires on
+-- every resume to re-point the join to the resume call site.
+m2bHasValuePosHandler :: CoreModule -> Bool
+m2bHasValuePosHandler cm = case m2bTheHandler cm of
+  Just h  -> Data.Maybe.isJust (hAnswerJoin h)
+  Nothing -> False
+
+-- | The handler is in value position AND is an abort handler (op arm never applies
+-- resume). In this case 'answerRebindRC' is a no-op (no resume fires), and the op
+-- arm delivers 'None' via 'Jump j [none]' directly to the outer case.
+m2bHasValuePosAbort :: CoreModule -> Bool
+m2bHasValuePosAbort cm = m2bHasValuePosHandler cm && m2bHasAbortArm cm
+
 -- | A coarse label of the generated program's shape, for the distribution readout.
 m2bClassify :: CoreModule -> String
 m2bClassify cm =
@@ -12332,6 +12725,10 @@ m2bClassify cm =
     <> (if m2bHasMovedBeforeOp cm then "/moved" else "")
     <> (if m2bHasBoxedAcrossOp cm then "/across" else "")
     <> (if m2bHasOpUnderCase cm then "/under-case" else "")
+    <> (if m2bHasParamHandler cm then "/param" else "")
+    <> (if m2bHasNestedParamAbort cm then "/nested-param-abort" else "")
+    <> (if m2bHasValuePosHandler cm then "/value-pos" else "")
+    <> (if m2bHasValuePosAbort cm then "/value-pos-abort" else "")
 
 -- | Suite G (M2b-1): the generative oracle for the handler fragment. The accepted=>
 -- sound property, the lint-clean property, and the generalized teeth, with coverage
@@ -12556,7 +12953,7 @@ mkResumeStoredHandler comp =
                [arm] Nothing Nothing Nothing
   in (hdlr, comp)
 
--- | The M2b-1 fragment predicate unit tests.
+-- | The M2b fragment predicate unit tests.
 rcM2b1FragmentTests :: TestTree
 rcM2b1FragmentTests = testGroup "m2b-1 fragment predicate"
   [ testCase "Reader-shaped (tail, no param, resume as call head): admitted" $
@@ -12580,23 +12977,19 @@ rcM2b1FragmentTests = testGroup "m2b-1 fragment predicate"
           cm = m2b1Pruned hdlr c
       in firstOrderNoHandlerViolations cm @?= []
 
-  , testCase "hParam = Just _ : rejected (mentions parameter)" $
+  , testCase "hParam = Just _ : admitted (M2b-2 baton model)" $
       let aName = Name (T.pack "a") (Unique 9908)
           comp  = m2b1Comp "State" "get" aName
           (hdlr, c) = mkParamHandler comp
           cm = m2b1Pruned hdlr c
-          viols = firstOrderNoHandlerViolations cm
-      in assertBool ("expected rejection for hParam; got: " <> show viols)
-           (any (T.isInfixOf (T.pack "handler-parameter")) viols)
+      in firstOrderNoHandlerViolations cm @?= []
 
-  , testCase "hAnswerJoin = Just _ : rejected (mentions non-tail)" $
+  , testCase "hAnswerJoin = Just _ : admitted (M2b-2 Task 5 value-position)" $
       let aName = Name (T.pack "a") (Unique 9909)
           comp  = m2b1Comp "E" "op" aName
           (hdlr, c) = mkValuePosHandler comp
           cm = m2b1Pruned hdlr c
-          viols = firstOrderNoHandlerViolations cm
-      in assertBool ("expected rejection for hAnswerJoin; got: " <> show viols)
-           (any (T.isInfixOf (T.pack "non-tail")) viols)
+      in firstOrderNoHandlerViolations cm @?= []
 
   , testCase "resume stored into a con: rejected (mentions escapes)" $
       let aName = Name (T.pack "a") (Unique 9969)
@@ -12625,6 +13018,13 @@ rcM2b1FragmentTests = testGroup "m2b-1 fragment predicate"
       let aName = Name (T.pack "a") (Unique 9972)
           comp  = m2b1Comp "E" "op" aName
           (hdlr, _) = mkResumeStoredHandler comp
+      in Esc.m2bHandlerInFragment hdlr
+           @?= null (m2bHandlerViolations hdlr)
+
+  , testCase "consistency: m2bHandlerInFragment agrees with (null . m2bHandlerViolations) for value-position" $
+      let aName = Name (T.pack "a") (Unique 9973)
+          comp  = m2b1Comp "E" "op" aName
+          (hdlr, _) = mkValuePosHandler comp
       in Esc.m2bHandlerInFragment hdlr
            @?= null (m2bHandlerViolations hdlr)
 
@@ -12657,3 +13057,132 @@ rcM2b1FragmentTests = testGroup "m2b-1 fragment predicate"
       in assertBool ("expected cross-region viol; got: " <> show viols)
            (any (T.isInfixOf (T.pack "cross-region")) viols)
   ]
+
+-- ---------------------------------------------------------------------------
+-- M2b-2 continuationOwned unit tests (code-review #3)
+
+-- | Build a minimal 'Handler' with 'hParam = Just pb' and an otherwise-empty
+-- body (no return expression needed; 'continuationOwned' only inspects the
+-- frame, not arm bodies).
+-- The hsc in each test simulates the post-resume state where pb is already
+-- bound in the handler scope; hReturn uses a distinct binder (Unique 9991) so
+-- the two roles never share a Unique.
+m2b2ParamHandler :: Binder -> Anf.Handler
+m2b2ParamHandler pb =
+  let retBndr = Binder (Name (T.pack "ret") (Unique 9991)) Unrestricted m2bBoxTy
+  in Anf.Handler
+    { Anf.hReturn     = (retBndr, Ret (ALit LUnit))
+    , Anf.hOps        = []
+    , Anf.hAnswerJoin = Nothing
+    , Anf.hParam      = Just pb
+    , Anf.hSelf       = Nothing
+    }
+
+-- | Build an 'Handler' with 'hParam = Nothing'.
+m2b2NoParamHandler :: Anf.Handler
+m2b2NoParamHandler =
+  Anf.Handler
+    { Anf.hReturn     = (Binder (Name (T.pack "v") (Unique 9990)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+    , Anf.hOps        = []
+    , Anf.hAnswerJoin = Nothing
+    , Anf.hParam      = Nothing
+    , Anf.hSelf       = Nothing
+    }
+
+-- | 'continuationOwned' of a prefix containing a PARAMETERIZED nested handler
+-- frame must include the parameter's dynamic address in the owned set.
+continuationOwnedNestedParam :: Assertion
+continuationOwnedNestedParam = do
+  let dynAddr = 7        -- non-static (positive) address
+      pb      = Binder (Name (T.pack "s") (Unique 8001)) Unrestricted m2bBoxTy
+      h       = m2b2ParamHandler pb
+      -- The frame's hsc binds pb's Unique to RVBox dynAddr.
+      hsc     = St.RCScope (Map.fromList [(Unique 8001, St.RVBox dynAddr)]) Map.empty
+      kont    = St.KHandleRC h 0 hsc St.KDoneRC
+  assertEqual "continuationOwned includes nested param addr" [dynAddr]
+    (St.continuationOwned kont)
+
+-- | 'continuationOwned' of a prefix containing a no-parameter nested handler
+-- frame must contribute NOTHING (M2b-1 behaviour unchanged).
+continuationOwnedNoParam :: Assertion
+continuationOwnedNoParam = do
+  let h    = m2b2NoParamHandler
+      hsc  = St.emptyRCScope
+      kont = St.KHandleRC h 0 hsc St.KDoneRC
+  assertEqual "continuationOwned with no hParam is empty" []
+    (St.continuationOwned kont)
+
+-- | The dedup invariant: the same param address reachable from TWO nested
+-- handler frames with different Uniques must appear TWICE (they are distinct
+-- owned slots, matching the refcount bump the interpreter performs on entry).
+continuationOwnedDedup :: Assertion
+continuationOwnedDedup = do
+  let dynAddr = 7
+      pb1     = Binder (Name (T.pack "s1") (Unique 8010)) Unrestricted m2bBoxTy
+      pb2     = Binder (Name (T.pack "s2") (Unique 8011)) Unrestricted m2bBoxTy
+      h1      = m2b2ParamHandler pb1
+      h2      = m2b2ParamHandler pb2
+      hsc1    = St.RCScope (Map.fromList [(Unique 8010, St.RVBox dynAddr)]) Map.empty
+      hsc2    = St.RCScope (Map.fromList [(Unique 8011, St.RVBox dynAddr)]) Map.empty
+      -- Two stacked parameterized handlers: inner h2 on top of outer h1.
+      kont    = St.KHandleRC h2 0 hsc2 (St.KHandleRC h1 0 hsc1 St.KDoneRC)
+  -- Distinct Uniques: both entries survive dedup -> addr appears twice.
+  assertEqual "two distinct param binders each contribute their addr"
+    [dynAddr, dynAddr]
+    (St.continuationOwned kont)
+
+-- | Dedup SUPPRESSES a DUPLICATE entry: the same binder Unique appearing twice
+-- (aliased live-across-frames) should be counted once, matching refcount.
+continuationOwnedSameUniqueDedup :: Assertion
+continuationOwnedSameUniqueDedup = do
+  let dynAddr = 7
+      pb      = Binder (Name (T.pack "s") (Unique 8020)) Unrestricted m2bBoxTy
+      h       = m2b2ParamHandler pb
+      hsc     = St.RCScope (Map.fromList [(Unique 8020, St.RVBox dynAddr)]) Map.empty
+      -- Same handler (same Unique pb) stacked twice: dedup collapses to one.
+      kont    = St.KHandleRC h 0 hsc (St.KHandleRC h 0 hsc St.KDoneRC)
+  assertEqual "same Unique deduped to a single addr" [dynAddr]
+    (St.continuationOwned kont)
+
+-- | The (Unique, Addr) dedup distinguishes SAME UNIQUE but DIFFERENT ADDRESSES.
+-- This is the 'set'-arm scenario after a two-arg resume (M2b-2 Task 4D): the
+-- param binder 'pb' appears in the KHandleRC frame (new value, addrA) AND in a
+-- KLetRC frame below it (old value in env2, addrB).  Both must be freed.
+-- A Unique-only dedup would collapse them into one free, leaking addrB.
+-- This test pins the (Unique, Addr) keying that 'continuationOwned' uses.
+continuationOwnedSameUniqueDiffAddr :: Assertion
+continuationOwnedSameUniqueDiffAddr = do
+  let addrA = 7    -- new param value (in KHandleRC)
+      addrB = 8    -- old param value (in KLetRC env2)
+      pb    = Binder (Name (T.pack "s") (Unique 8030)) Unrestricted m2bBoxTy
+      h     = m2b2ParamHandler pb
+      hsc   = St.RCScope (Map.fromList [(Unique 8030, St.RVBox addrA)]) Map.empty
+      -- KLetRC frame: result binder 'rr' (Unique 8031), body = Ret (AVar pb) so
+      -- that 'frameOwned' sees pb.Unique as an owning (non-head) occurrence that
+      -- is also free in the body. The scope binds pb.Unique to addrB (old value).
+      rr    = Binder (Name (T.pack "rr") (Unique 8031)) Unrestricted m2bBoxTy
+      body  = Ret (AVar (Name (T.pack "s") (Unique 8030)))
+      sc2   = St.RCScope (Map.fromList [(Unique 8030, St.RVBox addrB)]) Map.empty
+      -- KHandleRC (new addrA) on top of KLetRC (old addrB in env2).
+      kont  = St.KHandleRC h 0 hsc (St.KLetRC rr body sc2 St.KDoneRC)
+  -- Both (pb.Unique, addrA) and (pb.Unique, addrB) survive dedup: different Addr.
+  assertEqual "same Unique but different addrs: BOTH freed (no Unique-only dedup)"
+    [addrA, addrB]
+    (St.continuationOwned kont)
+
+-- | Test group for M2b-2 code-review #3: 'continuationOwned' frees a nested
+-- parameterized handler's parameter.
+rcM2b2ContinuationOwnedTests :: TestTree
+rcM2b2ContinuationOwnedTests =
+  testGroup "continuationOwned (m2b-2 #3: nested param freed on abort)"
+    [ testCase "continuationOwned: nested parameterized handler contributes param addr"
+        continuationOwnedNestedParam
+    , testCase "continuationOwned: no-param handler contributes nothing (M2b-1 unchanged)"
+        continuationOwnedNoParam
+    , testCase "continuationOwned: two distinct Uniques each contribute (no over-dedup)"
+        continuationOwnedDedup
+    , testCase "continuationOwned: same Unique deduped to one (no double-free)"
+        continuationOwnedSameUniqueDedup
+    , testCase "continuationOwned: same Unique at DIFFERENT addrs: both freed ((Unique,Addr) keying)"
+        continuationOwnedSameUniqueDiffAddr
+    ]

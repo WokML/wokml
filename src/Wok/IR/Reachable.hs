@@ -29,7 +29,6 @@ import qualified Data.Text as Tx
 import qualified Wok.IR.Anf as Anf
 import qualified Wok.IR.Name as Name
 import Wok.IR.Name (Unique)
-import Data.Maybe (isNothing)
 import Wok.IR.Escape
   ( isBoxedType, letRecMemberConsumesCaptureNonEscaping
   , rawEnclosingFv, m2bResumeEscapes )
@@ -351,14 +350,12 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
           ++ go Set.empty lr bsc (snd (Anf.hReturn h))
           ++ concat [ go Set.empty lr bsc (Anf.oaBody op) | op <- Anf.hOps h ]
 
--- | Precise violation messages for a handler that is OUTSIDE the M2b-1
+-- | Precise violation messages for a handler that is OUTSIDE the M2b
 -- fragment.  Derived from the SAME conditions as 'm2bHandlerInFragment' so
--- guard emptiness and the predicate agree.
+-- guard emptiness and the predicate agree. Value-position handlers
+-- ('hAnswerJoin = Just') are admitted as of M2b-2 Task 5 and no longer
+-- reported here.
 m2bHandlerViolations :: Anf.Handler -> [Text]
 m2bHandlerViolations h =
-  [ Tx.pack "effect handler with a handler-parameter (M2b-2; not yet on the RC store)"
-  | not (isNothing (Anf.hParam h)) ]
-  ++ [ Tx.pack "effect handler in value (non-tail) position (M2b-2)"
-     | not (isNothing (Anf.hAnswerJoin h)) ]
-  ++ [ Tx.pack "effect op arm whose resume ESCAPES its body (first-class/stored continuation; M3)"
-     | oa <- Anf.hOps h, m2bResumeEscapes (Anf.oaResume oa) (Anf.oaBody oa) ]
+  [ Tx.pack "effect op arm whose resume ESCAPES its body (first-class/stored continuation; M3)"
+  | oa <- Anf.hOps h, m2bResumeEscapes (Anf.oaResume oa) (Anf.oaBody oa) ]

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perceus: skipping the tracing GC</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --warn:#c0392b; --ok:#2e8b57; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.62 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:780px;margin:0 auto;padding:46px 22px 96px}
+  h1{font-size:1.85rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.16rem;margin:42px 0 2px}
+  .sub,.cap{color:var(--mut)} .sub{margin:.2em 0 0} .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  p{margin:12px 0}
+
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:190px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+  .fork{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0;width:100%}
+  .row>*{flex:1;min-width:170px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:14px}
+  .card h3{margin:0 0 6px;font-size:.96rem}
+  .card p{margin:0;font-size:.92rem;color:var(--ink)}
+  .label{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .verdict{font-family:ui-monospace,monospace;font-weight:700;font-size:.8rem}
+  .yes{color:var(--ok)} .no{color:var(--warn)} .acc{color:var(--accent)}
+  .card.trace{border-top:3px solid var(--warn)} .card.rc{border-top:3px solid var(--ok)}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0}
+  .note.warn{border-left-color:var(--warn)}
+  .note b{color:var(--accent)} .note.warn b{color:var(--warn)}
+  svg{display:block;max-width:100%;height:auto;margin:8px auto 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Perceus: skipping the tracing GC</h1>
+  <p class="sub">What reference counting actually drops, what it keeps, and where the pointer/non-pointer question goes.</p>
+
+  <div class="note">
+    <b>One correction first.</b> Perceus skips <em>tracing</em> &mdash; yes. But it does <em>not</em> stop
+    "bookkeeping references": the per-object <b>reference count</b> <em>is</em> the bookkeeping. What disappears is the
+    global <em>reachability walk</em>. So allocations aren't metadata-free either &mdash; each object still carries a
+    count word &mdash; they just carry none of the <em>tracing</em> apparatus (mark bits, card tables, forwarding pointers).
+  </div>
+
+  <!-- Direct yes/no to the question as asked -->
+  <h2>Your questions, directly</h2>
+  <div class="grid">
+    <div class="card"><span class="label">tracing GC?</span><h3 class="verdict yes">SKIPPED</h3><p>No graph walk, no mark-and-sweep, no collector pauses.</p></div>
+    <div class="card"><span class="label">reference bookkeeping?</span><h3 class="verdict no">KEPT</h3><p>Each object has a count; the compiler adjusts it inline.</p></div>
+    <div class="card"><span class="label">stack maps / safepoint root scan?</span><h3 class="verdict yes">NOT NEEDED</h3><p>There is no GC-time root enumeration to drive.</p></div>
+    <div class="card"><span class="label">pointer/non-pointer register split?</span><h3 class="verdict yes">NOT (at runtime)</h3><p>Resolved statically by the compiler instead.</p></div>
+  </div>
+
+  <!-- How each one finds garbage -->
+  <h2>1 &middot; How each one finds garbage</h2>
+  <div class="grid">
+    <div class="card trace">
+      <span class="label">tracing GC</span>
+      <h3>walk from the roots</h3>
+      <p>Pause, start from the <b>roots</b> (stack slots, registers, globals), walk the whole reachable
+      graph, mark what is live, reclaim the rest. To do this it must <b>enumerate roots at runtime</b>.</p>
+    </div>
+    <div class="card rc">
+      <span class="label">perceus rc</span>
+      <h3>count, locally</h3>
+      <p>Every object carries a count. Compiler-inserted <code>dup</code>/<code>drop</code> adjust it at use
+      sites; at <b>0</b> the object frees itself and decrements its children. <b>No walk, no root scan, no pause.</b></p>
+    </div>
+  </div>
+
+  <!-- The crux: where the pointer/non-pointer question goes -->
+  <h2>2 &middot; Where the "is this a pointer?" question goes</h2>
+  <p class="sub">The question splits in two &mdash; and only one half is what stack maps and register partitioning exist for.</p>
+  <div class="fork">
+    <div class="box hi">which things are pointers?</div>
+    <div class="arrow">&darr;</div>
+    <div class="row">
+      <div class="card trace">
+        <span class="label">roots &mdash; stack slots &amp; registers</span>
+        <h3>Tracing: needs maps</h3>
+        <p>A precise trace must know, at every safepoint, which stack/register slots hold live references &mdash;
+        that is exactly <b>stack maps + pointer/non-pointer register partitioning</b>.</p>
+        <p style="margin-top:8px"><span class="verdict acc">Perceus:</span> never asked. No root scan &rarr; <b>no stack maps, no register partitioning for a collector.</b></p>
+      </div>
+      <div class="card rc">
+        <span class="label">fields &mdash; inside an object</span>
+        <h3>Both need this one</h3>
+        <p>To walk (tracing) or to decrement children on free (RC), you must know which <em>fields</em> are pointers.</p>
+        <p style="margin-top:8px"><span class="verdict acc">Perceus:</span> it is the object's <b>static layout</b>, used only when a cell hits 0 (the cascade) &mdash; per-type, not a root map.</p>
+      </div>
+    </div>
+  </div>
+  <p class="cap">fig &mdash; stack maps and register partitioning answer the <em>roots</em> question; RC never asks it</p>
+
+  <!-- The cost just moves -->
+  <h2>3 &middot; The cost just moves</h2>
+  <div class="grid">
+    <div class="card trace">
+      <span class="label">tracing pays at</span>
+      <h3>run time</h3>
+      <p>Root scan, stack maps, safepoints, pauses, and write barriers (for generational/incremental variants).
+      The collector is machinery that runs <em>while the program runs</em>.</p>
+    </div>
+    <div class="card rc">
+      <span class="label">perceus pays at</span>
+      <h3>compile time</h3>
+      <p>One static analysis decides every <code>dup</code>/<code>drop</code>. At runtime: just inline count
+      bumps and a free when a count reaches 0. <b>Scan-free</b> &mdash; no roots, no maps, no pauses.</p>
+    </div>
+  </div>
+  <p>So the pointer/non-pointer knowledge is not gone &mdash; Perceus <em>relies</em> on it. It is just consumed
+  by the <em>compiler</em> (which binders are boxed &rarr; where to emit <code>dup</code>/<code>drop</code>) rather
+  than by a <em>collector</em> reading runtime tables. The trade is real: tracing front-loads nothing and pays in
+  runtime metadata + pauses; Perceus front-loads the analysis and runs lean.</p>
+
+  <div class="note warn">
+    <b>The catch.</b> Reference counts can't see <em>cycles</em> &mdash; a tracing GC reclaims them for free.
+    wok's price for dropping tracing is guaranteeing <b>no reference cycles by construction</b> (immutable data +
+    the "carrier wall" that keeps a continuation out of the data it owns), instead of bolting on a cycle collector.
+    Two more honest notes: every object still carries a count word, and the inc/dec is real per-operation work
+    (minimized by precise placement and reuse/FBIP); and today wok runs this in an <em>interpreter</em> with an
+    explicit counted Store &mdash; the "no stack maps, no register partitioning" payoff is about the eventual
+    compiled backend, which is precisely the model Perceus is designed to enable.
+  </div>
+
+  <footer style="margin-top:46px;padding-top:18px;border-top:1px solid var(--line);color:var(--mut);font:.78rem ui-monospace,monospace">
+    wok compiler &middot; why Perceus is scan-free reference counting
+  </footer>
+
+</div>
+</body>
+</html>

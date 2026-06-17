@@ -1,0 +1,28 @@
+module Main
+import Std.Base
+
+-- M2b-2 code-review F3: value-position handler with a BOXED local in the
+-- answer-join consumer.  The handler sits in VALUE position (hAnswerJoin = Just
+-- j, arms deliver via Jump j), so 'answerRebindRC' re-points j to the resume
+-- call site on resume.  The answer-join consumer (the j body) allocates and
+-- consumes a boxed 'Option U64' ('bonus'), exercising the heap oracle on the
+-- value-position path.
+--
+-- The value-position arm's Jump to the outer answer-join is NOT statically
+-- audited by 'lintInstrumented' (ctxJoins is cleared by 'armCtxReset');
+-- the runtime heap oracle covers this path instead.
+--
+-- Expected output: Some 14 (prog returns 10+1=11, bonus=3: 11+3=14);
+-- heap returns to baseline.
+effect Reader = { ask : U64 }
+
+prog : Reader -> U64 with Reader
+prog r = let m = r.ask in m + 1
+
+main : Option U64
+main =
+  let r = (with self = Reader { ask -> 10 ; v -> v } in prog self) in
+  let bonus = Some 3 in
+  case bonus of
+    None   -> None
+    Some b -> Some (r + b)

@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+
+-- M2b-2 Task 4A: a parameterized State handler coexisting with a Reader handler.
+-- The State handler uses two-arg resume (baton model); the Reader is no-param.
+-- Exercises a parameterized frame nested alongside another handler frame in the
+-- prefix.  The Reader env is U64 (unboxed) to stay within the M2b fragment
+-- (boxed enclosing captures in arms are deferred).
+-- prog: reads Reader env=5, gets State=10, sets State=(10+5+3)=18, gets State=18.
+-- runReader discharges Reader; runState wraps with final state.
+-- Expected: (18, 18); heap returns to baseline.
+effect State s = { get : s, set : s -> () }
+effect Reader = { ask : U64 }
+
+runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
+runState i c = with State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
+
+runReader : U64 -> (Reader -> a with Reader + eff e) -> a with eff e
+runReader e c = with self = Reader { ask -> e } in c self
+
+prog : Reader -> () -> U64 with State U64 + Reader
+prog r u =
+  let e  = r.ask in
+  let a  = State.get in
+  let u2 = State.set (a + e + 3) in
+  let b  = State.get in
+  b
+
+main : (U64, U64)
+main = runState 10 (\u -> runReader 5 (\r -> prog r u))
