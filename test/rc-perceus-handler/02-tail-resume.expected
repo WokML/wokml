@@ -1,23 +1,17 @@
-pickTag tag xs =
-  join j72(r) =
-    let chosen = r
-    chosen
-  case xs of
-    Nil ->
-      let _drop.1 = __rc_drop(xs)
-      jump j72(tag)
-    Cons _.1 _.2 ->
-      let _drop.2 = __rc_drop(tag)
-      jump j72(xs)
+useEnv u =
+  let t = Env.get()
+  t
 
 main =
-  let t.1 = Nil
-  let t.2 = Cons(9, t.1)
-  let t.4 = Nil
-  let t.3 = Cons(2, t.4)
-  let t.5 = Cons(1, t.3)
-  let t.6 = pickTag(t.2, t.5)
-  t.6
+  let t.1 = useEnv(())
+  t.1
+  with {
+    return v -> v
+    Env.get(resume) ->
+      let t.2 = Held(7)
+      let res = resume(t.2)
+      res
+  }
 
 id x =
   x

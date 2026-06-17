@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+
+-- M2b-1 Task 4, the spec §4.2 COUNTEREXAMPLE: a boxed value 'x' is MOVED into a
+-- container 'ys' (a list cell) BEFORE the throw, so 'x' is DEAD at the op site
+-- (its last use preceded the op). On abort the continuation's owned set must free
+-- the container 'ys' ONCE, NOT the stale binder 'x' AND 'ys' (that double-frees
+-- the cell 'x' points to). If 'continuationOwned' wrongly includes the moved-away
+-- 'x', the RC store crashes with "double-free". The 'freeVarsExpr' intersection is
+-- what excludes the dead 'x' (it is not free after the move).
+data Box = Box U64
+
+effect Exn = { throw : U64 -> Never }
+
+prog : Exn -> [Box] with Exn
+prog e =
+  let x  = Box 1 in
+  let ys = [x] in
+  let u  = e.throw 7 in
+  ys
+
+run : (Exn -> a with Exn + eff e) -> Option a with eff e
+run c = with self = Exn { throw n k -> None ; v -> Some v } in c self
+
+main : Option [Box]
+main = run prog

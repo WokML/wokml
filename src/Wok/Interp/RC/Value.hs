@@ -12,6 +12,10 @@ module Wok.Interp.RC.Value
   , RCJoin (..)
     -- * Continuation stack
   , RCKont (..)
+  , kontDepth
+  , continuationOwned
+  , moveOutCont
+  , spliceKont
     -- * Heap nodes
   , Node (..)
   , CaptureMode (..)
@@ -53,10 +57,13 @@ import Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.Interp.Value (RuntimeError (..))
-import Wok.IR.Anf (Atom (..), Binder (..), Expr, Lit (..))
+import Wok.IR.Anf
+  ( Atom (..), Binder (..), Expr, Handler (..), Lit (..), binderUnique, freeVarsExpr )
+import Wok.IR.Escape (dropTargets, nonHeadOccs)
 import Wok.IR.Name (JoinId, Unique, nameHint, nameUniq)
 
 -- ---------------------------------------------------------------------------
@@ -80,6 +87,13 @@ data RCValue
   | RVBox Addr
   | RVRecMember Addr Int Addr
     -- ^ groupAddr (static, uncounted), index, envAddr (counted)
+  | RVInst Unique Int
+    -- ^ A named effect-instance handle (the RC analogue of
+    -- 'Wok.Interp.Value.VInst'): the handler self-binder 'Unique' (the install
+    -- SITE) paired with the per-activation tag (the 'kontDepth' at install). It
+    -- is an UNBOXED IDENTITY pair --- it owns no counted heap cell, so
+    -- 'valueChildren' is empty and dup/drop of it are inert (no counted ref to
+    -- acquire or release).
   deriving (Eq, Show)
 
 -- | The counted heap addresses reachable from an 'RCValue'. This is the single
@@ -90,10 +104,12 @@ data RCValue
 --   * 'RVRecMember' — one counted address: the shared env cell (@envAddr@).
 --     The @groupAddr@ is static/immortal and therefore UNCOUNTED; it is
 --     deliberately excluded.
+--   * 'RVInst'      — no counted children (an unboxed identity pair).
 valueChildren :: RCValue -> [Addr]
 valueChildren (RVLit _)          = []
 valueChildren (RVBox a)          = [a]
 valueChildren (RVRecMember _ _ e) = [e]
+valueChildren (RVInst _ _)        = []
 
 -- | The counted addresses a set of values references (skip static). The SINGLE
 -- unit of both capture-incref and free-cascade, via 'valueChildren' --- so every
@@ -112,6 +128,7 @@ type REnv = Map Unique RCValue
 -- 'Wok.Interp.Value.Scope'. M1 is the no-handler fragment, so there are no
 -- effect-handler frames; only term bindings and join points appear.
 data RCScope = RCScope { rscEnv :: REnv, rscJoins :: Map JoinId RCJoin }
+  deriving (Eq, Show)
 
 -- | The empty scope: no term bindings, no join points.
 emptyRCScope :: RCScope
@@ -121,19 +138,30 @@ emptyRCScope = RCScope Map.empty Map.empty
 -- defined, its parameters, its body, and the continuation to run after it.
 -- The RC analogue of 'Wok.Interp.Value.JoinPoint'.
 data RCJoin = RCJoin RCScope [Binder] Expr RCKont
+  deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
 -- Continuation stack
 
 -- | The continuation stack for the RC machine. Mirrors
--- 'Wok.Interp.Value.Kont' but for the no-handler fragment: there are no
--- effect-handler frames, so 'KHandle' has no analogue.
+-- 'Wok.Interp.Value.Kont'. The M2b-1 'KHandleRC' frame brings reference
+-- counting to effect handlers (the counted analogue of 'KHandle').
 data RCKont
   = KDoneRC
   | KLetRC Binder Expr RCScope RCKont
     -- ^ bind the produced value to the 'Binder', then run the 'Expr' in scope.
   | KAppRC [RCValue] RCKont
     -- ^ over-application: apply the produced value to these extra args.
+  | KHandleRC Handler Int RCScope RCKont
+    -- ^ effect delimiter (the counted analogue of 'Wok.Interp.Value.KHandle').
+    -- The 'Int' is the activation tag (the 'kontDepth' at install) that, with the
+    -- handler's self-binder 'Unique', identifies this activation for named
+    -- dispatch; ambient dispatch ignores it.
+    --
+    -- RC DISCIPLINE: the frame captures its 'RCScope' BY REFERENCE, exactly like
+    -- 'KLetRC' --- it does NOT incref the scope's values on install. The scope's
+    -- values are owned by their binders and released by the Perceus pass at last
+    -- use; the frame holds them only so the return arm resolves consistently.
   | KDropCellRC Addr RCKont
     -- ^ DEFERRED CONSUME of an unnamed-intermediate closure cell (M2a-2). When an
     -- application CONSUMES an anonymous function value (an over-application
@@ -146,6 +174,140 @@ data RCKont
     -- (cascading the cell's OWN owned captures, now that the body is done borrowing
     -- them) and threads the value onward. The cell is alive throughout its own call,
     -- exactly as the named-head borrow case keeps it alive via its binder.
+  deriving (Eq, Show)
+
+-- | Number of frames in a continuation (the RC analogue of
+-- 'Wok.Interp.Value.kontDepth'). Used as the per-activation tag when a named
+-- handler is installed: distinct COEXISTING (nested) activations of one runner
+-- site sit at strictly different depths, so the tag tells them apart. Counts
+-- 'KLetRC'/'KAppRC'/'KHandleRC'/'KDropCellRC' frames; 'KDoneRC' is depth 0.
+kontDepth :: RCKont -> Int
+kontDepth = go 0
+  where
+    go n KDoneRC             = n
+    go n (KLetRC _ _ _ k)    = go (n + 1) k
+    go n (KAppRC _ k)        = go (n + 1) k
+    go n (KHandleRC _ _ _ k) = go (n + 1) k
+    go n (KDropCellRC _ k)   = go (n + 1) k
+
+-- | The OWNED SET of a captured continuation prefix (M2b-1, the crux; spec §4.2):
+-- the addresses the continuation's own pending drop/move instructions would free
+-- if it ran. This is NOT all the values in the captured scopes --- a runtime scope
+-- mixes OWNED, BORROWED, MOVED-AWAY (stale), and GLOBAL bindings, and cascading
+-- all of them double-frees the latter three. The abort path ('cascadeChildren' for
+-- 'NCont') frees EXACTLY this set, then the shell; resume (Task 5) frees neither
+-- (the spliced frames' own instructions fire as they run).
+--
+-- Deduped by binder 'Unique': a value live across several frames is owned by ONE
+-- binder and freed once; two DISTINCT aliasing binders (a @let a = x@ the pass
+-- dup'd) are owned separately and freed twice, matching the refcount. 'KAppRC' /
+-- 'KDropCellRC' contribute RAW owned addresses (no 'Unique', never deduped against
+-- vars). For each 'KLetRC r body sc' frame the owned binders are:
+--
+--   * @nonHeadOccs body@ --- the MOVE/consuming occurrences (the 'Wok.IR.Escape'
+--     single source of truth: it already excludes a saturated call HEAD = borrow-
+--     on-call, and the @__rc_dup@/@__rc_drop@ args);
+--   * UNION @dropTargets body@ --- a value BORROWED then DROPPED (a call head the
+--     pass drops at last use) is in NEITHER 'nonHeadOccs' NOR the escaping atoms,
+--     only here (e.g. @c@ in @let r = c(self) in __rc_drop c; r@). ESSENTIAL;
+--   * INTERSECT @freeVarsExpr body@ --- only values LIVE at the op site (bound
+--     before it) count. This EXCLUDES a MOVED-AWAY value (its last use preceded the
+--     op, so it is not free here --- not double-freed);
+--   * MINUS the frame binder @r@ (the pending result; does not exist yet).
+--
+-- 'countedRefs [v]' resolves a binding to its counted (non-static) addresses, so
+-- globals/static are skipped and an unboxed 'RVInst' contributes nothing.
+continuationOwned :: RCKont -> [Addr]
+continuationOwned = dedup . go
+  where
+    -- (Maybe Unique, Addr): scope-resolved vars carry their Unique for dedup;
+    -- KAppRC/KDropCellRC contribute raw owned addresses (no Unique).
+    go :: RCKont -> [(Maybe Unique, Addr)]
+    go KDoneRC                = []
+    go (KLetRC r body sc k)   = frameOwned r body sc ++ go k
+    go (KAppRC vs k)          = [ (Nothing, a) | a <- countedRefs vs ] ++ go k
+    go (KDropCellRC a k)      = [ (Nothing, a) | not (isStaticAddr a) ] ++ go k
+    -- A nested handler frame in the captured prefix: skip its scope. SOUND IN M2b-1
+    -- ONLY because a no-parameter handler whose arms cannot capture an enclosing boxed
+    -- local (rejected by the boundary guard) owns nothing live across the outer op.
+    --
+    -- !!! M2b-2 PREREQUISITE (code-review #3): once handler PARAMETERS (hParam) land, a
+    -- nested PARAMETERIZED handler frame OWNS its parameter value (e.g. State's `s`).
+    -- Skipping it here will LEAK that parameter when the outer continuation aborts.
+    -- M2b-2 MUST process this frame's hsc (at least the param slot, drop-old/own-new
+    -- aware) and ship an exploit test (a nested `State` inside an aborting outer
+    -- handler). Do not widen hParam admission without fixing this line.
+    go (KHandleRC _ _ _ k)    = go k
+    frameOwned r body sc =
+      let owned = (nonHeadOccs Set.empty body `Set.union` dropTargets body)
+                    `Set.intersection` freeVarsExpr body
+          owned' = Set.delete (binderUnique r) owned
+      in [ (Just u, a)
+         | u <- Set.toList owned'
+         , Just v <- [Map.lookup u (rscEnv sc)]
+         , a <- countedRefs [v] ]
+    -- Dedup the named-binder entries by Unique (a value live across several frames is
+    -- owned once; two DISTINCT aliasing binders stay separate, matching refcount). The
+    -- raw-address entries (KAppRC over-args, KDropCellRC) carry no Unique and are emitted
+    -- verbatim.
+    --
+    -- !!! DEFERRED, LATENT (code-review #7): a (Nothing, a) raw entry is NEVER compared
+    -- against the (Just u, a) named entries, so if the SAME cell is ever reachable both
+    -- through a named frame binder AND through a raw KAppRC/KDropCellRC frame, address `a`
+    -- is freed twice -> double-free. Believed unreachable today (over-application args are
+    -- caller-scope; captured frames are callee-scope; M2a-2 over-applied-member env-shares
+    -- have not been seen to coincide with a live named sibling in a prefix). REVISIT when
+    -- over-application (KAppRC) or an over-applied M2a-2 recursive member (KDropCellRC env)
+    -- can appear inside a captured continuation: either dedup raw addrs against named ones
+    -- (preserving genuine refcount->=2 aliases) or add that generator shape to settle it.
+    dedup = goD Set.empty
+      where
+        goD _ [] = []
+        goD seen ((Just u, a) : rest)
+          | u `Set.member` seen = goD seen rest
+          | otherwise           = a : goD (Set.insert u seen) rest
+        goD seen ((Nothing, a) : rest) = a : goD seen rest
+
+-- | Resume move-out (M2b-1 Task 5; spec §4.3 RESUME, §4.5.0): free the 'NCont'
+-- shell WITHOUT cascading its children, and return the captured frame prefix +
+-- handler-reinstall info. One-shot guarantees @rc == 1@ (the single owner is
+-- consumed here); the children's refcounts are LEFT UNTOUCHED because ownership
+-- transfers to the re-prepended live frames (the move) --- their own pending
+-- @__rc_drop@/move instructions fire as the spliced frames run. Contrast
+-- 'dropAddr'/'cascadeChildren', which frees the owned set ('continuationOwned').
+-- A defensive @rc /= 1@ check turns a slipped multi-shot into a loud error rather
+-- than a silent use-after-free.
+moveOutCont :: Addr -> Store -> Either RuntimeError (RCKont, (Handler, Int, RCScope), Store)
+moveOutCont a s = do
+  c <- deref a s
+  case cNode c of
+    NCont prefix hinfo
+      | cRc c == 1 ->
+          let st = stStats s
+              s' = s { stCells = IM.delete a (stCells s)
+                     , stDead  = IS.insert a (stDead s)
+                     , stStats = st { stFrees = stFrees st + 1, stLive = stLive st - 1 } }
+          in Right (prefix, hinfo, s')
+      | otherwise ->
+          Left (PrimError (Tx.pack ("internal: resume of a continuation with rc=" <> show (cRc c)
+                                     <> " (one-shot violation); addr " <> show a)))
+    _ -> Left (PrimError (Tx.pack ("resume of non-continuation addr " <> show a)))
+
+-- | Splice (M2b-1 Task 5): replace the innermost 'KDoneRC' marker of a captured
+-- prefix with the given tail. The prefix (built by @rcDispatchOp@ as @above
+-- KDoneRC@) is a linear chain of 'KLetRC'/'KAppRC'/'KHandleRC'/'KDropCellRC'
+-- frames terminated by exactly one 'KDoneRC' (the op site is always below a
+-- handler, so the walk that built it never reached a real 'KDoneRC'). This
+-- mirrors the reference @enter@ 'VCont' arm's @kb k@ frame re-prepend; the tail
+-- @tl@ is the re-installed handler over the post-resume continuation.
+spliceKont :: RCKont -> RCKont -> RCKont
+spliceKont prefix tl = go prefix
+  where
+    go KDoneRC                = tl
+    go (KLetRC b e sc k)      = KLetRC b e sc (go k)
+    go (KAppRC vs k)          = KAppRC vs (go k)
+    go (KHandleRC h tag sc k) = KHandleRC h tag sc (go k)
+    go (KDropCellRC a k)      = KDropCellRC a (go k)
 
 -- ---------------------------------------------------------------------------
 -- Heap nodes
@@ -177,6 +339,22 @@ data Node
   -- Allocated on the DYNAMIC heap (counted). All members of the group share a
   -- single 'NEnv' node; when the last member handle is dropped the env cell
   -- is freed and its owned children are cascaded via 'nodeValues'.
+  | NCont RCKont (Handler, Int, RCScope)
+  -- ^ A REIFIED DELIMITED CONTINUATION (M2b-1 Task 4): the captured frame prefix
+  -- (the @above@ frames between an op site and its handler, stored CONCRETELY as
+  -- an 'RCKont' terminated by 'KDoneRC' --- the splice marker for resume) plus the
+  -- matching handler's @(handler, activation tag, captured scope)@ for re-install
+  -- on resume (Task 5). Reached via an ordinary 'RVBox' handle bound to the op-arm
+  -- @resume@ binder.
+  --
+  -- RC DISCIPLINE (the crux). An 'NCont's free does NOT route through the generic
+  -- 'nodeValues' cascade ('nodeValues (NCont _ _) = []'): cascading every value in
+  -- the captured scopes would double-free borrowed/moved/global bindings. Instead
+  -- its OWNED SET --- the addresses the continuation's own pending drop/move
+  -- instructions would consume --- is computed by 'continuationOwned' and freed by
+  -- 'cascadeChildren' (the single free path in 'dropAddr'). Capture increfs nothing
+  -- (the frames are MOVED in, still owned by their binders); abort frees the owned
+  -- set once; resume (Task 5) discards the shell WITHOUT freeing the owned set.
   deriving (Eq, Show)
 
 -- | Whether a closure BODY receives ownership of its captures on entry. This is
@@ -406,7 +584,7 @@ dropAddr a0 s0 = go [a0] s0
             Nothing -> Left (PrimError (Tx.pack ("drop of dangling addr " <> show a)))
             Just c
               | cRc c <= 1 ->  -- rc about to reach 0 -> free
-                  let kids = countedRefs (nodeValues (cNode c))
+                  let kids = cascadeChildren (cNode c)
                       st   = stStats s
                       s'   = s { stCells = IM.delete a (stCells s)
                                , stDead  = IS.insert a (stDead s)
@@ -426,6 +604,19 @@ nodeValues (NRecord _ m)        = Map.elems m
 nodeValues (NClosure env _ _ _) = Map.elems env
 nodeValues (NGroupCode _)       = []
 nodeValues (NEnv m)             = Map.elems m
+-- An 'NCont's free does NOT cascade through 'nodeValues' --- see 'cascadeChildren'.
+nodeValues (NCont _ _)          = []
+
+-- | The addresses to free when a node's cell is freed (the single free path,
+-- consumed by 'dropAddr'). For every node EXCEPT 'NCont' this is the counted refs
+-- of its 'nodeValues' (the generic cascade). For 'NCont' it is the continuation's
+-- OWNED SET ('continuationOwned'), NOT a blind cascade of every captured-scope
+-- value: that would double-free borrowed/moved/global bindings (spec §4.2). So
+-- @__rc_drop resume@ on an aborting continuation frees its owned set then the shell
+-- --- one place, the single free path.
+cascadeChildren :: Node -> [Addr]
+cascadeChildren (NCont prefix _) = continuationOwned prefix
+cascadeChildren other            = countedRefs (nodeValues other)
 
 -- ---------------------------------------------------------------------------
 -- Primitives
@@ -493,6 +684,7 @@ renderRCValue s (RVBox a)           = do
   c <- deref a s
   renderNode s (cNode c)
 renderRCValue _ RVRecMember{} = Right (Tx.pack "<closure>")
+renderRCValue _ (RVInst _ _)  = Right (Tx.pack "<instance>")
 
 renderNode :: Store -> Node -> Either RuntimeError Text
 renderNode _ (NCon t []) | t == Tx.pack "Nil" = Right (Tx.pack "[]")
@@ -512,6 +704,7 @@ renderNode s (NRecord t m) = do
 renderNode _ NClosure{}      = Right (Tx.pack "<closure>")
 renderNode _ (NGroupCode _)  = Right (Tx.pack "<closure>")
 renderNode _ (NEnv _)        = Right (Tx.pack "<env>")
+renderNode _ (NCont _ _)     = Right (Tx.pack "<continuation>")
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)
@@ -539,6 +732,7 @@ renderList s h0 tl0 = do
           _ -> improper acc v
       RVLit _           -> improper acc v
       RVRecMember{} -> improper acc v
+      RVInst _ _    -> improper acc v
     improper acc v = do
       rest <- renderRCValue s v
       Right (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc)

@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+effect Eff = { eop : U64 -> Never }
+
+prog : Eff -> [U64] with Eff
+prog e =
+  let xs = [9, 8] in
+  let
+    go n =
+      case n of
+        0 -> xs
+        _ -> go (n - 1)
+  in
+  let u = e.eop 1 in
+  go 2
+
+run : (Eff -> [U64] with Eff + eff r) -> Result [U64] U64 with eff r
+run c = with self = Eff { eop n k -> Err n ; v -> Ok v } in c self
+
+main : Result [U64] U64
+main = run prog

@@ -56,6 +56,12 @@ rcDup = RCPrim (Tx.pack "__rc_dup") 1 [] $ \args s -> case args of
   -- ('valueChildren'). Dup increfs the env (a no-op on the static empty-env
   -- sentinel); the group code label is static and never counted.
   [v@(RVRecMember _ _ e)] -> do s' <- incref e s; Right (PRDone v, s')
+  -- A named effect-instance handle: an UNBOXED identity pair owning no counted
+  -- cell ('valueChildren' is empty), so dup is inert (same as 'dropBoxed'). This
+  -- fires once resume runs a captured frame that drops/dups the @self@ handle
+  -- (M2b-1 Task 5); the abort path never reached it because the arm returned
+  -- before the captured frame ran.
+  [v@(RVInst _ _)] -> Right (PRDone v, s)
   _             -> Left (ArityError (Tx.pack "__rc_dup"))
 
 -- | @__rc_drop x@ decrefs the handle (freeing at zero, recursively) and returns
@@ -67,6 +73,12 @@ rcDrop = RCPrim (Tx.pack "__rc_drop") 1 [] $ \args s -> case args of
   -- A shared-env recursive member: drop decrefs the env (a no-op on the static
   -- empty-env sentinel), freeing it at zero and cascading its owned captures.
   [RVRecMember _ _ e] -> do s' <- dropAddr e s; Right (PRDone (RVLit LUnit), s')
+  -- A named effect-instance handle: an UNBOXED identity pair owning no counted
+  -- cell ('valueChildren' is empty), so drop is inert (same as 'dropBoxed'). This
+  -- fires once resume runs a captured frame that drops the @self@/instance handle
+  -- (M2b-1 Task 5); the abort path never reached it because the arm returned
+  -- before the captured frame ran.
+  [RVInst _ _] -> Right (PRDone (RVLit LUnit), s)
   _           -> Left (ArityError (Tx.pack "__rc_drop"))
 
 -- ---------------------------------------------------------------------------
@@ -127,6 +139,7 @@ asBool (RVBox a) s = do
     _ -> Left (PrimError (Tx.pack "expected Bool"))
 asBool (RVLit _)           _ = Left (PrimError (Tx.pack "expected Bool, got a literal"))
 asBool RVRecMember{} _ = Left (PrimError (Tx.pack "expected Bool, got a closure handle"))
+asBool (RVInst _ _)  _ = Left (PrimError (Tx.pack "expected Bool, got an instance handle"))
 
 -- | Allocate a boxed boolean constructor and return its handle.
 allocBool :: Bool -> Store -> (RCValue, Store)
@@ -167,3 +180,4 @@ dropBoxed :: RCValue -> Store -> Either RuntimeError Store
 dropBoxed (RVBox a)          s = dropAddr a s
 dropBoxed (RVLit _)          s = Right s
 dropBoxed (RVRecMember _ _ e) s = dropAddr e s
+dropBoxed (RVInst _ _)       s = Right s

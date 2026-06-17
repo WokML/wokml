@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- M2b-1 Task 3: a NAMED-instance handler whose handled body performs NO
+-- operation. The body '7' is pure, so the 'tick' arm is never reached; the
+-- handler simply installs its self-instance handle and delivers the body's
+-- value through the return arm. This exercises the counted handler frame
+-- (KHandleRC), the named-instance handle ('RVInst', bound from 'hSelf'), and
+-- normal-completion return-arm dispatch -- without any continuation machinery
+-- (Tasks 4-5). The heap must return to baseline: the frame captures its scope
+-- by reference (no incref), and 'RVInst' is unboxed (owns no counted cell).
+effect Tick = { tick : () }
+
+runTick : U64
+runTick = with self = Tick { tick k -> k () } in 7
+
+main : U64
+main = runTick

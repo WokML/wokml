@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- M2b-1 Task 5: RESUME CALLED TWICE. 'prog' performs 'tick' twice; each op
+-- captures a continuation, and the handler's 'tick k -> k 1' tail-resumes with 1.
+-- The FIRST resume splices its captured frame (the 'let a = ... in let b = ...
+-- in a + b' suffix) back; running that suffix fires the SECOND op, which captures
+-- a fresh NCont, resumes again, and so on. This exercises the move-out path twice
+-- in one run, each freeing exactly one NCont shell without cascade. Output is
+-- '1 + 1 = 2'; the heap returns to baseline.
+effect Tick = { tick : U64 }
+
+runTick : (Tick -> a with Tick + eff e) -> a with eff e
+runTick c = with self = Tick { tick k -> k 1 } in c self
+
+prog : Tick -> U64 with Tick
+prog t = let a = t.tick in let b = t.tick in a + b
+
+main : U64
+main = runTick prog

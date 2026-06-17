@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- M2b-1 regression (full-branch review, verified UAF). An op arm that SEALS an
+-- enclosing boxed local ('x : [U64]') into a constructor, on the ABORT path
+-- ('throw' never applies 'k'). The arm is instrumented as a fresh owned scope so
+-- it does not account the capture, while the enclosing handler-body still drops
+-- 'x' --- a double-free when the arm result flows up through 'kBelow'. Must be
+-- REJECTED by the boundary guard (deferred to M2b-2/M3).
+data Wrap = Wrap [U64]
+
+effect Exn = { throw : U64 -> Never }
+
+prog : Exn -> Wrap with Exn
+prog e = let u = e.throw 1 in Wrap [9]
+
+run : [U64] -> (Exn -> Wrap with Exn + eff e) -> Wrap with eff e
+run x c = with self = Exn { throw n k -> Wrap x ; v -> v } in c self
+
+main : Wrap
+main = let x = [7, 8] in run x prog

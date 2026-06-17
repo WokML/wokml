@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+
+-- M2b-1 Task 4: a boxed value ('xs', a list cell) is LIVE in the frame ABOVE the
+-- throw. The op arm aborts (returns 'None', never resumes), so the captured
+-- continuation is dropped. 'xs' is in the continuation's OWNED SET (it is free in
+-- the throw's continuation body and occurs in an owning position), so the abort
+-- path must free it --- else it leaks (live cells > baseline). The differential
+-- oracle catches the value mismatch; the heap-balance assertion catches the leak.
+effect Exn = { throw : U64 -> Never }
+
+prog : Exn -> [U64] with Exn
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.throw 9 in
+  xs
+
+run : (Exn -> a with Exn + eff e) -> Option a with eff e
+run c = with self = Exn { throw n k -> None ; v -> Some v } in c self
+
+main : Option [U64]
+main = run prog

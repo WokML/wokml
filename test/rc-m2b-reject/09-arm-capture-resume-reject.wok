@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+-- M2b-1 regression (full-branch review, verified UAF). An auto-resuming op arm
+-- ('get -> x' elaborates to 'get(resume) -> resume(x)') that hands an enclosing
+-- boxed local ('x : [U64]') to 'resume', on the TAIL-RESUME path. Same root
+-- cause as 08: the arm does not account the capture, the enclosing handler-body
+-- drops 'x', so resuming with 'x' double-frees it. Must be REJECTED by the
+-- boundary guard (deferred to M2b-2/M3).
+effect Get = { get : [U64] }
+
+prog : Get -> [U64] with Get
+prog g = g.get
+
+run : [U64] -> (Get -> a with Get + eff e) -> a with eff e
+run x c = with self = Get { get -> x } in c self
+
+main : [U64]
+main = let y = [4, 5] in run y prog

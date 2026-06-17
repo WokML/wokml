@@ -54,7 +54,7 @@ import qualified Wok.IR.Perceus as Perceus
 import qualified Wok.IR.Escape as Esc
 import Wok.IR.Reachable
   ( pruneToReachable, exprUniques
-  , firstOrderNoHandlerViolations )
+  , firstOrderNoHandlerViolations, m2bHandlerViolations )
 import qualified Wok.IR.Multiplicity as Mult
 import Wok.IR.Multiplicity (Card (..))
 import Wok.IR.Anf
@@ -83,6 +83,16 @@ main = do
   multFiles          <- findByExtension [".wok"] "test/multiplicity-examples"
   multFailFiles      <- findByExtension [".wok"] "test/multiplicity-fail-examples"
   perceusFiles       <- findByExtension [".wok"] "test/rc-examples"
+  -- M2b-1 (Task 2): STATIC-ONLY handler corpus. These programs perform effects, so
+  -- they cannot run on the RC store until the handler runtime lands (Tasks 3-5); they
+  -- are wired ONLY to the static Perceus golden + balance-lint groups (NOT the
+  -- RC-differential / heap-accounting groups, which execute the program).
+  perceusHandlerFiles <- findByExtension [".wok"] "test/rc-perceus-handler"
+  -- M2b-1 (Task 3+): handler programs that RUN on the RC store. As the handler
+  -- runtime lands incrementally (Task 3 = install + return-arm; Tasks 4-5 = op
+  -- dispatch + resume), each admitted program is wired to the RC-differential
+  -- (Suite A) and heap-accounting (Suite B) groups, the same as 'test/rc-examples'.
+  rcM2bFiles <- findByExtension [".wok"] "test/rc-m2b"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -215,13 +225,21 @@ main = do
     , testGroup "perceus lint"
         [ testCase (takeBaseName f) (perceusLintHarness f)
         | f <- perceusFiles ]
+    -- M2b-1 (Task 2): STATIC-ONLY handler corpus --- the instrumented dump (golden)
+    -- and the balance lint, but NOT the RC-run groups (no handler runtime yet).
+    , testGroup "perceus handler golden"
+        [ goldenVsString (takeBaseName f) (perceusHandlerGoldenFor f) (perceusDumpHarness f)
+        | f <- perceusHandlerFiles ]
+    , testGroup "perceus handler lint"
+        [ testCase (takeBaseName f) (perceusLintHarness f)
+        | f <- perceusHandlerFiles ]
     , testGroup "rc differential"
         [ testCase (takeBaseName f) (rcDifferentialHarness f)
-        | f <- perceusFiles ]
+        | f <- perceusFiles ++ rcM2bFiles ]
     , testGroup "rc stats"
         [ testGroup "heap accounting"
             [ testCase (takeBaseName f) (rcStatsHarness f)
-            | f <- perceusFiles ]
+            | f <- perceusFiles ++ rcM2bFiles ]
         , testGroup "golden"
             [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
             | f <- perceusFiles ]
@@ -230,7 +248,11 @@ main = do
     , rcDeepListTests
     , rcPropertyTests
     , rcM2a1PropertyTests
+    , rcM2bPropertyTests
+    , rcM2bRejectTests
+    , rcM2bResumeEscapeTests
     , rvRecMemberRepTests
+    , rcM2b1FragmentTests
     ]
 
 goldenFor :: FilePath -> FilePath
@@ -360,6 +382,11 @@ multFailHarness path = do
 perceusGoldenFor :: FilePath -> FilePath
 perceusGoldenFor f =
   replaceDirectory (replaceExtension f ".expected") "test/rc-perceus-golden"
+
+-- | M2b-1 (Task 2): golden path for the static-only handler corpus.
+perceusHandlerGoldenFor :: FilePath -> FilePath
+perceusHandlerGoldenFor f =
+  replaceDirectory (replaceExtension f ".expected") "test/rc-perceus-handler"
 
 perceusDumpHarness :: FilePath -> IO BL.ByteString
 perceusDumpHarness path = do
@@ -4217,6 +4244,20 @@ anfTests = testGroup "Anf"
           rendered = Anf.prettyModuleTyped cm
       in assertBool ("expected 'x : U64' in: " ++ T.unpack rendered)
                     (T.isInfixOf (T.pack "x : U64") rendered)
+
+  , testCase "freeVarsExpr includes op-arm free vars" $ do
+      let x   = Name (T.pack "x") (Unique 9001)
+          k   = Name (T.pack "k") (Unique 9002)
+          v   = Name (T.pack "v") (Unique 9003)
+          u64 = Ty.CTCon Ty.TcU64 []
+          h = Handler (Binder v Unrestricted u64, Ret (AVar v))
+                      [ OpArm (T.pack "E") (T.pack "op") [] (Binder k Unrestricted u64)
+                              (Ret (AVar x)) ]
+                      Nothing Nothing Nothing
+          e = Handle (Ret (ALit (LInt 0))) h
+      Set.member (Unique 9001) (freeVarsExpr e) @?= True
+      Set.member (Unique 9002) (freeVarsExpr e) @?= False
+      Set.member (Unique 9003) (freeVarsExpr e) @?= False
   ]
 
 interpValueTests :: TestTree
@@ -6292,6 +6333,7 @@ runAndAccount e =
               case St.dropAddr envA s of
                 Left err -> assertFailure ("result drop failed: " <> show err)
                 Right s' -> pure (txt, St.stLive (St.stStats s'))
+            St.RVInst _ _        -> pure (txt, St.stLive (St.stStats s))
 
 rcMachineTests :: TestTree
 rcMachineTests = testGroup "rc machine"
@@ -7604,6 +7646,74 @@ boundaryViolationsOf path = do
         Left s  -> assertFailure ("elaborate: " <> s)
         Right cm -> pure (firstOrderNoHandlerViolations cm)
 
+-- M2b-1 boundary regression (full-branch review, verified UAF): a handler whose
+-- return/op arm captures an enclosing BOXED local double-frees that local (on both
+-- the abort and tail-resume paths) because the arm is instrumented as a fresh owned
+-- scope while the enclosing handler-body still drops the capture, and
+-- 'continuationOwned' does not process the handler scope (spec 4.2). It is DEFERRED
+-- and must be REJECTED at the boundary. These programs live in 'test/rc-m2b-reject/'
+-- (NOT the auto-discovered 'test/rc-m2b/' run-corpus, since the differential harness
+-- uses 'runModuleRCUnchecked' which bypasses the guard and would UAF on them).
+rcM2bRejectTests :: TestTree
+rcM2bRejectTests = testGroup "m2b-1 boundary (enclosing-capture arms REJECTED)"
+  [ testCase "abort arm sealing an enclosing boxed local into a con is REJECTED" $ do
+      vs <- boundaryViolationsOf "test/rc-m2b-reject/08-arm-capture-con-reject.wok"
+      assertBool "handler arm capturing an enclosing boxed local must be rejected"
+        (not (null vs))
+  , testCase "tail-resume arm handing an enclosing boxed local to resume is REJECTED" $ do
+      vs <- boundaryViolationsOf "test/rc-m2b-reject/09-arm-capture-resume-reject.wok"
+      assertBool "handler arm capturing an enclosing boxed local must be rejected"
+        (not (null vs))
+  , testCase "op arm that ALIASES resume (let k2 = k) is REJECTED (code-review #4)" $ do
+      vs <- boundaryViolationsOf "test/rc-m2b-reject/12-resume-alias-reject.wok"
+      assertBool "an aliased resume escapes the move-out tracking and must be rejected"
+        (not (null vs))
+  ]
+
+-- | Direct unit coverage for the M2b-1 resume-escape predicate (code-review #2/#4).
+-- m2bResumeEscapes must (a) NOT follow alias-renames (an aliased resume escapes the
+-- ctxResume move-out tracking -> leak) and (b) DESCEND into nested handler arms (a
+-- resume stored inside a nested handler's arm escapes). It must still ADMIT a direct
+-- tail-resume and an abort (resume unused). Built at the ANF level to avoid the
+-- surface parser's friction with nested with-in handlers inside an arm.
+rcM2bResumeEscapeTests :: TestTree
+rcM2bResumeEscapeTests = testGroup "m2b-1 resume-escape predicate (code-review #2/#4)"
+  [ testCase "direct tail-resume does NOT escape (admitted)" $
+      Esc.m2bResumeEscapes resumeB tailResumeBody @?= False
+  , testCase "abort (resume unused) does NOT escape (admitted)" $
+      Esc.m2bResumeEscapes resumeB abortBody @?= False
+  , testCase "aliased resume (let k2 = k) DOES escape (rejected)" $
+      Esc.m2bResumeEscapes resumeB aliasBody @?= True
+  , testCase "resume stored inside a NESTED handler arm DOES escape (rejected)" $
+      Esc.m2bResumeEscapes resumeB nestedArmBody @?= True
+  ]
+  where
+    u64       = Ty.CTCon Ty.TcU64 []
+    nm s i    = Name (T.pack s) (Unique i)
+    resumeB   = Binder (nm "resume" 7001) Unrestricted u64
+    resumeV   = AVar (nm "resume" 7001)
+    -- let res = resume(0) in res
+    tailResumeBody =
+      Let (Binder (nm "res" 7002) Unrestricted u64) (RApp resumeV [ALit (LInt 0)])
+          (Ret (AVar (nm "res" 7002)))
+    -- Ret 0  (resume never applied)
+    abortBody = Ret (ALit (LInt 0))
+    -- let k2 = resume in let r = k2(0) in r
+    aliasBody =
+      Let (Binder (nm "k2" 7003) Unrestricted u64) (RAtom resumeV)
+        (Let (Binder (nm "r" 7004) Unrestricted u64) (RApp (AVar (nm "k2" 7003)) [ALit (LInt 0)])
+             (Ret (AVar (nm "r" 7004))))
+    -- handle (Ret 0) with { return v -> v;  B.bop(bk) -> let c = Cons resume Nil in Ret 0 }
+    -- resume is stored into a Cons INSIDE the nested handler's op arm.
+    nestedArmBody =
+      Handle (Ret (ALit (LInt 0)))
+        (Handler (Binder (nm "v" 7005) Unrestricted u64, Ret (AVar (nm "v" 7005)))
+                 [ OpArm (T.pack "B") (T.pack "bop") [] (Binder (nm "bk" 7006) Unrestricted u64)
+                     (Let (Binder (nm "c" 7007) Unrestricted u64)
+                          (RCon (T.pack "Cons") [resumeV, ALit LUnit])
+                          (Ret (ALit (LInt 0)))) ]
+                 Nothing Nothing Nothing)
+
 rcM2a1BaselineTests :: TestTree
 rcM2a1BaselineTests = testGroup "m2a-1 boundary (escape-narrowed guards)"
   [ testCase "consuming-capture non-escape #1 is REJECTED (deferred)" $ do
@@ -8272,7 +8382,11 @@ rcMemSafetyFault :: IV.RuntimeError -> Bool
 rcMemSafetyFault (IV.PrimError m) =
   any (`T.isInfixOf` m)
     [ T.pack "double-free", T.pack "use-after-free", T.pack "dangling"
-    , T.pack "is not NEnv", T.pack "internal:" ]
+    , T.pack "is not NEnv", T.pack "internal:"
+    -- M2b: the resume move-out faults (a continuation handle applied to a freed/
+    -- non-continuation address). The rc/=1 one-shot-violation message already
+    -- starts with "internal:"; this covers the non-NCont case.
+    , T.pack "resume of non-continuation" ]
 rcMemSafetyFault _ = False
 
 -- | The constructor tag of a 'RuntimeError', ignoring its payload text (which
@@ -11697,6 +11811,543 @@ clusterAltBody (AltCon _ _ b) = b
 clusterAltBody (AltLit _ b)   = b
 clusterAltBody (AltDefault b) = b
 
+-- ===========================================================================
+-- Suite G (M2b-1): generative property over the supported HANDLER fragment.
+--
+-- The hand-written corpus 'test/rc-m2b/01..07' covers only the shapes we thought
+-- to write. This generator is the DURABLE adversarial oracle: for every generated,
+-- in-fragment, one-shot handler program, the RC interpreter must HEAP-BALANCE and
+-- AGREE with the reference interpreter. A shape that isn't generated is a shape that
+-- ships green-broken --- so the generator MUST stress the owned-set failure modes
+-- (spec §4.2): a value MOVED into a cell before the op (the stale binder must not
+-- double-free), a boxed value LIVE ACROSS the op, two distinct ALIASES of one cell
+-- (both freed, matching the dup), a global/CAF reference across the op (must NOT be
+-- freed --- 'isStaticAddr'), an op under a non-trivial 'above' (Let / Case / two ops).
+--
+-- TRACTABLE STRATEGY (do NOT free-generate arbitrary ANF). A program is
+-- @main = Handle <progBody> <handler>@ where the handler is one of two AMBIENT
+-- (no 'hSelf'), M2b-1-fragment skeletons (hParam = Nothing, hAnswerJoin = Nothing,
+-- one-arg resume, resume non-escaping):
+--
+--   * ABORT:  @op(n, k) -> Some? / None@   --- k is bound, NEVER applied. Perceus
+--             drops @k@ at the end of the arm; the runtime frees the captured
+--             continuation's OWNED SET (spec §4.2). This is the path where the
+--             owned-set computation is exercised (the moved/aliased/captured cases).
+--   * RESUME: @op(n, k) -> let r = k <x> in r@  --- tail-applies @k@; the captured
+--             frames splice back and run. This exercises the move-out path (spliced
+--             frames' own drops fire; the shell frees without cascade).
+--
+-- The op-performing 'progBody' is varied across the owned-set dimensions. Building
+-- correct ANF directly (boxed types for cons/box/pair, unboxed U64 for scalars) the
+-- same way 'genM2a1Program' does. Ambient dispatch ('ROp Nothing') routes to the
+-- nearest covering handler, so no self-instance binder is needed --- the simplest
+-- in-fragment shape. Out-of-fragment shapes are not generated (we keep the handlers
+-- no-param / tail / one-arg / resume-non-escaping); the boundary guard would reject
+-- any that slipped, making the property vacuously true for them.
+
+-- | Which handler skeleton wraps the generated computation.
+data M2bHandlerKind
+  = M2bAbort        -- ^ op arm returns a value WITHOUT applying resume (abort / no-resume)
+  | M2bTailResume   -- ^ op arm tail-applies resume (tail-resume move-out)
+  deriving (Eq, Show)
+
+-- | The owned-set dimension the generated computation stresses (spec §4.2 / §7).
+data M2bShape
+  = M2bMovedBeforeOp     -- ^ a boxed value MOVED into a cell before the op (abort):
+                         --   the stale binder must NOT double-free (the §4.2 counterexample).
+  | M2bCapturedBoxed     -- ^ a boxed value LIVE in the captured frame (created before,
+                         --   used after the op): freed once on abort, moved-back on resume.
+  | M2bAliasedBoxed      -- ^ two distinct ALIASES (@let a = x@ the pass dup'd) of one cell,
+                         --   both live across the op: freed twice, matching the refcount.
+  | M2bGlobalAcrossOp    -- ^ a top-level boxed CAF referenced across the op: must NOT be
+                         --   freed (static addr); pins the 'isStaticAddr' no-op.
+  deriving (Eq, Show, Enum, Bounded)
+
+-- | A boxed catch-all return/escape vehicle type. 'isBoxedType' tracks it as a heap
+-- cell, the same convention as 'boxTyC' in the m2a-1 generator.
+m2bBoxTy :: Ty.CType
+m2bBoxTy = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+
+m2bPairTy :: Ty.CType
+m2bPairTy = gtyCType GPair
+
+m2bListTy :: Ty.CType
+m2bListTy = gtyCType GList
+
+m2bOptTy :: Ty.CType
+m2bOptTy = Ty.CTCon (Ty.TcUser (T.pack "Option")) []
+
+m2bU64 :: Ty.CType
+m2bU64 = gtyCType GInt
+
+-- | The single effect label/op the generator uses (ambient). Distinct names so the
+-- generated handler is the unique covering handler.
+m2bLbl, m2bOp :: Text
+m2bLbl = T.pack "Eff"
+m2bOp  = T.pack "op"
+
+-- | A binary integer prim atom (resolved by hint at runtime, like 'primAtom').
+m2bPlus :: Atom
+m2bPlus = AVar (primName (T.pack "+"))
+
+-- | Whether the generated computation references a top-level boxed CAF. Carried out
+-- of the 'GenM' so 'genM2bProgram' can splice the CAF bind alongside @main@.
+data M2bGlobals = M2bGlobals
+  { m2bgCafName :: Maybe Name   -- ^ the CAF binder name, when a global is used
+  }
+
+-- | The whole-program generator for Suite G's M2b-1 handler fragment. Builds
+-- @main = Handle progBody handler@ (plus an optional boxed CAF bind when the global
+-- dimension fires), directly as ANF, mirroring 'genM2a1Program'. The handler kind
+-- (abort / tail-resume) and the owned-set shape are chosen so the §4.2 dimensions are
+-- all reachable; coverage floors in 'prop_m2bEscape' pin that they actually appear.
+genM2bProgram :: Gen CoreModule
+genM2bProgram = sized $ \sz -> do
+  let fuel = max 1 (min sz 4)
+  -- The aliased shape is only sound on the ABORT path (the pass dup's @let a = x@ and
+  -- both copies are freed); pairing it with a tail-resume would still be in-fragment
+  -- but the move-out semantics make the dimension less pointed, so we keep aliased on
+  -- abort. Every other shape is exercised under BOTH handler kinds.
+  kind  <- elements [M2bAbort, M2bTailResume]
+  shape0 <- elements [minBound .. maxBound :: M2bShape]
+  let shape = if shape0 == M2bAliasedBoxed && kind == M2bTailResume
+                then M2bMovedBeforeOp   -- keep aliased on the abort path
+                else shape0
+  -- How many ops the computation performs (1 or 2): a second op makes the captured
+  -- 'above' prefix multi-frame and, on tail-resume, drives move-out twice.
+  nOps  <- elements [1, 1, 2 :: Int]
+  -- Whether the op fires INSIDE a Case arm (so 'above' is a non-trivial multi-frame
+  -- prefix that includes a Case continuation), versus only under a Let chain.
+  underCase <- elements [False, True]
+  (body, globals, _) <-
+    runStateT3 (genM2bBody kind shape nOps underCase fuel) 1
+  let mainN  = Name (T.pack "main") (Unique 1000000)
+      mainB  = TopBind mainN [] body
+  case m2bgCafName globals of
+    Nothing  -> pure (CoreModule [mainB])
+    Just cN  -> pure (CoreModule [m2bCafBind cN, mainB])
+
+-- | Run a 'GenM' that also accumulates an 'M2bGlobals', returning the value, the
+-- globals, and the final unique counter. (A thin wrapper over the same 'StateT Int
+-- Gen' the m2a-1 generator uses, threading 'M2bGlobals' alongside.)
+runStateT3 :: StateT (Int, M2bGlobals) Gen a -> Int -> Gen (a, M2bGlobals, Int)
+runStateT3 m u0 = do
+  (a, (u, gl)) <- runStateT m (u0, M2bGlobals Nothing)
+  pure (a, gl, u)
+
+-- | The Suite-G generation monad: a fresh-Unique counter plus the accumulated
+-- top-level CAF usage.
+type GenM2b = StateT (Int, M2bGlobals) Gen
+
+freshN2b :: Text -> GenM2b Name
+freshN2b hint = state (\(u, gl) -> (Name hint (Unique u), (u + 1, gl)))
+
+liftG2b :: Gen a -> GenM2b a
+liftG2b = lift
+
+useCaf :: GenM2b Name
+useCaf = state (\(u, gl) ->
+  let cN = Name (T.pack "g_caf") (Unique 800000)
+  in (cN, (u, gl { m2bgCafName = Just cN })))
+
+-- | The boxed-CAF top-level bind: @g_caf = Cons(9, Nil)@ (a value-CAF; contributes
+-- to 'rcBaseline', is never freed, and 'isStaticAddr' must make the abort owned-set
+-- skip it). Uniques are reserved well above the 'GenM2b' range.
+m2bCafBind :: Name -> TopBind
+m2bCafBind cN =
+  TopBind cN []
+    (Let (Binder (Name (T.pack "g_nil") (Unique 800001)) Unrestricted m2bListTy)
+         (RCon (T.pack "Nil") [])
+      (Let (Binder cN Unrestricted m2bListTy)
+           (RCon (T.pack "Cons") [ALit (LInt 9), AVar (Name (T.pack "g_nil") (Unique 800001))])
+        (Ret (AVar cN))))
+
+-- | Build @Handle progBody handler@ for the chosen kind/shape. The handler is the
+-- AMBIENT (no hSelf), no-param, tail-position skeleton; @progBody@ is the
+-- op-performing computation varied across the owned-set dimensions.
+genM2bBody :: M2bHandlerKind -> M2bShape -> Int -> Bool -> Int -> GenM2b Expr
+genM2bBody kind shape nOps underCase fuel = do
+  (prog, progTy) <- genM2bProg shape nOps underCase fuel
+  hdlr <- genM2bHandler kind progTy
+  pure (Handle prog hdlr)
+
+-- | The handler skeleton. The arm's op-args are one U64 (the op argument); the
+-- resume binder is one-arg. ABORT returns a fresh boxed value WITHOUT applying
+-- resume; TAIL-RESUME tail-applies resume to a literal and returns the result. The
+-- return arm wraps the handled result in 'Some' (a boxed cell, exercising the
+-- return-arm's own drop), so the answer type is 'Option progTy'. The whole handler
+-- has hParam = Nothing, hAnswerJoin = Nothing, hSelf = Nothing.
+genM2bHandler :: M2bHandlerKind -> Ty.CType -> GenM2b Handler
+genM2bHandler kind progTy = do
+  vN     <- freshN2b (T.pack "v")
+  nN     <- freshN2b (T.pack "opn")
+  kN     <- freshN2b (T.pack "k")
+  -- return arm: v -> let sv = Some v in sv  (Some is a boxed cell)
+  svN    <- freshN2b (T.pack "sv")
+  let retArm =
+        ( Binder vN Unrestricted progTy
+        , Let (Binder svN Unrestricted m2bOptTy) (RCon (T.pack "Some") [AVar vN])
+            (Ret (AVar svN)) )
+  armBody <- case kind of
+    M2bAbort -> do
+      -- return a DIFFERENT boxed value (None : Option progTy) without using k.
+      noneN <- freshN2b (T.pack "none")
+      pure (Let (Binder noneN Unrestricted m2bOptTy) (RCon (T.pack "None") [])
+              (Ret (AVar noneN)))
+    M2bTailResume -> do
+      -- tail-apply resume to a literal: let r = k 1 in r
+      rN <- freshN2b (T.pack "rr")
+      pure (Let (Binder rN Unrestricted progTy) (RApp (AVar kN) [ALit (LInt 1)])
+              (Ret (AVar rN)))
+  -- The resume binder MUST carry a BOXED type. The reified continuation is always a
+  -- boxed heap cell (an 'RVBox' -> 'NCont'); Perceus's op-arm own-set only tracks
+  -- BOXED arm binders ('boxedBinder'), so an UNBOXED resume binder would NOT be
+  -- dropped on the abort path and the 'NCont' would LEAK (verified). We give it the
+  -- boxed answer type 'Option', exactly as the corpus does (@resume : Option a0@ in
+  -- 'test/rc-m2b/02-except-abort'). Runtime is untyped, so this only steers
+  -- boxedness; resume is an opaque 'NCont' handle when it runs.
+  let arm = OpArm m2bLbl m2bOp
+              [Binder nN Unrestricted m2bU64]
+              (Binder kN Unrestricted m2bOptTy)
+              armBody
+  pure (Handler retArm [arm] Nothing Nothing Nothing)
+
+-- | The op-performing computation and its result type. Varied across the owned-set
+-- dimensions. @nOps@ ops are performed; @underCase@ fires the (first) op inside a
+-- Case arm so the captured prefix is a non-trivial multi-frame above.
+genM2bProg :: M2bShape -> Int -> Bool -> Int -> GenM2b (Expr, Ty.CType)
+genM2bProg shape nOps underCase _fuel = case shape of
+  M2bMovedBeforeOp -> do
+    -- x = Box 1 ; ys = Box2(x)   [x MOVED into ys, x now stale]
+    -- <ops, possibly under a Case on ys> ; return ys
+    xN  <- freshN2b (T.pack "x")
+    ysN <- freshN2b (T.pack "ys")
+    let seed cont =
+          Let (Binder xN Unrestricted m2bBoxTy) (RCon (T.pack "Box") [ALit (LInt 1)])
+            (Let (Binder ysN Unrestricted m2bBoxTy) (RCon (T.pack "Box2") [AVar xN]) cont)
+    inner <- m2bReturnBoxed ysN m2bBoxTy
+    e <- m2bWithOps nOps underCase (AVar ysN) [(ysN, m2bBoxTy)] inner
+    pure (seed e, m2bBoxTy)
+  M2bCapturedBoxed -> do
+    -- xs = Cons(5, Nil)   [boxed, live ACROSS the op] ; <ops> ; return head-ish via case
+    nilN <- freshN2b (T.pack "nil")
+    xsN  <- freshN2b (T.pack "xs")
+    let seed cont =
+          Let (Binder nilN Unrestricted m2bListTy) (RCon (T.pack "Nil") [])
+            (Let (Binder xsN Unrestricted m2bListTy)
+                 (RCon (T.pack "Cons") [ALit (LInt 5), AVar nilN]) cont)
+    -- consume xs by a Case after the op: Cons h t -> h ; Nil -> 0  (boxed live across)
+    hN <- freshN2b (T.pack "h")
+    tN <- freshN2b (T.pack "t")
+    let consume =
+          Case (AVar xsN)
+            [ AltCon (T.pack "Cons") [Binder hN Unrestricted m2bU64, Binder tN Unrestricted m2bListTy]
+                (Ret (AVar hN))
+            , AltCon (T.pack "Nil") [] (Ret (ALit (LInt 0))) ]
+    e <- m2bWithOps nOps underCase (AVar xsN) [(xsN, m2bListTy)] consume
+    pure (seed e, m2bU64)
+  M2bAliasedBoxed -> do
+    -- x = Box 1 ; a = x   [alias; the pass dup's it] ; <ops> ; return Pair(a, x)
+    xN  <- freshN2b (T.pack "x")
+    aN  <- freshN2b (T.pack "a")
+    prN <- freshN2b (T.pack "pr")
+    let seed cont =
+          Let (Binder xN Unrestricted m2bBoxTy) (RCon (T.pack "Box") [ALit (LInt 1)])
+            (Let (Binder aN Unrestricted m2bBoxTy) (RAtom (AVar xN)) cont)
+        consume =
+          Let (Binder prN Unrestricted m2bPairTy) (RCon (T.pack "Pair") [AVar aN, AVar xN])
+            (Ret (AVar prN))
+    e <- m2bWithOps nOps underCase (AVar xN) [(xN, m2bBoxTy)] consume
+    pure (seed e, m2bPairTy)
+  M2bGlobalAcrossOp -> do
+    -- reference a top-level boxed CAF g_caf ACROSS the op, then return its head.
+    cN <- useCaf
+    hN <- freshN2b (T.pack "gh")
+    tN <- freshN2b (T.pack "gt")
+    let consume =
+          Case (AVar cN)
+            [ AltCon (T.pack "Cons") [Binder hN Unrestricted m2bU64, Binder tN Unrestricted m2bListTy]
+                (Ret (AVar hN))
+            , AltCon (T.pack "Nil") [] (Ret (ALit (LInt 0))) ]
+    e <- m2bWithOps nOps underCase (AVar cN) [(cN, m2bListTy)] consume
+    pure (e, m2bU64)
+
+-- | A trivial boxed-result body: just return the named boxed binder.
+m2bReturnBoxed :: Name -> Ty.CType -> GenM2b Expr
+m2bReturnBoxed n _ = pure (Ret (AVar n))
+
+-- | Wrap @inner@ with @nOps@ effect operations. The op result is bound to a fresh
+-- (dead) U64 binder. When @underCase@, the FIRST op fires inside a Case arm on
+-- @scrut@ (a non-trivial multi-frame 'above'); otherwise the ops sit in a plain Let
+-- chain. @scrutEnv@ lists the live binders the Case arm may keep (used only to keep
+-- the scrutinee live across the inner op so the captured prefix is realistic).
+m2bWithOps :: Int -> Bool -> Atom -> [(Name, Ty.CType)] -> Expr -> GenM2b Expr
+m2bWithOps nOps underCase scrut _scrutEnv inner = do
+  -- Build the op-Let chain that ends in @inner@.
+  let opLet cont = do
+        uN <- freshN2b (T.pack "u")
+        litN <- liftG2b (choose (0, 9 :: Integer))
+        pure (Let (Binder uN Unrestricted m2bU64) (ROp Nothing m2bLbl m2bOp [ALit (LInt litN)]) cont)
+  chain <- foldOps (max 1 nOps) opLet inner
+  if underCase
+    then do
+      -- Fire the chain inside a Case default arm on @scrut@ so the captured 'above'
+      -- prefix spans a Case continuation (a non-trivial multi-frame above). The
+      -- scrutinee atom is matched by a default arm (keeps it live; no child binders).
+      pure (Case scrut [AltDefault chain])
+    else pure chain
+  where
+    foldOps 0 _ acc = pure acc
+    foldOps k mk acc = do acc' <- mk acc; foldOps (k - 1) mk acc'
+
+-- | The accepted=>sound property for the M2b-1 handler fragment. Mirrors
+-- 'prop_m2a1Escape': prune, check the boundary guard; if not accepted, the property
+-- is vacuously true (rejection is the conservative, always-sound verdict); else run
+-- BOTH interpreters and require output equality AND heap balance (stLive == baseline
+-- AND allocs - frees == baseline), with the both-fail branch hardened EXACTLY as
+-- m2a-1 (reject an RC mem-safety fault hidden behind a reference failure; require the
+-- same 'errCtorTag'). The 'checkCoverage' floors below make NON-VACUITY a HARD
+-- FAILURE: if a generator regression stops producing any owned-set dimension above
+-- its floor, the property goes red.
+prop_m2bEscape :: Property
+prop_m2bEscape =
+  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 ->
+    let cm       = pruneToReachable cm0
+        accepted = null (firstOrderNoHandlerViolations cm)
+        refRes   = Interp.runModule cm
+        rcRes    = RCM.runModuleRCUnchecked (Perceus.insertRC cm)
+        report   =
+          "boundary accepted: " <> show accepted
+            <> "\ninstrumented ANF:\n" <> T.unpack (Perceus.prettyPerceus cm)
+            <> "\nreference: " <> showR (fmap Interp.renderValue refRes)
+            <> "\nrc:        " <> showRC rcRes
+        -- Structural detectors for the owned-set dimensions (used for the coverage
+        -- floors). They classify the GENERATED, accepted-and-run program.
+        ranSound  = accepted && either (const False) (const True) rcRes
+        isAbort   = m2bHasAbortArm cm
+        isResume  = m2bHasResumeArm cm
+        movedB    = m2bHasMovedBeforeOp cm
+        boxedAcr  = m2bHasBoxedAcrossOp cm
+        opAbove   = m2bHasOpUnderCase cm
+    in checkCoverage $
+       cover 25.0 (isAbort && ranSound)  "abort path: accepted+run" $
+       cover 25.0 (isResume && ranSound) "tail-resume path: accepted+run" $
+       cover 12.0 (boxedAcr && ranSound) "boxed-value live across op: accepted+run" $
+       cover 12.0 (movedB && ranSound)   "moved-before-op (stale binder): accepted+run" $
+       cover 12.0 (opAbove && ranSound)  "op under non-trivial above (Case): accepted+run" $
+       QC.label (show (m2bClassify cm) <> (if accepted then " accepted" else " rejected")) $
+       counterexample report $
+         if not accepted
+           then property True
+           else case (refRes, rcRes) of
+                  (Right v, Right run) ->
+                    let outOk      = Interp.renderValue v == RCM.rcOutput run
+                        st         = RCM.rcStats run
+                        baseline   = RCM.rcBaseline run
+                        liveOk     = St.stLive st == baseline
+                        balancedOk = St.stAllocs st - St.stFrees st == baseline
+                    in counterexample "ACCEPTED but unsound: output / heap-empty / balanced mismatch"
+                         (outOk && liveOk && balancedOk)
+                  (Left refE, Left rcE)
+                    | rcMemSafetyFault rcE ->
+                        counterexample ("ACCEPTED but unsound: RC memory-safety fault hidden behind a \
+                                        \reference failure: rc=" <> show rcE <> " ref=" <> show refE)
+                          False
+                    | errCtorTag refE == errCtorTag rcE ->
+                        counterexample "both interpreters failed the same way (agreement)" True
+                    | otherwise ->
+                        counterexample ("ACCEPTED but unsound: RC failure DIVERGES from the reference \
+                                        \failure: ref=" <> show refE <> " rc=" <> show rcE)
+                          False
+                  _ ->
+                    counterexample "ACCEPTED but unsound: exactly one interpreter failed" False
+  where
+    showR (Right t)  = T.unpack t
+    showR (Left e)   = "FAILED (" <> show e <> ")"
+    showRC (Right run) = T.unpack (RCM.rcOutput run)
+    showRC (Left e)    = "FAILED (" <> show e <> ")"
+
+-- | balanceLint must be clean on every IN-FRAGMENT generated M2b-1 program (one the
+-- boundary guard ACCEPTS). Mirrors 'prop_m2a1LintClean'. A boundary-rejected program
+-- may legitimately lint dirty (the conservative reject), so we gate on acceptance.
+prop_m2bLintClean :: Property
+prop_m2bLintClean =
+  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 ->
+    let cm   = pruneToReachable cm0
+        viol = Perceus.balanceLint cm
+    in if not (null (firstOrderNoHandlerViolations cm))
+         then property True
+         else counterexample ("balanceLint reported on an IN-FRAGMENT program: " <> show viol
+                                <> "\nANF:\n" <> T.unpack (Perceus.prettyPerceus cm))
+                (null viol)
+
+-- | Every single-site RC mutation must be CAUGHT on every generated M2b-1 program ---
+-- statically ('lintInstrumented') or at runtime (a 'Left'). Mirrors 'prop_m2a1Teeth'
+-- via the shared 'mutationCaught'. A mutation that is a structural no-op on a given
+-- program (no drop / no dup site) is byte-identical to the correct instrumentation
+-- and counts as vacuously fine.
+prop_m2bTeeth :: Property
+prop_m2bTeeth =
+  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 ->
+    let cm = pruneToReachable cm0
+    in conjoin
+         [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
+                             <> T.unpack (Perceus.prettyPerceus cm))
+             (mutationCaught mut cm)
+         | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+
+-- | Shrinker for a generated M2b program. The program is a handler bind (plus an
+-- optional CAF bind), so the generic single-main 'shrinkProgram' does not apply; we
+-- shrink only the @main@ bind's body to a structurally-contained, well-scoped
+-- sub-expression (reusing 'shrinkExpr'), keeping any CAF bind intact. A program whose
+-- main body shrinks below the 'Handle' simply drops out of the fragment (no handler),
+-- which the boundary guard still accepts, so a shrunk counterexample stays valid.
+shrinkProgramM2b :: CoreModule -> [CoreModule]
+shrinkProgramM2b (CoreModule binds) =
+  case reverse binds of
+    (TopBind n ps body : revRest) ->
+      let rest = reverse revRest
+      in [ CoreModule (rest ++ [TopBind n ps body']) | body' <- shrinkExpr body ]
+    [] -> []
+
+-- ---------------------------------------------------------------------------
+-- Structural detectors for the Suite-G (M2b-1) coverage floors. They classify the
+-- GENERATED program by inspecting its single 'Handle' node and its op-performing
+-- body --- NOT by re-running the pass. Used only for 'cover' / 'label' non-vacuity.
+
+-- | The unique 'Handler' of a generated program (its single 'Handle' node), if any.
+m2bTheHandler :: CoreModule -> Maybe Handler
+m2bTheHandler (CoreModule binds) =
+  case [ h | TopBind _ _ body <- binds, h <- handlersIn body ] of
+    (h : _) -> Just h
+    []      -> Nothing
+  where
+    handlersIn e = case e of
+      Handle inner h    -> h : handlersIn inner
+      Let _ _ b         -> handlersIn b
+      Case _ alts       -> concatMap (handlersIn . clusterAltBody) alts
+      LetJoin _ _ jb b  -> handlersIn jb ++ handlersIn b
+      LetRec ds b       -> concatMap (\(_, _, d) -> handlersIn d) ds ++ handlersIn b
+      _                 -> []
+
+-- | The op-performing computation (the inner expression of the single 'Handle').
+m2bTheProg :: CoreModule -> Maybe Expr
+m2bTheProg (CoreModule binds) =
+  case [ inner | TopBind _ _ body <- binds, inner <- innersIn body ] of
+    (e : _) -> Just e
+    []      -> Nothing
+  where
+    innersIn e = case e of
+      Handle inner _    -> inner : innersIn inner
+      Let _ _ b         -> innersIn b
+      Case _ alts       -> concatMap (innersIn . clusterAltBody) alts
+      LetJoin _ _ jb b  -> innersIn jb ++ innersIn b
+      LetRec ds b       -> concatMap (\(_, _, d) -> innersIn d) ds ++ innersIn b
+      _                 -> []
+
+-- | The single op arm's body applies its resume binder as a call head (tail-resume).
+m2bHasResumeArm :: CoreModule -> Bool
+m2bHasResumeArm cm = case m2bTheHandler cm of
+  Just h  -> any (\oa -> resumeApplied (oaResume oa) (oaBody oa)) (hOps h)
+  Nothing -> False
+  where
+    resumeApplied k = go
+      where
+        ku = binderUnique k
+        go e = case e of
+          Let _ (RApp (AVar f) _) b -> Name.nameUniq f == ku || go b
+          Let _ _ b                 -> go b
+          Case _ alts               -> any (go . clusterAltBody) alts
+          LetJoin _ _ jb b          -> go jb || go b
+          _                         -> False
+
+-- | The single op arm never applies its resume binder (abort / no-resume).
+m2bHasAbortArm :: CoreModule -> Bool
+m2bHasAbortArm cm = case m2bTheHandler cm of
+  Just h  -> not (null (hOps h)) && not (m2bHasResumeArm cm)
+  Nothing -> False
+
+-- | The computation MOVES a boxed binder into a constructor field, then performs the
+-- op while that move-source binder is dead (the §4.2 stale-binder shape). Detected
+-- structurally: a @let ys = Con(.. x ..)@ whose field @x@ was a prior boxed @let@,
+-- followed (later in the body) by an op.
+m2bHasMovedBeforeOp :: CoreModule -> Bool
+m2bHasMovedBeforeOp cm = case m2bTheProg cm of
+  Just e  -> go Set.empty e
+  Nothing -> False
+  where
+    -- @boxed@ = boxed binders bound so far whose RHS allocated a fresh cell.
+    go boxed e = case e of
+      Let b (RCon _ as) body ->
+        (movesBoxed boxed as && hasOpAfter body)
+          || go (Set.insert (binderUnique b) boxed) body
+      Let b _ body -> go (insertIfBoxed b boxed) body
+      Case _ alts  -> any (go boxed . clusterAltBody) alts
+      LetJoin _ _ jb body -> go boxed jb || go boxed body
+      _ -> False
+    insertIfBoxed b s = if Esc.isBoxedType (bndType b) then Set.insert (binderUnique b) s else s
+    movesBoxed boxed = any (\a -> case a of AVar n -> Set.member (nameUniq n) boxed; _ -> False)
+    hasOpAfter e = case e of
+      Let _ (ROp{}) _ -> True
+      Let _ _ b       -> hasOpAfter b
+      Case _ alts     -> any (hasOpAfter . clusterAltBody) alts
+      LetJoin _ _ jb b -> hasOpAfter jb || hasOpAfter b
+      _               -> False
+
+-- | A boxed binder is bound BEFORE the op and USED AFTER it (live across the op).
+m2bHasBoxedAcrossOp :: CoreModule -> Bool
+m2bHasBoxedAcrossOp cm = case m2bTheProg cm of
+  Just e  -> go Set.empty e
+  Nothing -> False
+  where
+    go boxed e = case e of
+      Let _ (ROp{}) body ->
+        -- at the op site, any boxed binder in scope that is FREE in the continuation
+        -- body is live across the op.
+        not (Set.null (Set.intersection boxed (freeVarsExpr body)))
+          || go boxed body
+      Let b _ body -> go (insertIfBoxed b boxed) body
+      Case _ alts  -> any (go boxed . clusterAltBody) alts
+      LetJoin _ _ jb body -> go boxed jb || go boxed body
+      _ -> False
+    insertIfBoxed b s = if Esc.isBoxedType (bndType b) then Set.insert (binderUnique b) s else s
+
+-- | The op fires inside a 'Case' arm (a non-trivial multi-frame 'above').
+m2bHasOpUnderCase :: CoreModule -> Bool
+m2bHasOpUnderCase cm = case m2bTheProg cm of
+  Just e  -> go False e
+  Nothing -> False
+  where
+    go inCase e = case e of
+      Let _ (ROp{}) body -> inCase || go inCase body
+      Let _ _ body       -> go inCase body
+      Case _ alts        -> any (go True . clusterAltBody) alts
+      LetJoin _ _ jb body -> go inCase jb || go inCase body
+      _ -> False
+
+-- | A coarse label of the generated program's shape, for the distribution readout.
+m2bClassify :: CoreModule -> String
+m2bClassify cm =
+  (if m2bHasAbortArm cm then "abort" else if m2bHasResumeArm cm then "resume" else "no-op")
+    <> (if m2bHasMovedBeforeOp cm then "/moved" else "")
+    <> (if m2bHasBoxedAcrossOp cm then "/across" else "")
+    <> (if m2bHasOpUnderCase cm then "/under-case" else "")
+
+-- | Suite G (M2b-1): the generative oracle for the handler fragment. The accepted=>
+-- sound property, the lint-clean property, and the generalized teeth, with coverage
+-- floors that fail the property if any owned-set dimension stops being generated.
+rcM2bPropertyTests :: TestTree
+rcM2bPropertyTests =
+  localOption (QuickCheckTests 800) $
+    testGroup "rc m2b-1 property (Suite G: handler fragment owned-set)"
+      [ testProperty "accepted => sound (heap-balanced + value-match); rejected => skipped"
+          prop_m2bEscape
+      , testProperty "balanceLint is clean on every in-fragment generated program"
+          prop_m2bLintClean
+      , testProperty "every single-site RC mutation is caught (generalized teeth)"
+          prop_m2bTeeth
+      ]
+
 -- ---------------------------------------------------------------------------
 -- Task 2: RVRecMember representation tests
 
@@ -11758,4 +12409,251 @@ rvRecMemberRepTests = testGroup "rvrecmember-rep"
   , testCase "drop of envAddr frees the NEnv cell"                 rvRecMemberDropCountsEnv
   , testCase "sentinel addr is static; incref/drop are no-ops"     rvRecMemberSentinelNoOp
   , testCase "renderRCValue of RVRecMember is <closure>"           rvRecMemberRender
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M2b-1 fragment predicate tests (Task 1)
+
+-- | Build a minimal 'CoreModule' whose @main@ body is 'Handle comp hdlr'.
+-- The @comp@ simply performs the single op then returns its result, so the
+-- computation is meaningful without an interpreter.
+m2b1Cm :: Anf.Handler -> Anf.Expr -> CoreModule
+m2b1Cm hdlr comp =
+  CoreModule
+    [ TopBind (Name (T.pack "main") (Unique 9900)) [] (Handle comp hdlr) ]
+
+-- | Helper: the unit 'CoreModule' for the M2b-1 tests. @comp@ is the inner
+-- expression. We use pruneToReachable so the guard only sees the main bind.
+m2b1Pruned :: Anf.Handler -> Anf.Expr -> CoreModule
+m2b1Pruned h c = pruneToReachable (m2b1Cm h c)
+
+-- Shared types / names used by the M2b-1 fixture builders.
+m2b1Unit :: Ty.CType
+m2b1Unit = Ty.CTCon Ty.TcUnit []
+
+m2b1U64 :: Ty.CType
+m2b1U64 = Ty.CTCon Ty.TcU64 []
+
+m2b1Nm :: String -> Int -> Name
+m2b1Nm h u = Name (T.pack h) (Unique u)
+
+m2b1Bnd :: String -> Int -> Ty.CType -> Binder
+m2b1Bnd h u t = Binder (m2b1Nm h u) Unrestricted t
+
+-- | A simple inner computation: @let a = E.op () in Ret (AVar a)@.
+m2b1Comp :: String -> String -> Name -> Expr
+m2b1Comp lbl op aName =
+  Let (Binder aName Unrestricted m2b1Unit)
+      (ROp Nothing (T.pack lbl) (T.pack op) [ALit LUnit])
+      (Ret (AVar aName))
+
+-- | Build a M2b-1 Reader-shaped handler:
+--   Ask.ask(p:U64, resume:?) -> let r = resume(41) in Ret r
+--   return v -> Ret v
+-- No hParam, no hAnswerJoin, resume used only as a call head.
+mkReaderHandler :: Expr -> (Anf.Handler, Expr)
+mkReaderHandler comp =
+  let v      = m2b1Nm "v"      9910
+      resume = m2b1Nm "resume" 9912
+      r      = m2b1Nm "r"      9913
+      armBody = Let (Binder (m2b1Nm "r" 9913) Unrestricted m2b1Unit)
+                    (RApp (AVar resume) [ALit (LInt 41)])
+                    (Ret (AVar r))
+      arm = Anf.OpArm (T.pack "Ask") (T.pack "ask")
+              [Binder (Name (T.pack "p") (Unique 9911)) Unrestricted m2b1Unit]
+              (Binder (Name (T.pack "resume") (Unique 9912)) Unrestricted m2b1Unit)
+              armBody
+      hdlr = Anf.Handler (Binder (Name (T.pack "v") (Unique 9910)) Unrestricted m2b1Unit, Ret (AVar v))
+               [arm] Nothing Nothing Nothing
+  in (hdlr, comp)
+
+-- | Build a Tick-shaped handler:
+--   Tick.tick(p, resume) -> let r = resume () in Ret r
+--   return v -> Ret v
+mkTickHandler :: Expr -> (Anf.Handler, Expr)
+mkTickHandler comp =
+  let v      = m2b1Nm "v"      9920
+      resume = m2b1Nm "resume" 9922
+      r      = m2b1Nm "r"      9923
+      armBody = Let (Binder (Name (T.pack "r") (Unique 9923)) Unrestricted m2b1Unit)
+                    (RApp (AVar resume) [ALit LUnit])
+                    (Ret (AVar r))
+      arm = Anf.OpArm (T.pack "Tick") (T.pack "tick")
+              [Binder (Name (T.pack "p") (Unique 9921)) Unrestricted m2b1Unit]
+              (Binder (Name (T.pack "resume") (Unique 9922)) Unrestricted m2b1Unit)
+              armBody
+      hdlr = Anf.Handler (Binder (Name (T.pack "v") (Unique 9920)) Unrestricted m2b1Unit, Ret (AVar v))
+               [arm] Nothing Nothing Nothing
+  in (hdlr, comp)
+
+-- | Build an Except-abort handler:
+--   Abort.abort(p, resume) -> Ret (ALit 7)   [resume unused]
+--   return v -> Ret v
+mkAbortHandler :: Expr -> (Anf.Handler, Expr)
+mkAbortHandler comp =
+  let v      = m2b1Nm "v"      9930
+      arm = Anf.OpArm (T.pack "Abort") (T.pack "abort")
+              [Binder (Name (T.pack "p") (Unique 9931)) Unrestricted m2b1Unit]
+              (Binder (Name (T.pack "resume") (Unique 9932)) Unrestricted m2b1Unit)
+              (Ret (ALit (LInt 7)))
+      hdlr = Anf.Handler (Binder (Name (T.pack "v") (Unique 9930)) Unrestricted m2b1Unit, Ret (AVar v))
+               [arm] Nothing Nothing Nothing
+  in (hdlr, comp)
+
+-- | Build a handler with a handler-parameter (must be REJECTED, M2b-2):
+--   hParam = Just someParam
+mkParamHandler :: Expr -> (Anf.Handler, Expr)
+mkParamHandler comp =
+  let v      = m2b1Nm "v"      9940
+      param  = m2b1Bnd "st" 9941 m2b1U64
+      resume = m2b1Nm "resume" 9942
+      r      = m2b1Nm "r"      9943
+      armBody = Let (Binder (Name (T.pack "r") (Unique 9943)) Unrestricted m2b1Unit)
+                    (RApp (AVar resume) [ALit LUnit])
+                    (Ret (AVar r))
+      arm = Anf.OpArm (T.pack "State") (T.pack "get")
+              []
+              (Binder (Name (T.pack "resume") (Unique 9942)) Unrestricted m2b1Unit)
+              armBody
+      hdlr = Anf.Handler (Binder (Name (T.pack "v") (Unique 9940)) Unrestricted m2b1Unit, Ret (AVar v))
+               [arm] Nothing (Just param) Nothing
+  in (hdlr, comp)
+
+-- | Build a handler in value (non-tail) position (must be REJECTED, M2b-2):
+--   hAnswerJoin = Just someJoin
+mkValuePosHandler :: Expr -> (Anf.Handler, Expr)
+mkValuePosHandler comp =
+  let v      = m2b1Nm "v"      9950
+      ajoin  = JoinId (Unique 9959)
+      resume = m2b1Nm "resume" 9952
+      r      = m2b1Nm "r"      9953
+      armBody = Let (Binder (Name (T.pack "r") (Unique 9953)) Unrestricted m2b1Unit)
+                    (RApp (AVar resume) [ALit LUnit])
+                    (Ret (AVar r))
+      arm = Anf.OpArm (T.pack "E") (T.pack "op")
+              []
+              (Binder (Name (T.pack "resume") (Unique 9952)) Unrestricted m2b1Unit)
+              armBody
+      hdlr = Anf.Handler (Binder (Name (T.pack "v") (Unique 9950)) Unrestricted m2b1Unit, Ret (AVar v))
+               [arm] (Just ajoin) Nothing Nothing
+  in (hdlr, comp)
+
+-- | Build a handler whose resume is stored into a Cons cell (must be REJECTED, M3):
+--   E.op(p, resume) -> let c = Cons resume Nil in Ret unit   [resume escapes into con]
+mkResumeStoredHandler :: Expr -> (Anf.Handler, Expr)
+mkResumeStoredHandler comp =
+  let v      = m2b1Nm "v"      9960
+      resume = m2b1Nm "resume" 9962
+      -- store resume into a Cons constructor
+      armBody = Let (Binder (Name (T.pack "c") (Unique 9963)) Unrestricted m2b1Unit)
+                    (RCon (T.pack "Cons") [AVar resume, ALit LUnit])
+                    (Ret (ALit LUnit))
+      arm = Anf.OpArm (T.pack "E") (T.pack "op")
+              []
+              (Binder (Name (T.pack "resume") (Unique 9962)) Unrestricted m2b1Unit)
+              armBody
+      hdlr = Anf.Handler (Binder (Name (T.pack "v") (Unique 9960)) Unrestricted m2b1Unit, Ret (AVar v))
+               [arm] Nothing Nothing Nothing
+  in (hdlr, comp)
+
+-- | The M2b-1 fragment predicate unit tests.
+rcM2b1FragmentTests :: TestTree
+rcM2b1FragmentTests = testGroup "m2b-1 fragment predicate"
+  [ testCase "Reader-shaped (tail, no param, resume as call head): admitted" $
+      let aName = Name (T.pack "a") (Unique 9905)
+          comp  = m2b1Comp "Ask" "ask" aName
+          (hdlr, c) = mkReaderHandler comp
+          cm = m2b1Pruned hdlr c
+      in firstOrderNoHandlerViolations cm @?= []
+
+  , testCase "Tick (tail, no param, resume once): admitted" $
+      let aName = Name (T.pack "a") (Unique 9906)
+          comp  = m2b1Comp "Tick" "tick" aName
+          (hdlr, c) = mkTickHandler comp
+          cm = m2b1Pruned hdlr c
+      in firstOrderNoHandlerViolations cm @?= []
+
+  , testCase "Abort-shaped (tail, no param, resume unused): admitted" $
+      let aName = Name (T.pack "a") (Unique 9907)
+          comp  = m2b1Comp "Abort" "abort" aName
+          (hdlr, c) = mkAbortHandler comp
+          cm = m2b1Pruned hdlr c
+      in firstOrderNoHandlerViolations cm @?= []
+
+  , testCase "hParam = Just _ : rejected (mentions parameter)" $
+      let aName = Name (T.pack "a") (Unique 9908)
+          comp  = m2b1Comp "State" "get" aName
+          (hdlr, c) = mkParamHandler comp
+          cm = m2b1Pruned hdlr c
+          viols = firstOrderNoHandlerViolations cm
+      in assertBool ("expected rejection for hParam; got: " <> show viols)
+           (any (T.isInfixOf (T.pack "handler-parameter")) viols)
+
+  , testCase "hAnswerJoin = Just _ : rejected (mentions non-tail)" $
+      let aName = Name (T.pack "a") (Unique 9909)
+          comp  = m2b1Comp "E" "op" aName
+          (hdlr, c) = mkValuePosHandler comp
+          cm = m2b1Pruned hdlr c
+          viols = firstOrderNoHandlerViolations cm
+      in assertBool ("expected rejection for hAnswerJoin; got: " <> show viols)
+           (any (T.isInfixOf (T.pack "non-tail")) viols)
+
+  , testCase "resume stored into a con: rejected (mentions escapes)" $
+      let aName = Name (T.pack "a") (Unique 9969)
+          comp  = m2b1Comp "E" "op" aName
+          (hdlr, c) = mkResumeStoredHandler comp
+          cm = m2b1Pruned hdlr c
+          viols = firstOrderNoHandlerViolations cm
+      in assertBool ("expected rejection for resume escape; got: " <> show viols)
+           (any (T.isInfixOf (T.pack "ESCAPES")) viols)
+
+  , testCase "consistency: m2bHandlerInFragment agrees with (null . m2bHandlerViolations) for Reader" $
+      let aName = Name (T.pack "a") (Unique 9970)
+          comp  = m2b1Comp "Ask" "ask" aName
+          (hdlr, _) = mkReaderHandler comp
+      in Esc.m2bHandlerInFragment hdlr
+           @?= null (m2bHandlerViolations hdlr)
+
+  , testCase "consistency: m2bHandlerInFragment agrees with (null . m2bHandlerViolations) for param handler" $
+      let aName = Name (T.pack "a") (Unique 9971)
+          comp  = m2b1Comp "State" "get" aName
+          (hdlr, _) = mkParamHandler comp
+      in Esc.m2bHandlerInFragment hdlr
+           @?= null (m2bHandlerViolations hdlr)
+
+  , testCase "consistency: m2bHandlerInFragment agrees with (null . m2bHandlerViolations) for resume-stored" $
+      let aName = Name (T.pack "a") (Unique 9972)
+          comp  = m2b1Comp "E" "op" aName
+          (hdlr, _) = mkResumeStoredHandler comp
+      in Esc.m2bHandlerInFragment hdlr
+           @?= null (m2bHandlerViolations hdlr)
+
+  , testCase "existing LetRec checks untouched: cross-region viol still fires" $
+      let intTy  = Ty.CTCon Ty.TcU64 []
+          funTy  = Ty.CTCon (Ty.TcUser (T.pack "Fun")) []
+          nm h u = Name (T.pack h) (Unique u)
+          -- Outer letrec has TWO members: f and g_outer.
+          -- Inner letrec (inside f's body) has h, which captures g_outer ---
+          -- an OUTER region member.  rawEnclosingFv {h} ∩ lr = {g_outer} /= {}.
+          body =
+            LetRec
+              [ ( Binder (nm "f" 8800) Unrestricted funTy
+                , [Binder (nm "k" 8801) Unrestricted intTy]
+                , LetRec
+                    [ ( Binder (nm "h" 8802) Unrestricted funTy
+                      , [Binder (nm "j" 8803) Unrestricted intTy]
+                      , Ret (AVar (nm "g_outer" 8810)) ) ]  -- captures outer member
+                    (Let (Binder (nm "r" 8804) Unrestricted funTy)
+                         (RApp (AVar (nm "h" 8802)) [ALit (LInt 0)])
+                      (Ret (AVar (nm "r" 8804)))) )
+              , ( Binder (nm "g_outer" 8810) Unrestricted funTy
+                , [Binder (nm "m" 8811) Unrestricted intTy]
+                , Ret (ALit (LInt 0)) ) ]
+              (Let (Binder (nm "res" 8805) Unrestricted funTy)
+                   (RApp (AVar (nm "f" 8800)) [ALit (LInt 0)])
+                (Ret (AVar (nm "res" 8805))))
+          cm = pruneToReachable (CoreModule [TopBind (nm "main" 8899) [] body])
+          viols = firstOrderNoHandlerViolations cm
+      in assertBool ("expected cross-region viol; got: " <> show viols)
+           (any (T.isInfixOf (T.pack "cross-region")) viols)
   ]

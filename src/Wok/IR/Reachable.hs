@@ -17,6 +17,7 @@ module Wok.IR.Reachable
   , exprUniques
   , firstOrderNoHandlerViolations
   , exprScopeFeatures
+  , m2bHandlerViolations
   ) where
 
 import Data.List (find, nub)
@@ -28,9 +29,10 @@ import qualified Data.Text as Tx
 import qualified Wok.IR.Anf as Anf
 import qualified Wok.IR.Name as Name
 import Wok.IR.Name (Unique)
+import Data.Maybe (isNothing)
 import Wok.IR.Escape
   ( isBoxedType, letRecMemberConsumesCaptureNonEscaping
-  , rawEnclosingFv )
+  , rawEnclosingFv, m2bResumeEscapes )
 
 -- | Semantics-preserving dead-bind elimination: keep only the binds reachable
 -- from 'main' (preserving bind order). A bind never reached from 'main' cannot
@@ -199,7 +201,7 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
       -- A lambda body is a fresh frame: reset the member-outer set to empty so a
       -- nested group inside it is treated like one at top level (it is sound).
       Anf.RLam _ b         -> go Set.empty lr bsc b
-      Anf.ROp{}            -> [Tx.pack "ROp (effect operation)"]
+      Anf.ROp{}            -> []
       Anf.RApp _ _         -> []
       Anf.RAtom _          -> []
       Anf.RCon _ _         -> []
@@ -326,4 +328,37 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
         let bsc' = Set.union bsc (Set.fromList (boxedBs ps))
         in go mob lr bsc' jb ++ go mob lr bsc body
       Anf.Jump _ _            -> []
-      Anf.Handle _ _          -> [Tx.pack "Handle (effect handler)"]
+      Anf.Handle inner h      ->
+        m2bHandlerViolations h
+          -- M2b-1 (verified UAF, full-branch review): a handler whose return/op arm
+          -- references an enclosing BOXED LOCAL is DEFERRED and must be rejected. The
+          -- arm is instrumented as a fresh owned scope (it does NOT account the enclosing
+          -- capture), while the enclosing handler-body still drops that local --- so when
+          -- an op fires and the arm consumes the local (moves it into a con, returns it,
+          -- or passes it to resume), it is freed twice (the arm's flow through 'kBelow'
+          -- hits the handler-body drop). 'continuationOwned' processes only the captured
+          -- ABOVE frames, not the handler scope (spec 4.2), so the abort path UAFs too;
+          -- both abort and tail-resume miscompile. Reject conservatively. @bsc@ is the
+          -- enclosing boxed-local set; 'Anf.freeVarsHandler' is the arms' free vars minus
+          -- their own binders and hParam/hSelf, so the intersection is exactly the captured
+          -- boxed enclosing locals. (Unboxed captures like a 'Reader U64' constant are NOT
+          -- in @bsc@, so Reader/Tick/Except stay admitted.)
+          ++ [ Tx.pack "effect handler whose arm captures an enclosing boxed local \
+                       \(handler scope not owned-set-processed; double-frees on abort and \
+                       \tail-resume) --- deferred to M2b-2/M3"
+             | not (Set.null (Anf.freeVarsHandler h `Set.intersection` bsc)) ]
+          ++ go mob lr bsc inner
+          ++ go Set.empty lr bsc (snd (Anf.hReturn h))
+          ++ concat [ go Set.empty lr bsc (Anf.oaBody op) | op <- Anf.hOps h ]
+
+-- | Precise violation messages for a handler that is OUTSIDE the M2b-1
+-- fragment.  Derived from the SAME conditions as 'm2bHandlerInFragment' so
+-- guard emptiness and the predicate agree.
+m2bHandlerViolations :: Anf.Handler -> [Text]
+m2bHandlerViolations h =
+  [ Tx.pack "effect handler with a handler-parameter (M2b-2; not yet on the RC store)"
+  | not (isNothing (Anf.hParam h)) ]
+  ++ [ Tx.pack "effect handler in value (non-tail) position (M2b-2)"
+     | not (isNothing (Anf.hAnswerJoin h)) ]
+  ++ [ Tx.pack "effect op arm whose resume ESCAPES its body (first-class/stored continuation; M3)"
+     | oa <- Anf.hOps h, m2bResumeEscapes (Anf.oaResume oa) (Anf.oaBody oa) ]

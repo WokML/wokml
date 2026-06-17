@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+
+-- M2b-1 Task 5: a BOXED value LIVE ACROSS THE RESUME. 'xs' (a list cell) is built
+-- BEFORE the op and used AFTER the resume returns, so it sits in the captured
+-- frame above 'ask'. On resume the frame is MOVED back: the move-out must hand
+-- 'xs' back to the now-live continuation (where 'sumList xs' consumes and drops
+-- it), NOT free it at the NCont shell free. Freeing the owned set on resume (the
+-- abort path's cascade) would double-free 'xs'; failing to splice would leak it.
+-- This is the load-bearing case for "discard shell WITHOUT cascade". Output is
+-- '3 + (1 + 2) = 6'; the heap returns to baseline.
+effect Reader = { ask : U64 }
+
+reader : U64 -> (Reader -> a with Reader + eff e) -> a with eff e
+reader n c = with self = Reader { ask -> n } in c self
+
+sumList : [U64] -> U64
+sumList xs = case xs of
+  []      -> 0
+  h :: t  -> h + sumList t
+
+prog : Reader -> U64 with Reader
+prog r =
+  let xs = [1, 2] in
+  let m  = r.ask in
+  m + sumList xs
+
+main : U64
+main = reader 3 prog

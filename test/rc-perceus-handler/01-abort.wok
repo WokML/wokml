@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+
+-- M2b-1 abort handler (Task 2). 'Fail.fail' aborts: its op arm binds the
+-- continuation 'k' but NEVER applies it (the handler returns a boxed error
+-- value directly). Perceus must therefore drop the boxed resume binder 'k' at
+-- the end of the op-arm path -- the abort cascade seam. The op argument 'msg'
+-- (boxed String) is consumed into 'Failed msg', and the return arm delivers its
+-- (boxed) binder. The handled expression runs first under the enclosing scope.
+-- The answer type ('Outcome') is boxed, so the resume binder 'k' is boxed and
+-- the golden shows '__rc_drop' of it.
+data Outcome = Got U64 | Failed String
+
+effect Fail = { fail : String -> Never }
+
+risky : Bool -> U64 with Fail
+risky b = if b then Fail.fail "boom" else 7
+
+main : Outcome
+main =
+  with { Fail.fail msg k -> Failed msg
+         ; v -> Got v }
+  risky True

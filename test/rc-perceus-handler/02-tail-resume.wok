@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- M2b-1 tail-resume handler (Task 2). 'Env.get' is a value op resumed in tail
+-- position: auto-resume elaborates the constant arm to 'get(resume) ->
+-- resume(<value>)'. The resume binder is BOXED here (the answer type 'Held' is
+-- boxed), and because it is applied as a saturated call head the application IS
+-- the consume -- so the golden shows NO '__rc_drop' of the resume binder (the
+-- complement of the abort case). The handled expression runs first.
+data Held = Held U64
+
+useEnv : () -> Held with Env
+useEnv u = Env.get
+
+effect Env = { get : Held }
+
+main : Held
+main =
+  with { Env.get -> Held 7 }
+  useEnv ()

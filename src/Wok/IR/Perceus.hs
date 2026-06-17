@@ -89,6 +89,7 @@ import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Mult (..)
+  , Handler (..), OpArm (..)
   , Rhs (..), TopBind (..), prettyModule
   , freeVarsExpr, freeVarsAlt, atomVars, binderUnique )
 import Wok.IR.Escape
@@ -96,7 +97,8 @@ import Wok.IR.Escape
   , nonHeadOccsRhs
   , rlamSiblingCaptureEscapes, letRecEnclosingCaptureEscapes
   , letRecMemberEscapes
-  , rawEnclosingFv )
+  , rawEnclosingFv
+  , m2bHandlerInFragment )
 import Wok.IR.Name (JoinId, Name (..), Unique (..))
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
 
@@ -146,7 +148,22 @@ exprMaxU = go
     go (Case a alts)       = maximum (atomMaxU a : map altMaxU alts)
     go (LetJoin _ ps jb e) = maximum (go jb : go e : map (uOf . bndName) ps)
     go (Jump _ as)         = foldr (max . atomMaxU) (-1) as
-    go (Handle e _)        = go e   -- Handle bodies are never instrumented in M1
+    go (Handle e h)        = max (go e) (handlerMaxU h)
+
+handlerMaxU :: Handler -> Int
+handlerMaxU h =
+  let (rb, rbody) = hReturn h
+      -- Include the self-instance and handler-parameter binder uniques: a
+      -- hand-built or generated handler may carry an 'hSelf'/'hParam' unique
+      -- larger than any arm/body unique, and the inserted @_dup@/@_drop@ binders
+      -- must not collide with them. (Elaborator output keeps these below the arm
+      -- uniques, but seeding defensively costs nothing and removes the footgun.)
+      selfParamUs = map (uOf . bndName) (maybe [] pure (hParam h) ++ maybe [] pure (hSelf h))
+  in maximum (uOf (bndName rb) : exprMaxU rbody : map opArmMaxU (hOps h) ++ selfParamUs)
+
+opArmMaxU :: OpArm -> Int
+opArmMaxU (OpArm _ _ args resume body) =
+  maximum (exprMaxU body : uOf (bndName resume) : map (uOf . bndName) args)
 
 altMaxU :: Alt -> Int
 altMaxU (AltCon _ bs e) = maximum (exprMaxU e : map (uOf . bndName) bs)
@@ -255,20 +272,37 @@ coveredExpr (LetJoin _ _ jb e)  = coveredExpr jb && coveredExpr e
 coveredExpr Jump{}              = True
 coveredExpr (LetRec defs e)     =
   all (\(_, _, body) -> coveredExpr body) defs && coveredExpr e
-coveredExpr Handle{}            = False
+-- M2b-1 (Task 2): a 'Handle' is covered iff its handler is in the M2b-1
+-- RC-supported fragment ('m2bHandlerInFragment' --- the CONTEXT-FREE part of the
+-- admission test) AND the handled expr + every arm body are themselves covered. An
+-- OUT-of-fragment handler stays 'False', so the pass leaves it untouched.
+-- NOTE: the boundary guard ('Wok.IR.Reachable') additionally rejects a handler whose
+-- arm captures an enclosing boxed local --- a context-dependent check this context-free
+-- predicate cannot make, so 'coveredExpr' is intentionally more permissive there. Sound
+-- because production runs the guard before the pass; see 'm2bHandlerInFragment' in
+-- "Wok.IR.Escape" for the full rationale.
+coveredExpr (Handle e h)        =
+  m2bHandlerInFragment h && coveredExpr e && coveredHandler h
 
 coveredAlt :: Alt -> Bool
 coveredAlt (AltCon _ _ e) = coveredExpr e
 coveredAlt (AltLit _ e)   = coveredExpr e
 coveredAlt (AltDefault e) = coveredExpr e
 
+-- | A handler's arm bodies (the return body + every op-arm body) are themselves
+-- within the covered fragment.
+coveredHandler :: Handler -> Bool
+coveredHandler h =
+  coveredExpr (snd (hReturn h)) && all (coveredExpr . oaBody) (hOps h)
+
 -- | RHS coverage. A standalone 'RLam' is covered iff its body is covered (its
 -- captures are moved into the closure cell at the build site --- see 'ownedOccs' /
 -- 'moveOperandUniques' --- and the body is instrumented as its own owned scope ---
--- see 'ownRhs'). An 'ROp' is never covered (effects, M2b).
+-- see 'ownRhs'). An 'ROp' (an effect operation) is covered (M2b-1): its operands
+-- MOVE like 'RApp' arguments, routed through the same 'Let'-case machinery; it only
+-- ever appears inside an in-fragment 'Handle's instrumented region.
 coveredRhs :: Rhs -> Bool
 coveredRhs (RLam _ e) = coveredExpr e
-coveredRhs ROp{}      = False
 coveredRhs _          = True
 
 -- ---------------------------------------------------------------------------
@@ -348,10 +382,21 @@ data Ctx = Ctx
     -- transfers that env handle out, so the env unit (member 0) MOVES out rather than
     -- being dropped. (Mirrors the lint's 'leEnvAlias'.)
   , ctxEnvAlias :: Map Unique Unique
+    -- | M2b-1 (Task 2) --- the op-arm RESUME binders ('oaResume') in scope. The
+    -- continuation is an affine OWNED local of the arm body whose APPLICATION is a
+    -- MOVE (the move-out: resuming hands the captured frames back), NOT the ordinary
+    -- borrow-on-call a function value gets. So a saturated @resume(x)@ as a call HEAD
+    -- consumes @resume@ (no extra drop on that path), while an op arm that never
+    -- applies @resume@ (abort) drops it at its last use --- routing to the @NCont@
+    -- cascade at runtime. Membership here makes the move helpers count the call head
+    -- as a move (see 'ownedOccs' / 'moveOperandUniques'); the lint mirror is
+    -- 'leResume'. One-shot (Multiplicity) guarantees at most one application, so the
+    -- move never double-consumes.
+  , ctxResume :: Set Unique
   }
 
 ctx0 :: Map Unique Binder -> Ctx
-ctx0 env = Ctx env Map.empty Set.empty Set.empty Set.empty Map.empty
+ctx0 env = Ctx env Map.empty Set.empty Set.empty Set.empty Map.empty Set.empty
 
 ctxBind :: Binder -> Ctx -> Ctx
 ctxBind b c = c { ctxEnv = Map.insert (binderUnique b) b (ctxEnv c) }
@@ -785,7 +830,7 @@ ownExpr ctx sup delta (LetRec defs body) =
             -- transfer (which would skip the dup and double-free the single 'NEnv').
             dCtx   = Ctx dEnv Map.empty (ctxExempt ctx)
                          (ctxBorrow ctx `Set.union` groupU `Set.union` caps)
-                         Set.empty (groupEnvAlias defs)
+                         Set.empty (groupEnvAlias defs) Set.empty
             dDelta = Set.fromList [ binderUnique p | p <- ps, boxedBinder p ]
             (sp', dbody') = ownExpr dCtx sp dDelta dbody
         in (sp', (b, ps, dbody'))
@@ -801,9 +846,69 @@ ownExpr ctx sup delta (LetRec defs body) =
       (sup3, dups)  = mkDupsForVars sup2 env dupPlan'
   in (sup3, foldr ($) (LetRec defs' body') dups)
 
--- 'Handle' is out of coverage ('coveredExpr' rejects it), so an instrumented
--- body never reaches here; the total case leaves it unchanged.
-ownExpr _ sup _ e@Handle{} = (sup, e)
+-- Handle (M2b-1 Task 2): an effect handler in the RC-supported fragment
+-- ('m2bHandlerInFragment' --- tail position, no handler parameter, no escaping
+-- resume; gated by 'coveredExpr'). Three independent instrumentation regions:
+--
+--   * THE HANDLED EXPR @e@ runs FIRST, in the enclosing scope, so it is
+--     instrumented under the CURRENT owned set @delta@ exactly like the
+--     sub-expression of any other covered construct --- it consumes the outer
+--     owned vars it uses (and drops the dead ones) on its own paths.
+--   * THE RETURN ARM @(rb, rbody)@ runs on normal completion: @rbody@ is a body
+--     that OWNS its binder @rb@ (the produced value is delivered there), instrumented
+--     as a FRESH owned scope --- analogous to a 'LetRec' member / lambda body owning
+--     its params. Last-use placement drops @rb@ if it is boxed and unused.
+--   * EACH OP ARM @OpArm _ _ args resume body@ runs when its op fires: @body@ OWNS
+--     @args ++ [resume]@ (the boxed ones) on entry, again a fresh owned scope. The
+--     resume binder is registered in 'ctxResume', so applying it as a saturated call
+--     head COUNTS AS A MOVE (the move-out): on the RESUME path the application is the
+--     consume (no extra drop), and on the ABORT path (resume never applied) the
+--     standard last-use machinery emits @__rc_drop resume@ --- the @NCont@ cascade
+--     seam. Boxed op args unused by the arm are likewise dropped.
+--
+-- The arms are instrumented as FRESH scopes (their @delta@ reset to only the arm's
+-- own boxed binders) rather than inheriting the outer @delta@: @e@ has already
+-- consumed the outer owned vars on its own paths, so an outer var is not owned again
+-- by an arm. The shared 'Ctx' (env, exempt, borrow) is kept so name/type resolution
+-- and borrow accounting are correct; only the owned set is reset. The lint mirror
+-- ('checkExpr') resets the per-path counts identically.
+ownExpr ctx sup delta (Handle e h)
+  | m2bHandlerInFragment h =
+      let (rb, rbody) = hReturn h
+          (sup1, e')  = ownExpr ctx sup delta e
+          -- Return arm: a fresh scope owning its (boxed) binder.
+          retCtx      = ctxBind rb (armCtxReset ctx)
+          retDelta    = Set.fromList [ binderUnique rb | boxedBinder rb ]
+          (sup2, rbody') = ownExpr retCtx sup1 retDelta rbody
+          (sup3, ops') = mapAccumLPairs (ownOpArm ctx) sup2 (hOps h)
+      in (sup3, Handle e' (h { hReturn = (rb, rbody'), hOps = ops' }))
+  | otherwise = (sup, Handle e h)   -- out of fragment: leave unchanged
+
+-- | A fresh ownership scope for a handler arm: a handler arm runs in a NEW control
+-- context (the handler's continuation), so the join table, the kept-alive shared-env
+-- units, and the env-alias map do NOT cross the handler boundary --- reset them
+-- (mirroring 'ownRhs (RLam ...)' / the 'LetRec' member 'dCtx'). The enclosing
+-- 'ctxEnv' (name/type resolution), 'ctxExempt', and 'ctxBorrow' are kept; the owned
+-- set is reset by the caller to only the arm's own binders.
+armCtxReset :: Ctx -> Ctx
+armCtxReset ctx = ctx
+  { ctxJoins    = Map.empty
+  , ctxEnvAlive = Set.empty
+  , ctxEnvAlias = Map.empty
+  , ctxResume   = Set.empty }
+
+-- | Instrument one op arm body as a fresh owned scope (its boxed @args@ and the
+-- @resume@ binder owned on entry). The resume binder is added to 'ctxResume' so an
+-- application of it counts as the consuming move-out (no extra drop on the resume
+-- path); an arm that never applies it (abort) drops it at its last use.
+ownOpArm :: Ctx -> Supply -> OpArm -> (Supply, OpArm)
+ownOpArm ctx sup (OpArm lbl op args resume body) =
+  let bs       = args ++ [resume]
+      armCtx   = (ctxBinds bs (armCtxReset ctx))
+                   { ctxResume = Set.singleton (binderUnique resume) }
+      armDelta = Set.fromList [ binderUnique b | b <- bs, boxedBinder b ]
+      (sup', body') = ownExpr armCtx sup armDelta body
+  in (sup', OpArm lbl op args resume body')
 
 -- | Transitively close a set of 'JoinId's over the join-to-join edges recorded in
 -- 'ctxJoins' (each join maps to its captured set PAIRED with its onward jump
@@ -909,7 +1014,12 @@ ownedOccs ctx delta rhs = case rhs of
   -- the closure cell). So the head is NOT a move here; it stays owned by its binder
   -- and is dropped at its real last use by the 'Let'/'Ret' last-use machinery,
   -- exactly like any other value. Only the ARGUMENTS are moves.
-  RApp _ as      -> count as
+  --
+  -- M2b-1 EXCEPTION (Task 2): a RESUME binder ('ctxResume') applied as a call head
+  -- IS a move (the move-out: resuming hands the captured frames back). So when the
+  -- head names a resume binder, count it too --- the application consumes @resume@,
+  -- and no extra @__rc_drop@ is placed on that path.
+  RApp f as      -> count (resumeHead f ++ as)
   RCon _ as      -> count as
   RRecord _ flds -> count (map snd flds)
   RProj _ _      -> Map.empty                 -- borrow, not a move
@@ -938,6 +1048,10 @@ ownedOccs ctx delta rhs = case rhs of
         | AVar n <- atoms, let u = nameUniq n
         , u `Set.member` delta
         , u `Set.notMember` ctxExempt ctx, u `Set.notMember` ctxBorrow ctx ]
+    -- The call head as a singleton MOVE list iff it names a resume binder
+    -- (M2b-1 move-out); empty for an ordinary borrow-on-call head.
+    resumeHead (AVar n) | nameUniq n `Set.member` ctxResume ctx = [AVar n]
+    resumeHead _ = []
 
 -- | The MOVE-position variable 'Unique's of a RHS, IGNORING ownership (no @delta@
 -- filter): every operand that is COPIED into a heap cell or transferred onward ---
@@ -1004,7 +1118,7 @@ ownRhs ctx sup delta (RLam ps e) =
       dEnv      = foldr (\p -> Map.insert (binderUnique p) p) (ctxEnv ctx) ps
       dCtx      = Ctx dEnv Map.empty (ctxExempt ctx `Set.intersection` capsBorrow)
                       (ctxBorrow ctx `Set.intersection` capsBorrow)
-                      Set.empty Map.empty
+                      Set.empty Map.empty Set.empty
       (sup', e') = ownExpr dCtx sup dDelta e
   in (sup', RLam ps e')
 ownRhs _ sup _ r = (sup, r)
@@ -1164,7 +1278,27 @@ mutExpr mut False (LetRec defs body) =
   in (d2, LetRec defs' body')
 mutExpr _   False e@(Ret _)    = (False, e)
 mutExpr _   False e@(Jump _ _) = (False, e)
-mutExpr _   False e@Handle{}   = (False, e)
+mutExpr mut False (Handle e h) =
+  -- M2b-1 (Task 2): the handler arms hold inserted RC calls now, so the
+  -- fault-injection walk descends into the handled expr first, then the return
+  -- arm, then each op arm (pre-order, left-to-right), threading @done@.
+  let (d0, e') = mutExpr mut False e
+      (rb, rbody) = hReturn h
+      (d1, rbody') = mutExpr mut d0 rbody
+      (d2, ops')   = mapAccumLOpsM (mutOp mut) d1 (hOps h)
+  in (d2, Handle e' (h { hReturn = (rb, rbody'), hOps = ops' }))
+
+mutOp :: Mutation -> Bool -> OpArm -> (Bool, OpArm)
+mutOp mut done (OpArm lbl op args resume body) =
+  let (d, body') = mutExpr mut done body in (d, OpArm lbl op args resume body')
+
+mapAccumLOpsM :: (Bool -> OpArm -> (Bool, OpArm)) -> Bool -> [OpArm] -> (Bool, [OpArm])
+mapAccumLOpsM f = go
+  where
+    go d []       = (d, [])
+    go d (x : xs) = let (d', x')   = f d x
+                        (d'', xs') = go d' xs
+                    in (d'', x' : xs')
 
 -- | Descend into an 'RLam' rhs body (the only rhs form that nests an instrumented
 -- expression); every other rhs is returned unchanged.
@@ -1286,7 +1420,7 @@ lintScope' fn owned0 exempt0 borrow0 ps body cnt0 =
   let tracked = Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]
                   `Set.union` trackedBinders body
                   `Set.union` owned0
-      env     = LintEnv fn tracked exempt0 (collectJoins body) borrow0 Map.empty
+      env     = LintEnv fn tracked exempt0 (collectJoins body) borrow0 Map.empty Set.empty
   in checkExpr env cnt0 body
 
 -- | The shared-env owning unit (member 0) for each member of @defs@: every member's
@@ -1314,6 +1448,10 @@ groupEnvAlias defs = case defs of
 --     @__rc_drop@ and every member move operates on the SAME 'NEnv' cell at
 --     runtime, so the audit CANONICALISES a member's 'Unique' to its env's before
 --     counting --- the env's single owned unit then balances across all members.
+--   * 'leResume'  --- M2b-1 (Task 2) the op-arm RESUME binders in scope (mirror of
+--     the pass's 'ctxResume'). Applying a resume binder as a call head is a MOVE (the
+--     move-out), so the lint relinquishes it there ('moveAtoms'); an arm that never
+--     applies it drops it (the abort cascade). One-shot guarantees at most one apply.
 data LintEnv = LintEnv
   { leFn       :: Name
   , leTracked  :: Set Unique
@@ -1321,6 +1459,7 @@ data LintEnv = LintEnv
   , leJoins    :: Map JoinId ([Binder], Expr)
   , leBorrow   :: Set Unique
   , leEnvAlias :: Map Unique Unique
+  , leResume   :: Set Unique
   }
 
 -- | Canonicalise a 'Unique' to its group's shared-env owning unit (member 0) when
@@ -1339,7 +1478,10 @@ collectJoins (LetJoin j ps jb e)  =
   Map.insert j (ps, jb) (collectJoins jb `Map.union` collectJoins e)
 collectJoins (Jump _ _)           = Map.empty
 collectJoins (LetRec _ e)         = collectJoins e   -- def bodies are own scopes
-collectJoins Handle{}             = Map.empty
+-- M2b-1 (Task 2): the handled expr runs in THIS scope, so its joins are collected
+-- here; each handler ARM is its own ownership scope (see 'checkExpr'), so its joins
+-- are collected when that arm is audited, not here.
+collectJoins (Handle e _)         = collectJoins e
 
 collectJoinsAlt :: Alt -> Map JoinId ([Binder], Expr)
 collectJoinsAlt (AltCon _ _ e) = collectJoins e
@@ -1367,7 +1509,10 @@ trackedBinders (LetJoin _ ps jb e) =
   Set.fromList [ binderUnique b | b <- ps, boxedBinder b ]
     `Set.union` trackedBinders jb `Set.union` trackedBinders e
 trackedBinders Jump{}         = Set.empty
-trackedBinders Handle{}       = Set.empty
+-- M2b-1 (Task 2): the handled expr's binders are tracked in THIS scope; the
+-- handler-arm binders + arm-body binders belong to the arm scopes (audited
+-- separately by 'checkExpr'), like 'LetRec' def-body binders, so not here.
+trackedBinders (Handle e _)   = trackedBinders e
 
 trackedAlt :: Alt -> Set Unique
 trackedAlt (AltCon _ bs e) =
@@ -1444,7 +1589,7 @@ checkExpr env cnt (Let b rhs body) =
           -- The alias-of-borrow site moves nothing (a borrow rename); every other
           -- form relinquishes its moved operands as usual.
           moves          = if aliasesBorrow then []
-                             else [ nameUniq m | AVar m <- moveAtoms rhs ]
+                             else [ nameUniq m | AVar m <- moveAtoms (leResume env) rhs ]
           (vs, cntMoved) = relAtoms env (Tx.pack "operand move") moves cnt
           -- ALIAS-OF-EXEMPT (M2a-1 hardening): @let b = AVar s@ where @s@ is an
           -- uncounted-region sibling (in 'leExempt'). Mirror the pass: 'b' is a
@@ -1577,7 +1722,43 @@ checkExpr env cnt (Jump j as) =
        Just (ps, jbody) ->
          let cnt2 = foldr (\b c -> if boxedBinder b then bumpC (binderUnique b) c else c) cnt1 ps
          in vs ++ checkExpr env cnt2 jbody
-checkExpr _ _ Handle{} = []   -- out of coverage
+checkExpr env cnt (Handle e h) =
+  -- M2b-1 (Task 2). Three regions, mirroring the pass ('ownExpr (Handle ...)'):
+  --
+  --   * THE HANDLED EXPR @e@ runs in THIS scope, so it is audited under the incoming
+  --     counts (it consumes the outer owned vars on its own paths). Its trailing
+  --     counts are discarded: an arm starts a FRESH scope (control does not flow from
+  --     @e@'s leaf into an arm carrying @e@'s counts; @e@ ran to completion / aborted).
+  --   * THE RETURN ARM is a fresh scope owning its (boxed) binder.
+  --   * EACH OP ARM is a fresh scope owning its boxed @oaArgs ++ [oaResume]@; the
+  --     resume binder is registered in 'leResume', so applying it is a move (no extra
+  --     drop) and an arm that never applies it must drop it (the abort cascade).
+  let (rb, rbody) = hReturn h
+      eViols   = checkExpr env cnt e
+      retViols = lintArmScope env Set.empty [rb] rbody
+      opViols  = concatMap (lintOpArm env) (hOps h)
+  in eViols ++ retViols ++ opViols
+  where
+    -- A handler arm body as its own ownership scope: its boxed binders @bs@ owned on
+    -- entry (+1 each), @resume0@ the arm's resume binders (move-on-apply). The
+    -- enclosing 'leBorrow'/'leExempt' are kept (borrow accounting); 'leJoins' and
+    -- 'leEnvAlias' do NOT cross the handler boundary (mirror the pass's 'armCtxReset')
+    -- so they reset to this arm's own joins / empty. Tracking is reset to the arm's
+    -- own binders + body binders --- an outer var referenced in an arm is NOT owned
+    -- here (the handled expr consumed it), so it is borrowed (a read emits nothing); a
+    -- MOVE/DROP of such an outer var would be an over-consume, the correct conservative
+    -- report for an unsupported arm-capture shape.
+    lintArmScope :: LintEnv -> Set Unique -> [Binder] -> Expr -> [Text]
+    lintArmScope outer resume0 bs body =
+      let tracked = Set.fromList [ binderUnique b | b <- bs, boxedBinder b ]
+                      `Set.union` trackedBinders body
+          armEnv  = LintEnv (leFn outer) tracked (leExempt outer) (collectJoins body)
+                            (leBorrow outer) Map.empty resume0
+          cnt0    = Map.fromList [ (binderUnique b, 1) | b <- bs, boxedBinder b ]
+      in checkExpr armEnv cnt0 body
+    lintOpArm :: LintEnv -> OpArm -> [Text]
+    lintOpArm outer (OpArm _ _ args resume body) =
+      lintArmScope outer (Set.singleton (binderUnique resume)) (args ++ [resume]) body
 
 -- | Audit one 'LetRec' closure body as a fresh scope. Its params are owned; its
 -- enclosing siblings carried in @env@ AND this member's enclosing captures
@@ -1624,7 +1805,7 @@ lintDef env groupU defs (_, ps, dbody) =
                   `Set.union` Set.singleton env0
                   `Set.union` caps
       leEnv  = LintEnv (leFn env) tracked exempt (collectJoins dbody)
-                       borrow (groupEnvAlias defs)
+                       borrow (groupEnvAlias defs) Set.empty
       cnt0   = Map.fromList [ (binderUnique b, 1) | b <- ps, boxedBinder b ]
   in checkExpr leEnv cnt0 dbody
 
@@ -1674,14 +1855,17 @@ leaks env cnt =
 -- only the 'nameUniq', and 'relC'/'relAny' filter to tracked (boxed owned) vars,
 -- so an empty-hint name suffices. The lambda BODY is audited as its own scope by
 -- 'checkExpr' (see the 'Let' case), not here.
-moveAtoms :: Rhs -> [Atom]
-moveAtoms rhs = case rhs of
+moveAtoms :: Set Unique -> Rhs -> [Atom]
+moveAtoms resume rhs = case rhs of
   RAtom a        -> [a]
   -- BORROW-ON-CALL (M2a-2 Task 1): the call head @f@ is READ, not moved (see
   -- 'ownedOccs'); only the arguments are moves. Keeping it consistent here is what
   -- lets 'balanceLint' certify a function value dropped at its last use rather
   -- than flag an over-consume on the (now-borrowed) head.
-  RApp _ as      -> as
+  --
+  -- M2b-1 EXCEPTION (Task 2): a RESUME head (in @resume@) IS a move (the move-out),
+  -- so include it; mirror of 'ownedOccs's 'resumeHead'.
+  RApp f as      -> resumeHead f ++ as
   RCon _ as      -> as
   RRecord _ flds -> map snd flds
   RProj _ _      -> []   -- borrow
@@ -1689,6 +1873,9 @@ moveAtoms rhs = case rhs of
     [ AVar (Name (Tx.pack "") u)
     | u <- Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps)) ]
   ROp _ _ _ as   -> as
+  where
+    resumeHead (AVar n) | nameUniq n `Set.member` resume = [AVar n]
+    resumeHead _ = []
 
 -- | Is this RHS a projection (a borrow, not an owning bind)?
 isProj :: Rhs -> Bool

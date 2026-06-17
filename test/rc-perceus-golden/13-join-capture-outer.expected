@@ -112,6 +112,8 @@ dict$Eq$Option d$Eq$0 =
 
 reader e c =
   let t = c(self)
+  let _drop.1 = __rc_drop(e)
+  let _drop.2 = __rc_drop(c)
   t
   with self = {
     return v -> v
@@ -153,6 +155,7 @@ writer c =
 
 except c =
   let t.1 = c(self)
+  let _drop.1 = __rc_drop(c)
   t.1
   with self = {
     return v ->
@@ -160,6 +163,7 @@ except c =
       t.3
     Except.throw(e, resume) ->
       let t.2 = Err(e)
+      let _drop.2 = __rc_drop(resume)
       t.2
   }
 
@@ -242,6 +246,7 @@ parBoth sa sb =
 
 asCoro c _.1 =
   let t.1 = c(())
+  let _drop = __rc_drop(c)
   t.1
   with {
     return v -> v
@@ -316,6 +321,7 @@ recallId t.1 =
 
 asConc c _ =
   let t.1 = c(())
+  let _drop = __rc_drop(c)
   t.1
   with {
     return v -> v
@@ -336,6 +342,7 @@ yield u =
   let t.1 = ReqYield
   let t.2 = Conc.req(t.1)
   let r = t.2
+  let _drop = __rc_drop(r)
   ()
 
 spawn f =
@@ -351,6 +358,7 @@ spawn f =
 
 async f =
   let t.6 = \_.1 -> let t.3 = \_.2 -> let t.1 = f(())
+  let _drop = __rc_drop(f)
   let t.2 = erase(t.1)
   t.2
   let t.4 = asConc(t.3)
@@ -383,6 +391,7 @@ send c v =
   let t.3 = ReqSend(t.1, t.2)
   let t.4 = Conc.req(t.3)
   let r = t.4
+  let _drop = __rc_drop(r)
   ()
 
 recv c =

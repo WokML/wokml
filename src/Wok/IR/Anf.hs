@@ -15,6 +15,7 @@ module Wok.IR.Anf
   , prettyExpr
     -- * Free-variable analysis
   , freeVarsExpr
+  , freeVarsHandler
   , freeVarsRhs
   , freeVarsAlt
   , atomVars
@@ -452,7 +453,19 @@ freeVarsExpr (LetJoin _ ps jb e) =
   let psU = Set.fromList (map binderUnique ps)
   in (freeVarsExpr jb `Set.difference` psU) `Set.union` freeVarsExpr e
 freeVarsExpr (Jump _ as)        = Set.unions (map atomVars as)
-freeVarsExpr (Handle e _)       = freeVarsExpr e
+freeVarsExpr (Handle e h)       = freeVarsExpr e `Set.union` freeVarsHandler h
+
+-- | Free vars of a handler's arms: the return-arm body minus its binder, plus each
+-- op-arm body minus that arm's args + resume binder; finally minus hParam/hSelf.
+freeVarsHandler :: Handler -> Set Unique
+freeVarsHandler (Handler (rb, rbody) ops _ mparam mself) =
+  let retFv = Set.delete (binderUnique rb) (freeVarsExpr rbody)
+      opFv  = Set.unions
+                [ freeVarsExpr body
+                    `Set.difference` Set.fromList (binderUnique resume : map binderUnique args)
+                | OpArm _ _ args resume body <- ops ]
+      bound = Set.fromList (map binderUnique (maybe [] pure mparam ++ maybe [] pure mself))
+  in (retFv `Set.union` opFv) `Set.difference` bound
 
 freeVarsAlt :: Alt -> Set Unique
 freeVarsAlt (AltCon _ bs e) = freeVarsExpr e `Set.difference` Set.fromList (map binderUnique bs)

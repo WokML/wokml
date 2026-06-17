@@ -1,0 +1,28 @@
+module Main
+import Std.Base
+
+-- ATTACK: Outer.oop performed INSIDE withInner's handled expression, handled by the
+-- OUTER handler -- so the captured continuation prefix crosses withInner's KHandleRC
+-- (a nested handler of a DIFFERENT effect). Boxed 'xs' live across the op. Abort
+-- (oop never resumes) must free xs once; continuationOwned recurses past the nested
+-- KHandleRC -- verify no leak / no double-free.
+effect Outer = { oop : U64 -> Never }
+effect Inner = { iop : U64 }
+
+body : Outer -> Inner -> [U64] with Outer + Inner
+body o i =
+  let xs = [10, 20] in
+  let u = o.oop 1 in
+  xs
+
+withInner : Outer -> (Outer -> Inner -> [U64] with Outer + Inner + eff e) -> [U64] with Outer + eff e
+withInner o f = with self = Inner { iop -> 7 } in f o self
+
+run : (Outer -> [U64] with Outer + eff e) -> Result [U64] U64 with eff e
+run c = with self = Outer { oop n k -> Err n ; v -> Ok v } in c self
+
+prog : Outer -> [U64] with Outer
+prog o = withInner o body
+
+main : Result [U64] U64
+main = run prog

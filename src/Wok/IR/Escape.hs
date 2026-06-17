@@ -32,6 +32,7 @@ module Wok.IR.Escape
   , escapingAtomsRhs
   , nonHeadOccsRhs
   , nonHeadOccs
+  , dropTargets
     -- * LetRec / closure escape + consume predicate family
   , escapesFrom
   , rlamSiblingCaptureEscapes
@@ -43,14 +44,19 @@ module Wok.IR.Escape
   , captureEscapesBody
   , consumingOccs
   , rawEnclosingFv
+    -- * M2b-1 handler-fragment predicates
+  , m2bResumeEscapes
+  , m2bHandlerInFragment
   ) where
 
+import Data.Maybe (isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
-  ( Alt (..), Atom (..), Binder (..), Expr (..), Rhs (..)
+  ( Alt (..), Atom (..), Binder (..), Expr (..), Handler (..), OpArm (..)
+  , Rhs (..)
   , freeVarsExpr, atomVars, binderUnique, bndType )
 import Wok.IR.Name (Name (..), Unique)
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
@@ -168,6 +174,55 @@ nonHeadOccsAlt :: Set Unique -> Alt -> Set Unique
 nonHeadOccsAlt g (AltCon _ _ e) = nonHeadOccs g e
 nonHeadOccsAlt g (AltLit _ e)   = nonHeadOccs g e
 nonHeadOccsAlt g (AltDefault e) = nonHeadOccs g e
+
+-- ---------------------------------------------------------------------------
+-- The __rc_drop targets of a continuation (M2b-1 owned-set, the crux)
+--
+-- A value that is BORROWED then DROPPED (a call head under uniform borrow-on-call
+-- that the pass drops at its last use) appears in NEITHER 'nonHeadOccs' (the head
+-- is exempt) NOR 'escapingAtomsRhs' --- only in an inserted @__rc_drop x@. The
+-- M2b-1 owned-set ('continuationOwned' in "Wok.Interp.RC.Value") needs it: such a
+-- borrowed-then-dropped value (e.g. the handler-runner's @c@ in
+-- @let r = c(self) in __rc_drop c; r@) is OWNED by the continuation and must be
+-- freed on abort, so its '__rc_drop' target is part of the owned set.
+
+-- | The set of 'Unique's that an inserted @__rc_drop x@ targets directly in @e@
+-- (its continuation structure). Scans for @Let _ (RApp (AVar h) [AVar x]) e@ with
+-- @nameHint h == __rc_drop@, collecting @x@. Recurses through the continuation
+-- structure ('Let' bodies, 'Case' alts, 'LetJoin'/'Jump', 'LetRec' defs + body,
+-- 'Handle' return/op arms) but NOT into nested 'RLam' bodies: a drop inside a
+-- lambda fires on the lambda's future CALL, not on this continuation's abort, so it
+-- is not part of THIS continuation's owned set.
+dropTargets :: Expr -> Set Unique
+dropTargets = goE
+  where
+    goE (Ret _)               = Set.empty
+    goE (Let _ r e)           = goR r `Set.union` dropOf r `Set.union` goE e
+    -- A 'LetRec' member body fires on the member's CALL, not as part of THIS linear
+    -- continuation, so its drops are NOT this continuation's owned set (same reason
+    -- the RLam body is excluded via 'goR'). Recurse only into the group BODY.
+    goE (LetRec _ e)          = goE e
+    goE (Case _ alts)         = Set.unions (map goAlt alts)
+    goE (LetJoin _ _ jb e)    = goE jb `Set.union` goE e
+    goE (Jump _ _)            = Set.empty
+    -- A nested handler's ARMS fire only when that handler's op fires (dynamic), not as
+    -- part of this linear continuation, so their drops are NOT this continuation's owned
+    -- set (and attributing them would over-free). Recurse only into the handled expr,
+    -- which DOES run linearly. This matches 'escapeWalk'/'nonHeadOccs', which also stop
+    -- at handler arms.
+    goE (Handle e _)          = goE e
+
+    goAlt (AltCon _ _ e) = goE e
+    goAlt (AltLit _ e)   = goE e
+    goAlt (AltDefault e) = goE e
+
+    -- Recurse into the RHS's own sub-expressions EXCEPT a nested 'RLam' body.
+    goR _ = Set.empty
+
+    -- The drop target named by THIS RHS, if it is exactly @__rc_drop x@.
+    dropOf (RApp (AVar h) [AVar x])
+      | nameHint h == dropHint = Set.singleton (nameUniq x)
+    dropOf _ = Set.empty
 
 -- ---------------------------------------------------------------------------
 -- The LetRec enclosing-capture ESCAPE predicate (M1.5 Phase 2)
@@ -527,3 +582,65 @@ rawEnclosingFv defs =
        [ (freeVarsExpr body `Set.difference` Set.fromList (map binderUnique ps))
            `Set.difference` groupU
        | (_, ps, body) <- defs ]
+
+-- ---------------------------------------------------------------------------
+-- M2b-1 handler-fragment predicates
+--
+-- The M2b-1 RC-supported fragment admits handlers that are TAIL-POSITION,
+-- have NO handler parameter, and whose every op-arm resume binder does NOT
+-- escape its body (it is only used as a saturated call head). 'm2bHandlerInFragment'
+-- is the CONTEXT-FREE part of the predicate (it needs only the 'Handler'); the
+-- Perceus pass ('coveredExpr') uses it directly.
+--
+-- IMPORTANT: this is NOT the whole admission test. The boundary guard
+-- ('Wok.IR.Reachable.firstOrderNoHandlerViolations') ALSO rejects a handler whose
+-- arm captures an enclosing BOXED local --- a CONTEXT-DEPENDENT check (it needs the
+-- enclosing boxed-local set) that cannot live in this context-free predicate, so
+-- 'coveredExpr' is deliberately MORE PERMISSIVE than the guard on that one case. That
+-- is sound because the production entry ('runModuleRC') always runs the guard first,
+-- and the test entries that bypass it (the rc-m2b corpus differential, the generative
+-- property) are themselves guard-checked or guard-gated. Do not "reconcile" the two by
+-- deleting the guard's extra check.
+
+-- | True iff the op-arm's resume binder occurs anywhere in @body@ in a position
+-- OTHER than the head of a saturated call. A resume used only as a direct saturated
+-- call head (tail / auto resume) or never used (abort) does NOT escape; anything else
+-- (stored into a con/record, returned, jumped, projected, captured into a closure, a
+-- pure alias-rename @let k2 = resume@, or a 'Case' scrutinee) is an escape that the
+-- one-shot move-out runtime cannot account, so the handler is refused.
+--
+-- This deliberately does NOT use 'escapesFrom': that walker (a) FOLLOWS pure alias
+-- renames (so @let k2 = resume in k2 x@ would be missed, while the move-out tracking
+-- 'ctxResume' is keyed on the original binder only and would treat @k2 x@ as a borrow
+-- --- a leak of the 'NCont'), and (b) like the shared 'escapeWalk', SKIPS nested
+-- handler arms (so a resume stored inside a NESTED handler's arm would be missed). This
+-- walker reuses the per-'Rhs' single source of truth ('escapingAtomsRhs', which exempts
+-- the call head and the @__rc_dup@/@__rc_drop@ intrinsics) but does its OWN traversal
+-- that descends into handler arms and treats an alias-rename as an escape.
+m2bResumeEscapes :: Binder -> Expr -> Bool
+m2bResumeEscapes resume = go
+  where
+    u = binderUnique resume
+    inAtoms as = u `Set.member` Set.unions (map atomVars as)
+    go e = case e of
+      Ret a               -> u `Set.member` atomVars a
+      Jump _ as           -> inAtoms as
+      Let _ r body        -> inAtoms (escapingAtomsRhs r) || go body
+      LetRec defs body    -> any (\(_, _, d) -> go d) defs || go body
+      Case a alts         -> u `Set.member` atomVars a || any goAlt alts
+      LetJoin _ _ jb body -> go jb || go body
+      Handle e' h         ->
+        go e' || go (snd (hReturn h)) || any (go . oaBody) (hOps h)
+    goAlt (AltCon _ _ e) = go e
+    goAlt (AltLit _ e)   = go e
+    goAlt (AltDefault e) = go e
+
+-- | True iff a handler is in the M2b-1 RC-supported fragment: no handler
+-- parameter, tail position (no answer-join), and no op-arm resume escapes its
+-- body. This is the AUTHORITATIVE coverage predicate shared by the boundary
+-- guard ('Wok.IR.Reachable') and the Perceus pass.
+m2bHandlerInFragment :: Handler -> Bool
+m2bHandlerInFragment h =
+  isNothing (hParam h)
+    && isNothing (hAnswerJoin h)
+    && all (\oa -> not (m2bResumeEscapes (oaResume oa) (oaBody oa))) (hOps h)

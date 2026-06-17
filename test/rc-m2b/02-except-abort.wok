@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+-- M2b-1 Task 4: a NAMED-instance handler whose op arm ABORTS (binds the resume
+-- continuation but never applies it). 'main' performs 'throw 5' through the named
+-- instance; the arm returns 'None' and the captured continuation is dropped
+-- (Perceus's '__rc_drop resume' frees the NCont's owned set, which is empty here:
+-- the only live value above the op is the unboxed instance handle / literal). The
+-- heap must return to baseline.
+effect Exn = { throw : U64 -> Never }
+
+prog : Exn -> U64 with Exn
+prog e = e.throw 5
+
+run : (Exn -> a with Exn + eff e) -> Option a with eff e
+run c = with self = Exn { throw n k -> None ; v -> Some v } in c self
+
+main : Option U64
+main = run prog

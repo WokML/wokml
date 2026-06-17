@@ -16,8 +16,8 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
-  ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Lit (..)
-  , Rhs (..), TopBind (..), binderUnique, freeVarsExpr )
+  ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
+  , Lit (..), OpArm (..), Rhs (..), TopBind (..), binderUnique, freeVarsExpr )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.Interp.RC.Prim (rcPrimTable)
@@ -66,6 +66,15 @@ returnToRC prims v (KAppRC args k)        s = enterRC False prims v args k s
 returnToRC _     v (KDropCellRC addr k)   s = do
   s' <- dropAddr addr s
   Right (RReturn v k s')
+-- Normal completion of a handled computation (M2b-1 Task 3): run the return arm,
+-- binding the produced value to the return binder in the frame's captured scope.
+-- Mirrors the reference 'Wok.Interp.Machine.returnTo' 'KHandle' arm. The frame
+-- captured 'hsc' by reference (no incref on install), so there is nothing to drop
+-- here: the value 'v' is delivered into the return-arm body, which the Perceus
+-- pass instruments for its own last-use drops.
+returnToRC _     v (KHandleRC h _ hsc k)  s =
+  let (rb, rbody) = hReturn h
+  in Right (REval rbody hsc { rscEnv = bindRCBinder rb v (rscEnv hsc) } k s)
 
 -- ---------------------------------------------------------------------------
 -- Eval
@@ -162,8 +171,23 @@ evalExprRC prims expr sc k s = case expr of
                           (rscEnv sc) (zip defs [0 ..])
     in Right (REval body sc { rscEnv = groupEnv } k sEnv)
 
-  Handle _ _ ->
-    Left (PrimError (Tx.pack "rc M1: effects not supported (no-handler fragment)"))
+  Handle e h ->
+    -- Install the counted handler frame (M2b-1 Task 3), mirroring the reference
+    -- 'Wok.Interp.Machine.evalExpr' 'Handle' arm. A NAMED handler binds its
+    -- self-instance binder to an 'RVInst' carrying the binder's 'Unique' (the
+    -- install SITE) and this activation's tag (the 'kontDepth' here); the same tag
+    -- is stored in the frame so named dispatch (Task 4) can match it. 'RVInst' is
+    -- UNBOXED, so binding 'self' adds nothing to the reference count.
+    --
+    -- RC DISCIPLINE: the 'KHandleRC' frame captures 'sc'' BY REFERENCE, exactly
+    -- like the 'KLetRC b body sc k' frame captures its 'sc' WITHOUT increfing ---
+    -- the scope's values are owned by their binders and dropped by the Perceus
+    -- pass at last use. We do NOT incref the scope's values on install.
+    let tag = kontDepth k
+        sc' = case hSelf h of
+                Just sb -> sc { rscEnv = bindRCBinder sb (RVInst (nameUniq (bndName sb)) tag) (rscEnv sc) }
+                Nothing -> sc
+    in Right (REval e sc' (KHandleRC h tag sc' k) s)
 
 evalRhsRC :: RCPrimTable -> Binder -> Rhs -> Expr -> RCScope -> RCKont -> Store
           -> Either RuntimeError RCConfig
@@ -199,15 +223,36 @@ evalRhsRC prims b rhs body sc k s = case rhs of
           _ -> Left (BadProjection l)
       RVLit _           -> Left (BadProjection l)
       RVRecMember{} -> Left (BadProjection l)
+      RVInst _ _    -> Left (BadProjection l)
 
   RApp f as -> do
     vs <- mapM (resolveRCAtom sc) as
     callFn prims sc f vs (KLetRC b body sc k) s
 
-  ROp{} ->
-    Left (PrimError (Tx.pack "rc M1: effects not supported (no-handler fragment)"))
+  -- An effect OPERATION (M2b-1 Task 4): the RC analogue of the reference
+  -- 'Wok.Interp.Machine' 'ROp' arm. Resolve the args and the optional named-
+  -- instance handle, then dispatch via 'rcDispatchOp' with the OP-SITE
+  -- continuation 'KLetRC b body sc k' (so the captured @above@ prefix includes
+  -- this 'Let' frame).
+  ROp minst lbl op as -> do
+    vs      <- mapM (resolveRCAtom sc) as
+    mTarget <- resolveInstRC sc minst
+    rcDispatchOp mTarget lbl op vs (KLetRC b body sc k) s
   where
     cont v s' = Right (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
+
+-- | Resolve the optional named-instance handle of an 'ROp' to its @(Unique, tag)@
+-- routing pair. 'Nothing' is ambient dispatch (route to the nearest covering
+-- handler); a 'Just' must resolve to an 'RVInst' (an unboxed identity pair). Any
+-- other value is an internal IR/elaboration error. Mirrors the reference
+-- 'Wok.Interp.Machine' 'ROp' instance-handle resolution.
+resolveInstRC :: RCScope -> Maybe Atom -> Either RuntimeError (Maybe (Unique, Int))
+resolveInstRC _  Nothing  = Right Nothing
+resolveInstRC sc (Just a) = do
+  v <- resolveRCAtom sc a
+  case v of
+    RVInst u tag -> Right (Just (u, tag))
+    _            -> Left (PrimError (Tx.pack "internal: instance handle not an RVInst"))
 
 -- ---------------------------------------------------------------------------
 -- Application
@@ -338,6 +383,24 @@ enterRC borrowHead _ fv args k s = case fv of
             s'  <- increfOwned s
             Right (REval body (RCScope (bindRCBinders ps use cenv) Map.empty)
                      (KAppRC over (deferConsume k)) s')
+      -- RESUME of a reified continuation (M2b-1 Task 5; spec §4.3 RESUME). Applying
+      -- the boxed 'NCont' handle (the op-arm @resume@ binder) MOVES the captured
+      -- frames back onto the live 'Kont': 'spliceKont' re-prepends the prefix and
+      -- re-installs the matching handler ('KHandleRC') over the post-resume
+      -- continuation @k@ (= the reference's @after@), then the resume argument @v@
+      -- is delivered into it. 'moveOutCont' frees the 'NCont' SHELL ONLY (one-shot
+      -- guarantees rc == 1) WITHOUT cascading its children --- their refcounts are
+      -- untouched because ownership transfers to the now-live spliced frames; their
+      -- own pending @__rc_drop@/move instructions fire as those frames run. Mirrors
+      -- the reference @enter@ 'VCont' arm: @Return v (kb k)@ with @kb = above .
+      -- KHandle@. M2b-1 resume is ONE-argument (@hParam = Nothing@); the two-arg
+      -- 'VContP'/param resume is M2b-2.
+      NCont{} -> case args of
+        [v] -> do
+          (prefix, (h, hTag, hsc), s') <- moveOutCont addr s
+          let k' = spliceKont prefix (KHandleRC h hTag hsc k)
+          Right (RReturn v k' s')
+        _ -> Left (ArityError (Tx.pack "continuation expects exactly one argument"))
       _ -> Left (NotAFunction (Tx.pack "applied a non-closure heap node"))
   RVLit _ -> Left (NotAFunction (Tx.pack "applied a literal"))
   RVRecMember gAddr i envAddr -> do
@@ -433,6 +496,7 @@ enterRC borrowHead _ fv args k s = case fv of
             s''' <- if borrowHead then Right s'' else dropAddr envAddr s''
             Right (RReturn (RVBox a') k s''')
       _ -> Left (NotAFunction (Tx.pack "RVRecMember group addr is not NGroupCode"))
+  RVInst _ _ -> Left (NotAFunction (Tx.pack "applied an instance handle"))
 
 -- | Apply a primitive to args, accumulating for currying and threading the
 -- store. Mirrors the reference 'enter' prim branch, sans the 'PRDrive'
@@ -474,6 +538,7 @@ matchAltsRC v alts sc k s = case v of
     goNode (cNode c)
   RVLit l -> goLit l
   RVRecMember{} -> Left (NonExhaustiveCase (Tx.pack "<closure>"))
+  RVInst _ _    -> Left (NonExhaustiveCase (Tx.pack "<instance>"))
   where
     -- Boxed scrutinee: match constructor alts against the NCon node; literal
     -- alts and default still apply (a literal alt simply never matches a node).
@@ -503,6 +568,7 @@ nodeTag (NRecord t _) = t
 nodeTag NClosure{}    = Tx.pack "<closure>"
 nodeTag (NGroupCode _) = Tx.pack "<closure>"
 nodeTag (NEnv _)       = Tx.pack "<env>"
+nodeTag (NCont _ _)    = Tx.pack "<continuation>"
 
 litText :: Lit -> Text
 litText (LInt n)  = Tx.pack (show n)
@@ -512,6 +578,73 @@ litText LUnit     = Tx.pack "()"
 
 renderJoin :: JoinId -> Text
 renderJoin (JoinId (Unique i)) = Tx.pack "j" <> Tx.pack (show i)
+
+-- ---------------------------------------------------------------------------
+-- Effect dispatch (M2b-1 Task 4): the RC analogue of the reference
+-- 'Wok.Interp.Machine.dispatchOp'/'findHandler', threading the 'Store'.
+
+-- | Walk outward from the operation's continuation to the nearest 'KHandleRC'
+-- that covers @(label, op)@. Returns: a builder that re-prepends the frames ABOVE
+-- the handler (the captured prefix), the matched handler, its activation tag, its
+-- captured scope @hsc@, and the continuation BELOW the handler. Mirrors the
+-- reference 'findHandler' over 'RCKont' (same ambient-vs-named 'instOk' routing).
+rcFindHandler
+  :: Maybe (Unique, Int) -> Text -> Text -> RCKont
+  -> Maybe (RCKont -> RCKont, Handler, Int, RCScope, RCKont)
+rcFindHandler mTarget lbl op = go id
+  where
+    go _   KDoneRC               = Nothing
+    go acc (KLetRC b e sc k)     = go (acc . KLetRC b e sc) k
+    go acc (KAppRC vs k)         = go (acc . KAppRC vs) k
+    go acc (KDropCellRC a k)     = go (acc . KDropCellRC a) k
+    go acc (KHandleRC h tag sc k)
+      | matches h                = Just (acc, h, tag, sc, k)
+      | otherwise                = go (acc . KHandleRC h tag sc) k
+      where
+        matches hh   = coversOp hh && instOk hh
+        coversOp hh  = any (\a -> oaLabel a == lbl && oaOp a == op) (hOps hh)
+        -- Ambient (Nothing) matches any covering handler; a named target matches
+        -- only the handler whose self-binder Unique = u AND whose activation tag =
+        -- t (so two activations of one runner site are told apart).
+        instOk hh = case mTarget of
+          Nothing     -> True
+          Just (u, t) -> (nameUniq . bndName <$> hSelf hh) == Just u && tag == t
+
+-- | The op arm of a handler matching @(label, op)@, if any. Mirrors the reference
+-- 'Wok.Interp.Machine.lookupOpArm'.
+lookupOpArmRC :: Text -> Text -> Handler -> Maybe OpArm
+lookupOpArmRC lbl op h =
+  case [ a | a <- hOps h, oaLabel a == lbl, oaOp a == op ] of
+    (a : _) -> Just a
+    []      -> Nothing
+
+-- | An effect operation: find the nearest matching handler, CAPTURE the delimited
+-- continuation above it CONCRETELY into a fresh 'NCont' cell, bind the op args and
+-- the (boxed 'NCont') resume, and run the arm under the handler's below-
+-- continuation. The RC analogue of the reference 'dispatchOp', threading the
+-- 'Store'. M2b-1: 'hAnswerJoin = Nothing' and 'hParam = Nothing', so NO answer-
+-- rebind and a one-arg resume (Task 5).
+--
+-- CAPTURE ACCOUNTING (spec §4.3): the @above@ frames are MOVED into the 'NCont'
+-- (rc = 1); NO incref of their children --- the values stay owned by their binders
+-- inside the captured frames. On ABORT the op arm drops @resume@ and the 'NCont's
+-- free runs its owned set ('cascadeChildren'); on RESUME (Task 5) the frames splice
+-- back and the shell is discarded WITHOUT freeing the owned set.
+rcDispatchOp
+  :: Maybe (Unique, Int) -> Text -> Text -> [RCValue] -> RCKont -> Store
+  -> Either RuntimeError RCConfig
+rcDispatchOp mTarget lbl op vs kCur s =
+  case rcFindHandler mTarget lbl op kCur of
+    Nothing -> Left (NoMatchingHandler lbl op)
+    Just (above, h, hTag, hsc, kBelow) ->
+      case lookupOpArmRC lbl op h of
+        Nothing -> Left (NoMatchingHandler lbl op)
+        Just oa ->
+          let prefix      = above KDoneRC
+              (cAddr, s') = alloc (NCont prefix (h, hTag, hsc)) s
+              env1 = bindRCBinders (oaArgs oa) vs (rscEnv hsc)
+              env2 = bindRCBinder (oaResume oa) (RVBox cAddr) env1
+          in Right (REval (oaBody oa) (RCScope env2 (rscJoins hsc)) kBelow s')
 
 -- ---------------------------------------------------------------------------
 -- Drivers

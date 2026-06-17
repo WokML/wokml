@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- M2b-1 regression (code-review #4, verified leak before fix). The op arm ALIASES
+-- the resume binder (`let k2 = k`) then calls the alias. The old m2bResumeEscapes
+-- used `escapesFrom`, which FOLLOWS pure alias-renames, so it returned "does not
+-- escape" and admitted this -- but the move-out tracking (ctxResume) is keyed on the
+-- ORIGINAL binder only, so `k2 0` is treated as a borrow and the NCont is neither
+-- moved-out nor dropped -> leak. The fixed m2bResumeEscapes does NOT follow aliases
+-- (an alias-rename is an escaping occurrence), so this is now REJECTED.
+effect Eff = { eop : U64 -> U64 }
+
+prog : Eff -> U64 with Eff
+prog e = e.eop 1
+
+run : (Eff -> U64 with Eff + eff r) -> U64 with eff r
+run c = with self = Eff { eop n k -> let k2 = k in k2 0 } in c self
+
+main : U64
+main = run prog
