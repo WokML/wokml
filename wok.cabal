@@ -92,6 +92,7 @@ library
         Wok.TypeChecking.Typed
         Wok.TypeChecking.Carrier
         Wok.IR.Name
+        Wok.IR.PrimNames
         Wok.IR.Anf
         Wok.IR.Escape
         Wok.IR.Elaborate

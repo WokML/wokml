@@ -1,5 +1,5 @@
 classify xs =
-  join j72(r) =
+  join j75(r) =
     let n = r
     let t = Pair(n, xs)
     t
@@ -9,10 +9,10 @@ classify xs =
       case ys of
         Nil ->
           let _drop.1 = __rc_drop(ys)
-          jump j72(0)
+          jump j75(0)
         Cons z _ ->
           let _drop.2 = __rc_drop(ys)
-          jump j72(z)
+          jump j75(z)
 
 main =
   let t.2 = Nil

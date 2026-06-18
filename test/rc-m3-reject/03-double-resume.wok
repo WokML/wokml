@@ -1,0 +1,41 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3-b Task 5: the DOUBLE-RESUME exploit (the rc==1 floor, spec 4.2 / 10 item 1).
+-- The op-arm parks 'resume' in a fresh-local cell, '__cont_take's it back out
+-- ONCE (the cell is now empty; the NCont addr has rc == 1), and then resumes the
+-- SAME taken continuation TWICE: 'k2 1' then 'k2 2'. The one-shot floor fires
+-- when 'moveOutCont' is called on a continuation with rc != 1 (i.e., rc == 2
+-- means two owners, each of which would resume it). The hand-built red-check in
+-- 'rcM3DoubleResumeTests' exercises this rc==2 path directly: it increfs the
+-- NCont to rc==2 then calls 'moveOutCont', which must error loudly ("one-shot
+-- violation") rather than silently proceed and later double-free the owned set.
+--
+-- The static 'Multiplicity' layer does NOT catch this shape: it tracks the
+-- 'resume' binder handed to '__cont_store', not a resume of a '__cont_take'
+-- result ('oaResume's Card does not follow the take-result). So this exploit is
+-- the DIRECT test of the runtime move-discipline floor --- the universal net
+-- that catches a multi-shot even when the static analysis cannot prove it.
+--
+-- This surface program documents the double-resume SHAPE; the deterministic
+-- loud-vs-silent red-check on the 'moveOutCont' rc==1 assert is exercised at the
+-- heap level in 'rcM3DoubleResumeTests' (Spec.hs), because the surface splice
+-- re-entry after the FIRST resume already runs the live continuation to the
+-- answer, so the SECOND resume's heap effect is not interpretable as a clean
+-- value-level differential (the hand-built scenario pins the floor precisely).
+effect Tick = { tick : U64 }
+
+runTick : (Tick -> a with Tick + eff e) -> a with eff e
+runTick c = with self = Tick { tick k ->
+  let cell   = __cont_cell_new () in
+  let filled = __cont_store cell k in
+  let k2     = __cont_take filled in
+  let first  = k2 1 in
+  k2 2 } in c self
+
+prog : Tick -> U64 with Tick
+prog t = t.tick
+
+main : U64
+main = runTick prog

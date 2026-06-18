@@ -14,6 +14,14 @@ module Wok.Pipeline
   , elaborateProgramFull
   , elaborateProgramFullTrusted
   , elaborateCheckedFull
+  , onceSinkKeys
+  , stdControlModule
+    -- * Test support
+    -- | Exported ONLY for the M3-a once-sink red-check test (it injects a
+    -- REDUCED key list to witness that a trust key is load-bearing). Production
+    -- code goes through 'elaborateProgramFullTrusted', which fixes the keys to
+    -- 'onceSinkKeys'. Not for production use.
+  , elaborateProgramWithOnceSinks
   ) where
 
 import Control.Monad (foldM)
@@ -142,12 +150,27 @@ elaborateProgramFullTrusted
   :: ModuleName
   -> [LoadedModule]
   -> Either String (CoreModule, Set Unique)
-elaborateProgramFullTrusted entryName ms = do
+elaborateProgramFullTrusted = elaborateProgramWithOnceSinks onceSinkKeys
+
+-- | TEST SUPPORT ONLY (exported solely for the M3-a once-sink red-check; see the
+-- export-list note). As 'elaborateProgramFullTrusted', but parameterized on the
+-- once-sink key list, so the red-check can witness that a given trust key is
+-- LOAD-BEARING (elaborate @m3-store-once@ with @onceSinkKeys@ MINUS @__cont_store@
+-- and the @park@ arm's verdict must flip from @1@ to @\969@). Production resolves
+-- the keys to the fixed 'onceSinkKeys' via 'elaborateProgramFullTrusted'.
+-- Resolution stays by @(module, name)@ extern identity via 'resolveTrusted' —
+-- never by hint text.
+elaborateProgramWithOnceSinks
+  :: [(Tx.Text, Tx.Text)]
+  -> ModuleName
+  -> [LoadedModule]
+  -> Either String (CoreModule, Set Unique)
+elaborateProgramWithOnceSinks keys entryName ms = do
   (resultMap, _warns) <- runPipelineFold entryName ms
   let mods = [ (modName, mrEnvOut mr, mrDecls mr)
              | (modName, mr) <- Map.toList resultMap ]
       (cm, globalByKey) = elaborateModulesSharedWithGlobals mods
-      onceSinks = resolveTrusted globalByKey onceSinkKeys
+      onceSinks = resolveTrusted globalByKey keys
   Right (cm, onceSinks)
 
 -- | The defining module of the genuine prelude coro prims.
@@ -155,11 +178,17 @@ stdControlModule :: Tx.Text
 stdControlModule = Tx.pack "Std.Control"
 
 -- | The trusted once-sink @extern@ prims, by @(definingModule, name)@: an
--- @extern@ whose semantics is to resume its continuation argument at most once.
--- Currently just @__coro_susp@ (the escape sink @start@ desugars to). This is the
--- C2 registry — a fixed set of prelude extern identities, resolved to 'Unique's.
+-- @extern@ whose semantics is to consume its continuation argument at most once.
+-- @__coro_susp@ is the coroutine escape sink (@start@ desugars to it);
+-- @__cont_store@ (M3-a) is the stored/escaping-continuation move-in sink (a
+-- scheduler op-arm hands its continuation to it to park it in a cell). This is
+-- the C2 registry — a fixed set of prelude extern identities, resolved to
+-- 'Unique's by extern identity in 'resolveTrusted' (never by hint text).
 onceSinkKeys :: [(Tx.Text, Tx.Text)]
-onceSinkKeys = [ (stdControlModule, Tx.pack "__coro_susp") ]
+onceSinkKeys =
+  [ (stdControlModule, Tx.pack "__coro_susp")
+  , (stdControlModule, Tx.pack "__cont_store")
+  ]
 
 -- | Resolve a set of @(module, name)@ extern keys to the canonical 'Unique's they
 -- map to in the elaborated global map (silently dropping any not present, e.g.

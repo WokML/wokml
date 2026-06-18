@@ -19,6 +19,8 @@ module Wok.Interp.RC.Value
     -- * Heap nodes
   , Node (..)
   , CaptureMode (..)
+  , nodeValues
+  , cascadeChildren
     -- * Store cells
   , Cell (..)
     -- * Allocation statistics
@@ -29,6 +31,7 @@ module Wok.Interp.RC.Value
   , alloc
   , allocStatic
   , writeStatic
+  , writeNode
   , isStaticAddr
   , deref
   , mkClosure
@@ -243,8 +246,9 @@ continuationOwned = dedup . go
     -- The parameter entry is keyed by the Binder's Unique so the dedup logic
     -- collapses aliased live-across-frames entries to one, matching the refcount.
     --
-    -- !!! DEFERRED, LATENT (code-review #7): raw-address dedup against named
-    -- entries is not performed here; see the 'dedup' note below.
+    -- RAW-VS-NAMED NON-DEDUP (code-review #5/#7): a raw (Nothing, a) entry is NOT
+    -- deduped against a named (Just u, a) entry. This is CORRECT-BY-RC-ACCOUNTING,
+    -- not a latent double-free; see the 'dedup' note below for the invariant.
     go (KHandleRC h _ hsc k)  =
       [ (Just (binderUnique pb), a)
       | Just pb <- [hParam h]
@@ -272,12 +276,54 @@ continuationOwned = dedup . go
     -- Raw-address entries (KAppRC over-args, KDropCellRC) carry no Unique and are
     -- emitted verbatim.
     --
-    -- !!! DEFERRED, LATENT (code-review #7): a (Nothing, a) raw entry is NEVER
-    -- compared against (Just u, a) named entries, so if the SAME cell is reachable
-    -- both through a named frame binder AND through a raw KAppRC/KDropCellRC frame,
-    -- address 'a' is freed twice -> double-free.  Believed unreachable today.
-    -- REVISIT when over-application (KAppRC) or an over-applied M2a-2 recursive
-    -- member (KDropCellRC env) can appear inside a captured continuation.
+    -- RAW-VS-NAMED NON-DEDUP IS CORRECT BY RC-ACCOUNTING (code-review #5/#7). A
+    -- (Nothing, a) raw entry is deliberately NEVER compared against a (Just u, a)
+    -- named entry, so when the SAME cell @a@ is owned BOTH through a named frame
+    -- binder AND through a raw KAppRC/KDropCellRC frame, @a@ appears in the owned set
+    -- TWICE and is freed twice. This is the RIGHT count, not a double-free:
+    --
+    --   THE INVARIANT: the owned set's MULTIPLICITY of @a@ equals @a@'s REFCOUNT.
+    --   Both the named occurrence (a MOVE binder) and the raw occurrence (a MOVE
+    --   over-arg / a moved-in closure cell) are CONSUMING positions, so the Perceus
+    --   pass inserts a @__rc_dup@ on the shared value at the second move position ---
+    --   @a@ genuinely has rc = 2, and freeing it twice (rc 2 -> 0) is exactly
+    --   balanced. DEDUPING here would emit @[a]@ and free @a@ ONCE (rc 2 -> 1), a
+    --   LEAK. (Empirically verified: with a KAppRC over-arg coinciding with a KLetRC
+    --   named binder at rc 2, the real per-entry free returns stLive to baseline
+    --   whereas a distinct-address dedup leaks one cell --- see the #5 dedup
+    --   experiment and 'rcM3RawVsNamedOwnedSetTests'.)
+    --
+    --   This is the SAME accounting that licenses keying the named dedup on the full
+    --   (Unique, Addr) pair rather than Unique alone: entries are collapsed ONLY when
+    --   they denote the SAME owner edge (same binder, same address); every DISTINCT
+    --   consuming edge (a second binder, OR a raw move position) is its own +1 the
+    --   Perceus dup already paid for, so it must be its own free.
+    --
+    -- INVARIANT, PRECISELY (code-review #5). For every cell @a@:
+    --   (owned-set multiplicity of @a@) == (refcount of @a@),
+    -- and this equality is MAINTAINED by the Perceus dups: each distinct consuming
+    -- owner edge of @a@ (a named binder OR a raw move position) is one +1 the pass
+    -- paid for with a @__rc_dup@, so it is one entry in the owned set AND one unit of
+    -- rc. Per-entry free (no raw/named dedup) therefore frees @a@ exactly rc-many
+    -- times: balanced, never a leak, never a double-free.
+    --
+    -- LOUD-ON-VIOLATION, NOT SILENT-CORRUPTION; the 'stDead' guard is the real net.
+    -- If the multiplicity ever EXCEEDED the refcount (a genuine Perceus
+    -- dup/drop-placement bug --- an over-count the dups did NOT pay for), the SURPLUS
+    -- free would hit 'dropAddr's 'stDead' double-free guard and raise a LOUD
+    -- "double-free: addr a" error, not silently corrupt the heap. So a desync is
+    -- caught at the exact violating free, by the universal allocator-level net ---
+    -- never a quiet wrong answer.
+    --
+    -- UNIT-PINNED, NOT CORPUS-REACHED. The raw+named coincidence (KAppRC/KDropCellRC
+    -- inside a captured continuation prefix at the SAME address as a named frame
+    -- binder) does NOT arise in the current language fragment, so this accounting is
+    -- pinned by the hand-built 'rcM3RawVsNamedOwnedSetTests' unit, NOT exercised
+    -- end-to-end by an elaboration->Perceus->run corpus program. The unit pins the
+    -- per-entry-free-vs-dedup distinction at the owned-set level; the 'stDead'
+    -- tripwire above is the end-to-end backstop that would catch any real desync if
+    -- the fragment ever grows to reach this path. (No cheap heap-balanced corpus
+    -- program reaches a raw+named coincidence today, so we do not force one.)
     dedup = goD Set.empty
       where
         goD _ [] = []
@@ -373,6 +419,20 @@ data Node
   -- 'cascadeChildren' (the single free path in 'dropAddr'). Capture increfs nothing
   -- (the frames are MOVED in, still owned by their binders); abort frees the owned
   -- set once; resume (Task 5) discards the shell WITHOUT freeing the owned set.
+  | NContCell (Maybe Addr)
+  -- ^ An AFFINE ONE-SHOT continuation slot (M3-b, spec §4.1): empty ('Nothing')
+  -- or holding exactly one continuation addr ('Just a'). The cell goes empty ->
+  -- holding -> empty (filled once by @__cont_store@, emptied once by
+  -- @__cont_take@), never overwriting a live value, so it forges no cycle.
+  --
+  -- RC DISCIPLINE. Unlike 'NCont', a cell uses the GENERIC cascade: the held
+  -- continuation is an ORDINARY COUNTED CHILD of the cell ('nodeValues' returns
+  -- it as a single 'RVBox', and 'cascadeChildren' falls through to the
+  -- 'countedRefs . nodeValues' default). So dropping a full cell at rc 0
+  -- decrements the held continuation, whose own drop then runs its owned-set free
+  -- once (the 'NCont' abort path) -- one free path, no double-free, no leak.
+  -- @__cont_store@ moves the addr in WITHOUT an incref (the binder is consumed),
+  -- so the cell holds the one counted edge the binder used to.
   deriving (Eq, Show)
 
 -- | Whether a closure BODY receives ownership of its captures on entry. This is
@@ -522,6 +582,17 @@ allocStatic n s =
 writeStatic :: Addr -> Node -> Store -> Store
 writeStatic a n s = s { stCells = IM.insert a (Cell 1 n) (stCells s) }
 
+-- | Overwrite the NODE payload of an existing cell while PRESERVING its reference
+-- count (and statistics). Used by the M3 continuation-cell move primitives
+-- (@__cont_store@/@__cont_take@) to transition an 'NContCell' between
+-- @Nothing@ (empty) and @Just a@ (holding) in place, since those are MOVES, not
+-- allocations: the cell keeps its identity and its refcount across the fill/empty.
+-- 'Left' if the address is dead or dangling (the cell must already exist).
+writeNode :: Addr -> Node -> Store -> Either RuntimeError Store
+writeNode a n s = do
+  c <- deref a s
+  Right s { stCells = IM.insert a c { cNode = n } (stCells s) }
+
 -- ---------------------------------------------------------------------------
 -- Closure construction
 
@@ -624,6 +695,10 @@ nodeValues (NGroupCode _)       = []
 nodeValues (NEnv m)             = Map.elems m
 -- An 'NCont's free does NOT cascade through 'nodeValues' --- see 'cascadeChildren'.
 nodeValues (NCont _ _)          = []
+-- The held continuation is an ordinary counted child of the cell (one 'RVBox');
+-- an empty cell has none. 'cascadeChildren' falls through to the generic
+-- 'countedRefs . nodeValues' default, so the cell's drop cascades to it once.
+nodeValues (NContCell mb)       = [ RVBox a | Just a <- [mb] ]
 
 -- | The addresses to free when a node's cell is freed (the single free path,
 -- consumed by 'dropAddr'). For every node EXCEPT 'NCont' this is the counted refs
@@ -723,6 +798,7 @@ renderNode _ NClosure{}      = Right (Tx.pack "<closure>")
 renderNode _ (NGroupCode _)  = Right (Tx.pack "<closure>")
 renderNode _ (NEnv _)        = Right (Tx.pack "<env>")
 renderNode _ (NCont _ _)     = Right (Tx.pack "<continuation>")
+renderNode _ (NContCell _)   = Right (Tx.pack "<cont-cell>")
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)

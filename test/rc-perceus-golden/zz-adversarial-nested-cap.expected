@@ -1,27 +1,27 @@
 build a b xs =
-  join j74(r.1) =
+  join j77(r.1) =
     let h = r.1
     let t.1 = Cell(h, a, b)
     t.1
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      join j77(r.2) =
+      join j80(r.2) =
         let g.1 = r.2
-        jump j74(g.1)
+        jump j77(g.1)
       case b of
-        Nil -> jump j77(0)
-        Cons p _.1 -> jump j77(p)
+        Nil -> jump j80(0)
+        Cons p _.1 -> jump j80(p)
     Cons y _.2 ->
       let _drop.2 = __rc_drop(xs)
-      join j84(r.3) =
+      join j87(r.3) =
         let g.2 = r.3
-        jump j74(g.2)
+        jump j77(g.2)
       case a of
-        Nil -> jump j84(y)
+        Nil -> jump j87(y)
         Cons q _.3 ->
           let t.2 = +(y, q)
-          jump j84(t.2)
+          jump j87(t.2)
 
 main =
   let t.1 = Nil

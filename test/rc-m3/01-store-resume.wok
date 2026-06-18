@@ -1,0 +1,35 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3-b Task 3: the store-then-take-then-resume oracle. The 'tick' op-arm does NOT
+-- tail-resume its continuation 'k' directly (the M2b shape 'tick k -> k 1');
+-- instead it PARKS 'k' in a fresh continuation cell via '__cont_store' (move-in,
+-- no incref), immediately TAKES it back out via '__cont_take' (move-out, no
+-- incref, cell emptied), and resumes the taken continuation ONCE with 1.
+--
+-- This exercises the full M3 move discipline in a single arm while staying within
+-- the handler's dynamic extent (resume-site semantics): the captured frame is
+-- moved into the cell and back out, then spliced by resume, whose 'moveOutCont'
+-- asserts rc == 1 (the soundness floor). 'store' returns the filled cell (Design
+-- A), which 'take' then drains.
+--
+-- 'prog' performs 'tick' twice, so the store/take/resume cycle runs TWICE in one
+-- program, each freeing exactly one NCont shell without cascade. Output is
+-- 1 + 1 = 2 (identical to the direct tail-resume), and the heap returns to
+-- baseline. The reference oracle models the cell as an immutable VCon wrapper and
+-- must agree.
+effect Tick = { tick : U64 }
+
+runTick : (Tick -> a with Tick + eff e) -> a with eff e
+runTick c = with self = Tick { tick k ->
+  let cell = __cont_cell_new () in
+  let filled = __cont_store cell k in
+  let k2 = __cont_take filled in
+  k2 1 } in c self
+
+prog : Tick -> U64 with Tick
+prog t = let a = t.tick in let b = t.tick in a + b
+
+main : U64
+main = runTick prog

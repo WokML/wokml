@@ -98,8 +98,9 @@ import Wok.IR.Escape
   , rlamSiblingCaptureEscapes, letRecEnclosingCaptureEscapes
   , letRecMemberEscapes
   , rawEnclosingFv
-  , m2bHandlerInFragment )
+  , m2bHandlerInFragmentStore )
 import Wok.IR.Name (JoinId, Name (..), Unique (..))
+import qualified Wok.IR.PrimNames as PN
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
 
 -- ---------------------------------------------------------------------------
@@ -108,8 +109,39 @@ import Wok.TypeChecking.Types (CType (..), TyCon (..))
 -- These MUST match the hint keys in 'Wok.Interp.RC.Prim.rcPrimTable'.
 
 dupHint, dropHint :: Text
-dupHint  = Tx.pack "__rc_dup"
-dropHint = Tx.pack "__rc_drop"
+dupHint  = PN.rcDupName
+dropHint = PN.rcDropName
+
+-- | The M3 stored-continuation move-out once-sink (@__cont_take cell@). Its CELL
+-- argument is a BORROW (the prim reads the cell, empties it in place, and returns
+-- the held continuation; it does NOT consume the cell handle), so the cell stays
+-- owned by its binder and is dropped at its real last use --- this frees the
+-- now-empty 'NContCell' exactly once. Its RESULT is a continuation: a resume
+-- binder (added to 'ctxResume' in the 'Let' rule) whose application is a MOVE-OUT
+-- (the runtime 'moveOutCont' frees the 'NCont' shell), so NO @__rc_drop@ is placed
+-- on the resume path. MUST match the hint key in
+-- "Wok.Interp.RC.Prim"/"Wok.Interp.Prim".
+contTakeHint :: Text
+contTakeHint = PN.contTakeName
+
+-- | True iff the RHS is a saturated @__cont_take cell@ call (the M3 move-out): its
+-- result is a continuation that resumes as a move-out, and its cell argument is a
+-- borrow. The result binder is threaded into 'ctxResume'.
+isContTakeRhs :: Rhs -> Bool
+isContTakeRhs (RApp (AVar h) _) = nameHint h == contTakeHint
+isContTakeRhs _                 = False
+
+-- | True iff @rhs@ binds a CONTINUATION resume binder, given the resume binders
+-- @resume@ already in scope: a @__cont_take cell@ call (M3 move-out) OR a pure
+-- alias @let k2 = t@ of an existing resume binder @t@ (the elaborator's split of
+-- @let k2 = __cont_take c@ into @let t = __cont_take c ; let k2 = t@). The new
+-- binder then joins the resume set. Shared by the pass ('Ctx' 'ctxResume') and the
+-- lint ('LintEnv' 'leResume') so both treat the take-result's application as a
+-- move-out identically.
+aliasesResume :: Set Unique -> Rhs -> Bool
+aliasesResume resume r = isContTakeRhs r || case r of
+  RAtom (AVar n) -> nameUniq n `Set.member` resume
+  _              -> False
 
 -- ---------------------------------------------------------------------------
 -- Fresh-Unique supply
@@ -273,16 +305,19 @@ coveredExpr Jump{}              = True
 coveredExpr (LetRec defs e)     =
   all (\(_, _, body) -> coveredExpr body) defs && coveredExpr e
 -- M2b-1 (Task 2): a 'Handle' is covered iff its handler is in the M2b-1
--- RC-supported fragment ('m2bHandlerInFragment' --- the CONTEXT-FREE part of the
--- admission test) AND the handled expr + every arm body are themselves covered. An
+-- RC-supported fragment ('m2bHandlerInFragmentStore' --- the CONTEXT-FREE part of
+-- the admission test, ADMITTING the M3 store route so its arm is instrumented and
+-- heap-balanced) AND the handled expr + every arm body are themselves covered. An
 -- OUT-of-fragment handler stays 'False', so the pass leaves it untouched.
 -- NOTE: the boundary guard ('Wok.IR.Reachable') additionally rejects a handler whose
 -- arm captures an enclosing boxed local --- a context-dependent check this context-free
--- predicate cannot make, so 'coveredExpr' is intentionally more permissive there. Sound
--- because production runs the guard before the pass; see 'm2bHandlerInFragment' in
--- "Wok.IR.Escape" for the full rationale.
+-- predicate cannot make, so 'coveredExpr' is intentionally more permissive there. The
+-- guard ALSO still rejects the store route (the non-store form 'm2bHandlerInFragment')
+-- until M3 Task 4's carrier-wall check; production runs the guard before the pass, and
+-- the M3 oracle bypasses the guard via 'runModuleRCUnchecked'. See
+-- 'm2bHandlerInFragmentStore' in "Wok.IR.Escape" for the full rationale.
 coveredExpr (Handle e h)        =
-  m2bHandlerInFragment h && coveredExpr e && coveredHandler h
+  m2bHandlerInFragmentStore h && coveredExpr e && coveredHandler h
 
 coveredAlt :: Alt -> Bool
 coveredAlt (AltCon _ _ e) = coveredExpr e
@@ -511,6 +546,13 @@ ownExpr ctx sup0 delta (Let b rhs body) =
       -- dup-on-consume here (the real escape, e.g. the closure that captures @a@,
       -- dups the shared env at its own use). 'a' is made borrowed in 'ctx'' below.
       aliasesBorrow = aliasesBorrowIn (ctxBorrow ctx) rhs
+      -- M3 (Task 3): @rhs@ binds a CONTINUATION resume binder iff it is a
+      -- @__cont_take cell@ call OR a pure alias of an existing resume binder
+      -- (@let k2 = t@ where @t@ is in 'ctxResume' --- the elaborator's split of
+      -- @let k2 = __cont_take c@). Either way the new binder @b@ joins 'ctxResume'.
+      -- 'aliasesResume' (the shared helper) is the SAME predicate the lint mirror
+      -- uses against 'leResume'.
+      bindsResume = aliasesResume (ctxResume ctx) rhs
       borrowMoves
         | aliasesBorrow = []
         | otherwise     = [ u | u <- moveOperandUniques rhs, u `Set.member` ctxBorrow ctx ]
@@ -605,6 +647,20 @@ ownExpr ctx sup0 delta (Let b rhs body) =
                     in (ctxBind b ctx)
                          { ctxBorrow   = Set.insert (binderUnique b) (ctxBorrow ctx)
                          , ctxEnvAlias = inheritedEnv `Map.union` ctxEnvAlias ctx }
+               -- M3 (Task 3): @let k2 = __cont_take cell@ binds a CONTINUATION, OR
+               -- @let k2 = t@ aliases an existing resume binder @t@. Track @k2@ as a
+               -- resume binder so applying it (@k2 v@) is treated as a MOVE-OUT (the
+               -- head is counted as consumed, no @__rc_drop@ is placed on the resume
+               -- path) --- mirroring the runtime, where resuming the taken 'NCont'
+               -- runs 'moveOutCont' (frees the shell). Without this, the
+               -- borrow-on-call + last-use machinery would place a @__rc_drop k2@
+               -- that double-frees the already-resumed shell. The alias case is
+               -- needed because the elaborator splits @let k2 = __cont_take c@ into
+               -- @let t = __cont_take c ; let k2 = t@. A resume binder is affine
+               -- (one-shot), so the alias is a RENAME, not a second owner.
+               | bindsResume =
+                    (ctxBind b ctx)
+                      { ctxResume = Set.insert (binderUnique b) (ctxResume ctx) }
                | otherwise     = ctxBind b ctx
   in
     -- 1. emit the dups the rhs needs (before the rhs runs): the owned-operand dups
@@ -875,7 +931,7 @@ ownExpr ctx sup delta (LetRec defs body) =
 -- (env, exempt, borrow) is kept; only the owned set is reset. The lint mirror
 -- ('checkExpr') resets per-path counts identically.
 ownExpr ctx sup delta (Handle e h)
-  | m2bHandlerInFragment h =
+  | m2bHandlerInFragmentStore h =
       let (rb, rbody) = hReturn h
           mParam      = hParam h
           paramBs     = maybe [] pure mParam
@@ -1039,6 +1095,12 @@ ownedOccs ctx delta rhs = case rhs of
   -- IS a move (the move-out: resuming hands the captured frames back). So when the
   -- head names a resume binder, count it too --- the application consumes @resume@,
   -- and no extra @__rc_drop@ is placed on that path.
+  -- M3 (Task 3): @__cont_take cell@ BORROWS its cell argument (the prim reads and
+  -- empties the cell in place, returning the held continuation; it does NOT move
+  -- the cell out). So the cell stays owned and is dropped at its last use, which
+  -- frees the now-empty cell once. Count nothing here.
+  RApp (AVar h) _
+    | nameHint h == contTakeHint -> Map.empty
   RApp f as      -> count (resumeHead f ++ as)
   RCon _ as      -> count as
   RRecord _ flds -> count (map snd flds)
@@ -1083,6 +1145,9 @@ ownedOccs ctx delta rhs = case rhs of
 moveOperandUniques :: Rhs -> [Unique]
 moveOperandUniques rhs = case rhs of
   RAtom a        -> atomUs [a]
+  -- M3 (Task 3): @__cont_take cell@ BORROWS its cell argument (see 'ownedOccs').
+  RApp (AVar h) _
+    | nameHint h == contTakeHint -> []
   RApp _ as      -> atomUs as
   RCon _ as      -> atomUs as
   RRecord _ flds -> atomUs (map snd flds)
@@ -1644,6 +1709,17 @@ checkExpr env cnt (Let b rhs body) =
                         _ -> Map.empty
                 in env { leBorrow   = Set.insert (binderUnique b) (leBorrow env)
                        , leEnvAlias = inheritedEnv `Map.union` leEnvAlias env }
+            -- M3 (Task 3): @let k2 = __cont_take cell@ binds a CONTINUATION, OR
+            -- @let k2 = t@ aliases an existing resume binder @t@ (the elaborator
+            -- splits @let k2 = __cont_take c@ into @let t = __cont_take c ; let k2 =
+            -- t@). Mirror the pass's 'aliasesResume': track @k2@ in 'leResume' so
+            -- applying it (@k2 v@) is a MOVE-OUT ('moveAtoms's 'resumeHead'
+            -- relinquishes the head, no extra drop on the resume path). @k2@ is boxed
+            -- so it STILL enters the owned set at +1 ('enters'); the move-out at the
+            -- application brings it back to 0. Without this the application would not
+            -- relinquish @k2@ (borrow-on-call) -> a false leak at the leaf.
+            | aliasesResume (leResume env) rhs =
+                env { leResume = Set.insert (binderUnique b) (leResume env) }
             | otherwise     = env
           -- A closure build also audits its lambda body as its OWN ownership
           -- scope: the boxed params and the boxed OWNED captures are owned on entry
@@ -1889,6 +1965,14 @@ moveAtoms resume rhs = case rhs of
   --
   -- M2b-1 EXCEPTION (Task 2): a RESUME head (in @resume@) IS a move (the move-out),
   -- so include it; mirror of 'ownedOccs's 'resumeHead'.
+  --
+  -- M3 (Task 3): @__cont_take cell@ BORROWS its cell argument (the prim reads and
+  -- empties the cell in place; the cell stays owned and is dropped at its last use).
+  -- 'ownedOccs' / 'moveOperandUniques' both exempt it, so the lint mirror MUST too,
+  -- or it counts the cell as moved AT the take and then over-consumes on the pass's
+  -- last-use @__rc_drop(cell)@.
+  RApp (AVar h) _
+    | nameHint h == contTakeHint -> []
   RApp f as      -> resumeHead f ++ as
   RCon _ as      -> as
   RRecord _ flds -> map snd flds

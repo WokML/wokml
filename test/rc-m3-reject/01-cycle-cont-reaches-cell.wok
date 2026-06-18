@@ -1,0 +1,40 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3 Task 4 (THE CYCLE EXPLOIT --- closest surface approximation). For an RC cycle
+-- 'cell -> NCont -> cell' to form, the stored continuation must counted-reach its
+-- own cell --- i.e. the cell must be a value LIVE ABOVE the op (in the captured
+-- continuation prefix), then have 'resume' stored INTO it. The most direct surface
+-- route is: make the cell the handler's OWN BATON ('hParam') and store the op-arm
+-- 'resume' into that baton. Then the parked continuation's owned set would include
+-- the baton cell (the nested-param route, verified constructible at the heap level
+-- by the 'm3 cycle red-check' unit test where 'continuationOwned prefix == [cell]'
+-- and the cell-drop cascade double-frees).
+--
+-- This program ('park k -> __cont_store cell k', where 'cell' is the handler
+-- parameter baton) is REJECTED before it can run --- by the TYPE CHECKER's
+-- OccursCheck: storing 'resume' into the baton unifies the cell's answer type 'r'
+-- with the continuation's own result type (which contains 'r'), so 'r' occurs in
+-- itself. This is the type-level carrier wall (spec §10.3): the surface cycle route
+-- is structurally unconstructible. (The runtime '__cont_store' carrier-wall check
+-- and the static 'm3CarrierWallViolations' boundary check are the two further
+-- defense-in-depth layers, exercised directly by the 'm3 cycle red-check' unit
+-- test on a hand-constructed owned set, since no surface program reaches them.)
+effect Park = { park : U64 }
+
+runPark : (Park -> U64 with Park + eff e) -> U64 with eff e
+runPark c =
+  with self = Park
+    { cell = __cont_cell_new ()
+    ; park k ->
+        let filled = __cont_store cell k in
+        let k2 = __cont_take filled in
+        k2 1 }
+  in c self
+
+prog : Park -> U64 with Park
+prog p = let a = p.park in a + 1
+
+main : U64
+main = runPark prog

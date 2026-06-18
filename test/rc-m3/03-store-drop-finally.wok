@@ -1,0 +1,59 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3-b Task 5: the cell-DROP path (store -> drop, "park and abandon"). The
+-- 'envAsk' op is RESUMABLE ('envAsk : U64', not 'Never'), so its captured
+-- continuation 'k' is a real NCont with a real OWNED SET --- here the boxed list
+-- 'xs', live in the frame above the op. The arm PARKS 'k' in a fresh-local cell
+-- via '__cont_store' (move-in, no incref) and then NEVER takes it: it returns
+-- the answer 'None'. The filled cell goes out of scope at the arm's end, so
+-- Perceus drops it. The cell-drop CASCADES to the held NCont
+-- ('cascadeChildren (NContCell (Just a)) = [a]'), whose own drop runs
+-- 'continuationOwned' EXACTLY ONCE (the M2b abort path, re-pointed at cell-drop)
+-- and frees the owned set ('xs'). The heap returns to baseline.
+--
+-- This is the M3 cell-drop path (spec 3.2 / 4.4), NOT the pre-existing M2b
+-- raw-abort leak (spec 10 item 6): a raw-abort arm 'envAsk k -> None' DISCARDS
+-- 'k' directly and leaks its owned set ('xs') because no drop is placed on a
+-- resumable arm's dead resume binder. Here the resume is MOVED into the cell (a
+-- counted edge the drop cascade follows), so its owned set IS reachable through
+-- the cell -> NCont -> continuationOwned cascade and is freed once. The store
+-- route is the CORRECT path; it does NOT trip the pre-existing leak.
+--
+-- "drop runs finally" REDUCES, for M3, to "the owned set is freed exactly once
+-- on cell-drop" --- the cleanup IS the free, via the cascade. A user-facing
+-- 'finally'/cleanup block is the DEFERRED M2 RAII drop-hook feature (the seam,
+-- not a hook); it is explicitly out of scope here.
+--
+-- The continuation is never resumed, so the answer is the arm's own 'None' (the
+-- 'prog' tail below the op is discarded with the dropped continuation). The
+-- reference oracle (no heap) returns the SAME 'None'; the RC machine must
+-- additionally be heap-balanced ('xs' and the NCont shell freed exactly once).
+effect Env = { envAsk : U64 }
+
+-- The 'Option a' answer type lets the abandon arm return 'None' while the
+-- resumed-program type stays 'a' --- the continuation 'k : U64 -> Option a'.
+envAbandon : (Env -> a with Env + eff e) -> Option a with eff e
+envAbandon c = with self = Env { envAsk k ->
+  let cell   = __cont_cell_new () in
+  let filled = __cont_store cell k in
+  None ; v -> Some v } in c self
+
+sumList : [U64] -> U64
+sumList xs = case xs of
+  []      -> 0
+  h :: t  -> h + sumList t
+
+-- 'xs' is built BEFORE the op and would be consumed AFTER the resume returns, so
+-- it sits in the captured frame above 'envAsk' --- it is in the parked
+-- continuation's OWNED SET. Since the continuation is abandoned (stored, never
+-- resumed), 'xs' is freed by the cell-drop cascade, not by 'sumList'.
+prog : Env -> U64 with Env
+prog r =
+  let xs = [1, 2, 3] in
+  let m  = r.envAsk in
+  m + sumList xs
+
+main : Option U64
+main = envAbandon prog

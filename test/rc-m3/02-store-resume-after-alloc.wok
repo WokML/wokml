@@ -1,0 +1,43 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3-b Task 3: a BOXED value LIVE ACROSS THE STORE. 'xs' (a list cell) is built
+-- BEFORE the op and consumed AFTER the resume returns, so it sits in the captured
+-- frame above 'ask'. The op-arm PARKS 'resume' in a continuation cell
+-- ('__cont_store', move-in) and immediately TAKES it back ('__cont_take',
+-- move-out) before resuming with 3.
+--
+-- The captured frame (holding 'xs') is MOVED into the NCont, then the NCont addr
+-- is MOVED into the cell and back out, then spliced by resume. At no point is 'xs'
+-- increfed or freed by the store path: store/take are pure moves of the NCont
+-- shell, which OWNS the captured frame. If '__cont_store' increfed the
+-- continuation, or the cell-cascade freed the owned set on the take path, 'xs'
+-- would double-free (or leak). Resume hands 'xs' back to the live continuation
+-- where 'sumList xs' consumes and drops it exactly once.
+--
+-- Output is '3 + (1 + 2) = 6' (identical to the direct tail-resume of
+-- rc-m2b/07); the heap returns to baseline. The reference oracle (immutable cell)
+-- must agree.
+effect Env = { envAsk : U64 }
+
+envReader : U64 -> (Env -> a with Env + eff e) -> a with eff e
+envReader n c = with self = Env { envAsk k ->
+  let cell = __cont_cell_new () in
+  let filled = __cont_store cell k in
+  let k2 = __cont_take filled in
+  k2 n } in c self
+
+sumList : [U64] -> U64
+sumList xs = case xs of
+  []      -> 0
+  h :: t  -> h + sumList t
+
+prog : Env -> U64 with Env
+prog r =
+  let xs = [1, 2] in
+  let m  = r.envAsk in
+  m + sumList xs
+
+main : U64
+main = envReader 3 prog

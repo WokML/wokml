@@ -1,0 +1,61 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-18-m3-stored-continuations.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: M3-a — __cont_store as trusted once-sink",
+      "status": "completed",
+      "description": "**Goal:** Declare M3 prelude externs (Cont/ContCell, __cont_cell_new/__cont_store/__cont_take) and register __cont_store in onceSinkKeys so Multiplicity charges One for store-once, Many for store-twice/store-and-call. Red-checked.\n\n```json:metadata\n{\"files\":[\"prelude/Std/Control.wok\",\"src/Wok/Pipeline.hs\",\"test/multiplicity-examples\",\"test/multiplicity-fail-examples\",\"test/multiplicity-golden\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test -- -p \\\"multiplicity\\\"\",\"acceptanceCriteria\":[\"externs declared and typecheck (tcCarrier)\",\"__cont_store in onceSinks by identity\",\"store-once dumps 1, store-twice/store-and-call ω\",\"red-check: removing from onceSinkKeys flips store-once to ω\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: M3-b — NContCell heap node + RC accounting",
+      "status": "completed",
+      "description": "**Goal:** Add NContCell (Maybe Addr) to data Node with counted-child accounting (held cont is a counted child; cell-drop cascades to it; empty cell drops cleanly). Unit-tested.\n\n```json:metadata\n{\"files\":[\"src/Wok/Interp/RC/Value.hs\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test -- -p \\\"rc m3 node\\\"\",\"acceptanceCriteria\":[\"NContCell (Maybe Addr) constructor\",\"full cell has held addr as single counted child; empty has none\",\"cell-drop at rc0 cascades to held cont, freed once\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: M3-b — __cont_store/__cont_take on both machines",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Implement move-in (__cont_store)/move-out (__cont_take) on the RC machine (rc==1 floor via moveOutCont/spliceKont) and the reference machine (immutable VCon ContCell wrapper). Prove store-then-take-then-resume heap-balanced + reference-matched.\n\n```json:metadata\n{\"files\":[\"src/Wok/Interp/RC/Machine.hs\",\"src/Wok/Interp/RC/Prim.hs\",\"src/Wok/Interp/Prim.hs\",\"test/rc-m3\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test -- -p \\\"rc-m3\\\"\",\"acceptanceCriteria\":[\"__cont_cell_new/store/take on RC store, no incref, rc==1 on resume\",\"reference VCon wrapper mirrors observable semantics\",\"01-store-resume heap-balanced + reference-match\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: M3-b — boundary admission + carrier-wall-on-store (cycle prevented)",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** Relax m2bHandlerViolations to admit resume escaping only into __cont_store (by identity); add m3CarrierWallViolations rejecting a stored cont counted-reachable from its own cell. Cycle exploit + red-check.\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Escape.hs\",\"src/Wok/IR/Reachable.hs\",\"src/Wok/Interp/RC/Machine.hs\",\"test/rc-m3-reject\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test -- -p \\\"rc-m3-reject\\\"\",\"acceptanceCriteria\":[\"resume into __cont_store admitted; other escapes rejected\",\"m3CarrierWallViolations rejects cont-reaches-own-cell\",\"cycle exploit rejected; red-check: remove check => surviving cycle/imbalance\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: M3-b — drop/finally on cell-drop; double-resume red-check",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** Cell dropped while holding an unresumed continuation runs placed finally + frees owned set once (M2b abort path re-pointed). Pin the rc==1 floor with the double-resume red-check (neuter moveOutCont => silent double-free).\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Perceus.hs\",\"src/Wok/Interp/RC/Machine.hs\",\"src/Wok/Interp/RC/Value.hs\",\"test/rc-m3\",\"test/rc-m3-reject\",\"test/Spec.hs\"],\"verifyCommand\":\"cabal test -- -p \\\"rc-m3\\\"\",\"acceptanceCriteria\":[\"dropped-unresumed cell runs finally + frees owned set once\",\"double-resume of take-result is compile-error or loud rc!=1 fault\",\"red-check: neuter moveOutCont rc-check => silent double-free caught by oracle\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: M3-c — document scheduler-expressibility boundary + answer-decoupling milestone",
+      "status": "completed",
+      "blockedBy": [5],
+      "description": "**Goal (RESCOPED after Task 4 finding):** baton-park-resume is not HM-expressible (OccursCheck). Document the boundary: coro/Conc ships the scheduler (provider-held, Step-typed); M3 ships the codegen-ready primitive; answer-decoupling (existential/Step-typed cell) is the named next milestone for the in-wok scheduler.\n\n```json:metadata\n{\"files\":[\"docs/superpowers/specs/2026-06-18-m3-stored-continuations-design.md\",\"test/rc-m3\"],\"verifyCommand\":\"cabal test -- -p \\\"rc-m3\\\"\",\"acceptanceCriteria\":[\"boundary documented: coro/Conc ships the scheduler; M3 ships the codegen-ready primitive; answer-decoupling is the named next milestone\",\"no unsound or non-expressible harness claimed\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: M3-c — genM3Program generative property + teeth",
+      "status": "completed",
+      "blockedBy": [5],
+      "_note": "balanceLint/__cont_take drift found+fixed by the oracle (shared aliasesResume predicate)",
+      "description": "**Goal:** Extend Suite G with genM3Program over stored-cont shapes (store-resume/store-drop/store-in-branch, aliased resume, owned-set shapes on abort, cycle-attempt) + prop_m3Escape/prop_m3LintClean/prop_m3Teeth with cover floors.\n\n```json:metadata\n{\"files\":[\"test/Spec.hs\"],\"verifyCommand\":\"cabal test -- -p \\\"m3 property\\\"\",\"acceptanceCriteria\":[\"generator varies store-route + owned-set + cycle-attempt shapes with cover floors\",\"prop_m3Escape >=800 cases, coverage met\",\"prop_m3Teeth catches every single-site mutation on store/drop\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Full-branch readiness (NOT merge)",
+      "status": "pending",
+      "blockedBy": [1, 6, 7],
+      "description": "**Goal:** Whole branch green, hlint-clean (excl src-generated), run-the-exploit corpus + 3 red-checks (once-sink, carrier-wall, rc-floor) present and biting. Ready for the user's full-branch /code-review gate. Do NOT merge.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"cabal test\",\"acceptanceCriteria\":[\"cabal build + full cabal test green\",\"hlint clean excluding src-generated\",\"3 red-checks each go red on revert; inventory documented\",\"STOP before merge; report ready for /code-review\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-18T00:00:00Z"
+}

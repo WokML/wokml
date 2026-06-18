@@ -590,6 +590,7 @@ nodeTag NClosure{}    = Tx.pack "<closure>"
 nodeTag (NGroupCode _) = Tx.pack "<closure>"
 nodeTag (NEnv _)       = Tx.pack "<env>"
 nodeTag (NCont _ _)    = Tx.pack "<continuation>"
+nodeTag (NContCell _)  = Tx.pack "<cont-cell>"
 
 litText :: Lit -> Text
 litText (LInt n)  = Tx.pack (show n)

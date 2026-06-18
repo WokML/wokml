@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3-a: the --dump-multiplicity proof artifact for a STORED (escaping)
+-- continuation. The `Park.park` op-arm hands its continuation `k` to the
+-- trusted once-sink `__cont_store` (the M3 store route) EXACTLY ONCE. The
+-- trusted-once relaxation certifies the arm `1`: storing the continuation into
+-- a cell is a single, affine consumption, mirroring `__coro_susp`.
+effect Park = { park : U64 -> U64 }
+
+usePark : () -> U64 with Park
+usePark u = Park.park 7
+
+main : U64
+main =
+  let cell = __cont_cell_new () in
+  with { Park.park x k -> let a = __cont_store cell k in 0 }
+  usePark ()

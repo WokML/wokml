@@ -1,25 +1,25 @@
 headCons xs =
-  join j72(r) =
+  join j75(r) =
     let h = r
     let t = Cell(h, xs)
     t
-  join j74() =
-    jump j72(0)
-  join j75(y.1) =
-    jump j72(y.1)
-  join j77(y.2) =
-    jump j72(y.2)
+  join j77() =
+    jump j75(0)
+  join j78(y.1) =
+    jump j75(y.1)
+  join j80(y.2) =
+    jump j75(y.2)
   case xs of
-    Nil -> jump j74()
+    Nil -> jump j77()
     Cons f.1 f.2 ->
       let _dup = __rc_dup(f.2)
       case f.2 of
         Nil ->
           let _drop.1 = __rc_drop(f.2)
-          jump j75(f.1)
+          jump j78(f.1)
         Cons f.3 f.4 ->
           let _drop.2 = __rc_drop(f.2)
-          jump j77(f.1)
+          jump j80(f.1)
 
 main =
   let t.3 = Nil

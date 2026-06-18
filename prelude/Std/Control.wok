@@ -41,6 +41,33 @@ extern __coro_unwrap : Step a b r (row e) -> r                   -- pure project
 extern __coro_done   : r -> Step a b r (row e)
 extern __coro_cancel : Suspension a b r (row e) -> ()
 
+-- STORED / ESCAPING CONTINUATIONS (prelude-declared `extern`; M3-a).
+--
+-- `ContCell` is the opaque, second-class, affine continuation cell: a one-shot
+-- park slot held in a scheduler handler's baton. You never construct one by
+-- hand other than via `__cont_cell_new`, and you feed it to `__cont_store`
+-- (move-in) / `__cont_take` (move-out). Its carrier + consume-once discipline
+-- rides the `extern type` marker (Embedded-only), not the name.
+extern type ContCell r (row e)
+--
+-- `__cont_store` is the trusted ONCE-SINK: it moves the op-arm continuation `k`
+-- into the cell exactly once (no `dup`; the binder is consumed) and RETURNS the
+-- (now-filled) cell. Mirroring `__coro_susp`, the continuation slot is a plain
+-- function `(b -> r with eff e)` decoupled from the cell, so the op-arm
+-- `op x k -> __cont_store cell k` unifies without an occurs-check; the
+-- continuation performs `e` on resume. The multiplicity analysis charges this
+-- slot `One` by EXTERN IDENTITY.
+--
+-- WHY store RETURNS the cell (M3-b, Design A): the reference oracle models the
+-- cell as an IMMUTABLE value (a pure CEK machine has no value store to mutate),
+-- so the filled cell must be threaded forward as a value; the program
+-- `__cont_take`s the RETURNED handle. The RC machine fills the cell in place and
+-- returns the SAME handle, so the differential agrees. (The multiplicity card is
+-- unaffected: the return is a cell, not the continuation.)
+extern __cont_cell_new : () -> ContCell r (row e)
+extern __cont_store    : ContCell r (row e) -> (b -> r with eff e) -> ContCell r (row e)
+extern __cont_take     : ContCell r (row e) -> (b -> r with eff e)
+
 -- start: install Coro, run the producer to its first suspension, return the FIRST
 -- outcome as a Step. e = the producer's NON-Coro residual: emitted at the start site
 -- (before-suspend effects) AND captured into the Step (performed on resume).

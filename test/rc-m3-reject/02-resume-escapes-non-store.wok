@@ -1,0 +1,31 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3 Task 4 (guard-relaxation NARROWNESS proof). The store-route relaxation admits
+-- a 'resume' that escapes ONLY into the LITERAL '__cont_store cell resume'
+-- continuation argument. This program first ALIASES 'resume' ('let k2 = k') and
+-- stores the ALIAS. The store-exempting walker ('m2bResumeEscapesStoreRoute') exempts
+-- ONLY the direct 'resume' atom in a '__cont_store' call --- an alias-rename
+-- 'let k2 = resume' is ITSELF an escape (it is a non-head occurrence of 'resume'),
+-- and 'k2' is a fresh binder the move-out tracking ('ctxResume', keyed on the
+-- original binder) does not follow, so a stored/resumed alias would leak the
+-- 'NCont'. Hence the arm must STAY rejected by 'firstOrderNoHandlerViolations' with
+-- the M3 boundary message. This is the carrier-wall narrowness check: the exemption
+-- does not extend through an alias (exactly as the M2b 'rc-m2b-reject/12' alias
+-- rejection, now re-confirmed under the store-route relaxation).
+effect Tick = { tick : U64 }
+
+runTick : (Tick -> U64 with Tick + eff e) -> U64 with eff e
+runTick c = with self = Tick { tick k ->
+  let k2 = k in
+  let cell = __cont_cell_new () in
+  let filled = __cont_store cell k2 in
+  let k3 = __cont_take filled in
+  k3 1 } in c self
+
+prog : Tick -> U64 with Tick
+prog t = let a = t.tick in a + 1
+
+main : U64
+main = runTick prog

@@ -1,14 +1,14 @@
 pickTag tag xs =
-  join j72(r) =
+  join j75(r) =
     let chosen = r
     chosen
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      jump j72(tag)
+      jump j75(tag)
     Cons _.1 _.2 ->
       let _drop.2 = __rc_drop(tag)
-      jump j72(xs)
+      jump j75(xs)
 
 main =
   let t.1 = Nil

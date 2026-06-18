@@ -6,6 +6,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf (Lit (..))
+import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.Value
   ( Prim (..), PrimResult (..), PrimTable, RuntimeError (..), Value (..), renderValue )
 
@@ -34,6 +35,9 @@ prims =
   , coroCancelP
   , coerceP
   , driveConcP
+  , contCellNewP
+  , contStoreP
+  , contTakeP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -129,8 +133,84 @@ u32Conv = mkPrim (Tx.pack "u32") 1 $ \args -> case args of
   [a] -> do _ <- asInt a; Right (PRDone a)
   _   -> Left (ArityError (Tx.pack "u32"))
 
+-- ---------------------------------------------------------------------------
+-- The M3 stored-continuation cell primitives (spec §4.1), reference side.
+--
+-- The reference machine is a pure CEK machine with no explicit value store, so
+-- the continuation CELL is modelled FUNCTIONALLY as an immutable
+-- @VCon "ContCell" [k]@ wrapper (Design A). This is a faithful differential
+-- oracle because usage is affine: the cell is filled exactly once
+-- (@__cont_store@) and emptied exactly once (@__cont_take@), so no in-place
+-- mutation is observable. The continuation @k@ is the op-arm resume binder ---
+-- a 'VCont' on this machine --- and resuming the taken @k@ reuses the existing
+-- 'enter' 'VCont' apply path (the Coro/scheduler handler is re-installed via the
+-- continuation builder, mirroring @__coro_resume@).
+
+-- | @__cont_cell_new ()@ produces a fresh EMPTY cell. The empty slot is the
+-- nullary @ContCellEmpty@ con; @__cont_take@ on an empty cell errors loudly.
+contCellNewP :: Prim
+contCellNewP = mkPrim PN.contCellNewName 1 $ \args -> case args of
+  [_] -> Right (PRDone (VCon (Tx.pack "ContCell") [VCon (Tx.pack "ContCellEmpty") []]))
+  _   -> Left (ArityError (Tx.pack "__cont_cell_new"))
+
+-- | @__cont_store cell k@ moves @k@ into the cell and RETURNS the filled
+-- @VCon "ContCell" [k]@. Immutable: a fresh filled wrapper is returned rather
+-- than the argument cell mutated. Design A signature: @store@ returns the filled
+-- cell (not @()@) precisely because this immutable model cannot fill a handle in
+-- place --- the program threads the returned cell to @__cont_take@. The RC
+-- machine mutates in place and returns the same handle, so the two agree.
+--
+-- ORACLE FAITHFULNESS (code-review #7). This reference is a DIFFERENTIAL ORACLE
+-- against the RC machine ('Wok.Interp.RC.Prim'); the two must AGREE on every
+-- program that reaches them. Two of the three soundness classes the RC machine
+-- guards are filtered UPSTREAM, before EITHER machine runs:
+--
+--   * the DOUBLE-STORE (one-shot) class is a compile error (the affine
+--     Multiplicity analysis rejects storing/resuming a continuation twice), and
+--   * the carrier-wall CYCLE class is rejected by the static fresh-local boundary
+--     guard ('Wok.IR.Reachable.m3CarrierWallViolations').
+--
+-- So the differential oracle operates only on ADMITTED programs, and the
+-- reference is faithful THERE. We nonetheless mirror the RC machine's ONE-SHOT
+-- empty->full check here (it is cheap in this functional cell model: an empty
+-- cell wraps the @ContCellEmpty@ sentinel, a full one wraps the continuation), so
+-- that IF a double-store ever reached both machines they would AGREE on the
+-- rejection rather than diverge (the RC machine errors "cell already holds a
+-- continuation"; the reference errors here). We deliberately do NOT replicate the
+-- carrier-wall CYCLE check: it is intrinsically RC-specific (it consults the
+-- captured continuation's OWNED SET via 'continuationOwned', which exists only on
+-- the RC machine --- this reference uses 'VCont', not 'NCont', and has no
+-- owned-set), and the cycle class is filtered upstream anyway, so there is nothing
+-- for the oracle to compare on it.
+contStoreP :: Prim
+contStoreP = mkPrim PN.contStoreName 2 $ \args -> case args of
+  [VCon t [inner], k] | t == Tx.pack "ContCell" ->
+    case inner of
+      VCon e [] | e == Tx.pack "ContCellEmpty" ->
+        Right (PRDone (VCon (Tx.pack "ContCell") [k]))
+      -- A cell already holding a continuation: the one-shot violation the RC
+      -- machine rejects loudly. Unreachable on admitted programs (filtered by
+      -- Multiplicity upstream), but we mirror it so the oracle never diverges.
+      _ ->
+        Left (PrimError (Tx.pack "__cont_store: cell already holds a continuation (one-shot violation)"))
+  [_cell, _k] -> Left (PrimError (Tx.pack "__cont_store: not a continuation cell"))
+  _           -> Left (ArityError (Tx.pack "__cont_store"))
+
+-- | @__cont_take cell@ moves the continuation out of a filled cell. Errors on an
+-- empty cell (taken twice / never stored) --- the reference analogue of the RC
+-- machine's empty-slot fault.
+contTakeP :: Prim
+contTakeP = mkPrim PN.contTakeName 1 $ \args -> case args of
+  [VCon t [k]] | t == Tx.pack "ContCell" ->
+    case k of
+      VCon e [] | e == Tx.pack "ContCellEmpty" ->
+        Left (PrimError (Tx.pack "__cont_take: cell is empty (taken twice or never stored)"))
+      _ -> Right (PRDone k)
+  [v] -> Left (PrimError (Tx.pack "__cont_take: not a continuation cell: " <> renderValue v))
+  _   -> Left (ArityError (Tx.pack "__cont_take"))
+
 mkPrim :: Text -> Int -> ([Value] -> Either RuntimeError PrimResult) -> Prim
-mkPrim name arity fn = Prim name arity [] fn
+mkPrim name arity = Prim name arity []
 
 asInt :: Value -> Either RuntimeError Integer
 asInt (VLit (LInt n)) = Right n

@@ -1,0 +1,2 @@
+multishot resume: the `Park.park` arm resumes its continuation more than once; handlers are one-shot.
+  resume at most once, or express the multi-shot logic explicitly (e.g. with a list).

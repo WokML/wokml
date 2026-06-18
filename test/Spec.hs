@@ -54,7 +54,8 @@ import qualified Wok.IR.Perceus as Perceus
 import qualified Wok.IR.Escape as Esc
 import Wok.IR.Reachable
   ( pruneToReachable, exprUniques
-  , firstOrderNoHandlerViolations, m2bHandlerViolations )
+  , firstOrderNoHandlerViolations, m2bHandlerViolations
+  , m3CarrierWallViolations )
 import qualified Wok.IR.Multiplicity as Mult
 import Wok.IR.Multiplicity (Card (..))
 import Wok.IR.Anf
@@ -93,6 +94,16 @@ main = do
   -- dispatch + resume), each admitted program is wired to the RC-differential
   -- (Suite A) and heap-accounting (Suite B) groups, the same as 'test/rc-examples'.
   rcM2bFiles <- findByExtension [".wok"] "test/rc-m2b"
+  -- M3-b (Task 3): STORED-CONTINUATION corpus. These programs route a captured
+  -- continuation through a runtime cell (@__cont_store@/@__cont_take@), which the
+  -- boundary guard ('firstOrderNoHandlerViolations') still REJECTS as an escaping
+  -- resume until the store-route admission lands (Task 4). So they are wired NOT to
+  -- the guard-gated 'rc differential'/'rc stats' corpus groups (which would
+  -- 'assertFailure'), but to a dedicated group ('rcM3StoreTests') that runs the
+  -- differential + heap-balance oracle via 'runModuleRCUnchecked' --- exactly the
+  -- bypass the M2a-1 guard-rejected programs use ('assertRcAgrees'). When Task 4
+  -- admits the route, these move into the auto-discovered corpus.
+  rcM3Files <- findByExtension [".wok"] "test/rc-m3"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -180,6 +191,7 @@ main = do
     , rcStoreTests
     , rcDropTests
     , rcIncrefTests
+    , rcM3NodeTests
     , rcMachineTests
     , rcModuleTests
     , rcLetRecTests
@@ -219,6 +231,7 @@ main = do
     , testGroup "multiplicity fail golden"
         [ goldenVsString (takeBaseName f) (multFailGoldenFor f) (multFailHarness f)
         | f <- multFailFiles ]
+    , multiplicityM3RedCheck
     , testGroup "perceus golden"
         [ goldenVsString (takeBaseName f) (perceusGoldenFor f) (perceusDumpHarness f)
         | f <- perceusFiles ]
@@ -249,7 +262,45 @@ main = do
     , rcPropertyTests
     , rcM2a1PropertyTests
     , rcM2bPropertyTests
+    -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
+    -- hardening; each test group verifies the floor bites when disabled):
+    --
+    -- (M3-a) once-sink: 'multiplicityM3RedCheck' (group "multiplicity m3 red-check")
+    --   Strip @__cont_store@ from 'onceSinkKeys' and the store-once arm flips
+    --   to omega (@MultishotResume@ error). Reverts Task 1.
+    --
+    -- (M3-b / cycle, runtime) carrier-wall: 'rcM3CarrierWallTests'
+    --   (group "m3 cycle red-check (carrier-wall is load-bearing)")
+    --   Disable the runtime carrier-wall check in @__cont_store@ and a cyclic
+    --   store + subsequent drop double-frees the owned set. Reverts Task 4.
+    --   Also contains the H1 static fresh-local rule tests: neuter
+    --   'scCellIsFresh' in 'storeRouteCells' and the op-arg-cell store +
+    --   nested-handler store flip from rejected to admitted.
+    --
+    -- (M3-b / cycle, H2 subsumed) 2-cell cycle: 'rcM3TwoCellCycleSubsumedTests'
+    --   (group "m3 #4: 2-cell cycle is SUBSUMED by H1's static fresh-local rule")
+    --   Single-level runtime check alone misses a 2-cell cycle (gap is real),
+    --   but H1 rejects any non-fresh-local cell before the cycle can form.
+    --
+    -- (M3-b / double-resume) rc==1 floor: 'rcM3DoubleResumeTests'
+    --   (group "m3 double-resume red-check (rc==1 floor is load-bearing)")
+    --   Neuter @moveOutCont@'s rc==1 assert and a second resume becomes a
+    --   silent double-free (the floor fires at rc==2 on the FIRST resume
+    --   attempt, before any frame is spliced). Also covers Task-3 no-incref.
+    --
+    -- (M3-b / owned-set, H2) raw-vs-named non-dedup: 'rcM3RawVsNamedOwnedSetTests'
+    --   (group "m3 #5: raw-vs-named owned-set per-entry free is load-bearing")
+    --   Naive dedup of the owned set collapses [A,A] to [A], freeing rc 2->1
+    --   and leaving the cell LIVE (a leak). Per-entry free is required.
+    , rcM3PropertyTests
     , rcM2bRejectTests
+    , rcM3StoreTests rcM3Files
+    , rcM3RejectTests
+    , rcM3AdmitTests
+    , rcM3CarrierWallTests
+    , rcM3TwoCellCycleSubsumedTests
+    , rcM3RawVsNamedOwnedSetTests
+    , rcM3DoubleResumeTests
     , rcM2bResumeEscapeTests
     , rvRecMemberRepTests
     , rcM2b1FragmentTests
@@ -371,6 +422,49 @@ multFailHarness path = do
       case Pipeline.elaborateCheckedFull entryName ms of
         Left s  -> pure (BL.pack (s <> "\n"))
         Right _ -> pure (BL.pack "UNEXPECTED: elaboration succeeded (no multishot error)\n")
+
+-- M3-a RED-CHECK: the @__cont_store@ once-sink registration is LOAD-BEARING.
+--
+-- @m3-store-once.wok@'s @Park.park@ arm hands its continuation to @__cont_store@
+-- exactly once; with the full once-sink set this is certified @1@ (no error).
+-- Strip @(Std.Control, "__cont_store")@ from the once-sink keys and the SAME arm
+-- must flip to @\969@ (a 'Mult.MultishotResume' error) — proving the trust on the
+-- store route is what admits store-once, not some incidental accounting. The coro
+-- sink stays in the reduced set, so @__coro_susp@ is unaffected (the flip is
+-- specific to @__cont_store@, by extern identity, never hint text).
+multiplicityM3RedCheck :: TestTree
+multiplicityM3RedCheck = testGroup "multiplicity m3 red-check"
+  [ testCase "store-once certified 1 with __cont_store trusted" $ do
+      (cm, trustFull) <- loadStoreOnce
+      let errs = Mult.analyzeModule trustFull cm
+      assertBool ("expected no multishot error with __cont_store trusted, got: "
+                    <> show errs)
+                 (parkErr `notElem` errs)
+  , testCase "store-once flips to omega WITHOUT __cont_store trusted" $ do
+      (cm, trustNoStore) <- loadStoreOnceWith keysWithoutStore
+      let errs = Mult.analyzeModule trustNoStore cm
+      assertBool ("expected Park.park multishot error when __cont_store is NOT "
+                    <> "trusted (the once-sink registration is load-bearing), got: "
+                    <> show errs)
+                 (parkErr `elem` errs)
+  ]
+  where
+    storeOncePath  = "test/multiplicity-examples/m3-store-once.wok"
+    parkErr        = Mult.MultishotResume (T.pack "Park") (T.pack "park")
+    -- The full once-sink keys minus the store route; the coro sink is retained,
+    -- so the flip isolates __cont_store's contribution.
+    keysWithoutStore =
+      filter (/= (Pipeline.stdControlModule, T.pack "__cont_store"))
+             Pipeline.onceSinkKeys
+    loadStoreOnce = loadStoreOnceWith Pipeline.onceSinkKeys
+    loadStoreOnceWith keys = do
+      result <- Loader.loadProgram storeOncePath []
+      case result of
+        Left lerr -> assertFailure ("loader: " <> show lerr)
+        Right (entryName, ms) ->
+          case Pipeline.elaborateProgramWithOnceSinks keys entryName ms of
+            Left s  -> assertFailure ("elaborate: " <> s)
+            Right r -> pure r
 
 -- ---------------------------------------------------------------------------
 -- Perceus pass golden + balance lint (Task 5)
@@ -4319,7 +4413,7 @@ interpPrimTests :: TestTree
 interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
-        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","__coro_susp","__coro_unwrap","__coro_resume","__coro_done","__coro_cancel","__coerce","__drive_conc"])
+        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","__coro_susp","__coro_unwrap","__coro_resume","__coro_done","__coro_cancel","__coerce","__drive_conc","__cont_cell_new","__cont_store","__cont_take"])
   , testCase "addition" $
       case runPrim (T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
@@ -6298,6 +6392,820 @@ rcIncrefTests = testGroup "rc incref"
                       St.stFrees (St.stStats s4) @?= 1
                       St.stLive  (St.stStats s4) @?= 0
   ]
+
+-- ---------------------------------------------------------------------------
+-- RC M3 node tests (M3-b Task 2: the NContCell heap node)
+--
+-- 'NContCell (Maybe Addr)' is the affine one-shot continuation slot: empty
+-- ('Nothing') or holding exactly one continuation addr ('Just a'). The held
+-- continuation is an ORDINARY COUNTED CHILD of the cell, so dropping a full cell
+-- at rc 0 cascades to the continuation (freed exactly once); an empty cell drops
+-- with no children touched. These low-level Store tests exercise the accounting
+-- in isolation, the same way 'rcDropTests' does for 'NCon'.
+
+rcM3NodeTests :: TestTree
+rcM3NodeTests = testGroup "rc m3 node"
+  [ testCase "full cell drop frees the held continuation exactly once" $ do
+      -- A minimal NCont with an EMPTY owned set (KDoneRC prefix): dropping the
+      -- cell cascades to the NCont, which frees its (empty) owned set then its
+      -- own shell. The whole heap returns to the baseline -- no leak, no
+      -- double-free.
+      let s0          = St.emptyStore
+          baseline    = St.stLive (St.stStats s0)
+          cont        = St.NCont St.KDoneRC (m2b2NoParamHandler, 0, St.emptyRCScope)
+          (contAddr, s1) = St.alloc cont s0
+          (cellAddr, s2) = St.alloc (St.NContCell (Just contAddr)) s1
+      -- The cell counts the continuation as its single child.
+      St.cascadeChildren (St.NContCell (Just contAddr)) @?= [contAddr]
+      St.stLive (St.stStats s2) @?= baseline + 2
+      case St.dropAddr cellAddr s2 of
+        Left e  -> assertFailure ("cell drop failed: " <> show e)
+        Right s3 -> do
+          -- Both the cell and the held continuation are freed; heap balanced.
+          St.stLive (St.stStats s3) @?= baseline
+          St.stFrees (St.stStats s3) - St.stFrees (St.stStats s2) @?= 2
+          -- The continuation cell is gone (a second free would be a double-free).
+          case St.deref contAddr s3 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "held continuation was not freed"
+          case St.deref cellAddr s3 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "cell was not freed"
+  , testCase "empty cell drops cleanly with no children" $ do
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (cellAddr, s1) = St.alloc (St.NContCell Nothing) s0
+      -- An empty cell has no children.
+      St.cascadeChildren (St.NContCell Nothing) @?= []
+      St.nodeValues (St.NContCell Nothing) @?= []
+      St.stLive (St.stStats s1) @?= baseline + 1
+      case St.dropAddr cellAddr s1 of
+        Left e  -> assertFailure ("empty cell drop failed: " <> show e)
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          St.stFrees (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
+  , testCase "cell-drop cascades through the continuation's owned set (freed once)" $ do
+      -- A continuation whose owned set has a real value: build it the way the
+      -- 'continuationOwned' unit tests do -- a nested parameterized handler frame
+      -- whose hsc binds the param's Unique to a live allocated addr. Dropping the
+      -- cell must reach that owned value through the cell -> NCont ->
+      -- continuationOwned cascade, freeing it exactly once.
+      let s0          = St.emptyStore
+          baseline    = St.stLive (St.stStats s0)
+          -- Allocate the owned value (e.g. the handler parameter's heap value).
+          (ownedAddr, s1) = St.alloc (St.NCon (T.pack "Owned") []) s0
+          pb          = Binder (Name (T.pack "s") (Unique 8200)) Unrestricted m2bBoxTy
+          h           = m2b2ParamHandler pb
+          hsc         = St.RCScope (Map.fromList [(Unique 8200, St.RVBox ownedAddr)]) Map.empty
+          prefix      = St.KHandleRC h 0 hsc St.KDoneRC
+          cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
+          (contAddr, s2) = St.alloc cont s1
+          (cellAddr, s3) = St.alloc (St.NContCell (Just contAddr)) s2
+      -- Sanity: the continuation's owned set is exactly the owned value.
+      St.continuationOwned prefix @?= [ownedAddr]
+      St.stLive (St.stStats s3) @?= baseline + 3
+      case St.dropAddr cellAddr s3 of
+        Left e  -> assertFailure ("cell drop failed: " <> show e)
+        Right s4 -> do
+          -- cell + NCont shell + owned value all freed: heap balanced.
+          St.stLive (St.stStats s4) @?= baseline
+          St.stFrees (St.stStats s4) - St.stFrees (St.stStats s3) @?= 3
+          case St.deref ownedAddr s4 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "owned value was not freed through the cell cascade"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M3-b (Task 3): the stored-continuation differential oracle.
+--
+-- Each 'test/rc-m3/*.wok' program routes a captured continuation THROUGH a
+-- runtime cell: the op-arm '__cont_store's its resume into a fresh
+-- 'ContCell' (move-in, no incref), '__cont_take's it back out (move-out, no
+-- incref, cell emptied), and resumes it ONCE within the handler's dynamic extent
+-- (resume-site semantics). 'store' returns the filled cell (Design A: the
+-- reference oracle models the cell as an immutable 'VCon "ContCell" [k]' wrapper
+-- with no in-place mutation, so the filled cell is threaded as a value; the RC
+-- machine mutates in place and returns the same handle, so the two agree).
+--
+-- The boundary guard ('firstOrderNoHandlerViolations') still REJECTS the escaping
+-- resume until Task 4, so these run via 'assertRcAgrees' (the
+-- 'runModuleRCUnchecked' bypass) rather than the guard-gated corpus groups.
+-- 'assertRcAgrees' is BOTH the differential (RC output == reference output) AND
+-- the heap-stats oracle (live + allocs-minus-frees return to the value-CAF
+-- baseline), with the 'rcMemSafetyFault' hardening that catches a
+-- double-free/UAF even behind a reference failure. NO incref on store/take is
+-- verified by the heap balance: an incref-on-store would leak the NCont
+-- (live > baseline); the rc==1 floor at 'moveOutCont' fires loudly on any slipped
+-- double-resume.
+rcM3StoreTests :: [FilePath] -> TestTree
+rcM3StoreTests files = testGroup "rc-m3 (stored-continuation differential)"
+  [ testCase (takeBaseName f) (assertRcAgrees f) | f <- files ]
+
+-- ---------------------------------------------------------------------------
+-- M3 Task 4: boundary admission of the store route + carrier-wall rejection.
+--
+-- PART A (admission) is proven by 'rcM3AdmitTests': the store-route program
+-- 'test/rc-m3/01-store-resume.wok' now produces EMPTY boundary violations under
+-- the relaxed 'm2bHandlerViolations' AND runs HEAP-BALANCED through the CHECKED
+-- production runner 'runModuleRC' (not just the 'Unchecked' bypass the
+-- differential corpus uses). That is the proof the relaxation actually lets the
+-- store route run in production.
+--
+-- PART A (narrowness) + the cycle exploit are proven by 'rcM3RejectTests':
+--   * 'test/rc-m3-reject/02-resume-escapes-non-store.wok' --- a 'resume' that
+--     escapes into a NON-'__cont_store' position (here, an ALIAS stored: 'let k2 =
+--     k') --- STAYS rejected by the boundary, confirming the exemption admits
+--     EXACTLY the literal '__cont_store cell resume' argument and nothing else.
+--   * 'test/rc-m3-reject/01-cycle-cont-reaches-cell.wok' --- the closest surface
+--     approximation of the cycle (store 'resume' into the handler's OWN baton, so
+--     the parked continuation would counted-reach its own cell) --- is REJECTED at
+--     ELABORATION by the type checker's OccursCheck (the type-level carrier wall,
+--     spec §10.3): the cell's answer type would have to contain the continuation's
+--     own result type. No surface program can build the cycle, so the static and
+--     runtime carrier-wall checks are exercised on a hand-constructed owned set in
+--     'rcM3CarrierWallTests' below (the bite at the achievable level).
+--
+-- RESEARCH FINDING (the headline). The cycle 'cell -> NCont -> cell' WAS built
+-- operationally at the heap level (see 'rcM3CarrierWallTests': a captured prefix
+-- whose nested-handler param value IS the cell, so 'continuationOwned prefix ==
+-- [cellAddr]'; dropping the cell then double-frees it). It is therefore a real,
+-- load-bearing hazard --- NOT a vacuous one. But every SURFACE route to it is
+-- blocked one layer up: storing/returning a 'resume' whose result type ties back
+-- to the cell/answer type is an OccursCheck. So the carrier-wall checks are a
+-- TESTED DEFENSIVE BACKSTOP (spec §4.3 "checked, not assumed"): the static
+-- 'm3CarrierWallViolations' rejects a store into a non-local (captured/enclosing)
+-- cell, and the runtime '__cont_store' check rejects a store whose continuation's
+-- owned set already contains the cell --- each red-checked here.
+
+-- | PART A admission proof: the store route is admitted by the guard AND runs
+-- heap-balanced through the CHECKED production runner 'runModuleRC'.
+rcM3AdmitTests :: TestTree
+rcM3AdmitTests = testGroup "rc-m3 admit (store route through CHECKED runModuleRC)"
+  [ testCase "01-store-resume: empty boundary violations under the relaxed guard" $ do
+      vs <- boundaryViolationsOf "test/rc-m3/01-store-resume.wok"
+      assertEqual "store route must be admitted (no boundary violations)" [] vs
+  , testCase "01-store-resume: heap-balanced through the CHECKED runModuleRC" $ do
+      cm <- elaboratedModuleOf "test/rc-m3/01-store-resume.wok"
+      let pruned = pruneToReachable cm
+      case (Interp.runModule pruned, RCM.runModuleRC (Perceus.insertRC pruned)) of
+        (Right v, Right run) -> do
+          -- Production runner agrees with the reference AND returns to baseline.
+          Interp.renderValue v @?= RCM.rcOutput run
+          let st = RCM.rcStats run
+              bl = RCM.rcBaseline run
+          assertEqual "live cells return to baseline (no leak) through runModuleRC"
+            bl (St.stLive st)
+          assertEqual "allocs minus frees equal baseline (no leak) through runModuleRC"
+            bl (St.stAllocs st - St.stFrees st)
+        (refRes, rcRes) ->
+          assertFailure
+            ("store route must run through the CHECKED runModuleRC; got ref="
+               <> either show (const "ok") refRes <> " rc="
+               <> either show (const "ok") rcRes)
+  ]
+
+-- | PART A narrowness + the cycle reject. The store route admits ONLY the literal
+-- '__cont_store cell resume' position; every other 'resume' escape stays rejected,
+-- and the surface cycle shape is type-rejected.
+rcM3RejectTests :: TestTree
+rcM3RejectTests = testGroup "rc-m3-reject (carrier-wall + narrow store-route)"
+  [ testCase "02-resume-escapes-non-store: aliased/non-store resume STAYS rejected" $ do
+      vs <- boundaryViolationsOf "test/rc-m3-reject/02-resume-escapes-non-store.wok"
+      assertBool
+        "a resume escaping into a non-__cont_store position must be rejected"
+        (not (null vs))
+  , testCase "01-cycle-cont-reaches-cell: own-baton store is REJECTED (OccursCheck)" $ do
+      -- The closest surface approximation of the cycle (store resume into the
+      -- handler's own baton) never reaches the boundary guard: the type checker
+      -- rejects it with an OccursCheck (the cell's answer type would contain the
+      -- continuation's own result type --- the type-level carrier wall). Pin the
+      -- rejection by asserting the file FAILS TO ELABORATE (mirroring the M2b
+      -- 'rc-m2b-reject/13' carrier-wall-param rejection).
+      result <- Loader.loadProgram "test/rc-m3-reject/01-cycle-cont-reaches-cell.wok" []
+      case result of
+        Left lerr -> assertFailure ("loader: " <> show lerr)
+        Right (entryName, ms) ->
+          case Pipeline.elaborateProgramFull entryName ms of
+            Left _  -> pure ()   -- expected: OccursCheck (self-referential carrier)
+            Right _ -> assertFailure
+              "expected elaboration failure (OccursCheck on the self-stored carrier), got Right"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- M3 Task 4: the CARRIER-WALL cycle-prevention checks, exercised + red-checked
+-- on a HAND-CONSTRUCTED owned set (the bite at the achievable level, since no
+-- surface program can construct the cycle --- see the OccursCheck reject above).
+--
+-- The construction (verified by 'cellInOwnedSet' below) is the operational cycle:
+-- an 'NCont' whose captured prefix is a nested PARAMETERIZED handler frame whose
+-- param value IS the cell it is parked in. Then 'continuationOwned prefix ==
+-- [cellAddr]' --- a counted edge from the NCont back to its own cell. This is the
+-- shape §3.4's "nested-param route" would have to reach; it is REAL (constructible
+-- at the heap level), so the checks are load-bearing, not vacuous.
+rcM3CarrierWallTests :: TestTree
+rcM3CarrierWallTests = testGroup "m3 cycle red-check (carrier-wall is load-bearing)"
+  [ testCase "the cycle IS constructible: continuationOwned includes the cell addr" $ do
+      let (_, _, _, prefix, cellAddr) = buildCycleStore
+      -- The cell is in the captured continuation's owned set: a counted edge back.
+      assertBool "cellAddr must appear in continuationOwned prefix (the cycle edge)"
+        (cellAddr `elem` St.continuationOwned prefix)
+
+  , testCase "RED-CHECK: WITHOUT the carrier-wall check, the store + drop double-frees" $ do
+      -- Bypass the '__cont_store' carrier-wall check by writing the cell directly
+      -- (the cycle the check would have rejected), then drop the cell ONCE. The
+      -- cell-drop cascades through the NCont's owned set, which contains the cell
+      -- itself, so the cascade re-enters and double-frees it --- caught LOUDLY by
+      -- 'dropAddr's 'stDead' guard. This proves the surviving cycle is a real
+      -- memory-safety fault, so the check is load-bearing.
+      let (s2, contAddr, _h, _prefix, cellAddr) = buildCycleStore
+      case St.writeNode cellAddr (St.NContCell (Just contAddr)) s2 of
+        Left e   -> assertFailure ("setup writeNode failed: " <> show e)
+        Right s3 ->
+          case St.dropAddr cellAddr s3 of
+            Left (IV.PrimError m)
+              | T.pack "double-free" `T.isInfixOf` m -> pure ()   -- the cycle bites
+            Left e  -> assertFailure
+              ("expected a double-free from the surviving cycle, got: " <> show e)
+            Right _ -> assertFailure
+              "expected the surviving cycle to double-free on cell-drop, but it balanced"
+
+  , testCase "GREEN: WITH the runtime carrier-wall check, __cont_store REJECTS the cycle" $ do
+      -- Drive the real '__cont_store' prim with the cyclic (cell, NCont) pair. The
+      -- runtime check ('cellAddr `notElem` continuationOwned prefix') must reject it
+      -- loudly with the carrier-wall message --- BEFORE it can write the cyclic edge.
+      let (s2, contAddr, _h, _prefix, cellAddr) = buildCycleStore
+      case Map.lookup (T.pack "__cont_store") RCP.rcPrimTable of
+        Nothing -> assertFailure "rcPrimTable is missing __cont_store"
+        Just p  ->
+          case St.rpFn p [St.RVBox cellAddr, St.RVBox contAddr] s2 of
+            Left (IV.PrimError m)
+              | T.pack "carrier-wall" `T.isInfixOf` m -> pure ()   -- rejected as designed
+            Left e  -> assertFailure
+              ("__cont_store must reject the cycle with a carrier-wall error, got: " <> show e)
+            Right _ -> assertFailure
+              "__cont_store accepted a cyclic store (cell in the continuation's owned set)"
+
+  , testCase "the static m3CarrierWallViolations flags a store into a NON-LOCAL cell" $ do
+      -- A hand-built handler whose op-arm stores 'resume' into a cell that is a
+      -- FREE VARIABLE of the arm (the handler baton / an enclosing local), not a
+      -- fresh '__cont_cell_new'. The static carrier-wall check must flag it; a
+      -- store into a fresh local cell (the admitted shape) must NOT be flagged.
+      assertBool "non-local (captured) store cell must be flagged"
+        (not (null (m3CarrierWallViolations carrierWallNonLocalHandler)))
+      assertEqual "fresh-local store cell must NOT be flagged" []
+        (m3CarrierWallViolations carrierWallLocalHandler)
+
+  -- 04-store-into-op-arg-cell: the STATIC scope hole (review #3). The op-arg-cell
+  -- shape is grammar-rejected at the surface, so it is exercised here as a UNIT
+  -- test on a hand-built arm. A store into an OP-ARGUMENT cell ('tick(cellArg) ->
+  -- __cont_store cellArg resume') is a non-fresh-local cell (the op arg is a value
+  -- live at the op, potentially captured above it), so it MUST be rejected. The
+  -- prior 'armFreeVars' subtracted op args, treating the op-arg cell as a local
+  -- and false-ADMITTING it.
+  , testCase "04-store-into-op-arg-cell: store into an OP-ARGUMENT cell is REJECTED" $
+      assertBool "an op-argument store cell must be flagged (it is not a fresh local)"
+        (not (null (m3CarrierWallViolations carrierWallOpArgHandler)))
+
+  -- A store buried in a NESTED handler arm, whose cell is a (non-fresh-local)
+  -- value relative to that nested arm, must also be rejected. 'storeRouteCells'
+  -- recurses into nested handler arms; the carrier-wall must reject any such store
+  -- whose cell is not freshly created by '__cont_cell_new' in the SAME scope as
+  -- the store.
+  , testCase "nested-handler-arm store into a captured cell is REJECTED" $
+      assertBool "a store inside a nested handler arm into a captured cell must be flagged"
+        (not (null (m3CarrierWallViolations carrierWallNestedHandlerHandler)))
+
+  -- POSITIVE guard against over-rejection: 'storeRouteCells' on the admitted
+  -- fresh-local shape returns exactly the freshly bound cell, and the carrier-wall
+  -- admits it (the corpus shape 'rc-m3/01').
+  , testCase "fresh-local store cell: storeRouteCells finds the fresh cell, carrier-wall admits" $
+      case Anf.hOps carrierWallLocalHandler of
+        (oa : _) -> do
+          let cells = Esc.storeRouteCells (Anf.oaResume oa) (Anf.oaBody oa)
+          assertEqual "exactly one store cell recognized" 1 (length cells)
+          assertEqual "fresh-local store cell carrier-wall-admitted" []
+            (m3CarrierWallViolations carrierWallLocalHandler)
+        [] -> assertFailure "carrierWallLocalHandler must have an op-arm"
+
+  -- __RC_DUP ALIAS-FOLLOW (code-review #4). The wall runs on POST-Perceus IR, where
+  -- the store cell operand can be a '__rc_dup' of the fresh cell (@let c2 = __rc_dup
+  -- cell; __cont_store c2 resume@). 'freshCellBinder' traces through that dup: a dup
+  -- of an ALREADY-fresh cell is still fresh-local, so the carrier-wall must ADMIT it.
+  , testCase "store into a __rc_dup of a FRESH cell is ADMITTED (#4 alias-follow)" $
+      assertEqual "a __rc_dup of a fresh-local cell is still fresh; admit the store" []
+        (m3CarrierWallViolations carrierWallDupFreshHandler)
+
+  -- The dual: a '__rc_dup' of a NON-fresh (baton / free-variable) cell is NOT
+  -- promoted to fresh (the operand is not in the fresh set), so the store must still
+  -- be REJECTED. This pins that the alias-follow only promotes dups of fresh cells.
+  , testCase "store into a __rc_dup of a NON-FRESH (baton) cell is REJECTED (#4 dual)" $
+      assertBool "a __rc_dup of a captured baton is not fresh; reject the store"
+        (not (null (m3CarrierWallViolations carrierWallDupBatonHandler)))
+  ]
+
+-- | A handler whose 'tick' op-arm binds a fresh cell ('__cont_cell_new'), then DUPs
+-- it ('__rc_dup') into 'c2', and stores 'resume' into 'c2': @let cell =
+-- __cont_cell_new (); let c2 = __rc_dup cell; __cont_store c2 resume@. The dup'd
+-- cell is the same fresh cell rc-bumped, so the carrier-wall must ADMIT the store
+-- (code-review #4 alias-follow through '__rc_dup').
+carrierWallDupFreshHandler :: Anf.Handler
+carrierWallDupFreshHandler = carrierWallDupHandlerWith True
+
+-- | The dual of 'carrierWallDupFreshHandler': the DUP'd cell is a 'baton' FREE
+-- variable of the arm (not bound by '__cont_cell_new' inside it), so the dup is not
+-- of a fresh cell and the store must be REJECTED.
+carrierWallDupBatonHandler :: Anf.Handler
+carrierWallDupBatonHandler = carrierWallDupHandlerWith False
+
+-- | Build a one-op handler whose arm is @let c2 = __rc_dup SRC; __cont_store c2
+-- resume@. When 'srcFresh' is True, SRC is a fresh @let cell = __cont_cell_new ()@
+-- bound in the arm (so the dup'd 'c2' is still fresh --- admit); when False, SRC is
+-- the 'baton' free variable (so 'c2' is a dup of a captured cell --- reject).
+carrierWallDupHandlerWith :: Bool -> Anf.Handler
+carrierWallDupHandlerWith srcFresh =
+  let resumeB = Binder (Name (T.pack "k")      (Unique 8431)) Unrestricted m2bBoxTy
+      cellB   = Binder (Name (T.pack "cell")    (Unique 8432)) Unrestricted m2bBoxTy
+      c2B     = Binder (Name (T.pack "c2")      (Unique 8433)) Unrestricted m2bBoxTy
+      batonN  = Name (T.pack "baton")           (Unique 8434)
+      cellNew = Name (T.pack "__cont_cell_new") (Unique 8435)
+      rcDup   = Name (T.pack "__rc_dup")        (Unique 8436)
+      storeN  = Name (T.pack "__cont_store")    (Unique 8437)
+      filledB = Binder (Name (T.pack "filled")  (Unique 8438)) Unrestricted m2bBoxTy
+      srcAtom = if srcFresh then AVar (Anf.bndName cellB) else AVar batonN
+      dupAndStore =
+        Let c2B (RApp (AVar rcDup) [srcAtom])
+          (Let filledB
+             (RApp (AVar storeN) [AVar (Anf.bndName c2B), AVar (Anf.bndName resumeB)])
+             (Ret (ALit LUnit)))
+      body = if srcFresh
+               then Let cellB (RApp (AVar cellNew) [ALit LUnit]) dupAndStore
+               else dupAndStore
+      op = Anf.OpArm
+             { Anf.oaLabel  = T.pack "Tick"
+             , Anf.oaOp     = T.pack "tick"
+             , Anf.oaArgs   = []
+             , Anf.oaResume = resumeB
+             , Anf.oaBody   = body
+             }
+  in Anf.Handler
+       { Anf.hReturn     = (Binder (Name (T.pack "v") (Unique 8439)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+       , Anf.hOps        = [op]
+       , Anf.hAnswerJoin = Nothing
+       , Anf.hParam      = Nothing
+       , Anf.hSelf       = Nothing
+       }
+
+-- | The operational cycle construction shared by the carrier-wall tests: a cell
+-- (allocated empty) and an 'NCont' whose captured prefix is a nested
+-- parameterized-handler frame binding the param's Unique to 'RVBox cellAddr'. So
+-- 'continuationOwned prefix == [cellAddr]' --- the continuation counted-reaches its
+-- own cell. Returns the store (with the cell + NCont allocated, cell still EMPTY so
+-- a real '__cont_store' can be invoked on it), the NCont addr, the handler, the
+-- prefix, and the cell addr.
+buildCycleStore :: (St.Store, St.Addr, Anf.Handler, St.RCKont, St.Addr)
+buildCycleStore =
+  let s0          = St.emptyStore
+      (cellAddr, s1) = St.alloc (St.NContCell Nothing) s0
+      pb          = Binder (Name (T.pack "baton") (Unique 8300)) Unrestricted m2bBoxTy
+      h           = m2b2ParamHandler pb
+      hsc         = St.RCScope (Map.fromList [(Unique 8300, St.RVBox cellAddr)]) Map.empty
+      prefix      = St.KHandleRC h 0 hsc St.KDoneRC
+      cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
+      (contAddr, s2) = St.alloc cont s1
+  in (s2, contAddr, h, prefix, cellAddr)
+
+-- | A handler whose 'tick' op-arm stores 'resume' into a cell that is a FREE
+-- VARIABLE of the arm body (the synthetic 'baton' binder, NOT bound inside the
+-- arm) --- the UNSAFE (non-local) store the static carrier-wall check must reject.
+carrierWallNonLocalHandler :: Anf.Handler
+carrierWallNonLocalHandler = carrierWallHandlerWith False
+
+-- | A handler whose 'tick' op-arm stores 'resume' into a cell bound LOCALLY inside
+-- the arm (by a synthetic '__cont_cell_new' call) --- the SAFE (fresh-local) store
+-- the static carrier-wall check must admit.
+carrierWallLocalHandler :: Anf.Handler
+carrierWallLocalHandler = carrierWallHandlerWith True
+
+-- | Build a one-op handler whose arm is @__cont_store CELL resume@, where CELL is
+-- either a fresh local ('localCell' = True: @let cell = __cont_cell_new () in ...@)
+-- or a free variable of the arm ('localCell' = False: a 'baton' name not bound in
+-- the arm). Used to exercise 'm3CarrierWallViolations' directly at the ANF level.
+carrierWallHandlerWith :: Bool -> Anf.Handler
+carrierWallHandlerWith localCell =
+  let resumeB = Binder (Name (T.pack "k")     (Unique 8401)) Unrestricted m2bBoxTy
+      cellB   = Binder (Name (T.pack "cell")   (Unique 8402)) Unrestricted m2bBoxTy
+      batonN  = Name (T.pack "baton") (Unique 8403)
+      cellNew = Name (T.pack "__cont_cell_new") (Unique 8404)
+      storeN  = Name (T.pack "__cont_store")    (Unique 8405)
+      filledB = Binder (Name (T.pack "filled") (Unique 8406)) Unrestricted m2bBoxTy
+      cellAtom = if localCell then AVar (Anf.bndName cellB) else AVar batonN
+      storeCall = Let filledB
+                    (RApp (AVar storeN) [cellAtom, AVar (Anf.bndName resumeB)])
+                    (Ret (ALit LUnit))
+      body = if localCell
+               then Let cellB (RApp (AVar cellNew) [ALit LUnit]) storeCall
+               else storeCall
+      op = Anf.OpArm
+             { Anf.oaLabel  = T.pack "Tick"
+             , Anf.oaOp     = T.pack "tick"
+             , Anf.oaArgs   = []
+             , Anf.oaResume = resumeB
+             , Anf.oaBody   = body
+             }
+  in Anf.Handler
+       { Anf.hReturn     = (Binder (Name (T.pack "v") (Unique 8407)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+       , Anf.hOps        = [op]
+       , Anf.hAnswerJoin = Nothing
+       , Anf.hParam      = Nothing
+       , Anf.hSelf       = Nothing
+       }
+
+-- | A handler whose op-arm receives a CELL as an OP ARGUMENT and stores 'resume'
+-- into it: @tick(cellArg, resume) -> __cont_store cellArg resume@. The op-arg cell
+-- is a value LIVE AT THE OP (it could be captured into the continuation prefix
+-- above the op), so it is NOT a fresh local of the arm and MUST be rejected by the
+-- carrier-wall check (review #3: the prior 'armFreeVars' subtracted op args,
+-- false-admitting this shape).
+carrierWallOpArgHandler :: Anf.Handler
+carrierWallOpArgHandler =
+  let resumeB = Binder (Name (T.pack "k")      (Unique 8411)) Unrestricted m2bBoxTy
+      cellArgB = Binder (Name (T.pack "cellArg") (Unique 8412)) Unrestricted m2bBoxTy
+      storeN  = Name (T.pack "__cont_store") (Unique 8413)
+      filledB = Binder (Name (T.pack "filled") (Unique 8414)) Unrestricted m2bBoxTy
+      body = Let filledB
+               (RApp (AVar storeN)
+                     [AVar (Anf.bndName cellArgB), AVar (Anf.bndName resumeB)])
+               (Ret (ALit LUnit))
+      op = Anf.OpArm
+             { Anf.oaLabel  = T.pack "Tick"
+             , Anf.oaOp     = T.pack "tick"
+             , Anf.oaArgs   = [cellArgB]
+             , Anf.oaResume = resumeB
+             , Anf.oaBody   = body
+             }
+  in Anf.Handler
+       { Anf.hReturn     = (Binder (Name (T.pack "v") (Unique 8415)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+       , Anf.hOps        = [op]
+       , Anf.hAnswerJoin = Nothing
+       , Anf.hParam      = Nothing
+       , Anf.hSelf       = Nothing
+       }
+
+-- | A handler whose op-arm body opens a NESTED handler, and the nested arm stores
+-- the OUTER arm's 'resume' into a cell bound in the OUTER arm (so the cell is a
+-- free variable of the NESTED arm). 'storeRouteCells' recurses into the nested
+-- arm; the carrier-wall must REJECT this store because its cell is not freshly
+-- created by '__cont_cell_new' within the SAME scope as the store (it is captured
+-- from an enclosing scope).
+carrierWallNestedHandlerHandler :: Anf.Handler
+carrierWallNestedHandlerHandler =
+  let resumeB = Binder (Name (T.pack "k")     (Unique 8421)) Unrestricted m2bBoxTy
+      cellB   = Binder (Name (T.pack "cell")   (Unique 8422)) Unrestricted m2bBoxTy
+      cellNew = Name (T.pack "__cont_cell_new") (Unique 8423)
+      storeN  = Name (T.pack "__cont_store")    (Unique 8424)
+      filledB = Binder (Name (T.pack "filled") (Unique 8425)) Unrestricted m2bBoxTy
+      innerResumeB = Binder (Name (T.pack "bk") (Unique 8426)) Unrestricted m2bBoxTy
+      -- The NESTED arm stores the OUTER 'resume' (k) into the OUTER 'cell'. From
+      -- the nested arm's perspective both 'cell' and 'k' are free variables.
+      nestedArm = Anf.OpArm
+        { Anf.oaLabel  = T.pack "B"
+        , Anf.oaOp     = T.pack "bop"
+        , Anf.oaArgs   = []
+        , Anf.oaResume = innerResumeB
+        , Anf.oaBody   =
+            Let filledB
+              (RApp (AVar storeN)
+                    [AVar (Anf.bndName cellB), AVar (Anf.bndName resumeB)])
+              (Ret (ALit LUnit))
+        }
+      nestedHandler = Anf.Handler
+        { Anf.hReturn     = (Binder (Name (T.pack "w") (Unique 8427)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+        , Anf.hOps        = [nestedArm]
+        , Anf.hAnswerJoin = Nothing
+        , Anf.hParam      = Nothing
+        , Anf.hSelf       = Nothing
+        }
+      -- Outer arm: bind 'cell' via __cont_cell_new, then open the nested handler.
+      body = Let cellB (RApp (AVar cellNew) [ALit LUnit])
+               (Handle (Ret (ALit LUnit)) nestedHandler)
+      op = Anf.OpArm
+             { Anf.oaLabel  = T.pack "Tick"
+             , Anf.oaOp     = T.pack "tick"
+             , Anf.oaArgs   = []
+             , Anf.oaResume = resumeB
+             , Anf.oaBody   = body
+             }
+  in Anf.Handler
+       { Anf.hReturn     = (Binder (Name (T.pack "v") (Unique 8428)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+       , Anf.hOps        = [op]
+       , Anf.hAnswerJoin = Nothing
+       , Anf.hParam      = Nothing
+       , Anf.hSelf       = Nothing
+       }
+
+-- ---------------------------------------------------------------------------
+-- Finding #4 (code-review H2): the runtime carrier-wall check is SINGLE-LEVEL, so
+-- by ITSELF it misses an N-cell cycle; but the static fresh-local rule (H1,
+-- 'm3CarrierWallViolations') is the COMPLETE cycle wall, which SUBSUMES the gap.
+--
+-- EMPIRICAL VERDICT (verified, not assumed). A 2-cell cycle IS constructible at the
+-- HEAP level (cellA holds contA owning cellB; cellB holds contB owning cellA) and
+-- the single-level runtime check passes BOTH legs (cellA is not in contA's owned
+-- set --- cellB is), so the cycle goes live and dropping any cell double-frees. BUT
+-- it is NOT constructible through the ADMITTED path: for a continuation to OWN a
+-- cell, that cell must be in its captured prefix's owned set --- a value live ABOVE
+-- the op (a handler param / enclosing local / op arg), which is exactly the
+-- NON-fresh-local cell H1 statically REJECTS. A fresh-local '__cont_cell_new' cell
+-- (the only kind H1 admits) is bound INSIDE the storing arm, BELOW the op, and can
+-- never be in any captured prefix's owned set. So every multi-cell cycle needs a
+-- non-fresh cell H1 walls; no fresh-local-cell cycle exists. The transitive walk a
+-- multi-cell cycle would otherwise demand is therefore DEAD CODE under H1 and
+-- deliberately omitted (not added).
+rcM3TwoCellCycleSubsumedTests :: TestTree
+rcM3TwoCellCycleSubsumedTests =
+  testGroup "m3 #4: 2-cell cycle is SUBSUMED by H1's static fresh-local rule"
+  [ testCase "the single-level runtime check ALONE misses a 2-cell cycle (the gap is real)" $ do
+      -- Build the 2-cell cycle directly on the heap (cellA->contA->cellB->contB->cellA).
+      -- Each continuation owns the OTHER cell, so the single-level check passes both
+      -- legs and the cycle goes live; dropping cellA then double-frees. This is the
+      -- gap the single-level runtime check has by itself.
+      let (s2, cellA, cellB, contA, contB) = buildTwoCellCycle
+      case Map.lookup (T.pack "__cont_store") RCP.rcPrimTable of
+        Nothing -> assertFailure "rcPrimTable is missing __cont_store"
+        Just storeP ->
+          -- leg 1: store contA into cellA. single-level: cellA `elem` owned(contA)?
+          case St.rpFn storeP [St.RVBox cellA, St.RVBox contA] s2 of
+            Left e -> assertFailure
+              ("leg1 should pass the single-level check (cellA is NOT in contA's owned set), got: "
+                <> show e)
+            Right (_, s3) ->
+              case St.rpFn storeP [St.RVBox cellB, St.RVBox contB] s3 of
+                Left e -> assertFailure
+                  ("leg2 should pass the single-level check (cellB is NOT in contB's owned set), got: "
+                    <> show e)
+                Right (_, s4) ->
+                  -- The cycle is now LIVE; dropping cellA double-frees (caught loudly by stDead).
+                  case St.dropAddr cellA s4 of
+                    Left (IV.PrimError m)
+                      | T.pack "double-free" `T.isInfixOf` m -> pure ()  -- the surviving cycle bites
+                    Left e  -> assertFailure
+                      ("expected a double-free from the surviving 2-cell cycle, got: " <> show e)
+                    Right _ -> assertFailure
+                      "the single-level runtime check let a 2-cell cycle go live without double-freeing \
+                      \--- the gap this test documents did not appear"
+
+  , testCase "H1 (static) REJECTS the 2-cell cycle: each store is into a NON-fresh-local cell" $ do
+      -- The SOURCE shape of the 2-cell cycle: each arm stores its resume into a cell
+      -- that the OTHER continuation must own --- i.e. an ENCLOSING / captured value,
+      -- NOT a '__cont_cell_new' fresh local of the storing arm. H1's static
+      -- 'm3CarrierWallViolations' rejects every such store, so the cycle's source
+      -- shape never reaches the runtime. This is why the gap above is SUBSUMED.
+      assertBool "store into an enclosing (cycle-capable) cell must be statically flagged"
+        (not (null (m3CarrierWallViolations twoCellCycleArmHandler)))
+
+  , testCase "H1 ADMITS only fresh-local cells, which can NEVER be in an owned set" $ do
+      -- The complement: a fresh-local cell IS admitted by H1, and (by construction)
+      -- it is bound below the op, so no captured continuation can own it. The
+      -- carrier-wall does not flag it, and there is no cycle to form.
+      assertEqual "a fresh-local store cell is carrier-wall-admitted (no cycle possible)" []
+        (m3CarrierWallViolations carrierWallLocalHandler)
+  ]
+
+-- | The 2-cell cycle at the HEAP level: two cells, each holding a continuation
+-- whose captured prefix OWNS the OTHER cell (via a nested parameterized-handler
+-- frame binding the param to 'RVBox' of the other cell). So
+-- @continuationOwned(contA) == [cellB]@ and @continuationOwned(contB) == [cellA]@:
+-- the single-level @__cont_store@ check (cell in its OWN continuation's owned set)
+-- passes both legs, yet the ring is closed. Both cells start EMPTY so the real
+-- '__cont_store' prim can be driven on them. Returns the store and the four addrs.
+buildTwoCellCycle :: (St.Store, St.Addr, St.Addr, St.Addr, St.Addr)
+buildTwoCellCycle =
+  let s0            = St.emptyStore
+      (cellA, s1)   = St.alloc (St.NContCell Nothing) s0
+      (cellB, s2)   = St.alloc (St.NContCell Nothing) s1
+      -- contA owns cellB (its nested-handler param value is RVBox cellB).
+      pbA           = Binder (Name (T.pack "pa") (Unique 8700)) Unrestricted m2bBoxTy
+      hA            = m2b2ParamHandler pbA
+      hscA          = St.RCScope (Map.fromList [(Unique 8700, St.RVBox cellB)]) Map.empty
+      prefixA       = St.KHandleRC hA 0 hscA St.KDoneRC
+      (contA, s3)   = St.alloc (St.NCont prefixA (m2b2NoParamHandler, 0, St.emptyRCScope)) s2
+      -- contB owns cellA.
+      pbB           = Binder (Name (T.pack "pb") (Unique 8710)) Unrestricted m2bBoxTy
+      hB            = m2b2ParamHandler pbB
+      hscB          = St.RCScope (Map.fromList [(Unique 8710, St.RVBox cellA)]) Map.empty
+      prefixB       = St.KHandleRC hB 0 hscB St.KDoneRC
+      (contB, s4)   = St.alloc (St.NCont prefixB (m2b2NoParamHandler, 0, St.emptyRCScope)) s3
+  in (s4, cellA, cellB, contA, contB)
+
+-- | A handler whose op-arm stores its 'resume' into a cell that is a FREE VARIABLE
+-- of the arm (an enclosing value the OTHER continuation in a 2-cell cycle would
+-- own) --- NOT a fresh '__cont_cell_new'. This is the SOURCE shape of one leg of a
+-- 2-cell cycle; H1's static carrier-wall must reject it (a non-fresh-local cell).
+twoCellCycleArmHandler :: Anf.Handler
+twoCellCycleArmHandler =
+  let resumeB = Binder (Name (T.pack "k")     (Unique 8721)) Unrestricted m2bBoxTy
+      otherN  = Name (T.pack "otherCell")     (Unique 8722)   -- the OTHER cell, enclosing free var
+      storeN  = Name (T.pack "__cont_store")  (Unique 8723)
+      filledB = Binder (Name (T.pack "filled") (Unique 8724)) Unrestricted m2bBoxTy
+      body = Let filledB
+               (RApp (AVar storeN) [AVar otherN, AVar (Anf.bndName resumeB)])
+               (Ret (ALit LUnit))
+      op = Anf.OpArm
+             { Anf.oaLabel  = T.pack "Tick"
+             , Anf.oaOp     = T.pack "tick"
+             , Anf.oaArgs   = []
+             , Anf.oaResume = resumeB
+             , Anf.oaBody   = body
+             }
+  in Anf.Handler
+       { Anf.hReturn     = (Binder (Name (T.pack "v") (Unique 8725)) Unrestricted m2bBoxTy, Ret (ALit LUnit))
+       , Anf.hOps        = [op]
+       , Anf.hAnswerJoin = Nothing
+       , Anf.hParam      = Nothing
+       , Anf.hSelf       = Nothing
+       }
+
+-- ---------------------------------------------------------------------------
+-- Finding #5 (code-review H2): the raw-vs-named owned-set NON-dedup is CORRECT by
+-- rc-accounting, and the per-entry free is LOAD-BEARING (deduping would leak).
+--
+-- The scenario: a captured continuation prefix where the SAME address @A@ is owned
+-- BOTH as a KLetRC NAMED binder ((Just u, A)) AND as a KAppRC RAW over-arg
+-- ((Nothing, A)). Both are CONSUMING (move) positions, so Perceus pays a
+-- @__rc_dup@ on the second --- @A@ has rc == 2. The owned set must therefore list
+-- @A@ TWICE so the cascade frees it twice (rc 2 -> 0). Deduping to a single @A@
+-- would free it once (rc 2 -> 1) --- a LEAK. (The corpus does not yet REACH a
+-- KAppRC/KDropCellRC inside a captured prefix, so this pins the accounting directly.)
+rcM3RawVsNamedOwnedSetTests :: TestTree
+rcM3RawVsNamedOwnedSetTests =
+  testGroup "m3 #5: raw-vs-named owned-set per-entry free is load-bearing"
+  [ testCase "continuationOwned lists A TWICE when owned as BOTH a named binder and a raw over-arg" $ do
+      let (_, ownedAddr, prefix) = buildRawAndNamedOwned
+      assertEqual "the owned set must list the address per-entry (named + raw), NOT deduped"
+        [ownedAddr, ownedAddr] (St.continuationOwned prefix)
+
+  , testCase "freeing per the (per-entry) owned set returns A's rc 2 -> 0 (balanced)" $ do
+      -- A is at rc 2 (a Perceus dup on the second move position). The cascade frees
+      -- it twice (the owned set lists it twice), returning the heap to baseline.
+      let (s0, _ownedAddr, prefix) = buildRawAndNamedOwned
+          baseline = St.stLive (St.stStats s0) - 1   -- after A is fully freed
+      case freeEach (St.continuationOwned prefix) s0 of
+        Left e  -> assertFailure ("per-entry free must balance rc 2 -> 0, got: " <> show e)
+        Right s -> assertEqual "per-entry free returns A's cell to freed (no leak)"
+          baseline (St.stLive (St.stStats s))
+
+  , testCase "RED-CHECK: a DEDUPED (distinct-address) free LEAKS A (rc 2 -> 1)" $ do
+      -- Simulate the naive dedup: free each DISTINCT owned address once. A is freed
+      -- once (rc 2 -> 1), leaving its cell LIVE --- the leak the per-entry free
+      -- prevents. This is the empirical proof that deduping is unsound.
+      let (s0, ownedAddr, prefix) = buildRawAndNamedOwned
+          distinct = Set.toList (Set.fromList (St.continuationOwned prefix))
+      assertEqual "naive dedup collapses [A,A] to [A]" [ownedAddr] distinct
+      case freeEach distinct s0 of
+        Left e  -> assertFailure ("the deduped free should not error, it should LEAK: " <> show e)
+        Right s ->
+          assertBool "the deduped free must LEAK A's cell (rc 2 -> 1, still live)"
+            (St.stLive (St.stStats s) > St.stLive (St.stStats s0) - 1)
+  ]
+
+-- | A captured continuation prefix where address @A@ is owned BOTH as a KLetRC
+-- NAMED binder (a non-head MOVE occurrence in the frame body) AND as a KAppRC RAW
+-- over-arg, with @A@ at rc == 2 (the Perceus dup on the second move position).
+-- Returns the store (A allocated at rc 2), A's address, and the prefix.
+buildRawAndNamedOwned :: (St.Store, St.Addr, St.RCKont)
+buildRawAndNamedOwned =
+  let s0          = St.emptyStore
+      (aAddr, s1) = St.alloc (St.NCon (T.pack "Owned") []) s0   -- rc 1
+      s2          = either (error . show) id (St.incref aAddr s1)  -- rc 2 (the dup)
+      -- KLetRC frame: body = Ret (AVar x) makes x a non-head MOVE occurrence, so x
+      -- (bound to RVBox aAddr) is in the frame's owned set --- the NAMED (Just u, A).
+      xName       = Name (T.pack "x") (Unique 8801)
+      rBndr       = Binder (Name (T.pack "r") (Unique 8802)) Unrestricted m2bBoxTy
+      body        = Ret (AVar xName)
+      sc          = St.RCScope (Map.fromList [(Unique 8801, St.RVBox aAddr)]) Map.empty
+      kLet        = St.KLetRC rBndr body sc St.KDoneRC
+      -- KAppRC frame above it: its over-arg is RVBox aAddr --- the RAW (Nothing, A).
+      prefix      = St.KAppRC [St.RVBox aAddr] kLet
+  in (s2, aAddr, prefix)
+
+-- | Free each address in a list in order (the owned-set cascade does exactly this:
+-- one 'dropAddr' per owned-set entry). 'Left' on the first error.
+freeEach :: [St.Addr] -> St.Store -> Either IV.RuntimeError St.Store
+freeEach addrs s0 = foldl (\acc a -> acc >>= St.dropAddr a) (Right s0) addrs
+
+-- ---------------------------------------------------------------------------
+-- M3 Task 5: the DOUBLE-RESUME red-check (the 'moveOutCont' rc==1 floor is
+-- load-bearing, spec §4.2 / §10 item 1). A stored continuation resumed TWICE is
+-- the new silent-failure frontier: the second resume re-uses a captured frame
+-- whose owned set the first resume already handed out, so the owned set is freed
+-- twice (a double-free). The 'moveOutCont' rc==1 assert is the SOUNDNESS FLOOR
+-- that turns this into a LOUD, LOCAL fault.
+--
+-- The static 'Multiplicity' layer does NOT prove single-resume for a
+-- '__cont_take' result (it tracks the 'resume' binder handed to '__cont_store',
+-- not the take-result), so the runtime move-discipline is the ONLY net for this
+-- shape --- exactly the "never rest soundness on a single static analysis"
+-- philosophy. Hence the floor is exercised + red-checked here at the heap level.
+--
+-- The surface double-resume corpus file 'test/rc-m3-reject/03-double-resume.wok'
+-- documents the SHAPE; the splice re-entry after the first resume runs the live
+-- continuation to the answer, so the second resume's heap effect is not a clean
+-- value-level differential --- the hand-built scenario below pins the floor.
+--
+-- The construction is the M3 stored-continuation analogue of the M2b resume
+-- move-out: an 'NCont' whose captured prefix is a nested parameterized-handler
+-- frame binding the param's Unique to a live 'Owned' value (so
+-- 'continuationOwned prefix == [ownedAddr]' --- a real owned set). Two resumes of
+-- the same continuation each free that owned set.
+rcM3DoubleResumeTests :: TestTree
+rcM3DoubleResumeTests = testGroup "m3 double-resume red-check (rc==1 floor is load-bearing)"
+  [ testCase "the surface double-resume shape is boundary-admitted (static layer does NOT catch it)" $ do
+      -- '03-double-resume.wok' stores 'resume' (admitted) then resumes the
+      -- '__cont_take' result twice. The boundary guard + 'Multiplicity' admit it
+      -- (the static layer tracks the stored 'resume', not the take-result), so the
+      -- RUNTIME 'moveOutCont' rc==1 floor is the only net --- the construction
+      -- below exercises that floor directly.
+      vs <- boundaryViolationsOf "test/rc-m3-reject/03-double-resume.wok"
+      assertEqual "the double-resume shape is admitted; the runtime floor is its net" [] vs
+
+  , testCase "the continuation has a real owned set (continuationOwned == [ownedAddr])" $ do
+      let (_, _, ownedAddr, prefix) = buildDoubleResumeNCont
+      St.continuationOwned prefix @?= [ownedAddr]
+
+  , testCase "GREEN: a SINGLE resume (moveOutCont rc==1) frees the owned set exactly once" $ do
+      -- The honest single-resume: 'moveOutCont' at rc==1 frees the NCont SHELL
+      -- only and hands the owned set to the spliced frames; those frames free it
+      -- once. Heap returns to baseline (the floor does NOT over-reject).
+      let (s0, contAddr, ownedAddr, _prefix) = buildDoubleResumeNCont
+          baseline = St.stLive (St.stStats s0)
+      case St.moveOutCont contAddr s0 of
+        Left e -> assertFailure ("a legitimate single resume must succeed at rc==1: " <> show e)
+        Right (_prefix', _hinfo, s1) ->
+          -- The spliced frames run and free the owned set exactly once.
+          case St.dropAddr ownedAddr s1 of
+            Left e  -> assertFailure ("owned-set free after one resume must succeed: " <> show e)
+            Right s2 -> St.stLive (St.stStats s2) @?= baseline - 2  -- shell + owned freed
+
+  , testCase "GREEN (the floor): a double-resume (rc==2) is caught LOUDLY by moveOutCont" $ do
+      -- A continuation with TWO owners (rc==2) is the double-resume hazard: two
+      -- aliases would each resume it. The rc==1 floor fires on the FIRST resume
+      -- attempt, BEFORE any frame is spliced or any owned value is freed --- a
+      -- loud, local "one-shot violation" rather than a silent double-free.
+      let (s0, contAddr, _ownedAddr, _prefix) = buildDoubleResumeNCont
+      case St.incref contAddr s0 of
+        Left e   -> assertFailure ("setup incref failed: " <> show e)
+        Right s1 ->
+          case St.moveOutCont contAddr s1 of
+            Left e
+              | rcMemSafetyFault e -> pure ()   -- the floor caught it loudly
+              | otherwise -> assertFailure
+                  ("rc!=1 must be a memory-safety fault (one-shot violation), got: " <> show e)
+            Right _ -> assertFailure
+              "moveOutCont accepted a resume of an rc==2 (double-owned) continuation --- \
+              \the one-shot floor did not fire"
+
+  , testCase "RED-CHECK: WITHOUT the rc==1 floor, the second resume double-frees the owned set" $ do
+      -- Demonstrate the corruption the floor prevents, using the public API. A
+      -- double-resume reuses the SAME captured prefix twice, so its owned set is
+      -- freed twice. Resume #1: 'moveOutCont' hands out the owned set; the spliced
+      -- frames free it ('dropAddr ownedAddr'). Resume #2 (the double-resume the
+      -- neutered floor would admit) re-runs the same prefix and frees the owned set
+      -- AGAIN --- a double-free, caught LOUDLY by 'dropAddr's 'stDead' guard. This
+      -- proves the second resume's corruption is REAL and is only SILENT at the
+      -- resume site (it surfaces later as a double-free / heap imbalance), which is
+      -- precisely what the rc==1 floor (caught above) prevents up front.
+      let (s0, contAddr, ownedAddr, _prefix) = buildDoubleResumeNCont
+      case St.moveOutCont contAddr s0 of
+        Left e -> assertFailure ("resume #1 must succeed at rc==1: " <> show e)
+        Right (_prefix', _hinfo, s1) ->
+          case St.dropAddr ownedAddr s1 of      -- resume #1's spliced frames free the owned set
+            Left e  -> assertFailure ("owned-set free after resume #1 must succeed: " <> show e)
+            Right s2 ->
+              case St.dropAddr ownedAddr s2 of   -- resume #2 (double-resume) frees it AGAIN
+                Left (IV.PrimError m)
+                  | T.pack "double-free" `T.isInfixOf` m -> pure ()   -- the corruption bites
+                Left e  -> assertFailure
+                  ("expected a double-free from the second resume, got: " <> show e)
+                Right _ -> assertFailure
+                  "expected the double-resume to double-free the owned set, but it balanced"
+  ]
+
+-- | The double-resume construction shared by 'rcM3DoubleResumeTests': an 'NCont'
+-- whose captured prefix is a nested parameterized-handler frame binding the
+-- param's Unique to a live 'Owned' value, so 'continuationOwned prefix ==
+-- [ownedAddr]' (a real, non-empty owned set). The NCont is allocated at rc==1.
+-- Returns the store, the NCont addr, the owned value's addr, and the prefix.
+buildDoubleResumeNCont :: (St.Store, St.Addr, St.Addr, St.RCKont)
+buildDoubleResumeNCont =
+  let s0             = St.emptyStore
+      (ownedAddr, s1) = St.alloc (St.NCon (T.pack "Owned") []) s0
+      pb             = Binder (Name (T.pack "s") (Unique 8500)) Unrestricted m2bBoxTy
+      h              = m2b2ParamHandler pb
+      hsc            = St.RCScope (Map.fromList [(Unique 8500, St.RVBox ownedAddr)]) Map.empty
+      prefix         = St.KHandleRC h 0 hsc St.KDoneRC
+      cont           = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
+      (contAddr, s2) = St.alloc cont s1
+  in (s2, contAddr, ownedAddr, prefix)
 
 -- ---------------------------------------------------------------------------
 -- RC machine tests (Task 2: store-threaded CEK over the no-handler fragment)
@@ -12743,6 +13651,388 @@ rcM2bPropertyTests =
           prop_m2bLintClean
       , testProperty "every single-site RC mutation is caught (generalized teeth)"
           prop_m2bTeeth
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Suite G (extended): the M3 STORED-CONTINUATION generative oracle (Task 7).
+--
+-- The BROAD soundness oracle for M3: an adversarial generative property over the
+-- EXPRESSIBLE + ADMITTED store-route fragment, catching the silent double-free /
+-- leak class hand-picked cases miss (the lesson this project learned twice).
+--
+-- The two routes (spec §3.1 / §3.2), exactly the fragment Tasks 1-5 support:
+--   * STORE -> TAKE -> RESUME within one op-arm (the corpus '01-store-resume'
+--     shape): the arm parks 'resume' in a FRESH-LOCAL cell ('__cont_cell_new'
+--     INSIDE the arm), immediately takes it back out, and resumes the taken
+--     continuation ONCE --- within the handler's dynamic extent (resume-site
+--     semantics). Heap-balanced; output matches the direct tail-resume.
+--   * STORE -> DROP (park-and-abandon; the corpus '03-store-drop-finally' shape):
+--     the arm parks 'resume' in a fresh-local cell and NEVER takes it; it returns
+--     the answer directly. The filled cell goes out of scope, Perceus drops it,
+--     and the cell-drop CASCADES to the held NCont, freeing its owned set exactly
+--     once (the §4.4 drop/finally seam = "free the owned set once"). This is the
+--     M3 CELL-drop path, NOT the pre-existing M2b raw-abort leak (§10 item 6): the
+--     'resume' is MOVED into the cell (a counted edge the drop cascade follows),
+--     so the owned set is reachable and freed --- the store route is the CORRECT
+--     drop path.
+--
+-- SCOPING (or the property ships green-broken or spuriously red --- spec §3.1 note,
+-- §10 items 6+7):
+--   * ONLY fresh-local cells. The cross-arm baton shape (the cell in 'hParam') hits
+--     an OccursCheck at elaboration (§3.1), so it would never elaborate; it is NOT
+--     generated.
+--   * NEVER the raw resumable-op abort that discards 'resume' directly (the
+--     pre-existing M2b leak, §10 item 6): that leaks independently of M3 and would
+--     make the property RED on a bug that is NOT M3's. M3's drop path is the
+--     CELL-drop (store then drop the filled cell), which frees correctly.
+-- The accept predicate is the REAL guard
+-- ('null (firstOrderNoHandlerViolations cm)'), which already wires in the M3
+-- carrier-wall check + the store-route-relaxed boundary; the property quantifies
+-- ONLY over accepted programs (the accepted/skipped split, mirroring
+-- 'prop_m2bEscape').
+
+-- | The store route the generated arm takes: resume after the round-trip, or
+-- abandon the parked continuation.
+data M3Route
+  = M3StoreResume   -- ^ store -> take -> resume (within one op-arm)
+  | M3StoreDrop     -- ^ store -> drop the filled cell (park-and-abandon)
+  deriving (Eq, Show)
+
+-- | Continuation-cell extern atoms, resolved by hint at runtime exactly as
+-- 'm2bPlus' resolves '+'; recognized by the SAME hint text the boundary guard
+-- ('contStoreHint'), the Perceus pass ('contTakeHint'), and both machines' prim
+-- tables key on. 'Unique' is irrelevant (prims dispatch by 'nameHint').
+m3CellNew, m3Store, m3Take :: Atom
+m3CellNew = AVar (primName (T.pack "__cont_cell_new"))
+m3Store   = AVar (primName (T.pack "__cont_store"))
+m3Take    = AVar (primName (T.pack "__cont_take"))
+
+-- | The whole-program generator for the M3 store route. Builds
+-- @main = Handle progBody storeRouteHandler@ (plus an optional boxed CAF bind when
+-- the global dimension fires), directly as ANF, mirroring 'genM2bProgram'. The op
+-- 'prog' computation is shared verbatim with M2b ('genM2bProg'), so the SAME
+-- owned-set dimensions (moved-into-con, two live aliases, op under a non-trivial
+-- 'above', a global/CAF live across the store) drive the captured continuation's
+-- owned set. The handler arm is the only difference: instead of tail-resuming (M2b)
+-- or aborting raw (the pre-existing leak), it routes 'resume' THROUGH a fresh-local
+-- continuation cell (store -> take -> resume, or store -> drop).
+--
+-- Dimensions varied (each pinned by a 'cover' floor in 'prop_m3Escape'):
+--   * route: M3StoreResume vs M3StoreDrop (both must appear);
+--   * owned-set shape on the store path: moved-into-con / two-alias / op-under-Case
+--     / global-CAF / captured-boxed (the M2b shapes, reused);
+--   * store-in-one-branch-of-a-Case: the cell-new/store fires inside a Case arm
+--     ('underCase'), so the captured 'above' is a non-trivial multi-frame prefix.
+genM3Program :: Gen CoreModule
+genM3Program = sized $ \sz -> do
+  let fuel  = max 1 (min sz 4)
+  let mainN = Name (T.pack "main") (Unique 1000000)
+  -- Both routes weighted equally so each clears its 'cover' floor within 800 tests.
+  route <- elements [M3StoreResume, M3StoreDrop]
+  -- The owned-set shape on the store path. The aliased-boxed shape (two live
+  -- aliases of one boxed cell) is sound on the DROP path (the pass dup's the alias
+  -- and both copies are freed via the cascade); on the RESUME path the round-trip
+  -- moves the continuation back and the alias is still freed once. Both are fine,
+  -- so every shape is exercised under both routes.
+  shape <- elements [minBound .. maxBound :: M2bShape]
+  -- How many ops the computation performs (1 or 2): a second op makes the captured
+  -- 'above' prefix multi-frame.
+  nOps  <- elements [1, 1, 2 :: Int]
+  -- Whether the op fires INSIDE a Case arm (a non-trivial multi-frame 'above',
+  -- i.e. store-in-one-branch-of-a-Case).
+  underCase <- elements [False, True]
+  (body, globals, _) <-
+    runStateT3 (genM3Body route shape nOps underCase fuel) 1
+  let mainB = TopBind mainN [] body
+  case m2bgCafName globals of
+    Nothing -> pure (CoreModule [mainB])
+    Just cN -> pure (CoreModule [m2bCafBind cN, mainB])
+
+-- | Build @Handle progBody storeRouteHandler@ for the chosen route/shape. The
+-- handler is AMBIENT (no hSelf), tail-position (no hAnswerJoin), non-parameterized
+-- (no hParam --- the fresh-local-cell fragment, §3.1). @progBody@ is the
+-- op-performing computation from 'genM2bProg' (shared with M2b).
+genM3Body :: M3Route -> M2bShape -> Int -> Bool -> Int -> GenM2b Expr
+genM3Body route shape nOps underCase fuel = do
+  (prog, progTy) <- genM2bProg shape nOps underCase fuel
+  hdlr <- genM3Handler route progTy
+  pure (Handle prog hdlr)
+
+-- | The store-route handler skeleton. The op arm routes its 'resume' binder @k@
+-- THROUGH a fresh-local continuation cell:
+--
+--   M3StoreResume:  op n k ->
+--     let cell   = __cont_cell_new () in
+--     let filled = __cont_store cell k in
+--     let k2     = __cont_take filled in
+--     let r      = k2 1 in
+--     r                                       -- resume once, answer = r : progTy
+--
+--   M3StoreDrop:    op n k ->
+--     let cell   = __cont_cell_new () in
+--     let filled = __cont_store cell k in
+--     None                                    -- abandon; filled drops -> cascade
+--                                             -- frees the owned set once
+--
+-- The return arm wraps the computation result in 'Some' (answer type 'Option
+-- progTy') for the DROP route (so the abandon arm's 'None' is type-compatible) and
+-- delivers the resumed result directly for the RESUME route (answer type 'progTy',
+-- mirroring 'genM2bHandler M2bTailResume'). Both arms route 'resume' ONLY into the
+-- '__cont_store' continuation argument --- the EXACT position the boundary guard's
+-- store-route exemption admits (every other escape stays rejected), and the cell is
+-- a FRESH '__cont_cell_new' bound inside the arm (the carrier-wall check admits it).
+genM3Handler :: M3Route -> Ty.CType -> GenM2b Handler
+genM3Handler route progTy = do
+  vN      <- freshN2b (T.pack "v")
+  nN      <- freshN2b (T.pack "opn")
+  kN      <- freshN2b (T.pack "k")
+  cellN   <- freshN2b (T.pack "cell")
+  filledN <- freshN2b (T.pack "filled")
+  case route of
+    M3StoreResume -> do
+      svN <- freshN2b (T.pack "sv")
+      k2N <- freshN2b (T.pack "k2")
+      rrN <- freshN2b (T.pack "rr")
+      -- Return arm: wrap in Some so it stays a boxed cell (parallels the M2b
+      -- skeleton). It is reached only if the program returns WITHOUT performing the
+      -- op; the generated 'prog' always performs the op, so the resume arm runs.
+      let retArm =
+            ( Binder vN Unrestricted progTy
+            , Let (Binder svN Unrestricted m2bOptTy) (RCon (T.pack "Some") [AVar vN])
+                (Ret (AVar svN)) )
+          -- The taken continuation is resumed in TAIL position (@k2 1@), exactly as
+          -- the admitted corpus '01-store-resume.wok'. ANF has no tail application,
+          -- so the tail @k2 1@ elaborates to @let rr = k2 1 in rr@ (the corpus's own
+          -- shape after ANF): the resume result is the arm's answer.
+          armBody =
+            Let (Binder cellN Unrestricted m2bBoxTy) (RApp m3CellNew [ALit LUnit])
+              (Let (Binder filledN Unrestricted m2bBoxTy)
+                   (RApp m3Store [AVar cellN, AVar kN])
+                (Let (Binder k2N Unrestricted m2bOptTy) (RApp m3Take [AVar filledN])
+                  (Let (Binder rrN Unrestricted progTy) (RApp (AVar k2N) [ALit (LInt 1)])
+                    (Ret (AVar rrN)))))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] Nothing Nothing Nothing)
+    M3StoreDrop -> do
+      svN   <- freshN2b (T.pack "sv")
+      noneN <- freshN2b (T.pack "none")
+      let retArm =
+            ( Binder vN Unrestricted progTy
+            , Let (Binder svN Unrestricted m2bOptTy) (RCon (T.pack "Some") [AVar vN])
+                (Ret (AVar svN)) )
+          armBody =
+            Let (Binder cellN Unrestricted m2bBoxTy) (RApp m3CellNew [ALit LUnit])
+              (Let (Binder filledN Unrestricted m2bBoxTy)
+                   (RApp m3Store [AVar cellN, AVar kN])
+                (Let (Binder noneN Unrestricted m2bOptTy) (RCon (T.pack "None") [])
+                  (Ret (AVar noneN))))
+          arm = OpArm m2bLbl m2bOp [Binder nN Unrestricted m2bU64]
+                  (Binder kN Unrestricted m2bOptTy) armBody
+      pure (Handler retArm [arm] Nothing Nothing Nothing)
+
+-- | Shrinker for a generated M3 program: identical to 'shrinkProgramM2b' (shrink
+-- the main bind's body to a structurally-contained sub-expression, keeping any CAF
+-- bind). A program whose main body shrinks below the 'Handle' drops out of the
+-- store-route fragment (no handler), which the boundary guard still accepts, so a
+-- shrunk counterexample stays valid.
+shrinkProgramM3 :: CoreModule -> [CoreModule]
+shrinkProgramM3 = shrinkProgramM2b
+
+-- ---------------------------------------------------------------------------
+-- Structural detectors for the M3 store-route coverage floors. They classify the
+-- GENERATED program by inspecting its single 'Handle' node's op arm --- NOT by
+-- re-running the pass. Used only for 'cover' / 'label' non-vacuity.
+
+-- | The op arm performs a '__cont_store' (the store route): its body contains a
+-- saturated @__cont_store cell resume@ call.
+m3HasStore :: CoreModule -> Bool
+m3HasStore cm = case m2bTheHandler cm of
+  Just h  -> any (storesIn . oaBody) (hOps h)
+  Nothing -> False
+  where
+    storesIn e = case e of
+      Let _ (RApp hd _) b -> isStoreAtom hd || storesIn b
+      Let _ _ b           -> storesIn b
+      Case _ alts         -> any (storesIn . clusterAltBody) alts
+      LetJoin _ _ jb b     -> storesIn jb || storesIn b
+      _                    -> False
+
+-- | The op arm '__cont_take's the cell back out and resumes it (the
+-- store -> take -> resume route).
+m3HasTakeResume :: CoreModule -> Bool
+m3HasTakeResume cm = case m2bTheHandler cm of
+  Just h  -> any (takesIn . oaBody) (hOps h)
+  Nothing -> False
+  where
+    takesIn e = case e of
+      Let _ (RApp hd _) b -> isTakeAtom hd || takesIn b
+      Let _ _ b           -> takesIn b
+      Case _ alts         -> any (takesIn . clusterAltBody) alts
+      LetJoin _ _ jb b     -> takesIn jb || takesIn b
+      _                    -> False
+
+-- | The op arm stores and ABANDONS (never takes): a store with no take (the
+-- store -> drop park-and-abandon route).
+m3HasStoreDrop :: CoreModule -> Bool
+m3HasStoreDrop cm = m3HasStore cm && not (m3HasTakeResume cm)
+
+isStoreAtom, isTakeAtom :: Atom -> Bool
+isStoreAtom (AVar n) = nameHint n == T.pack "__cont_store"
+isStoreAtom _        = False
+isTakeAtom (AVar n) = nameHint n == T.pack "__cont_take"
+isTakeAtom _        = False
+
+-- | A coarse label of the generated M3 program's shape, for the distribution
+-- readout.
+m3Classify :: CoreModule -> String
+m3Classify cm =
+  (if m3HasTakeResume cm then "store-resume"
+   else if m3HasStoreDrop cm then "store-drop" else "no-store")
+    <> (if m2bHasMovedBeforeOp cm then "/moved" else "")
+    <> (if m2bHasBoxedAcrossOp cm then "/across" else "")
+    <> (if m2bHasAliasedBoxed cm  then "/aliased" else "")
+    <> (if m2bHasGlobalAcrossOp cm then "/global" else "")
+    <> (if m2bHasOpUnderCase cm then "/under-case" else "")
+
+-- | The computation has TWO live aliases of one boxed cell (the 'M2bAliasedBoxed'
+-- shape): a @let a = x@ (a pure alias-rename) of a boxed binder @x@, both live
+-- across the op. Detected structurally: a @let a = RAtom (AVar x)@ where @x@ is a
+-- prior boxed @let@.
+m2bHasAliasedBoxed :: CoreModule -> Bool
+m2bHasAliasedBoxed cm = case m2bTheProg cm of
+  Just e  -> go Set.empty e
+  Nothing -> False
+  where
+    go boxed e = case e of
+      Let _ (RAtom (AVar x)) body
+        | Set.member (nameUniq x) boxed -> True
+        | otherwise -> go boxed body
+      Let b _ body -> go (insertIfBoxed b boxed) body
+      Case _ alts  -> any (go boxed . clusterAltBody) alts
+      LetJoin _ _ jb body -> go boxed jb || go boxed body
+      _ -> False
+    insertIfBoxed b s =
+      if Esc.isBoxedType (bndType b) then Set.insert (binderUnique b) s else s
+
+-- | The computation references a top-level boxed CAF (the 'M2bGlobalAcrossOp'
+-- shape): the program has the splice 'g_caf' bind alongside main.
+m2bHasGlobalAcrossOp :: CoreModule -> Bool
+m2bHasGlobalAcrossOp (CoreModule binds) =
+  any (\(TopBind n _ _) -> nameHint n == T.pack "g_caf") binds
+
+-- | The accepted=>sound property for the M3 store route. Mirrors 'prop_m2bEscape'
+-- EXACTLY (the accepted/skipped split, the dual heap-balance + value-match oracle,
+-- the 'rcMemSafetyFault' both-fail hardening). The accept predicate is the REAL
+-- guard, which already includes the M3 carrier-wall check and the store-route
+-- boundary relaxation. The 'checkCoverage' floors make NON-VACUITY a HARD FAILURE:
+-- if the generator stops producing a store-route dimension above its floor, the
+-- property goes red.
+prop_m3Escape :: Property
+prop_m3Escape =
+  forAllShrink genM3Program shrinkProgramM3 $ \cm0 ->
+    let cm       = pruneToReachable cm0
+        accepted = null (firstOrderNoHandlerViolations cm)
+        refRes   = Interp.runModule cm
+        rcRes    = RCM.runModuleRCUnchecked (Perceus.insertRC cm)
+        report   =
+          "boundary accepted: " <> show accepted
+            <> "\ninstrumented ANF:\n" <> T.unpack (Perceus.prettyPerceus cm)
+            <> "\nreference: " <> showR (fmap Interp.renderValue refRes)
+            <> "\nrc:        " <> showRC rcRes
+        ranSound    = accepted && either (const False) (const True) rcRes
+        storeResume = m3HasTakeResume cm
+        storeDrop   = m3HasStoreDrop cm
+        movedB      = m2bHasMovedBeforeOp cm
+        aliased     = m2bHasAliasedBoxed cm
+        boxedAcr    = m2bHasBoxedAcrossOp cm
+        opAbove     = m2bHasOpUnderCase cm
+        globalAcr   = m2bHasGlobalAcrossOp cm
+    in checkCoverage $
+       cover 30.0 (storeResume && ranSound) "store-resume run (store->take->resume)" $
+       cover 30.0 (storeDrop && ranSound)   "store-drop run (store->drop, cascade free)" $
+       cover 10.0 (movedB && ranSound)      "moved-into-con present (store path)" $
+       cover  8.0 (aliased && ranSound)     "two-alias present (store path)" $
+       cover 10.0 (boxedAcr && ranSound)    "boxed-value live across store" $
+       cover 12.0 (opAbove && ranSound)     "store under non-trivial above (Case branch)" $
+       cover  6.0 (globalAcr && ranSound)   "global/CAF live across store" $
+       QC.label (m3Classify cm <> (if accepted then " accepted" else " rejected")) $
+       counterexample report $
+         if not accepted
+           then property True
+           else case (refRes, rcRes) of
+                  (Right v, Right run) ->
+                    let outOk      = Interp.renderValue v == RCM.rcOutput run
+                        st         = RCM.rcStats run
+                        baseline   = RCM.rcBaseline run
+                        liveOk     = St.stLive st == baseline
+                        balancedOk = St.stAllocs st - St.stFrees st == baseline
+                    in counterexample "ACCEPTED but unsound: output / heap-empty / balanced mismatch"
+                         (outOk && liveOk && balancedOk)
+                  (Left refE, Left rcE)
+                    | rcMemSafetyFault rcE ->
+                        counterexample ("ACCEPTED but unsound: RC memory-safety fault hidden behind a \
+                                        \reference failure: rc=" <> show rcE <> " ref=" <> show refE)
+                          False
+                    | errCtorTag refE == errCtorTag rcE ->
+                        counterexample "both interpreters failed the same way (agreement)" True
+                    | otherwise ->
+                        counterexample ("ACCEPTED but unsound: RC failure DIVERGES from the reference \
+                                        \failure: ref=" <> show refE <> " rc=" <> show rcE)
+                          False
+                  _ ->
+                    counterexample "ACCEPTED but unsound: exactly one interpreter failed" False
+  where
+    showR (Right t)  = T.unpack t
+    showR (Left e)   = "FAILED (" <> show e <> ")"
+    showRC (Right run) = T.unpack (RCM.rcOutput run)
+    showRC (Left e)    = "FAILED (" <> show e <> ")"
+
+-- | balanceLint must be clean on every ADMITTED M3 store-route program. Mirrors
+-- 'prop_m2bLintClean': a boundary-rejected program may legitimately lint dirty (the
+-- conservative reject), so we gate on acceptance.
+prop_m3LintClean :: Property
+prop_m3LintClean =
+  forAllShrink genM3Program shrinkProgramM3 $ \cm0 ->
+    let cm   = pruneToReachable cm0
+        viol = Perceus.balanceLint cm
+    in if not (null (firstOrderNoHandlerViolations cm))
+         then property True
+         else counterexample ("balanceLint reported on an ADMITTED store-route program: " <> show viol
+                                <> "\nANF:\n" <> T.unpack (Perceus.prettyPerceus cm))
+                (null viol)
+
+-- | Every single-site RC mutation must be CAUGHT on every generated M3 store-route
+-- program --- statically ('lintInstrumented'), at runtime (a 'Left'), OR via heap
+-- imbalance ('stLive /= baseline' or 'stAllocs - stFrees /= baseline'). The
+-- heap-imbalance check is necessary for the cell-drop path: omitting the
+-- '__rc_drop(filled)' on the abandon arm leaks the parked NCont + its owned set
+-- (a LEAK, 'stLive > baseline') rather than a crash. Reuses 'mutationCaughtM2b'
+-- (the M2b teeth oracle with the heap-imbalance detector).
+prop_m3Teeth :: Property
+prop_m3Teeth =
+  forAllShrink genM3Program shrinkProgramM3 $ \cm0 ->
+    let cm = pruneToReachable cm0
+    in conjoin
+         [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
+                             <> T.unpack (Perceus.prettyPerceus cm))
+             (mutationCaughtM2b mut cm)
+         | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+
+-- | Suite G (extended, M3): the generative oracle for the stored-continuation
+-- store route. The accepted=>sound property, the lint-clean property, and the
+-- generalized teeth, with coverage floors that fail the property if any store-route
+-- dimension stops being generated.
+rcM3PropertyTests :: TestTree
+rcM3PropertyTests =
+  localOption (QuickCheckTests 800) $
+    testGroup "rc m3 property (Suite G extended: stored-continuation store route)"
+      [ testProperty "accepted => sound (heap-balanced + value-match); rejected => skipped"
+          prop_m3Escape
+      , testProperty "balanceLint is clean on every admitted store-route program"
+          prop_m3LintClean
+      , testProperty "every single-site RC mutation is caught on the store/drop path"
+          prop_m3Teeth
       ]
 
 -- ---------------------------------------------------------------------------

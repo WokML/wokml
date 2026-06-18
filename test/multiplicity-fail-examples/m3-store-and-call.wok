@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- M3-a (fail): storing the continuation AND tail-calling it resumes it twice.
+-- `__cont_store` charges `1` for the store; the direct `k v` charges `1` for the
+-- resume; `addC One One = Many`, so the arm is `ω` and the law rejects it.
+effect Park = { park : U64 -> U64 }
+
+usePark : () -> U64 with Park
+usePark u = Park.park 7
+
+main : U64
+main =
+  let cell = __cont_cell_new () in
+  with { Park.park x k -> let a = __cont_store cell k in k x }
+  usePark ()
+

@@ -1,11 +1,11 @@
 headCons xs =
-  join j72(r) =
+  join j75(r) =
     let h = r
     let t = Cell(h, xs)
     t
   case xs of
-    Nil -> jump j72(0)
-    Cons y _ -> jump j72(y)
+    Nil -> jump j75(0)
+    Cons y _ -> jump j75(y)
 
 main =
   let t.2 = Nil

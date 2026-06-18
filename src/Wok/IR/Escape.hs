@@ -46,7 +46,13 @@ module Wok.IR.Escape
   , rawEnclosingFv
     -- * M2b-1 handler-fragment predicates
   , m2bResumeEscapes
+  , m2bResumeEscapesStoreRoute
   , m2bHandlerInFragment
+  , m2bHandlerInFragmentStore
+    -- * M3 carrier-wall (cycle-prevention) helper
+  , storeRouteCells
+  , storeCalls
+  , StoreCall (..)
   ) where
 
 import Data.Set (Set)
@@ -58,6 +64,7 @@ import Wok.IR.Anf
   , Rhs (..)
   , freeVarsExpr, atomVars, binderUnique, bndType )
 import Wok.IR.Name (Name (..), Unique)
+import qualified Wok.IR.PrimNames as PN
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
 
 -- ---------------------------------------------------------------------------
@@ -69,8 +76,42 @@ import Wok.TypeChecking.Types (CType (..), TyCon (..))
 -- (and 'Wok.Interp.RC.Prim.rcPrimTable').
 
 dupHint, dropHint :: Text
-dupHint  = Tx.pack "__rc_dup"
-dropHint = Tx.pack "__rc_drop"
+dupHint  = PN.rcDupName
+dropHint = PN.rcDropName
+
+-- | The M3 stored-continuation move-in once-sink (@__cont_store cell k@). The
+-- escape walker, under the STORE-ROUTE exemption ('m2bResumeEscapesStoreRoute'),
+-- treats the continuation argument of this extern as a NON-escape (the op-arm
+-- @resume@ handed to @__cont_store@ is MOVED into the cell, not leaked into
+-- first-class data). This MUST match the hint key in
+-- "Wok.Interp.RC.Prim"/"Wok.Interp.Prim" and the @onceSinkKeys@ entry in
+-- "Wok.Pipeline". See the §7/§10.3 design note: the exemption is BOTH the Perceus
+-- COVERAGE seam (so the store-route arm is instrumented and heap-balanced) AND, as
+-- of M3 Task 4, the boundary GUARD admission ('m2bHandlerViolations' now uses the
+-- store-exempting form 'm2bResumeEscapesStoreRoute'). The cycle the exemption could
+-- otherwise admit is walled off by the carrier-wall checks
+-- ('Wok.IR.Reachable.m3CarrierWallViolations' statically + the runtime
+-- @__cont_store@ owned-set check), which landed alongside this relaxation.
+--
+-- TRUST ANCHOR (code-review #6). @__cont_store@ is recognized HERE by HINT TEXT,
+-- exactly as the RC intrinsics @__rc_dup@/@__rc_drop@ are ('dupHint'/'dropHint'
+-- above), and NOT by extern identity ('Unique'). This is the established
+-- convention for compiler-placed intrinsics: the elaborator/Perceus pass is the
+-- only producer of @__cont_store@ in the IR these passes see, so a hint match is a
+-- reliable identity match (no user binding named @__cont_store@ ever reaches
+-- 'Wok.IR.Escape'/'Wok.IR.Reachable' --- it is a privileged @extern@ in
+-- @Std.Control@, and an op-arm storing its @resume@ is grammar-checked). This
+-- DIFFERS from the once-sink @__coro_susp@, which 'Wok.Pipeline' resolves by
+-- @(module, name)@ extern identity ('onceSinkKeys'/'resolveTrusted'): there a USER
+-- binding merely HINTED @__coro_susp@ is plausible (it is surface-reachable via
+-- @start@), so identity is required to avoid trusting a look-alike. Threading the
+-- resolved @__cont_store@ 'Unique' into these predicates would mean widening
+-- 'Wok.IR.Reachable.firstOrderNoHandlerViolations' (and its caller
+-- 'Wok.Interp.RC.Machine.runModuleRC', which takes only a 'CoreModule') to carry
+-- the once-sink set --- invasive signature threading for no soundness gain over
+-- the hint convention, so hint recognition is kept (matching @__rc_dup@/@__rc_drop@).
+contStoreHint :: Text
+contStoreHint = PN.contStoreName
 
 -- ---------------------------------------------------------------------------
 -- Boxed-ness
@@ -616,15 +657,62 @@ rawEnclosingFv defs =
 -- walker reuses the per-'Rhs' single source of truth ('escapingAtomsRhs', which exempts
 -- the call head and the @__rc_dup@/@__rc_drop@ intrinsics) but does its OWN traversal
 -- that descends into handler arms and treats an alias-rename as an escape.
+-- The boundary-guard form: the @__cont_store@ argument position is NOT exempt,
+-- so a stored (escaping) resume IS an escape and the route stays REJECTED until
+-- the carrier-wall check lands (M3 Task 4).
 m2bResumeEscapes :: Binder -> Expr -> Bool
-m2bResumeEscapes resume = go
+m2bResumeEscapes = m2bResumeEscapesWalk False
+
+-- | As 'm2bResumeEscapes', but ADMITTING the M3 STORE ROUTE (spec §7). The op-arm
+-- @resume@ handed DIRECTLY to the @__cont_store@ extern as its CONTINUATION
+-- (second) argument of a SATURATED 2-arg call does NOT count as an escape --- it
+-- is MOVED into the cell, exactly as the @__rc_dup@/@__rc_drop@ intrinsic
+-- arguments are exempted in 'escapingAtomsRhs'.
+--
+-- The Perceus COVERAGE predicate ('m2bHandlerInFragmentStore') uses this form so
+-- the store-route arm is instrumented (and thus heap-balanced); as of M3 Task 4
+-- the boundary GUARD ('Wok.IR.Reachable.m2bHandlerViolations') ALSO uses it ---
+-- admitting the store route in production, now that the carrier-wall
+-- cycle-prevention checks ('m3CarrierWallViolations' + the runtime @__cont_store@
+-- owned-set check) license it. The non-exempting form 'm2bResumeEscapes' remains
+-- the 'm2bHandlerInFragment' coverage predicate and the direct unit-test oracle.
+--
+-- NARROWNESS (code-review #2). The exemption fires ONLY through the shared
+-- 'contStoreCell' recognizer --- a SATURATED 2-arg @__cont_store cell resume@ call
+-- with @resume@ in the continuation (second) argument. A non-saturated arity (a
+-- partial @__cont_store cell@, an over-applied @__cont_store cell resume x@) or
+-- @resume@ in the CELL (first) position is NOT a recognized store and stays an
+-- ordinary escape. An ALIAS (@let k2 = resume in __cont_store cell k2@) is NOT
+-- exempt either (the alias-rename @let k2 = resume@ is itself an escape). This is
+-- the SAME recognizer 'storeCalls' uses for the carrier-wall cell set, so the
+-- guard's admission and the carrier-wall check cannot disagree on which calls are
+-- store calls (code-review #9/#10).
+m2bResumeEscapesStoreRoute :: Binder -> Expr -> Bool
+m2bResumeEscapesStoreRoute = m2bResumeEscapesWalk True
+
+-- | The shared escape walk for the two M2b resume-escape predicates. The
+-- @exemptStore@ flag is INTERNAL ONLY (never exposed): the two public entries
+-- 'm2bResumeEscapes' (non-exempting) and 'm2bResumeEscapesStoreRoute' (exempting)
+-- name the policy structurally, so a caller cannot silently transpose the boolean
+-- (code-review #8). Under the exemption a recognized store RHS ('contStoreCell')
+-- drops @resume@ from its escaping atoms (the @cell@ still escapes); every other
+-- position is the single-source-of-truth 'escapingAtomsRhs'.
+m2bResumeEscapesWalk :: Bool -> Binder -> Expr -> Bool
+m2bResumeEscapesWalk exemptStore resume = go
   where
     u = binderUnique resume
     inAtoms as = u `Set.member` Set.unions (map atomVars as)
+    -- The atoms of an 'Rhs' that count as escapes here. Normally
+    -- 'escapingAtomsRhs' (head + intrinsics exempt); under the store-route
+    -- exemption, a recognized @__cont_store cell resume@ contributes ONLY @cell@
+    -- (the @resume@ continuation argument is moved, not leaked).
+    escAtoms r
+      | exemptStore, Just cell <- contStoreCell u r = [cell]
+      | otherwise                                   = escapingAtomsRhs r
     go e = case e of
       Ret a               -> u `Set.member` atomVars a
       Jump _ as           -> inAtoms as
-      Let _ r body        -> inAtoms (escapingAtomsRhs r) || go body
+      Let _ r body        -> inAtoms (escAtoms r) || go body
       LetRec defs body    -> any (\(_, _, d) -> go d) defs || go body
       Case a alts         -> u `Set.member` atomVars a || any goAlt alts
       LetJoin _ _ jb body -> go jb || go body
@@ -634,12 +722,178 @@ m2bResumeEscapes resume = go
     goAlt (AltLit _ e)   = go e
     goAlt (AltDefault e) = go e
 
+-- | The SINGLE source of truth for recognizing a @__cont_store cell resume@ move-in
+-- (code-review #2/#9/#10). Returns @Just cell@ iff @r@ is EXACTLY a SATURATED
+-- 2-arg @__cont_store@ call whose CONTINUATION (second) argument is the bare
+-- @resume@ ('Unique' @u@). Both the boundary admission exemption
+-- ('m2bResumeEscapesWalk') and the carrier-wall cell extraction ('storeCalls')
+-- consult THIS recognizer, so they cannot drift on what counts as a store: a shape
+-- the guard exempts is exactly a shape the carrier-wall sees, and vice versa.
+--
+-- The 2-arg SATURATION and second-argument POSITION are both load-bearing: a
+-- partial @__cont_store cell@ or over-applied @__cont_store cell resume x@ is not a
+-- move-in the runtime performs, and @resume@ in the cell (first) position is not a
+-- continuation move --- neither is recognized, so neither is exempted nor walled
+-- (it falls through to the ordinary escape, which REJECTS it).
+contStoreCell :: Unique -> Rhs -> Maybe Atom
+contStoreCell u (RApp (AVar hd) [cell, AVar k])
+  | nameHint hd == contStoreHint, nameUniq k == u = Just cell
+contStoreCell _ _ = Nothing
+
 -- | True iff a handler is in the M2b RC-supported fragment: no op-arm resume
 -- escapes its body. Handler parameters ('hParam') are admitted as of M2b-2
 -- Task 2 (the baton model). Value-position handlers ('hAnswerJoin = Just')
--- are admitted as of M2b-2 Task 5 (answerRebindRC). This is the AUTHORITATIVE
--- coverage predicate shared by the boundary guard ('Wok.IR.Reachable') and
--- the Perceus pass.
+-- are admitted as of M2b-2 Task 5 (answerRebindRC). This is the NON-store-route
+-- form: it does NOT admit the store route. As of M3 Task 4 the boundary guard
+-- ('Wok.IR.Reachable.m2bHandlerViolations') uses the store-EXEMPTING walker
+-- directly (so it admits the store route, walled by 'm3CarrierWallViolations'),
+-- so this predicate is no longer the guard's admission test --- it stays the
+-- direct unit-test oracle and the consistency reference for the NON-store shapes.
 m2bHandlerInFragment :: Handler -> Bool
 m2bHandlerInFragment h =
   all (\oa -> not (m2bResumeEscapes (oaResume oa) (oaBody oa))) (hOps h)
+
+-- | As 'm2bHandlerInFragment', but ADMITTING the store route: an op-arm whose
+-- @resume@ escapes ONLY into the @__cont_store@ continuation argument is in
+-- fragment. This is the PERCEUS COVERAGE predicate (spec §7): it widens
+-- instrumentation to the store-route arm so its allocations (the continuation
+-- cell, captured frame) are dup/drop-accounted and the program is heap-balanced.
+-- It is NOT the boundary guard --- the carrier-wall check
+-- ('Wok.IR.Reachable.m3CarrierWallViolations') walls the cyclic SUBSET of the
+-- store route that this admits.
+m2bHandlerInFragmentStore :: Handler -> Bool
+m2bHandlerInFragmentStore h =
+  all (\oa -> not (m2bResumeEscapesStoreRoute (oaResume oa) (oaBody oa))) (hOps h)
+
+-- | A recognized @__cont_store cell resume@ move-in within an op-arm body, tagged
+-- with whether its @cell@ is a FRESH LOCAL of the store's own scope (a value bound
+-- by @__cont_cell_new@ in the SAME scope chain as the store, the only sound shape
+-- per spec §3.1/§4.3) or NOT (the handler baton, an enclosing local, an op
+-- argument, or a cell captured from an enclosing scope into a nested handler arm).
+data StoreCall = StoreCall
+  { scCell         :: Atom   -- ^ the cell the continuation is parked in
+  , scCellIsFresh  :: Bool   -- ^ True iff @scCell@ is a fresh @__cont_cell_new@ of the SAME scope
+  }
+
+-- | The SINGLE @__cont_store@ extraction (code-review #9/#10) feeding BOTH the
+-- carrier-wall cell set ('storeRouteCells', below) and the carrier-wall admission
+-- decision ('Wok.IR.Reachable.m3CarrierWallViolations'). It collects every
+-- recognized @__cont_store cell resume@ move-in ('contStoreCell' --- the SAME
+-- recognizer the boundary exemption uses), tagging each with whether its @cell@ is
+-- a FRESH LOCAL of the store's own scope.
+--
+-- FRESH-LOCAL is the EXPRESSIBLE+SOUND fragment (spec §3.1 note, §4.3): a cell
+-- bound by @__cont_cell_new@ in the scope chain LEADING to the store. The walk
+-- threads the set of such fresh cell 'Unique's; a 'Let' of @__cont_cell_new ()@
+-- adds its binder; an ordinary 'Let' / 'Case' alt / 'LetRec' def / 'LetJoin' body
+-- propagates the set unchanged. Descending into a NESTED handler's arms RESETS the
+-- fresh set to empty: a cell created in the OUTER arm is a captured (enclosing)
+-- value from the nested arm's perspective (a different dynamic extent --- the
+-- nested arm runs under its own @kBelow@), so it is NOT a fresh local of a store
+-- buried inside the nested arm, and storing into it must be REJECTED (the
+-- nested-handler-cell hole, code-review #3). An op-ARGUMENT cell is never bound by
+-- @__cont_cell_new@ in the body, so it is never fresh either (the op-arg-cell hole,
+-- code-review #3).
+--
+-- LAMBDA COUPLING (H1 review). This walk recognizes a store only as a 'Let'-RHS
+-- @__cont_store@ call ('storeOf'/'contStoreCell'); it does NOT recurse into an
+-- 'RLam' body, so a store BURIED inside a lambda (@let f = \\x -> __cont_store
+-- cell resume@) is invisible HERE. That is sound only because such a lambda
+-- CAPTURES @resume@, which the resume-escape guard ('m2bResumeEscapes' via
+-- 'escapingAtomsRhs's 'RLam' arm) already flags as an escape and REJECTS the arm
+-- before the carrier-wall ever runs --- so no lambda-buried store reaches an
+-- admitted program. This walk and that guard are coupled: if the escape guard
+-- ever admitted a @resume@ captured into a lambda, this walk would need to recurse
+-- into 'RLam' bodies to keep walling cycles.
+--
+-- LETREC MEMBER FRESHNESS (code-review #3). The same captured-extent reasoning
+-- applies to 'LetRec' member def bodies, which is why the 'LetRec' arm below resets
+-- 'fresh' to empty (mirroring the nested-'Handle' arms): a member runs in its own
+-- dynamic extent, so an OUTER-arm fresh cell is a captured value INSIDE the member,
+-- never a fresh local of a store buried there. Resetting makes the wall
+-- self-sufficient (it would reject such a store on its own), rather than leaning on
+-- the resume-escape guard rejecting a LetRec-captured @resume@ first.
+storeCalls :: Binder -> Expr -> [StoreCall]
+storeCalls resume = go Set.empty
+  where
+    u = binderUnique resume
+    cellNewHint = PN.contCellNewName
+    -- The binder a @let b = ...@ adds to the fresh-local set, if its RHS is one of:
+    --   (1) a direct @__cont_cell_new (..)@ allocation;
+    --   (2) a pure ALIAS-RENAME @let b = AVar n@ of an already-fresh @n@;
+    --   (3) a @__rc_dup@ of an already-fresh @n@ (@let b = __rc_dup n@).
+    -- ANF elaboration binds the cell administratively (@let t = __cont_cell_new ();
+    -- let cell = t; ...@), so the @__cont_store@ atom is the alias, not the original
+    -- --- the alias closure (2) is REQUIRED to recognize the corpus fresh-local shape
+    -- (an alias of a fresh cell is still a fresh local).
+    --
+    -- ADMIT-DIRECTION HINT (code-review #6). Case (1) recognizes @__cont_cell_new@ by
+    -- HINT TEXT ('cellNewHint'), with no extern-identity ('Unique') guard. Unlike the
+    -- once-sink @__coro_susp@ (which 'Wok.Pipeline' resolves by @(module, name)@
+    -- identity because a USER binding hinted @__coro_susp@ is surface-plausible), this
+    -- is safe by hint alone: @__cont_cell_new@ is an Embedded-only @Std.Control@
+    -- prelude @extern@ that users cannot rebind, so a hint match IS an identity match
+    -- here --- the SAME documented convention as the @__rc_dup@/@__rc_drop@ and
+    -- @__cont_store@ hint recognition (see 'dupHint'/'dropHint'/'contStoreHint'). It
+    -- only PROMOTES a cell to fresh (the safe ADMIT direction): a false hint match
+    -- cannot widen admission, since the cell still must clear the carrier-wall.
+    --
+    -- __RC_DUP ALIAS-FOLLOW (code-review #4). Because this wall runs on POST-Perceus
+    -- IR, the @__cont_store@ cell operand may be a @__rc_dup@ of the fresh cell
+    -- (@let c2 = __rc_dup cell; __cont_store c2 resume@). Case (3) traces through that
+    -- dup: a @__rc_dup@ of an ALREADY-fresh cell is the SAME cell, rc-bumped --- still
+    -- fresh-local. This is sound because it promotes ONLY a dup of a cell already in
+    -- @fresh@; a @__rc_dup@ of the baton (or any non-fresh value) is NOT promoted
+    -- (the operand is not in @fresh@), so a dup'd baton store is still rejected.
+    freshCellBinder fresh bd r = case r of
+      RApp (AVar hd) _
+        | nameHint hd == cellNewHint                    -> Just (binderUnique bd)
+      RApp (AVar hd) [AVar n]
+        | nameHint hd == dupHint
+        , nameUniq n `Set.member` fresh                 -> Just (binderUnique bd)
+      RAtom (AVar n)
+        | nameUniq n `Set.member` fresh                 -> Just (binderUnique bd)
+      _                                                 -> Nothing
+    -- Is this cell atom a fresh local of the current scope (in @fresh@)? Literals are
+    -- never cells (vacuously NOT fresh; a literal cell is impossible from a real
+    -- @__cont_cell_new@, so this never admits one).
+    cellIsFresh fresh (AVar n) = nameUniq n `Set.member` fresh
+    cellIsFresh _     (ALit _) = False
+    storeOf fresh r = case contStoreCell u r of
+      Just cell -> [StoreCall cell (cellIsFresh fresh cell)]
+      Nothing   -> []
+    go fresh e = case e of
+      Ret _               -> []
+      Jump _ _            -> []
+      Let bd r body       ->
+        let fresh' = maybe fresh (`Set.insert` fresh) (freshCellBinder fresh bd r)
+        in storeOf fresh r ++ go fresh' body
+      -- A LetRec member body runs in its OWN dynamic extent (a (mutually) recursive
+      -- def reachable from multiple call sites), so an OUTER-scope fresh cell is a
+      -- CAPTURED value from a member's perspective --- exactly as a nested handler
+      -- arm (Handle, below) is. Reset 'fresh' to empty when descending into member
+      -- bodies (a cell freshly created INSIDE a member re-accumulates from empty), so
+      -- the wall is SELF-SUFFICIENT and not merely guard-coupled (see the LetRec note
+      -- in LAMBDA COUPLING above). No corpus program stores into a LetRec-captured
+      -- cell, so this reset only removes a guard-coupling; it never over-rejects.
+      LetRec defs body    -> concatMap (\(_, _, d) -> go Set.empty d) defs ++ go fresh body
+      Case _ alts         -> concatMap (goAlt fresh) alts
+      LetJoin _ _ jb body -> go fresh jb ++ go fresh body
+      -- A nested handler's arms run in a DIFFERENT scope (their own @kBelow@): a
+      -- fresh cell of THIS scope is a captured value there, so reset the fresh set.
+      Handle e' h         ->
+        go fresh e'
+          ++ go Set.empty (snd (hReturn h))
+          ++ concatMap (go Set.empty . oaBody) (hOps h)
+    goAlt fresh (AltCon _ _ e) = go fresh e
+    goAlt fresh (AltLit _ e)   = go fresh e
+    goAlt fresh (AltDefault e) = go fresh e
+
+-- | The CELL atoms that the op-arm @resume@ binder is @__cont_store@'d INTO within
+-- @body@ --- the @cell@ of every recognized @__cont_store cell resume@ move-in
+-- ('storeCalls'). Used by 'Wok.IR.Reachable.m3CarrierWallViolations' as the M3
+-- carrier-wall input (spec §4.3); the guard rejects any store whose cell is not a
+-- fresh local ('scCellIsFresh' = False). The runtime check in @__cont_store@ is
+-- the operational backstop (@cellAddr `notElem` continuationOwned prefix@).
+storeRouteCells :: Binder -> Expr -> [Atom]
+storeRouteCells resume = map scCell . storeCalls resume

@@ -1,10 +1,10 @@
 sumPairs p.1 p.2 =
-  join j71(x, xs, y, ys) =
+  join j74(x, xs, y, ys) =
     let t.1 = +(x, y)
     let t.2 = sumPairs(xs, ys)
     let t.3 = +(t.1, t.2)
     t.3
-  join j79() =
+  join j82() =
     0
   case p.1 of
     Cons f.1 f.2 ->
@@ -14,15 +14,15 @@ sumPairs p.1 p.2 =
         Cons f.3 f.4 ->
           let _dup.2 = __rc_dup(f.4)
           let _drop.2 = __rc_drop(p.2)
-          jump j71(f.1, f.2, f.3, f.4)
+          jump j74(f.1, f.2, f.3, f.4)
         _ ->
           let _drop.3 = __rc_drop(p.2)
           let _drop.4 = __rc_drop(f.2)
-          jump j79()
+          jump j82()
     _ ->
       let _drop.5 = __rc_drop(p.1)
       let _drop.6 = __rc_drop(p.2)
-      jump j79()
+      jump j82()
 
 main =
   let t.3 = Nil

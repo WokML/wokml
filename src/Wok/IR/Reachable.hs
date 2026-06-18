@@ -18,6 +18,7 @@ module Wok.IR.Reachable
   , firstOrderNoHandlerViolations
   , exprScopeFeatures
   , m2bHandlerViolations
+  , m3CarrierWallViolations
   ) where
 
 import Data.List (find, nub)
@@ -31,7 +32,8 @@ import qualified Wok.IR.Name as Name
 import Wok.IR.Name (Unique)
 import Wok.IR.Escape
   ( isBoxedType, letRecMemberConsumesCaptureNonEscaping
-  , rawEnclosingFv, m2bResumeEscapes )
+  , rawEnclosingFv, m2bResumeEscapesStoreRoute
+  , storeCalls, StoreCall (..) )
 
 -- | Semantics-preserving dead-bind elimination: keep only the binds reachable
 -- from 'main' (preserving bind order). A bind never reached from 'main' cannot
@@ -329,6 +331,11 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
       Anf.Jump _ _            -> []
       Anf.Handle inner h      ->
         m2bHandlerViolations h
+          -- M3 Task 4: the carrier-wall cycle-prevention check runs over EVERY
+          -- handler, alongside the (now store-route-relaxed) M3 boundary rejection.
+          -- It is independent of 'm2bHandlerViolations' (one admits the store route,
+          -- the other rejects the cyclic SUBSET of it), so both must fire here.
+          ++ m3CarrierWallViolations h
           -- M2b-1 (verified UAF, full-branch review): a handler whose return/op arm
           -- references an enclosing BOXED LOCAL is DEFERRED and must be rejected. The
           -- arm is instrumented as a fresh owned scope (it does NOT account the enclosing
@@ -350,12 +357,95 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
           ++ go Set.empty lr bsc (snd (Anf.hReturn h))
           ++ concat [ go Set.empty lr bsc (Anf.oaBody op) | op <- Anf.hOps h ]
 
--- | Precise violation messages for a handler that is OUTSIDE the M2b
--- fragment.  Derived from the SAME conditions as 'm2bHandlerInFragment' so
--- guard emptiness and the predicate agree. Value-position handlers
--- ('hAnswerJoin = Just') are admitted as of M2b-2 Task 5 and no longer
--- reported here.
+-- | Precise violation messages for a handler that is OUTSIDE the M2b/M3
+-- store-route fragment. Value-position handlers ('hAnswerJoin = Just') are
+-- admitted as of M2b-2 Task 5 and no longer reported here.
+--
+-- This is the GUARD's authoritative rejection. It is derived from the
+-- store-EXEMPTING walker ('m2bResumeEscapesStoreRoute'), so it admits the store
+-- route --- it therefore deliberately DIVERGES from the non-exempting coverage
+-- predicate 'Wok.IR.Escape.m2bHandlerInFragment' (which still rejects the store
+-- route) on exactly that one case. The Perceus pass uses the matching store-EXEMPTING
+-- coverage predicate 'm2bHandlerInFragmentStore', so guard and instrumentation
+-- stay aligned on what is admitted.
+--
+-- M3 Task 4 (the §7 boundary-guard evolution + §10.3 defense-in-depth flag): the
+-- rejection is now CONDITIONAL on the STORE-ROUTE exemption. An op-arm whose
+-- @resume@ escapes ONLY into the @__cont_store@ continuation argument is ADMITTED
+-- (the extern-cell route, licensed by the carrier-wall cycle-prevention check
+-- 'm3CarrierWallViolations'); a @resume@ escaping into ANY OTHER non-head position
+-- --- a constructor/record field, a non-store call argument, a return, a jump, a
+-- projection, a closure capture, a 'Case' scrutinee, or a pure alias-rename @let
+-- k2 = resume@ --- STAYS rejected. This is achieved by the store-exempting walker
+-- 'm2bResumeEscapesStoreRoute': it drops @resume@ from the escape set ONLY when
+-- @resume@ is exactly the continuation (second) argument of a SATURATED 2-arg
+-- @__cont_store cell resume@ call (the shared 'Wok.IR.Escape.contStoreCell'
+-- recognizer), and reports every other escape unchanged. So the relaxation admits
+-- EXACTLY the @__cont_store@ argument position and nothing else (the §10.3
+-- narrowness requirement). The carrier-wall check ('m3CarrierWallViolations', run
+-- alongside in 'firstOrderNoHandlerViolations') then rejects the cycle shape among
+-- the admitted stores --- and because both consult the SAME 'storeCalls' /
+-- 'contStoreCell' recognition, the admission and the wall cannot disagree on which
+-- calls are stores.
 m2bHandlerViolations :: Anf.Handler -> [Text]
 m2bHandlerViolations h =
-  [ Tx.pack "effect op arm whose resume ESCAPES its body (first-class/stored continuation; M3)"
-  | oa <- Anf.hOps h, m2bResumeEscapes (Anf.oaResume oa) (Anf.oaBody oa) ]
+  [ Tx.pack "effect op arm whose resume ESCAPES its body into a NON-\
+            \__cont_store position (first-class/stored continuation; M3)"
+  | oa <- Anf.hOps h
+  , m2bResumeEscapesStoreRoute (Anf.oaResume oa) (Anf.oaBody oa) ]
+
+-- | The M3 CARRIER-WALL (cycle-prevention) boundary check (spec §4.3 "checked, not
+-- assumed"). For every op-arm @resume@ that is @__cont_store@'d into a cell (the
+-- store route admitted by 'm2bHandlerViolations'), ADMIT the store ONLY when that
+-- cell is a FRESH LOCAL of the store's own scope (a value bound by @__cont_cell_new@
+-- in the SAME scope chain as the store, 'scCellIsFresh'); REJECT every other cell
+-- (the handler baton @hParam@, an enclosing local, an op ARGUMENT, or a cell
+-- captured from an enclosing scope into a NESTED handler arm) conservatively.
+--
+-- WHY this is the right static condition. A counted cycle @cell -> NCont -> cell@
+-- forms iff the cell appears in the stored continuation's owned set
+-- ('continuationOwned', the addresses the captured @above@ frames own). The
+-- captured frames are exactly the continuation prefix BETWEEN the op and its
+-- handler; their owned set can only contain values that are LIVE AT THE OP (bound
+-- above it) --- never a value freshly bound by @__cont_cell_new@ INSIDE the op-arm
+-- body in the store's own scope, which is a sibling scope below the op (the arm
+-- runs under @kBelow@). So a fresh-local cell (the admitted scheduler shape) can
+-- never be counted-reached by the continuation, and storing into it is acyclic.
+-- Any OTHER cell --- one that flows in from ENCLOSING scope (the baton, an
+-- enclosing local), an op argument (a value live at the op), or a fresh cell of an
+-- OUTER arm referenced from a NESTED handler arm (a captured value there) --- is
+-- the static shape that COULD be in the owned set, so it is conservatively
+-- REJECTED. Because every cyclic store needs at least one such non-fresh cell
+-- (the fresh-local cell can never be counted-reached, as argued above), rejecting
+-- EVERY non-fresh-cell store rejects EVERY cycle: THIS static rule is the COMPLETE
+-- cycle wall, not a backstop.
+--
+-- The other two layers are NOT independent complete walls; they are subordinate
+-- (spec §10.3 "defense in depth"):
+--   * the RUNTIME @__cont_store@ check (@cellAddr `notElem` continuationOwned
+--     prefix@) is a SINGLE-LEVEL operational BACKSTOP --- it tests only the one-hop
+--     shape (this cell in THIS continuation's own owned set), subsumed by the
+--     static rule but kept as a tripwire; and
+--   * the type checker's OccursCheck is a GENERIC infinite-type check (NOT an
+--     M3-specific carrier check) that INCIDENTALLY blocks the direct surface route
+--     (store @resume@ into the handler's own baton): the cell's answer type would
+--     have to contain the continuation's own type. It is incidental coverage, not
+--     a designed cycle wall.
+--
+-- The owned-set deref is a runtime quantity; statically we approximate it SOUNDLY
+-- by "admit ONLY a fresh-local cell" (over-rejection is safe). The fresh-local
+-- classification ('scCellIsFresh') is computed ONCE per store during the SINGLE
+-- 'storeCalls' walk (shared with the boundary admission's @__cont_store@
+-- recognition), so the admission exemption and this check cannot disagree on which
+-- calls are stores (code-review #2/#3/#9/#10), and no per-cell @freeVarsExpr@ is
+-- recomputed (code-review #12).
+m3CarrierWallViolations :: Anf.Handler -> [Text]
+m3CarrierWallViolations h =
+  [ Tx.pack "effect op arm stores resume into a NON-LOCAL continuation cell \
+            \(the cell is a captured/enclosing value, an op argument, or a \
+            \nested-handler capture --- not a fresh __cont_cell_new in the \
+            \store's own scope); the stored continuation could counted-reach \
+            \its own cell --- carrier-wall cycle prevention (M3 §4.3)"
+  | oa <- Anf.hOps h
+  , sc <- storeCalls (Anf.oaResume oa) (Anf.oaBody oa)
+  , not (scCellIsFresh sc) ]
