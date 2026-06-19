@@ -7,10 +7,10 @@ main =
   t
   with {
     return v : U64 -> v
-    State.get(resume.1 : U64) ->
+    State.get(resume.1 : U64 -> U64) ->
       let res.1 : U64 = resume.1(0)
       res.1
-    State.set(s : a0, resume.2 : ()) ->
+    State.set(s : a1, resume.2 : () -> U64) ->
       let res.2 : () = resume.2(())
       res.2
   }

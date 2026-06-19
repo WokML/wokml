@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- Same leak with a Never-typed op and an UNBOXED answer (U64): the Never typing
+-- does NOT save it (refutes the M3 spec's Never-vs-resumable framing). Heap must
+-- return to baseline after the fix.
+effect Exn = { throw : U64 -> Never }
+
+prog : Exn -> U64 with Exn
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.throw 9 in
+  case xs of
+    []       -> 0
+    (h :: _) -> h
+
+run : (Exn -> U64 with Exn + eff e) -> U64 with eff e
+run c = with self = Exn { throw n k -> 88 ; v -> v } in c self
+
+main : U64
+main = run prog

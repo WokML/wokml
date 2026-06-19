@@ -7,7 +7,7 @@ logToIO c : () -> a0 =
   t.1
   with {
     return v : a0 -> v
-    Logger.log(m : String, resume : ()) ->
+    Logger.log(m : String, resume : () -> a0) ->
       let t.2 : () = IO.write(m)
       let res : () = resume(t.2)
       res
@@ -18,7 +18,7 @@ runIO c : () -> a0 =
   t
   with {
     return v : a0 -> v
-    IO.write(m : String, resume : ()) ->
+    IO.write(m : String, resume : () -> a0) ->
       let res : () = resume(())
       res
   }

@@ -140,6 +140,7 @@ main = do
     , exprBasicTests
     , exprLetTests
     , inferTypedTests
+    , resumeBinderTypeTests
     , typedDeclBodyTests
     , clauseArityTests
     , unsupportedHeadTests
@@ -604,7 +605,7 @@ typedExprForTest env = goE
       in Typed.TAlt (goPat pat) [] body'
 
     goArm (Abs.HArm (Abs.ConId (_, en)) (Abs.VarId (_, op)) ps body) =
-      Typed.TOpArm en op (map goAP ps) (T.pack "") (goE body)
+      Typed.TOpArm en op (map goAP ps) (T.pack "") (Ty.CTArr testTy Ty.CREmpty testTy) (goE body)
     goArm (Abs.HUArm (Abs.VarId (_, v)) _ body) =
       Typed.TReturnArm (tpa (Typed.TPVar v)) (goE body)
     goArm (Abs.HParam _ _) =
@@ -1476,6 +1477,196 @@ zonkTests = testGroup "Zonk"
 -- | Assert that inferExprW builds typed nodes with the right constructor
 -- shape. We inspect the TexpF structure (annotations carry mutable Type s and
 -- are awkward to compare, so we match on node shape and concrete literals).
+-- ---------------------------------------------------------------------------
+-- Resume-binder-type property tests (spec 2026-06-19).
+--
+-- The resume binder of every handler op arm must be typed as the continuation
+-- arrow `T -> R` (always boxed), NOT the answer type `R`. Typing it `R`
+-- mis-marks an unboxed-answer continuation as unboxed, so the Perceus pass omits
+-- its drop on a discard arm and the captured owned set leaks. These run in
+-- memory (parse -> reorder -> inferProgramWith B.initialEnv) over builtins-only
+-- handler programs and inspect the typed 'TOpArm' resume-type field. The
+-- Core-level 'genProgram' generates no handlers, so it cannot cover this; this
+-- is the type-layer net.
+
+-- | A representative type with its source text, a sample literal, its CType, and
+-- whether it is boxed (reference-counted). Spans unboxed scalars and boxed lists.
+data RTy = RTy
+  { rtyText  :: String
+  , rtyLit   :: String
+  , rtyCType :: Ty.CType
+  , rtyBoxed :: Bool
+  }
+  deriving (Show)
+
+reprTys :: [RTy]
+reprTys =
+  [ RTy "U64"     "0"     (Ty.CTCon Ty.TcU64 [])                                      False
+  , RTy "()"      "()"    (Ty.CTCon Ty.TcUnit [])                                     False
+  , RTy "String"  "\"s\"" (Ty.CTCon Ty.TcString [])                                   False
+  , RTy "[U64]"   "[0]"   (Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []])                 True
+  , RTy "[[U64]]" "[[0]]" (Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]]) True
+  ]
+
+data ArmShape = DiscardNamed | DiscardWild | ApplyNamed | AutoResume
+  deriving (Show, Eq, Enum, Bounded)
+
+-- | A self-contained, well-typed handler module using only builtin types. The op
+-- result type @tRes@ (= T) and the handler answer type @rAns@ (= R) vary
+-- independently, as does the arm shape and whether the handler is AMBIENT
+-- (@with { E.op ... } e@, elaborated via 'inferHandler') or NAMED
+-- (@with self = E { ... } in@, via 'inferNamedHandler') -- both inference paths
+-- thread the resume type. No 'Std.Base' import, so 'B.initialEnv' suffices for
+-- the in-memory typecheck.
+renderHandlerSrc :: Bool -> RTy -> RTy -> ArmShape -> String
+renderHandlerSrc ambient tRes rAns shape
+  | ambient = unlines
+      [ "module Main"
+      , "effect E = { fire : U64 -> " ++ rtyText tRes ++ " }"
+      , "prog : () -> " ++ rtyText rAns ++ " with E"
+      , "prog u = let x = E.fire 0 in " ++ rtyLit rAns
+      , "run : (() -> " ++ rtyText rAns ++ " with E + eff e) -> " ++ rtyText rAns ++ " with eff e"
+      , "run c = with { E." ++ arm ++ " ; v -> v } c ()"
+      , "main : " ++ rtyText rAns
+      , "main = run prog"
+      ]
+  | otherwise = unlines
+      [ "module Main"
+      , "effect E = { fire : U64 -> " ++ rtyText tRes ++ " }"
+      , "prog : E -> " ++ rtyText rAns ++ " with E"
+      , "prog e = let u = e.fire 0 in " ++ rtyLit rAns
+      , "run : (E -> " ++ rtyText rAns ++ " with E + eff e) -> " ++ rtyText rAns ++ " with eff e"
+      , "run c = with self = E { " ++ arm ++ " ; v -> v } in c self"
+      , "main : " ++ rtyText rAns
+      , "main = run prog"
+      ]
+  where
+    arm = case shape of
+      DiscardNamed -> "fire n k -> " ++ rtyLit rAns
+      DiscardWild  -> "fire n _ -> " ++ rtyLit rAns
+      ApplyNamed   -> "fire n k -> k (" ++ rtyLit tRes ++ ")"
+      AutoResume   -> "fire n -> " ++ rtyLit tRes
+
+genHandlerSrc :: Gen (String, Bool, RTy, RTy, ArmShape)
+genHandlerSrc = do
+  ambient <- elements [False, True]
+  tRes    <- elements reprTys
+  rAns    <- elements reprTys
+  shape   <- elements [minBound .. maxBound]
+  pure (renderHandlerSrc ambient tRes rAns shape, ambient, tRes, rAns, shape)
+
+-- | Parse + reorder + infer a self-contained module under the builtins env;
+-- returns the output env (for in-memory elaboration in P3) and the typed decls.
+typeCheckSrc :: String -> Either String (TE.Env, [TC.TypedDecl])
+typeCheckSrc src =
+  case parse (T.pack src) of
+    Left e    -> Left ("parse: " ++ e)
+    Right ast -> case reorderModule ast of
+      Left es  -> Left ("reorder: " ++ show es)
+      Right rm -> case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
+        Left e             -> Left ("infer: " ++ show e)
+        Right (env, ds, _) -> Right (env, ds)
+
+-- | Every 'TOpArm' resume-type annotation reachable in the inferred decls.
+resumeTysOf :: [TC.TypedDecl] -> [Ty.CType]
+resumeTysOf = concatMap (concatMap (goE . snd) . TC.tdClauses)
+  where
+    goE (Typed.Texp _ f) = goF f
+    goF f = case f of
+      Typed.TApp h as            -> goE h ++ concatMap goE as
+      Typed.TLam _ e             -> goE e
+      Typed.TIf a b c            -> goE a ++ goE b ++ goE c
+      Typed.TTuple es            -> concatMap goE es
+      Typed.TList es             -> concatMap goE es
+      Typed.TProj e _            -> goE e
+      Typed.TPerformOn e _ _     -> goE e
+      Typed.TRecord _ fs         -> concatMap (goE . snd) fs
+      Typed.TRecordExt _ e fs    -> goE e ++ concatMap (goE . snd) fs
+      Typed.TLet ds e            -> concatMap goLD ds ++ goE e
+      Typed.TCase e alts         -> goE e ++ concatMap goAlt alts
+      Typed.THandle e arms       -> goE e ++ concatMap goArm arms
+      Typed.TWithNamedH _ arms e -> concatMap goArm arms ++ goE e
+      _                          -> []
+    goArm (Typed.TOpArm _ _ _ _ rty b) = rty : goE b
+    goArm (Typed.TReturnArm _ b)       = goE b
+    goArm (Typed.TParamArm _ e)        = goE e
+    goAlt (Typed.TAlt _ ds e)          = concatMap goLD ds ++ goE e
+    goLD (Typed.TLocalDecl _ _ e)      = goE e
+
+-- | The resume binder type of every elaborated 'Anf.OpArm' in a Core module
+-- (the Elaborate-layer counterpart of 'resumeTysOf', for the P3 agreement check).
+coreResumeTysOf :: Anf.CoreModule -> [Ty.CType]
+coreResumeTysOf cm = concatMap (goE . Anf.tbBody) (Anf.cmBinds cm)
+  where
+    goE e = case e of
+      Anf.Let _ rhs b      -> goR rhs ++ goE b
+      Anf.LetRec ds b      -> concatMap (\(_, _, db) -> goE db) ds ++ goE b
+      Anf.LetJoin _ _ jb b -> goE jb ++ goE b
+      Anf.Case _ alts      -> concatMap goAlt alts
+      Anf.Handle e' h      -> goE e' ++ concatMap goOp (Anf.hOps h)
+      _                    -> []
+    goR rhs = case rhs of
+      Anf.RLam _ b -> goE b
+      _            -> []
+    goOp oa = Anf.bndType (Anf.oaResume oa) : goE (Anf.oaBody oa)
+    goAlt (Anf.AltCon _ _ b) = goE b
+    goAlt (Anf.AltLit _ b)   = goE b
+    goAlt (Anf.AltDefault b) = goE b
+
+-- | The (domain, codomain) of a single arrow, ignoring its effect row; 'Nothing'
+-- for a non-arrow. Used to check @resume : T -> R@ on BOTH the domain T and the
+-- codomain R (a wrong-but-boxed @R -> R@ must NOT pass).
+arrowParts :: Ty.CType -> Maybe (Ty.CType, Ty.CType)
+arrowParts (Ty.CTArr a _ b) = Just (a, b)
+arrowParts _                = Nothing
+
+resumeBinderTypeTests :: TestTree
+resumeBinderTypeTests = testGroup "resumeBinderType"
+  [ testProperty "P1: every resume binder is a boxed arrow (T -> R)" $
+      QC.forAll genHandlerSrc $ \(src, ambient, _tRes, rAns, shape) ->
+        checkCoverage $
+        cover 20 (rtyBoxed rAns)       "boxed answer"   $
+        cover 20 (not (rtyBoxed rAns)) "unboxed answer" $
+        cover 10 (shape == DiscardNamed || shape == DiscardWild) "discard arm" $
+        cover 10 (shape == ApplyNamed  || shape == AutoResume)   "resuming arm" $
+        cover 20 ambient        "ambient handler" $
+        cover 20 (not ambient)  "named handler"   $
+          case typeCheckSrc src of
+            Left e        -> counterexample ("typecheck failed (generator bug):\n" ++ src ++ "\n" ++ e) False
+            Right (_, ds) ->
+              let rtys = resumeTysOf ds
+              in counterexample ("resume types: " ++ show rtys ++ "\nsrc:\n" ++ src)
+                   (not (null rtys) && all isArrowBoxed rtys)
+  , testProperty "P2: resume binder is the continuation type T -> R (domain AND codomain)" $
+      QC.forAll genHandlerSrc $ \(src, _ambient, tRes, rAns, _shape) ->
+        case typeCheckSrc src of
+          Left _        -> property True   -- typecheck failures are P1's job to report
+          Right (_, ds) -> conjoin
+            [ counterexample
+                ("resume " ++ show rty ++ " /= " ++ rtyText tRes ++ " -> " ++ rtyText rAns ++ "\n" ++ src)
+                (arrowParts rty == Just (rtyCType tRes, rtyCType rAns))
+            | rty <- resumeTysOf ds ]
+  , testProperty "P3: elaborated resume binder agrees with the inferred type (boxed T -> R)" $
+      QC.forAll genHandlerSrc $ \(src, _ambient, tRes, rAns, _shape) ->
+        case typeCheckSrc src of
+          Left _          -> property True
+          Right (env, ds) ->
+            let core = coreResumeTysOf (elaborateModule env ds)
+            in counterexample ("elaborated resume types: " ++ show core ++ "\n" ++ src)
+                 (not (null core)
+                  && all (\t -> Esc.isBoxedType t && arrowParts t == Just (rtyCType tRes, rtyCType rAns)) core)
+  , testProperty "P4: any arrow type is boxed" $
+      QC.forAll genArrow Esc.isBoxedType
+  ]
+  where
+    isArrowBoxed t@(Ty.CTArr _ _ _) = Esc.isBoxedType t
+    isArrowBoxed _                  = False
+    genArrow :: Gen Ty.CType
+    genArrow = do
+      a <- elements [Ty.CTCon Ty.TcU64 [], Ty.CTCon Ty.TcUnit [], Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]]
+      b <- elements [Ty.CTCon Ty.TcU64 [], Ty.CTCon Ty.TcString []]
+      pure (Ty.CTArr a Ty.CREmpty b)
+
 inferTypedTests :: TestTree
 inferTypedTests = testGroup "InferTyped"
   [ testCase "literal 1 yields Texp _ (TLitI 1)" $

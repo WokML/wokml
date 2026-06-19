@@ -8,7 +8,7 @@ main =
   t
   with {
     return v : U64 -> v
-    Ask.ask(resume : U64) ->
+    Ask.ask(resume : U64 -> U64) ->
       let res : U64 = resume(41)
       res
   }

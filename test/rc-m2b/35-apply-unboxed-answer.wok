@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- Unboxed answer (U64), arm APPLIES resume (resume now in the owned set after the
+-- fix AND consumed as a move-out). Must be balanced before AND after the fix (the
+-- move-out, not the owned-set drop, consumes resume; no double-free).
+effect Choose = { choose : U64 -> U64 }
+
+prog : Choose -> U64 with Choose
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.choose 9 in
+  case xs of
+    []       -> u
+    (h :: _) -> h
+
+run : (Choose -> U64 with Choose + eff e) -> U64 with eff e
+run c = with self = Choose { choose n k -> k 7 ; v -> v } in c self
+
+main : U64
+main = run prog

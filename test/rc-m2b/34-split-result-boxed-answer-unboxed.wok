@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- Op RESULT type is [U64] (boxed) but the handler ANSWER type is U64 (unboxed).
+-- Still leaks before the fix -> the leak is driven by the ANSWER type, not the op
+-- result type. Heap must return to baseline after the fix.
+effect Choose = { choose : U64 -> [U64] }
+
+prog : Choose -> U64 with Choose
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.choose 9 in
+  case xs of
+    []       -> 0
+    (h :: _) -> h
+
+run : (Choose -> U64 with Choose + eff e) -> U64 with eff e
+run c = with self = Choose { choose n k -> 88 ; v -> v } in c self
+
+main : U64
+main = run prog

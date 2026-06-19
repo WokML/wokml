@@ -550,8 +550,8 @@ elabKF tk ty node = elabRhsF ty node (deliverRhs tk ty)
 -- putting a named handler's self binder in scope for `e` before calling.
 elabHandle :: TailK -> TExpr -> [THandlerArm CType] -> Maybe Binder -> Elab Expr
 elabHandle tk e arms mSelf = do
-  let opArmsSrc  = [ (effect, op, ps, resume, body)
-                   | TOpArm effect op ps resume body <- arms ]
+  let opArmsSrc  = [ (effect, op, ps, resume, resumeTy, body)
+                   | TOpArm effect op ps resume resumeTy body <- arms ]
       retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
       paramSrc   = [ (name, initE) | TParamArm name initE <- arms ]
   handledBody <- elabK TRet e
@@ -597,8 +597,8 @@ elabHandle tk e arms mSelf = do
     paramWrap (Just (pn, nm, _)) = withLocal nm pn
     paramWrap Nothing            = id
 
-    elabOpArm :: TailK -> Maybe (Name, Text, TExpr) -> (Text, Text, [TPat], Text, TExpr) -> Elab OpArm
-    elabOpArm tk2 mParam (effect, op, ps, resumeName, body) = do
+    elabOpArm :: TailK -> Maybe (Name, Text, TExpr) -> (Text, Text, [TPat], Text, CType, TExpr) -> Elab OpArm
+    elabOpArm tk2 mParam (effect, op, ps, resumeName, resumeContTy, body) = do
       (argBinders, extender) <- elabParams ps
       resumeN <- bindFresh (Tx.pack "resume")
       armBody <-
@@ -618,13 +618,14 @@ elabHandle tk e arms mSelf = do
             -- CONTROL: bind the surface name to the resume binder; elaborate the
             -- body as-is (it already has the answer type R).
             paramWrap mParam $ extender $ withLocal resumeName resumeN (elabK tk2 body)
-      -- NOTE: the resume binder is annotated with `teType body`, which is the op
-      -- RESULT type T in the auto-resume branch (correct) but the ANSWER type R in
-      -- the control branch (imprecise: the continuation is T -> R). This field is
-      -- currently unused (the interpreter keys resume by name; no typed pass reads
-      -- it), so it is a latent placeholder. Fix when the typed-Core pass needs a
-      -- precise resume type -- it will need T threaded onto TOpArm (roadmap follow-up).
-      pure (OpArm effect op argBinders (Binder resumeN Unrestricted (teType body)) armBody)
+      -- The resume binder is typed with the threaded continuation type `T -> R`
+      -- (the type the checker bound `k` to when checking this arm body), NOT
+      -- `teType body` (the answer type R). An arrow is ALWAYS boxed, so the
+      -- Perceus pass counts `resume` in the arm's owned set and drops it on a
+      -- discard arm; typing it with an unboxed answer R would silently drop it
+      -- from the owned set and leak the captured continuation (spec
+      -- docs/superpowers/specs/2026-06-19-m2b-resume-binder-type-leak-fix).
+      pure (OpArm effect op argBinders (Binder resumeN Unrestricted resumeContTy) armBody)
 
 -- ---------------------------------------------------------------------------
 -- Tail position elaboration

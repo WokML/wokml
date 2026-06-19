@@ -2082,8 +2082,30 @@ texpMentions name = goE
     goD (Ty.TLocalDecl _ _ b)   = goE b
     goA (Ty.TAlt _ ds b)        = any goD ds || goE b
     goArm (Ty.TReturnArm _ b)   = goE b
-    goArm (Ty.TOpArm _ _ _ _ b) = goE b
+    goArm (Ty.TOpArm _ _ _ _ _ b) = goE b
     goArm (Ty.TParamArm _ b)    = goE b
+
+-- | The continuation type for an op-arm @resume@ binder: @T -> R@, or
+-- @sigma -> T -> R@ for a parameterized handler (@sigma@ = parameter type, @T@ =
+-- op result, @R@ = handler answer). Each arrow carries a fresh OPEN effect row so
+-- that applying @resume@ in the body flows its effects into the outer ambient
+-- (mirroring ordinary application; see EApp). The leading @paramRow@ is allocated
+-- ONLY for a parameterized handler (no wasted metavar otherwise).
+--
+-- Threaded onto 'Ty.TOpArm' (every arm shape, both handler forms) so the
+-- elaborator types @resume@ as the (always-boxed) arrow it is rather than the
+-- answer type R; an unboxed R would mis-mark the continuation as unboxed and the
+-- Perceus pass would omit its drop on a discard arm, leaking the captured owned
+-- set (spec docs/superpowers/specs/2026-06-19-m2b-resume-binder-type-leak-fix).
+-- Shared by 'inferHandler' (ambient) and 'inferNamedHandler' (named).
+resumeContTyFor :: Maybe (Type s) -> Type s -> Type s -> TC s (Type s)
+resumeContTyFor mParamTy resultTy answerT = do
+  resumeRow <- freshRVar
+  case mParamTy of
+    Just paramTy -> do
+      paramRow <- freshRVar
+      pure (arrowT paramTy paramRow (arrowT resultTy resumeRow answerT))
+    Nothing -> pure (arrowT resultTy resumeRow answerT)
 
 inferHandler :: Map.Map Text (Type s) -> [Text] -> Maybe (Int, Int) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
 inferHandler mono header headerPos e arms = do
@@ -2185,6 +2207,10 @@ inferHandler mono header headerPos e arms = do
           resultTy <- case mResult of
             Just r  -> pure r
             Nothing -> throwError (UnknownOperation (Just pos) en op)
+          -- The resume binder's continuation type (see 'resumeContTyFor'),
+          -- threaded onto every arm shape so the elaborator types it as the
+          -- always-boxed arrow it is, not the answer type R.
+          resumeContTy <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
           case binderPs of
             [] -> do
               -- AUTO-RESUME: no continuation binder. The arm body has the op's
@@ -2192,7 +2218,7 @@ inferHandler mono header headerPos e arms = do
               -- The empty resume name signals the auto-wrap path to the elaborator.
               (bodyT, bodyNode) <- inferExprW mono1 body
               unify (Just pos) bodyT resultTy
-              pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
+              pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
             [Abs.APWild] -> do
               -- WILDCARD DISCARD: explicit intentional discard; body has the
               -- answer type R; bind nothing; never lint. Resume-name sentinel
@@ -2203,23 +2229,12 @@ inferHandler mono header headerPos e arms = do
               -- harmless because the body never references it.
               (bodyT, bodyNode) <- inferExprW mono1 body
               unify (Just pos) bodyT answerT
-              pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") bodyNode)
+              pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
             [Abs.APVar (Abs.VarId (_, kname))] -> do
-              -- CONTROL: the trailing pattern is the continuation binder `k`. The
-              -- arm body has the handler ANSWER type R; `resume : T -> R` (T is the
-              -- op's result type). The arrow carries a fresh open effect row so
-              -- that applying `k` in the body flows its effects into the outer
-              -- ambient (mirroring ordinary application; see EApp).
-              resumeRow <- freshRVar
-              -- A parameterized handler gives `resume : sigma -> T -> R` (one
-              -- extra leading arrow for the threaded parameter); an unparameterized
-              -- handler keeps the slice-1 shape `resume : T -> R`. The leading
-              -- parameter arrow carries its own fresh open effect row.
-              paramRow <- freshRVar
-              let resumeTy = case mParam of
-                    Just (_, paramTy, _) -> arrowT paramTy paramRow (arrowT resultTy resumeRow answerT)
-                    Nothing              -> arrowT resultTy resumeRow answerT
-                  mono2    = Map.insert kname resumeTy mono1
+              -- CONTROL: the trailing pattern is the continuation binder `k`, typed
+              -- with the shared 'resumeContTy' (`T -> R`) above so applying it in
+              -- the body flows its effects into the outer ambient.
+              let mono2 = Map.insert kname resumeContTy mono1
               (bodyT, bodyNode) <- inferExprW mono2 body
               unify (Just pos) bodyT answerT
               -- Forgotten-resume lint: a NAMED binder, unreferenced in the body,
@@ -2229,7 +2244,7 @@ inferHandler mono header headerPos e arms = do
               let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
               unless (isNever || texpMentions kname bodyNode) $
                 addWarning (ForgottenResume (Just pos) en op)
-              pure (Ty.TOpArm en op argPatNodes kname bodyNode)
+              pure (Ty.TOpArm en op argPatNodes kname resumeContTy bodyNode)
             _ ->
               -- More than `arity + 1` patterns, or a non-variable continuation
               -- binder: not a valid operation arm shape.
@@ -2339,29 +2354,27 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
         resultTy <- case mResult of
           Just r  -> pure r
           Nothing -> throwError (UnknownOperation (Just pos) en op)
+        -- The resume binder's continuation type (see 'resumeContTyFor'), threaded
+        -- onto every arm shape (same as the ambient-handler path above).
+        resumeContTy <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
         case binderPs of
           [] -> do
             (bodyT, bodyNode) <- inferExprW mono1 b
             unify (Just pos) bodyT resultTy
-            pure (Ty.TOpArm en op argPatNodes Tx.empty bodyNode)
+            pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
           [Abs.APWild] -> do
             (bodyT, bodyNode) <- inferExprW mono1 b
             unify (Just pos) bodyT answerT
-            pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") bodyNode)
+            pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
           [Abs.APVar (Abs.VarId (_, kname))] -> do
-            resumeRow <- freshRVar
-            paramRow  <- freshRVar
-            let resumeTy = case mParam of
-                  Just (_, paramTy, _) -> arrowT paramTy paramRow (arrowT resultTy resumeRow answerT)
-                  Nothing              -> arrowT resultTy resumeRow answerT
-                mono2    = Map.insert kname resumeTy mono1
+            let mono2 = Map.insert kname resumeContTy mono1
             (bodyT, bodyNode) <- inferExprW mono2 b
             unify (Just pos) bodyT answerT
             resultTy' <- force resultTy
             let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
             unless (isNever || texpMentions kname bodyNode) $
               addWarning (ForgottenResume (Just pos) en op)
-            pure (Ty.TOpArm en op argPatNodes kname bodyNode)
+            pure (Ty.TOpArm en op argPatNodes kname resumeContTy bodyNode)
           _ -> throwError (MalformedHandlerArm (Just pos) en op)
   -- The body sees @self : handleTy@. Ambient effects of the body flow outward
   -- unchanged (we do NOT open a sub-ambient -- named performs never touch it).

@@ -368,7 +368,7 @@ checkAlt ctx env (TAlt pat decls body) =
 checkArm :: Ctx -> Env -> THandlerArm CType -> Either TypeError ()
 checkArm ctx env arm = case arm of
   TReturnArm pat body    -> check (ctx { ctxHandlerArm = True }) (bindPats (ctxCarrierTys ctx) env [pat]) False body
-  TOpArm _ _ pats _ body -> check (ctx { ctxHandlerArm = True }) (bindPats (ctxCarrierTys ctx) env pats) False body
+  TOpArm _ _ pats _ _ body -> check (ctx { ctxHandlerArm = True }) (bindPats (ctxCarrierTys ctx) env pats) False body
   TParamArm _ initE      -> check ctx env False initE
 
 -- | Extend the environment with a pattern's binders: all names join @locals@;
@@ -551,7 +551,7 @@ freeVarsAlt (TAlt pat decls body) =
 freeVarsArm :: THandlerArm CType -> Set Text
 freeVarsArm arm = case arm of
   TReturnArm pat body      -> freeVars body `Set.difference` patVars pat
-  TOpArm _ _ pats res body ->
+  TOpArm _ _ pats res _ body ->
     (freeVars body `Set.difference` Set.unions (map patVars pats))
       `Set.difference` Set.singleton res
   TParamArm _ initE        -> freeVars initE
@@ -701,7 +701,7 @@ walk carrierTys trust sp name (Texp _ node) = case node of
             walk carrierTys trust sp name altBody
     walkArm arm = case arm of
       TReturnArm pat body    -> introducedBy (futureBindersOfPat carrierTys pat) body >> walk carrierTys trust sp name body
-      TOpArm _ _ pats _ body -> introducedBy (Set.unions (map (futureBindersOfPat carrierTys) pats)) body
+      TOpArm _ _ pats _ _ body -> introducedBy (Set.unions (map (futureBindersOfPat carrierTys) pats)) body
                                   >> walk carrierTys trust sp name body
       TParamArm _ initE      -> walk carrierTys trust sp name initE
 
@@ -865,7 +865,7 @@ consumeCard trust s = go (Set.singleton s) Set.empty
       TReturnArm pat body
         | not (Set.null (Set.intersection aliases (patVars pat))) -> Zero
         | otherwise -> go aliases (Set.union locals (patVars pat)) body
-      TOpArm _ _ pats _ body
+      TOpArm _ _ pats _ _ body
         | not (Set.null (Set.intersection aliases (Set.unions (map patVars pats)))) -> Zero
         | otherwise -> go aliases (Set.union locals (Set.unions (map patVars pats))) body
       TParamArm _ initE -> go aliases locals initE

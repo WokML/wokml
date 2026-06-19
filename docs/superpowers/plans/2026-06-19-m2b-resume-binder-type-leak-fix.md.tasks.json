@@ -1,0 +1,33 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-19-m2b-resume-binder-type-leak-fix.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Red-state reproducers (file corpus)",
+      "status": "completed",
+      "description": "Land leak reproducers + balanced locks as test/rc-m2b corpus files; confirm unboxed-answer discard arms are RED (heap-imbalanced) before the fix. Files 30-35; exact contents in the plan. 30/31/33/34 already verified via /tmp repros.\n\n```json:metadata\n{\"files\": [\"test/rc-m2b/30-discard-unboxed-answer-leak.wok\",\"test/rc-m2b/31-discard-never-unboxed-answer-leak.wok\",\"test/rc-m2b/32-discard-unboxed-answer-wildcard.wok\",\"test/rc-m2b/33-discard-boxed-answer-balanced.wok\",\"test/rc-m2b/34-split-result-boxed-answer-unboxed.wok\",\"test/rc-m2b/35-apply-unboxed-answer.wok\"],\"verifyCommand\":\"BIN=$(cabal list-bin exe:wok); for f in 30-discard-unboxed-answer-leak 31-discard-never-unboxed-answer-leak 32-discard-unboxed-answer-wildcard 34-split-result-boxed-answer-unboxed; do \\\"$BIN\\\" test/rc-m2b/$f.wok --dump-rc-stats; done\",\"acceptanceCriteria\":[\"30/31/32/34 imbalanced before fix\",\"33/35 balanced\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: The fix — thread the resume continuation type",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "Type the resume binder as T -> R (boxed arrow) the checker already computes, replacing teType body. Modify Typed.hs (add `a` field to TOpArm), Infer.hs (hoist+thread resumeContTy; widen goArm), Carrier.hs (4 TOpArm patterns), Elaborate.hs (use threaded type; drop stale comment). Perceus untouched. Exact code in the plan.\n\n```json:metadata\n{\"files\":[\"src/Wok/TypeChecking/Typed.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"src/Wok/TypeChecking/Carrier.hs\",\"src/Wok/IR/Elaborate.hs\"],\"verifyCommand\":\"cabal build exe:wok && BIN=$(cabal list-bin exe:wok); for f in 30-discard-unboxed-answer-leak 31-discard-never-unboxed-answer-leak 32-discard-unboxed-answer-wildcard 33-discard-boxed-answer-balanced 34-split-result-boxed-answer-unboxed 35-apply-unboxed-answer; do \\\"$BIN\\\" test/rc-m2b/$f.wok --dump-rc-stats | head -2; done\",\"acceptanceCriteria\":[\"builds clean\",\"all six corpus files balanced\",\"Perceus.hs no logic change\",\"dump shows __rc_drop(resume)\",\"full suite green\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Typechecker / inference property tests",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "In-memory QuickCheck property at the typechecker layer: every generated well-typed handler's resume binder is a boxed arrow (T -> R). Modify test/Spec.hs (new resumeBinderTypeTests group + generator; register in tree). Uses parse -> reorderModule -> TC.inferProgramWith B.initialEnv (builtins-only). Generator/walker/properties (P1/P2/P4) in the plan.\n\n```json:metadata\n{\"files\":[\"test/Spec.hs\"],\"verifyCommand\":\"cabal test --test-options='-p \\\"resumeBinderType\\\"' 2>&1 | tail -30\",\"acceptanceCriteria\":[\"group registered near inferTypedTests\",\"P1 passes with boxed+unboxed coverage\",\"P2 passes\",\"P4 passes\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Adversarial review and full verification",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "Independently verify soundness + completeness before the user's /code-review gate. Build-the-exploit (fresh reviewer subagent), prove the red-check (revert Task 2 -> file 30 leaks AND P1 fails -> restore -> green), confirm no double-free (33/35 + Never 02/03), discharge spec §6 consistency checks, full suite green. Update project memory. Do NOT merge to main.\n\n```json:metadata\n{\"files\":[],\"verifyCommand\":\"cabal test 2>&1 | tail -20\",\"acceptanceCriteria\":[\"red-check proven (revert->red, restore->green)\",\"no double-free on 33/35/02/03\",\"Perceus logic unchanged\",\"spec §6 consistency discharged\",\"full suite green\",\"not merged to main\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-19T23:59:59Z"
+}

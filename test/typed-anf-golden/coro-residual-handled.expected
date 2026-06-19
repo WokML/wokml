@@ -15,7 +15,7 @@ drive u : () =
       t.2
   with {
     return v : U64 -> v
-    Log.emit(n : U64, resume : U64) ->
+    Log.emit(n : U64, resume : () -> U64) ->
       let t.3 : U64 = resume(())
       t.3
   }

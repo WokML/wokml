@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+
+-- M2b resume-binder-type leak (spec 2026-06-19): a resumable op whose arm BINDS
+-- but DISCARDS resume, with an UNBOXED answer type (U64). 'xs' is boxed and live
+-- across the op (in the captured continuation's owned set). Before the fix the
+-- resume binder is typed with the answer type U64 (unboxed) and is excluded from
+-- the arm's owned set, so __rc_drop(resume) is omitted and xs leaks. After the
+-- fix resume is typed T -> R (boxed) and the owned set is freed. Heap must
+-- return to baseline.
+effect Choose = { choose : U64 -> U64 }
+
+prog : Choose -> U64 with Choose
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.choose 9 in
+  case xs of
+    []       -> 0
+    (h :: _) -> h
+
+run : (Choose -> U64 with Choose + eff e) -> U64 with eff e
+run c = with self = Choose { choose n k -> 88 ; v -> v } in c self
+
+main : U64
+main = run prog

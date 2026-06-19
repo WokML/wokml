@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+-- Boxed answer ([U64]) discard arm: already balanced before the fix (the boxed
+-- answer coincidentally typed resume boxed). Must STAY balanced after the fix
+-- (no double-free regression on the previously-working path).
+effect Choose = { choose : U64 -> U64 }
+
+prog : Choose -> [U64] with Choose
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.choose 9 in
+  xs
+
+run : (Choose -> [U64] with Choose + eff e) -> [U64] with eff e
+run c = with self = Choose { choose n k -> [9, 9] ; v -> v } in c self
+
+main : [U64]
+main = run prog

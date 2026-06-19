@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+
+-- Parameterized-handler (M2b-2, two-arg resume; resume : sigma -> T -> R) variant
+-- of the resume-binder-type leak. The 'set' arm DISCARDS its resume k with an
+-- UNBOXED answer type (U64), while a boxed value 'xs' is live across the op. The
+-- generative typechecker property is unparameterized, so this pins the
+-- sigma -> T -> R threading path. Before the fix resume was typed with the answer
+-- R (unboxed) and leaked xs; after the fix it is a boxed arrow and is dropped.
+-- Heap must return to baseline.
+effect State s = { get : s, set : s -> () }
+
+runState : s -> (() -> U64 with State s + eff e) -> U64 with eff e
+runState i c = with State { s = i ; get -> s ; set x k -> 77 ; v -> v } c ()
+
+prog : () -> U64 with State U64
+prog u =
+  let xs = [1, 2, 3] in
+  let a  = State.get in
+  let u2 = State.set (a + 1) in
+  case xs of
+    []       -> a
+    (h :: _) -> h
+
+main : U64
+main = runState 5 prog

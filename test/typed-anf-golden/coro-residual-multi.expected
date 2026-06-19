@@ -17,13 +17,13 @@ drive u : () =
       t.2
   with {
     return v.1 : U64 -> v.1
-    Log.emit(n : U64, resume.1 : U64) ->
+    Log.emit(n : U64, resume.1 : () -> U64) ->
       let t.3 : U64 = resume.1(())
       t.3
   }
   with {
     return v.2 : U64 -> v.2
-    Tick.tick(resume.2 : U64) ->
+    Tick.tick(resume.2 : U64 -> U64) ->
       let t.4 : U64 = resume.2(1)
       t.4
   }

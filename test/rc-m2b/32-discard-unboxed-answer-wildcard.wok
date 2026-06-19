@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- The wildcard-discard arm (`choose n _ -> ...`) takes the same control path as a
+-- named-but-unused arm: body typed R, resume discarded. Leaks identically when R
+-- is unboxed. Heap must return to baseline after the fix.
+effect Choose = { choose : U64 -> U64 }
+
+prog : Choose -> U64 with Choose
+prog e =
+  let xs = [1, 2, 3] in
+  let u  = e.choose 9 in
+  case xs of
+    []       -> 0
+    (h :: _) -> h
+
+run : (Choose -> U64 with Choose + eff e) -> U64 with eff e
+run c = with self = Choose { choose n _ -> 88 ; v -> v } in c self
+
+main : U64
+main = run prog
