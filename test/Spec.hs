@@ -6348,22 +6348,22 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
       ]
   , testGroup "cardOfWithTrust (inter-procedural)"
       [ testCase "helper trusted One in slot 0 -> direct k pass = One" $
-          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One])])
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One])]) Map.empty
             kName callHelperWithK @?= One
       , testCase "helper trusted Many in slot 0 -> Many (relaxation no-op)" $
-          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [Many])])
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [Many])]) Map.empty
             kName callHelperWithK @?= Many
       , testCase "helper absent from trust map -> Many (catch-all)" $
-          Mult.cardOfWithTrust trustedSusp Map.empty kName callHelperWithK @?= Many
+          Mult.cardOfWithTrust trustedSusp Map.empty Map.empty kName callHelperWithK @?= Many
       , testCase "k passed to two One-slots in one call = Many (addC)" $
-          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One, One])])
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One, One])]) Map.empty
             kName callHelperWithKK @?= Many
       , testCase "partial application of trusted helper to k = Many (escape, saturation guard)" $
           -- helper has arity 2 (trust [One, One]) but is applied to ONLY k: that
           -- partial app CAPTURES k into the closure f rather than consuming it.
           -- The two later f n calls re-invoke the captured continuation. Clause B
           -- must NOT fire (length as 1 != length cs 2) -> falls through to Many.
-          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One, One])])
+          Mult.cardOfWithTrust trustedSusp (Map.fromList [(helperUniq, [One, One])]) Map.empty
             kName partialHelperEscape @?= Many
       ]
   , testGroup "analyzeModule"

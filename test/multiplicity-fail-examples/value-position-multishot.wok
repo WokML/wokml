@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- RED-CHECK: a GENUINE multi-shot VALUE-POSITION handler (resumes its
+-- continuation twice) must STILL be rejected after the answer-join exit-seed
+-- fix. The two `k` calls force `ω`; the seed only removes the spurious `ω` from
+-- the exit jump, never a real resume.
+effect Tick = { tick : U64 -> U64 }
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  let r = (with { Tick.tick x k -> let a = k 0 in let b = k 1 in a + b } useTick ()) in
+  case r of
+    0 -> 0
+    _ -> r

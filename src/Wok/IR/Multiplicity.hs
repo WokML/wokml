@@ -65,7 +65,7 @@ mentionsAny r = any (mentionsAtom r)
 -- the original conservative, purely-intra-procedural behaviour for every caller
 -- (and unit test) that does not supply a trust map.
 cardOf :: Set Unique -> Name -> Expr -> Card
-cardOf onceSinks = cardOfWithTrust onceSinks Map.empty
+cardOf onceSinks = cardOfWithTrust onceSinks Map.empty Map.empty
 
 -- | The same affine analysis as 'cardOf', closed over a @trustMap@ that records,
 -- for each top-level function (keyed by its 'Unique'), the per-parameter
@@ -82,8 +82,15 @@ cardOf onceSinks = cardOfWithTrust onceSinks Map.empty
 -- STARTS FROM EMPTY (see 'computeTrustMap'), so a callee absent from the map is
 -- treated as @Many@ for that slot; trust only ever grows monotonically as cards
 -- DECREASE, hence the relaxation can never wrongly trust a multishot callee.
-cardOfWithTrust :: Set Unique -> Map Unique [Card] -> Name -> Expr -> Card
-cardOfWithTrust onceSinks trustMap r = go Map.empty
+-- @seedEnv@ pre-populates the join-cardinality env used by the 'Jump' rule. The
+-- handler's ANSWER-JOIN is seeded to 'Zero' there (see 'armCard'), because it is
+-- an EXIT whose body runs after the handler returns and structurally cannot
+-- invoke this arm's resume binder @r@. A join NOT in @seedEnv@ (and not
+-- 'LetJoin'-bound in scope) still defaults to 'Many' (the recursive-join case),
+-- so the relaxation is confined to the known exit join and can never lower a
+-- genuine multi-shot below 'Many'.
+cardOfWithTrust :: Set Unique -> Map Unique [Card] -> Map JoinId Card -> Name -> Expr -> Card
+cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
   where
     go :: Map JoinId Card -> Expr -> Card
     go env e = case e of
@@ -209,10 +216,10 @@ data MultiplicityError = MultishotResume Text Text
   deriving (Eq, Show)
 
 -- | Every operation arm reachable in a module (handlers may nest anywhere).
-opArmsInModule :: CoreModule -> [OpArm]
+opArmsInModule :: CoreModule -> [(Maybe JoinId, OpArm)]
 opArmsInModule cm = concatMap (opArmsInExpr . tbBody) (cmBinds cm)
 
-opArmsInExpr :: Expr -> [OpArm]
+opArmsInExpr :: Expr -> [(Maybe JoinId, OpArm)]
 opArmsInExpr e = case e of
   Ret _            -> []
   Let _ rhs b      -> opArmsInRhs rhs ++ opArmsInExpr b
@@ -222,24 +229,33 @@ opArmsInExpr e = case e of
   Jump _ _         -> []
   Handle e' h      -> opArmsInExpr e' ++ opArmsInHandler h
 
-opArmsInRhs :: Rhs -> [OpArm]
+opArmsInRhs :: Rhs -> [(Maybe JoinId, OpArm)]
 opArmsInRhs (RLam _ b) = opArmsInExpr b
 opArmsInRhs _          = []
 
-opArmsInAlt :: Alt -> [OpArm]
+opArmsInAlt :: Alt -> [(Maybe JoinId, OpArm)]
 opArmsInAlt (AltCon _ _ b) = opArmsInExpr b
 opArmsInAlt (AltLit _ b)   = opArmsInExpr b
 opArmsInAlt (AltDefault b) = opArmsInExpr b
 
-opArmsInHandler :: Handler -> [OpArm]
-opArmsInHandler (Handler (_, re) ops _ _ _) =
-  opArmsInExpr re ++ concatMap (\oa -> oa : opArmsInExpr (oaBody oa)) ops
+-- | Each op arm is paired with its handler's 'hAnswerJoin' (the value-position
+-- answer-join, or 'Nothing' in tail position) so 'armCard' can seed that join as
+-- a zero-cost exit. Nested handlers reached via @opArmsInExpr (oaBody oa)@ carry
+-- their own answer-join.
+opArmsInHandler :: Handler -> [(Maybe JoinId, OpArm)]
+opArmsInHandler (Handler (_, re) ops aj _ _) =
+  opArmsInExpr re ++ concatMap (\oa -> (aj, oa) : opArmsInExpr (oaBody oa)) ops
 
 -- | The card of an arm's continuation under a trust map: walk the body, keyed on
 -- the resume binder.
-armCard :: Set Unique -> Map Unique [Card] -> OpArm -> Card
-armCard onceSinks tm oa =
-  cardOfWithTrust onceSinks tm (bndName (oaResume oa)) (oaBody oa)
+-- @mAnswerJoin@ is the enclosing handler's 'hAnswerJoin' (value-position) or
+-- 'Nothing' (tail position). It is seeded to 'Zero' so the arm's exit jump to the
+-- answer-join is not charged 'Many' (the answer-join's body cannot invoke this
+-- arm's resume binder). Without it EVERY value-position arm is falsely 'Many'.
+armCard :: Set Unique -> Map Unique [Card] -> Maybe JoinId -> OpArm -> Card
+armCard onceSinks tm mAnswerJoin oa =
+  cardOfWithTrust onceSinks tm seed (bndName (oaResume oa)) (oaBody oa)
+  where seed = maybe Map.empty (\j -> Map.singleton j Zero) mAnswerJoin
 
 -- | The per-function, per-parameter trust map: for each top-level binding, the
 -- cardinality of each of its parameters in its own body, computed under the
@@ -263,7 +279,7 @@ computeTrustMap onceSinks cm = fixpoint Map.empty
   where
     step tm = Map.fromList
       [ ( nameUniq (tbName tb)
-        , [ cardOfWithTrust onceSinks tm (bndName p) (tbBody tb)
+        , [ cardOfWithTrust onceSinks tm Map.empty (bndName p) (tbBody tb)
           | p <- tbParams tb ] )
       | tb <- cmBinds cm ]
     fixpoint tm =
@@ -278,8 +294,8 @@ analyzeModule :: Set Unique -> CoreModule -> [MultiplicityError]
 analyzeModule onceSinks cm =
   let tm = computeTrustMap onceSinks cm
   in [ MultishotResume (oaLabel oa) (oaOp oa)
-     | oa <- opArmsInModule cm
-     , armCard onceSinks tm oa == Many ]
+     | (aj, oa) <- opArmsInModule cm
+     , armCard onceSinks tm aj oa == Many ]
 
 renderMultiplicityError :: MultiplicityError -> Text
 renderMultiplicityError (MultishotResume lbl op) =
@@ -296,8 +312,8 @@ prettyMultiplicity :: Set Unique -> CoreModule -> Text
 prettyMultiplicity onceSinks cm =
   let tm = computeTrustMap onceSinks cm
   in Tx.intercalate (Tx.pack "\n")
-       [ Tx.concat [ oaLabel oa, Tx.pack ".", oaOp oa, Tx.pack " : ", renderCard (armCard onceSinks tm oa) ]
-       | oa <- opArmsInModule cm ]
+       [ Tx.concat [ oaLabel oa, Tx.pack ".", oaOp oa, Tx.pack " : ", renderCard (armCard onceSinks tm aj oa) ]
+       | (aj, oa) <- opArmsInModule cm ]
 
 renderCard :: Card -> Text
 renderCard Zero = Tx.pack "0"

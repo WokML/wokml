@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+
+-- VALUE-POSITION handler whose arm DISCARDS its resume (zero-shot) -- certified
+-- `0`, not `ω`. Same answer-join exit-jump path as the one-shot case.
+effect Tick = { tick : U64 -> U64 }
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  let r = (with { Tick.tick x k -> 88 } useTick ()) in
+  case r of
+    0 -> 0
+    _ -> r
