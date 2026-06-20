@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- A named State (`s`) beside a named Writer (`w`) -- two DIFFERENT named effects,
+-- the Writer accumulating a list. Distinct from 53-mixed-row (named State beside
+-- an AMBIENT Writer): here BOTH are named instances. a = s.get = 7; w.tell [7];
+-- s.set 9; b = s.get = 9; w.tell [9]; result = 9. The `writer` runner wraps as
+-- (value, log) = (9, [7, 9]); the `state` runner then wraps as (that, finalState)
+-- = ((9, [7, 9]), 9).
+prog : State U64 -> Writer [U64] -> U64
+prog s w =
+  let a  = s.get in
+  let l1 = w.tell [a] in
+  let u  = s.set 9 in
+  let b  = s.get in
+  let l2 = w.tell [b] in
+  b
+
+main : ((U64, [U64]), U64)
+main = with s = state 7 in with w = writer in prog s w

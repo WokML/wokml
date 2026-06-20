@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: UnsupportedFeature Nothing "pattern binding component must be a variable or `_`; for richer patterns use `case`"
+typecheck: typecheck in Main: UnsupportedFeature (Just (12,17)) "pattern binding component must be a variable or `_`; for richer patterns use `case`"

@@ -58,6 +58,7 @@ import Wok.IR.Reachable
   , m3CarrierWallViolations )
 import qualified Wok.IR.Multiplicity as Mult
 import Wok.IR.Multiplicity (Card (..))
+import qualified Wok.IR.PrimNames as PN
 import Wok.IR.Anf
 import qualified Wok.Interp as Interp
 import qualified System.Directory as Dir
@@ -267,7 +268,7 @@ main = do
     -- hardening; each test group verifies the floor bites when disabled):
     --
     -- (M3-a) once-sink: 'multiplicityM3RedCheck' (group "multiplicity m3 red-check")
-    --   Strip @__cont_store@ from 'onceSinkKeys' and the store-once arm flips
+    --   Strip @__cont_store@ from 'onceSinkNames' and the store-once arm flips
     --   to omega (@MultishotResume@ error). Reverts Task 1.
     --
     -- (M3-b / cycle, runtime) carrier-wall: 'rcM3CarrierWallTests'
@@ -406,9 +407,9 @@ multDumpHarness path = do
       -- imported modules (the prelude `Coro.suspend` arm desugars to the genuine
       -- `__coro_susp` escape sink), matching what the law accepts. The trusted
       -- escape-sink identity is resolved by the pipeline.
-      case Pipeline.elaborateProgramFullTrusted entryName ms of
-        Left s            -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
-        Right (cm, trust) -> pure (BL.pack (T.unpack (Mult.prettyMultiplicity trust cm) <> "\n"))
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s   -> pure (BL.pack ("elaborateProgram: " <> s <> "\n"))
+        Right cm -> pure (BL.pack (T.unpack (Mult.prettyMultiplicity PN.onceSinkNames cm) <> "\n"))
 
 multFailGoldenFor :: FilePath -> FilePath
 multFailGoldenFor f =
@@ -436,14 +437,14 @@ multFailHarness path = do
 multiplicityM3RedCheck :: TestTree
 multiplicityM3RedCheck = testGroup "multiplicity m3 red-check"
   [ testCase "store-once certified 1 with __cont_store trusted" $ do
-      (cm, trustFull) <- loadStoreOnce
-      let errs = Mult.analyzeModule trustFull cm
+      cm <- loadStoreOnce
+      let errs = Mult.analyzeModule PN.onceSinkNames cm
       assertBool ("expected no multishot error with __cont_store trusted, got: "
                     <> show errs)
                  (parkErr `notElem` errs)
   , testCase "store-once flips to omega WITHOUT __cont_store trusted" $ do
-      (cm, trustNoStore) <- loadStoreOnceWith keysWithoutStore
-      let errs = Mult.analyzeModule trustNoStore cm
+      cm <- loadStoreOnce
+      let errs = Mult.analyzeModule sinksWithoutStore cm
       assertBool ("expected Park.park multishot error when __cont_store is NOT "
                     <> "trusted (the once-sink registration is load-bearing), got: "
                     <> show errs)
@@ -452,18 +453,19 @@ multiplicityM3RedCheck = testGroup "multiplicity m3 red-check"
   where
     storeOncePath  = "test/multiplicity-examples/m3-store-once.wok"
     parkErr        = Mult.MultishotResume (T.pack "Park") (T.pack "park")
-    -- The full once-sink keys minus the store route; the coro sink is retained,
-    -- so the flip isolates __cont_store's contribution.
-    keysWithoutStore =
-      filter (/= (Pipeline.stdControlModule, T.pack "__cont_store"))
-             Pipeline.onceSinkKeys
-    loadStoreOnce = loadStoreOnceWith Pipeline.onceSinkKeys
-    loadStoreOnceWith keys = do
+    -- The full once-sink identities minus the store route; the coro sink is
+    -- retained, so the flip isolates __cont_store's contribution. Injected
+    -- DIRECTLY into 'analyzeModule' (the trust parameter is now the qualified
+    -- (module, name) identity set), so the red-check witnesses that the
+    -- __cont_store registration is what admits store-once.
+    sinksWithoutStore =
+      Set.delete PN.contStoreKey PN.onceSinkNames
+    loadStoreOnce = do
       result <- Loader.loadProgram storeOncePath []
       case result of
         Left lerr -> assertFailure ("loader: " <> show lerr)
         Right (entryName, ms) ->
-          case Pipeline.elaborateProgramWithOnceSinks keys entryName ms of
+          case Pipeline.elaborateProgramFull entryName ms of
             Left s  -> assertFailure ("elaborate: " <> s)
             Right r -> pure r
 
@@ -1651,7 +1653,7 @@ resumeBinderTypeTests = testGroup "resumeBinderType"
         case typeCheckSrc src of
           Left _          -> property True
           Right (env, ds) ->
-            let core = coreResumeTysOf (elaborateModule env ds)
+            let core = coreResumeTysOf (elaborateModule (T.pack "Main") Set.empty env ds)
             in counterexample ("elaborated resume types: " ++ show core ++ "\n" ++ src)
                  (not (null core)
                   && all (\t -> Esc.isBoxedType t && arrowParts t == Just (rtyCType tRes, rtyCType rAns)) core)
@@ -4573,18 +4575,27 @@ interpValueTests = testGroup "InterpValue"
       in case IV.resolveAtom Map.empty sc (Anf.AVar n) of
            Right v -> IV.renderValue v @?= T.pack "9"
            Left e  -> assertFailure (show e)
-  , testCase "resolveAtom: falls back to prim table by hint" $
-      let n  = runFresh (freshName (T.pack "+"))
-          p  = IV.Prim (T.pack "+") 2 [] (\_ -> Left (IV.PrimError (T.pack "unused")))
-          pt = Map.fromList [(T.pack "+", p)]
-      in case IV.resolveAtom pt IV.emptyScope (Anf.AVar n) of
-           Right (IV.VPrim q) -> IV.primName q @?= T.pack "+"
-           Right _            -> assertFailure "expected VPrim"
-           Left e             -> assertFailure (show e)
+  , testCase "missing binder colliding with a prim errors UnboundVar" $
+      -- A binder named "+" whose Unique is NOT in the runtime env. With the old
+      -- by-hint fallback this silently returned the + prim (the latent bug #12);
+      -- without it this is a loud UnboundVar. The prim table DOES carry "+", so
+      -- the only thing distinguishing UnboundVar from VPrim is the absence of the
+      -- fallback.
+      let missing = Name (T.pack "+") (Unique 999999)
+      in case IV.resolveAtom IP.primTable (IV.Scope Map.empty Map.empty)
+                (Anf.AVar missing) of
+           Left (IV.UnboundVar _) -> pure ()
+           other -> assertFailure
+                      ("missing binder must be UnboundVar, got " <> show other)
   , testCase "resolveAtom: unbound errors" $
       let n = runFresh (freshName (T.pack "ghost"))
       in IV.resolveAtom Map.empty IV.emptyScope (Anf.AVar n)
            @?= Left (IV.UnboundVar (T.pack "ghost"))
+  , testCase "APrim resolves via the prim table" $
+      case IV.resolveAtom IP.primTable (IV.Scope Map.empty Map.empty)
+             (Anf.APrim (T.pack "Std.Base", T.pack "+")) of
+        Right (IV.VPrim _) -> pure ()
+        other -> assertFailure ("APrim + should resolve to a VPrim, got " <> show other)
   ]
 
 -- ---------------------------------------------------------------------------
@@ -4686,14 +4697,11 @@ interpMachineTests = testGroup "InterpMachine"
       in assertEval Map.empty e (T.pack "3")
 
   , testCase "primitive application 2 + 3" $
-      let nplus = runFresh (freshName (T.pack "+"))
-          (e, _) = runFresh $ do
+      let e = runFresh $ do
             t <- freshName (T.pack "t")
-            np <- freshName (T.pack "+")
             let b = Anf.Binder t Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
-            pure ( Anf.Let b (Anf.RApp (Anf.AVar np) [Anf.ALit (Anf.LInt 2), Anf.ALit (Anf.LInt 3)])
-                            (Anf.Ret (Anf.AVar t))
-                 , nplus )
+            pure (Anf.Let b (Anf.RApp (primAtom (T.pack "+")) [Anf.ALit (Anf.LInt 2), Anf.ALit (Anf.LInt 3)])
+                            (Anf.Ret (Anf.AVar t)))
       in assertEval Map.empty e (T.pack "5")
 
   , testCase "closure: identity applied to 9" $
@@ -4788,13 +4796,13 @@ interpMachineTests = testGroup "InterpMachine"
       -- letrec loop n = case n of { 0 -> 0 ; _ -> loop (n-1) } ; ret (loop 3)
       let e = runFresh $ do
             loop <- freshName (T.pack "loop"); n <- freshName (T.pack "n")
-            nm   <- freshName (T.pack "-");    t <- freshName (T.pack "t")
+            t    <- freshName (T.pack "t")
             r    <- freshName (T.pack "r")
             let body = Anf.Case (Anf.AVar n)
                   [ Anf.AltLit (Anf.LInt 0) (Anf.Ret (Anf.ALit (Anf.LInt 0)))
                   , Anf.AltDefault
                       (Anf.Let (Anf.Binder t Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                        (Anf.RApp (Anf.AVar nm) [Anf.AVar n, Anf.ALit (Anf.LInt 1)])
+                        (Anf.RApp (primAtom (T.pack "-")) [Anf.AVar n, Anf.ALit (Anf.LInt 1)])
                         (Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                           (Anf.RApp (Anf.AVar loop) [Anf.AVar t])
                           (Anf.Ret (Anf.AVar r)))) ]
@@ -4856,9 +4864,9 @@ interpEffectTests = testGroup "InterpEffect"
   , testCase "return arm transforms a normally-completing computation" $
       -- handle (ret 5) of return v -> let r = v + 100 ; ret r   (no ops)
       let e = runFresh $ do
-            v <- freshName (T.pack "v"); r <- freshName (T.pack "r"); np <- freshName (T.pack "+")
+            v <- freshName (T.pack "v"); r <- freshName (T.pack "r")
             let retArm = Anf.Let (Anf.Binder r Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                           (Anf.RApp (Anf.AVar np) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
+                           (Anf.RApp (primAtom (T.pack "+")) [Anf.AVar v, Anf.ALit (Anf.LInt 100)])
                            (Anf.Ret (Anf.AVar r))
                 hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), retArm) [] Nothing Nothing Nothing
             pure (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 5))) hdlr)
@@ -4892,7 +4900,7 @@ interpEffectTests = testGroup "InterpEffect"
             b <- freshName (T.pack "b"); p <- freshName (T.pack "p")
             resume <- freshName (T.pack "resume")
             r0 <- freshName (T.pack "r0"); r1 <- freshName (T.pack "r1")
-            s <- freshName (T.pack "s"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
+            s <- freshName (T.pack "s"); v <- freshName (T.pack "v")
             let comp = Anf.Let (Anf.Binder b Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                          (Anf.ROp Nothing (T.pack "Flip") (T.pack "flip") [Anf.ALit Anf.LUnit])
                          (Anf.Case (Anf.AVar b)
@@ -4901,7 +4909,7 @@ interpEffectTests = testGroup "InterpEffect"
                 armBody =
                   Anf.Let (Anf.Binder r0 Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 0)])
                     (Anf.Let (Anf.Binder r1 Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar resume) [Anf.ALit (Anf.LInt 1)])
-                      (Anf.Let (Anf.Binder s Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (Anf.AVar np) [Anf.AVar r0, Anf.AVar r1])
+                      (Anf.Let (Anf.Binder s Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) (Anf.RApp (primAtom (T.pack "+")) [Anf.AVar r0, Anf.AVar r1])
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "Flip") (T.pack "flip")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) armBody
@@ -4921,14 +4929,14 @@ interpEffectTests = testGroup "InterpEffect"
       let e = runFresh $ do
             x <- freshName (T.pack "x"); y <- freshName (T.pack "y"); s <- freshName (T.pack "s")
             p <- freshName (T.pack "p"); resume <- freshName (T.pack "resume")
-            r <- freshName (T.pack "r"); v <- freshName (T.pack "v"); np <- freshName (T.pack "+")
+            r <- freshName (T.pack "r"); v <- freshName (T.pack "v")
             let comp =
                   Anf.Let (Anf.Binder x Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                     (Anf.ROp Nothing (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
                     (Anf.Let (Anf.Binder y Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
                       (Anf.ROp Nothing (T.pack "E") (T.pack "op") [Anf.ALit Anf.LUnit])
                       (Anf.Let (Anf.Binder s Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
-                        (Anf.RApp (Anf.AVar np) [Anf.AVar x, Anf.AVar y])
+                        (Anf.RApp (primAtom (T.pack "+")) [Anf.AVar x, Anf.AVar y])
                         (Anf.Ret (Anf.AVar s))))
                 arm = Anf.OpArm (T.pack "E") (T.pack "op")
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit []))
@@ -5023,6 +5031,50 @@ runSourceWith elaborate src = do
             Right cm -> case Interp.runModule cm of
               Left rerr -> pure (Left ("runtime: " <> show rerr))
               Right v   -> pure (Right (Interp.renderValue v))
+
+-- Load + whole-program-elaborate a single-file program, returning the elaborated
+-- CoreModule (for IR-shape assertions). Unique temp path per call; cleaned up.
+elaborateSourceFull :: Text -> IO (Either String Anf.CoreModule)
+elaborateSourceFull src = do
+  u <- newUnique
+  let path = "test/.interp-tmp-" <> show (hashUnique u) <> ".wok"
+  go path `Control.Exception.finally` removeFileIfExists path
+  where
+    go path = do
+      TIO.writeFile path src
+      result <- Loader.loadProgram path []
+      case result of
+        Left lerr -> pure (Left ("loader: " <> show lerr))
+        Right (entryName, ms) -> pure (Pipeline.elaborateProgramFull entryName ms)
+
+-- Every APrim (module, name) key appearing anywhere in a CoreModule's bodies.
+aprimKeysInModule :: Anf.CoreModule -> Set.Set (Text, Text)
+aprimKeysInModule (Anf.CoreModule binds) =
+  Set.unions (map (goE . Anf.tbBody) binds)
+  where
+    goA (Anf.APrim qkey) = Set.singleton qkey
+    goA _                = Set.empty
+    goR r = case r of
+      RAtom a       -> goA a
+      RApp h as     -> Set.unions (map goA (h : as))
+      RCon _ as     -> Set.unions (map goA as)
+      RLam _ b      -> goE b
+      ROp m _ _ as  -> Set.unions (map goA (maybe as (: as) m))
+      RRecord _ fls -> Set.unions (map (goA . snd) fls)
+      RProj _ a     -> goA a
+    goE e = case e of
+      Ret a               -> goA a
+      Jump _ as           -> Set.unions (map goA as)
+      Let _ r body        -> goR r `Set.union` goE body
+      LetRec ds body      -> Set.unions (goE body : [ goE d | (_, _, d) <- ds ])
+      Case a alts         -> goA a `Set.union` Set.unions (map goAlt alts)
+      LetJoin _ _ jb body -> goE jb `Set.union` goE body
+      Handle e' h         ->
+        goE e' `Set.union` goE (snd (Anf.hReturn h))
+               `Set.union` Set.unions (map (goE . Anf.oaBody) (Anf.hOps h))
+    goAlt (AltCon _ _ e) = goE e
+    goAlt (AltLit _ e)   = goE e
+    goAlt (AltDefault e) = goE e
 
 runSourceToValue :: Text -> IO (Either String Text)
 runSourceToValue = runSourceWith Pipeline.elaborateProgram
@@ -5123,6 +5175,21 @@ interpWholeProgramTests = testGroup "InterpWholeProgram"
              , T.pack "import Std.Base"
              , T.pack "main = const 7 99" ])
       r @?= Right (T.pack "7")
+  , testCase "builtin (+) elaborates to APrim (Std.Base, +)" $ do
+      -- The elaborator routes a value-level prelude extern reference to APrim by
+      -- extern identity. `1 + 2` lowers `(+)` to its prelude extern, so the
+      -- elaborated IR must contain APrim ("Std.Base", "+") and NOT a bare AVar "+".
+      cm <- elaborateSourceFull (T.unlines
+              [ T.pack "module Main"
+              , T.pack "import Std.Base"
+              , T.pack "main = 1 + 2" ])
+      case cm of
+        Left s   -> assertFailure s
+        Right m  ->
+          let keys = aprimKeysInModule m
+          in assertBool ("expected APrim (Std.Base, +) in elaborated IR, got APrims: "
+                           <> show keys)
+                        ((T.pack "Std.Base", T.pack "+") `Set.member` keys)
   ]
 
 -- ---------------------------------------------------------------------------
@@ -5695,7 +5762,7 @@ buildElabModule =
       kBody = Abs.EVar (varId (T.pack "idf"))
       kDecl = Abs.DEqn kLhs kBody Abs.NoWhere
       (envOut, tds) = typedModuleForTest B.initialEnv (Abs.Module [idfDecl, kDecl])
-      cm = elaborateModule envOut tds
+      cm = elaborateModule (T.pack "Main") Set.empty envOut tds
       binds = Anf.cmBinds cm
       idfBind = case filter (\b -> nameHint (Anf.tbName b) == T.pack "idf") binds of
                   (b:_) -> b
@@ -6096,7 +6163,7 @@ eqElaborateTests = testGroup "ElaborateClass"
           Right rm ->
             case TC.inferProgramWith B.initialEnv SO.Embedded (reorderedAst rm) of
               Left e            -> assertFailure ("ElaborateClass typecheck: " ++ show e)
-              Right (env, ds, _) -> k (elaborateModule env ds)
+              Right (env, ds, _) -> k (elaborateModule (T.pack "Main") Set.empty env ds)
 
     findBind :: Text -> Anf.CoreModule -> Maybe Anf.TopBind
     findBind n (Anf.CoreModule binds) =
@@ -6427,23 +6494,23 @@ multiplicityUnitTests = testGroup "multiplicity (unit)"
       CoreModule [ TopBind (Name (T.pack "main") (Unique 91)) []
                      (Handle (Ret unit) (handlerWith oa)) ]
     -- Trusted-once relaxation: handing the resume binder to a GENUINE once-sink
-    -- extern (__coro_susp) counts as One. The relaxation keys on the prim's
-    -- IDENTITY (its Unique) being in the trusted once-sink SET, not its hint text,
-    -- so `trustedSusp` carries the canonical Unique of the genuine sink (Unique
-    -- 70). A user binding hinted the same with a DIFFERENT Unique is NOT in the
-    -- set, hence NOT trusted (C2) — see `spoofCoroSuspResume`.
-    trustedSusp  = Set.singleton (Unique 70)
-    coroSuspName = Name (T.pack "__coro_susp") (Unique 70)
-    -- A USER binding hinted `__coro_susp` but with a distinct identity.
+    -- extern (__coro_susp) counts as One. The relaxation keys on the call head
+    -- being an APrim whose qualified (module, name) identity is in the trusted
+    -- once-sink SET, not its hint text, so `trustedSusp` carries the genuine
+    -- sink's identity. A user binding hinted the same resolves to an AVar (never
+    -- APrim) and is NOT trusted (C2) — see `spoofCoroSuspResume`.
+    coroSuspKey  = PN.coroSuspKey
+    trustedSusp  = Set.singleton coroSuspKey
+    -- A USER binding hinted `__coro_susp` but bound as an ordinary AVar.
     spoofSuspName = Name (T.pack "__coro_susp") (Unique 80)
     fooName      = Name (T.pack "foo")         (Unique 71)
     xName        = Name (T.pack "x")           (Unique 72)
-    -- Let _ = __coro_susp x k; Ret ()
+    -- Let _ = __coro_susp x k; Ret ()  -- genuine sink routed to APrim
     coroSuspResume =
       Let (bnd (Name (T.pack "s") (Unique 73)))
-          (RApp (AVar coroSuspName) [AVar xName, AVar kName])
+          (RApp (APrim coroSuspKey) [AVar xName, AVar kName])
           (Ret unit)
-    -- Let _ = <user __coro_susp> x k; Ret ()  -- spoof: distinct identity = Many
+    -- Let _ = <user __coro_susp> x k; Ret ()  -- spoof: an AVar head = Many
     spoofCoroSuspResume =
       Let (bnd (Name (T.pack "s3") (Unique 81)))
           (RApp (AVar spoofSuspName) [AVar xName, AVar kName])
@@ -6918,18 +6985,16 @@ carrierWallDupHandlerWith srcFresh =
       cellB   = Binder (Name (T.pack "cell")    (Unique 8432)) Unrestricted m2bBoxTy
       c2B     = Binder (Name (T.pack "c2")      (Unique 8433)) Unrestricted m2bBoxTy
       batonN  = Name (T.pack "baton")           (Unique 8434)
-      cellNew = Name (T.pack "__cont_cell_new") (Unique 8435)
       rcDup   = Name (T.pack "__rc_dup")        (Unique 8436)
-      storeN  = Name (T.pack "__cont_store")    (Unique 8437)
       filledB = Binder (Name (T.pack "filled")  (Unique 8438)) Unrestricted m2bBoxTy
       srcAtom = if srcFresh then AVar (Anf.bndName cellB) else AVar batonN
       dupAndStore =
         Let c2B (RApp (AVar rcDup) [srcAtom])
           (Let filledB
-             (RApp (AVar storeN) [AVar (Anf.bndName c2B), AVar (Anf.bndName resumeB)])
+             (RApp m3Store [AVar (Anf.bndName c2B), AVar (Anf.bndName resumeB)])
              (Ret (ALit LUnit)))
       body = if srcFresh
-               then Let cellB (RApp (AVar cellNew) [ALit LUnit]) dupAndStore
+               then Let cellB (RApp m3CellNew [ALit LUnit]) dupAndStore
                else dupAndStore
       op = Anf.OpArm
              { Anf.oaLabel  = T.pack "Tick"
@@ -6986,15 +7051,13 @@ carrierWallHandlerWith localCell =
   let resumeB = Binder (Name (T.pack "k")     (Unique 8401)) Unrestricted m2bBoxTy
       cellB   = Binder (Name (T.pack "cell")   (Unique 8402)) Unrestricted m2bBoxTy
       batonN  = Name (T.pack "baton") (Unique 8403)
-      cellNew = Name (T.pack "__cont_cell_new") (Unique 8404)
-      storeN  = Name (T.pack "__cont_store")    (Unique 8405)
       filledB = Binder (Name (T.pack "filled") (Unique 8406)) Unrestricted m2bBoxTy
       cellAtom = if localCell then AVar (Anf.bndName cellB) else AVar batonN
       storeCall = Let filledB
-                    (RApp (AVar storeN) [cellAtom, AVar (Anf.bndName resumeB)])
+                    (RApp m3Store [cellAtom, AVar (Anf.bndName resumeB)])
                     (Ret (ALit LUnit))
       body = if localCell
-               then Let cellB (RApp (AVar cellNew) [ALit LUnit]) storeCall
+               then Let cellB (RApp m3CellNew [ALit LUnit]) storeCall
                else storeCall
       op = Anf.OpArm
              { Anf.oaLabel  = T.pack "Tick"
@@ -7021,10 +7084,9 @@ carrierWallOpArgHandler :: Anf.Handler
 carrierWallOpArgHandler =
   let resumeB = Binder (Name (T.pack "k")      (Unique 8411)) Unrestricted m2bBoxTy
       cellArgB = Binder (Name (T.pack "cellArg") (Unique 8412)) Unrestricted m2bBoxTy
-      storeN  = Name (T.pack "__cont_store") (Unique 8413)
       filledB = Binder (Name (T.pack "filled") (Unique 8414)) Unrestricted m2bBoxTy
       body = Let filledB
-               (RApp (AVar storeN)
+               (RApp m3Store
                      [AVar (Anf.bndName cellArgB), AVar (Anf.bndName resumeB)])
                (Ret (ALit LUnit))
       op = Anf.OpArm
@@ -7052,8 +7114,6 @@ carrierWallNestedHandlerHandler :: Anf.Handler
 carrierWallNestedHandlerHandler =
   let resumeB = Binder (Name (T.pack "k")     (Unique 8421)) Unrestricted m2bBoxTy
       cellB   = Binder (Name (T.pack "cell")   (Unique 8422)) Unrestricted m2bBoxTy
-      cellNew = Name (T.pack "__cont_cell_new") (Unique 8423)
-      storeN  = Name (T.pack "__cont_store")    (Unique 8424)
       filledB = Binder (Name (T.pack "filled") (Unique 8425)) Unrestricted m2bBoxTy
       innerResumeB = Binder (Name (T.pack "bk") (Unique 8426)) Unrestricted m2bBoxTy
       -- The NESTED arm stores the OUTER 'resume' (k) into the OUTER 'cell'. From
@@ -7065,7 +7125,7 @@ carrierWallNestedHandlerHandler =
         , Anf.oaResume = innerResumeB
         , Anf.oaBody   =
             Let filledB
-              (RApp (AVar storeN)
+              (RApp m3Store
                     [AVar (Anf.bndName cellB), AVar (Anf.bndName resumeB)])
               (Ret (ALit LUnit))
         }
@@ -7077,7 +7137,7 @@ carrierWallNestedHandlerHandler =
         , Anf.hSelf       = Nothing
         }
       -- Outer arm: bind 'cell' via __cont_cell_new, then open the nested handler.
-      body = Let cellB (RApp (AVar cellNew) [ALit LUnit])
+      body = Let cellB (RApp m3CellNew [ALit LUnit])
                (Handle (Ret (ALit LUnit)) nestedHandler)
       op = Anf.OpArm
              { Anf.oaLabel  = T.pack "Tick"
@@ -7196,10 +7256,9 @@ twoCellCycleArmHandler :: Anf.Handler
 twoCellCycleArmHandler =
   let resumeB = Binder (Name (T.pack "k")     (Unique 8721)) Unrestricted m2bBoxTy
       otherN  = Name (T.pack "otherCell")     (Unique 8722)   -- the OTHER cell, enclosing free var
-      storeN  = Name (T.pack "__cont_store")  (Unique 8723)
       filledB = Binder (Name (T.pack "filled") (Unique 8724)) Unrestricted m2bBoxTy
       body = Let filledB
-               (RApp (AVar storeN) [AVar otherN, AVar (Anf.bndName resumeB)])
+               (RApp m3Store [AVar otherN, AVar (Anf.bndName resumeB)])
                (Ret (ALit LUnit))
       op = Anf.OpArm
              { Anf.oaLabel  = T.pack "Tick"
@@ -7992,14 +8051,14 @@ rcModuleTests = testGroup "rc module"
 -- only residue at scope exit is the two-closure region, dropped explicitly. The
 -- result (1) is an unboxed literal, so runAndAccount has nothing further to free.
 
--- | Compiler-internal prim handles. dup/drop and the arithmetic/comparison
--- prims are resolved by HINT through the prim table (see 'callFn' in
--- "Wok.Interp.RC.Machine"), so any negative 'Unique' that cannot collide with a
--- 'runFresh'-minted binder works as the identity.
-rcDropName, rcEqName, rcSubName :: Name.Name
+-- | The Perceus-synthesized @__rc_drop@ intrinsic handle. It is resolved by HINT
+-- through the RC prim table (see 'callFn' in "Wok.Interp.RC.Machine" -- the one
+-- by-hint case retained for the two RC intrinsics), so any negative 'Unique' that
+-- cannot collide with a 'runFresh'-minted binder works as the identity. The
+-- arithmetic/comparison prims are instead routed via 'primAtom' (an 'APrim' by
+-- identity), mirroring the elaborator.
+rcDropName :: Name.Name
 rcDropName = Name.Name (T.pack "__rc_drop") (Unique (-1))
-rcEqName   = Name.Name (T.pack "eqU64")     (Unique (-3))
-rcSubName  = Name.Name (T.pack "-")         (Unique (-4))
 
 -- | A parity-clause body: @\\param -> case eqU64 param 0 of { True -> baseLit;
 -- False -> sibling (param - 1) }@, fully ANF-instrumented with a drop of the
@@ -8014,7 +8073,7 @@ rcParityClause param baseLit sibling = do
   pure $
     Anf.Let (rcBnd nZ) (Anf.RAtom (Anf.ALit (Anf.LInt 0)))
     (Anf.Let (rcBnd nB)
-      (Anf.RApp (Anf.AVar rcEqName) [Anf.AVar param, Anf.AVar nZ])
+      (Anf.RApp (primAtom (T.pack "eqU64")) [Anf.AVar param, Anf.AVar nZ])
     (Anf.Case (Anf.AVar nB)
       [ Anf.AltCon (T.pack "True") []
           (Anf.Let (rcBnd nU) (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nB])
@@ -8022,7 +8081,7 @@ rcParityClause param baseLit sibling = do
       , Anf.AltCon (T.pack "False") []
           (Anf.Let (rcBnd nU) (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nB])
            (Anf.Let (rcBnd nM)
-             (Anf.RApp (Anf.AVar rcSubName) [Anf.AVar param, Anf.ALit (Anf.LInt 1)])
+             (Anf.RApp (primAtom (T.pack "-")) [Anf.AVar param, Anf.ALit (Anf.LInt 1)])
            (Anf.Let (rcBnd nRec)
              (Anf.RApp (Anf.AVar sibling) [Anf.AVar nM])
              (Anf.Ret (Anf.AVar nRec)))))
@@ -9517,6 +9576,7 @@ rcMemSafetyFault _ = False
 errCtorTag :: IV.RuntimeError -> Text
 errCtorTag e = case e of
   IV.UnboundVar{}        -> T.pack "UnboundVar"
+  IV.UnboundPrim{}       -> T.pack "UnboundPrim"
   IV.NotAFunction{}      -> T.pack "NotAFunction"
   IV.NonExhaustiveCase{} -> T.pack "NonExhaustiveCase"
   IV.NoMatchingHandler{} -> T.pack "NoMatchingHandler"
@@ -10030,7 +10090,7 @@ genIntRhs env = do
     [ (4, do op <- liftG (elements [T.pack "+", T.pack "-", T.pack "*"])
              x  <- genAtom env GInt
              y  <- genAtom env GInt
-             pure (RApp (AVar (primName op)) [x, y]))
+             pure (RApp (primAtom op) [x, y]))
     , (if null projSources then 0 else 2,
          do (nm, lbl) <- liftG (elements projSources)
             pure (RProj lbl (AVar nm)))
@@ -10104,13 +10164,6 @@ hintFor GInt  = T.pack "i"
 hintFor GPair = T.pack "p"
 hintFor GList = T.pack "xs"
 hintFor GRec  = T.pack "r"
-
--- | The 'Name' under which a binary integer prim is referenced. The 'Unique' is
--- irrelevant: both interpreters resolve prims by HINT (the textual name) when the
--- name is absent from the runtime env (see 'callFn'/the reference 'enter'), so a
--- placeholder unique suffices.
-primName :: Text -> Name
-primName op = Name op (Unique 2000000)
 
 -- ---------------------------------------------------------------------------
 -- Adversarial join clusters (Suite F, review #1 follow-up)
@@ -10411,7 +10464,7 @@ genLetRecCaptureCluster env n ty = do
                        [ AltCon (T.pack "Tuple2") [pxB1, pyB1]
                            (Ret (AVar pxN1)) ])
                  , AltDefault
-                     (Let ks1B (RApp (AVar (primName (T.pack "-")))
+                     (Let ks1B (RApp (primAtom (T.pack "-"))
                                      [AVar kN1, ALit (LInt 1)])
                        (Let r1B (RApp (AVar gN) [AVar ks1N])
                          (Ret (AVar r1N)))) ]
@@ -10424,7 +10477,7 @@ genLetRecCaptureCluster env n ty = do
                        [ AltCon (T.pack "Tuple2") [pxB2, pyB2]
                            (Ret (AVar pyN2)) ])
                  , AltDefault
-                     (Let ks2B (RApp (AVar (primName (T.pack "-")))
+                     (Let ks2B (RApp (primAtom (T.pack "-"))
                                      [AVar kN2, ALit (LInt 1)])
                        (Let r2B (RApp (AVar fN) [AVar ks2N])
                          (Ret (AVar r2N)))) ]
@@ -10622,9 +10675,13 @@ genMutualGroup capN mkFBase mkGBase = do
                          ,(Binder gN Unrestricted intTy, [kB2], gBody)] cont
   pure (fN, gN, wrap)
 
--- | A prim atom (binary integer op), resolved by hint at runtime.
+-- | A surface prim atom (e.g. a binary integer op). The elaborator routes every
+-- prelude @extern@ to an 'APrim' carrying its @(module, name)@ identity; these
+-- hand-built RC/interpreter fixtures mirror that so the interpreters resolve them
+-- by the name part (Caveat B). The module label is cosmetic at runtime (lookup is
+-- name-keyed) -- 'Std.Base' is where these arithmetic/comparison prims live.
 primAtom :: Text -> Atom
-primAtom op = AVar (primName op)
+primAtom op = APrim (T.pack "Std.Base", op)
 
 -- | Seed a boxed Pair capture from two random int literals, returning its binder
 -- name and a wrapper that prefixes the seeding 'Let'.
@@ -12550,6 +12607,7 @@ captureFlowsOut u0 = goE (Set.singleton u0)
     hit tracked a = case a of
       AVar n -> nameUniq n `Set.member` tracked
       ALit _ -> False
+      APrim _ -> False
     anyHit tracked = any (hit tracked)
     goE tracked e = case e of
       Ret a              -> hit tracked a
@@ -12596,6 +12654,7 @@ oldCaptureEscapesBody u0 = goE (Set.singleton u0)
     hit tracked a = case a of
       AVar n -> Name.nameUniq n `Set.member` tracked
       ALit _ -> False
+      APrim _ -> False
     anyHit tracked = any (hit tracked)
     goE tracked e = case e of
       Ret a                 -> hit tracked a
@@ -13026,9 +13085,9 @@ m2bOuterLbl, m2bOuterOp :: Text
 m2bOuterLbl = T.pack "OuterEff"
 m2bOuterOp  = T.pack "outerOp"
 
--- | A binary integer prim atom (resolved by hint at runtime, like 'primAtom').
+-- | A binary integer prim atom (an 'APrim' by identity, like 'primAtom').
 m2bPlus :: Atom
-m2bPlus = AVar (primName (T.pack "+"))
+m2bPlus = primAtom (T.pack "+")
 
 -- | Whether the generated computation references a top-level boxed CAF. Carried out
 -- of the 'GenM' so 'genM2bProgram' can splice the CAF bind alongside @main@.
@@ -13889,14 +13948,16 @@ data M3Route
   | M3StoreDrop     -- ^ store -> drop the filled cell (park-and-abandon)
   deriving (Eq, Show)
 
--- | Continuation-cell extern atoms, resolved by hint at runtime exactly as
--- 'm2bPlus' resolves '+'; recognized by the SAME hint text the boundary guard
--- ('contStoreHint'), the Perceus pass ('contTakeHint'), and both machines' prim
--- tables key on. 'Unique' is irrelevant (prims dispatch by 'nameHint').
+-- | Continuation-cell extern atoms. As the elaborator emits for a genuine
+-- @Std.Control@ continuation extern, these are 'APrim' heads carrying the
+-- qualified @(module, name)@ identity --- the SAME identity the boundary guard
+-- ('Wok.IR.Escape.contStoreCell'), the Perceus pass ('contTakeKey'), and both
+-- machines' prim tables (by the name part) recognize. (A user binding hinted the
+-- same resolves to an 'AVar' and is correctly NOT recognized.)
 m3CellNew, m3Store, m3Take :: Atom
-m3CellNew = AVar (primName (T.pack "__cont_cell_new"))
-m3Store   = AVar (primName (T.pack "__cont_store"))
-m3Take    = AVar (primName (T.pack "__cont_take"))
+m3CellNew = APrim PN.contCellNewKey
+m3Store   = APrim PN.contStoreKey
+m3Take    = APrim PN.contTakeKey
 
 -- | The whole-program generator for the M3 store route. Builds
 -- @main = Handle progBody storeRouteHandler@ (plus an optional boxed CAF bind when
@@ -14069,10 +14130,10 @@ m3HasStoreDrop :: CoreModule -> Bool
 m3HasStoreDrop cm = m3HasStore cm && not (m3HasTakeResume cm)
 
 isStoreAtom, isTakeAtom :: Atom -> Bool
-isStoreAtom (AVar n) = nameHint n == T.pack "__cont_store"
-isStoreAtom _        = False
-isTakeAtom (AVar n) = nameHint n == T.pack "__cont_take"
-isTakeAtom _        = False
+isStoreAtom (APrim k) = k == PN.contStoreKey
+isStoreAtom _         = False
+isTakeAtom (APrim k) = k == PN.contTakeKey
+isTakeAtom _         = False
 
 -- | A coarse label of the generated M3 program's shape, for the distribution
 -- readout.

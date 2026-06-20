@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Same-effect AND cross-effect named routing AT ONCE: two State instances
+-- (`count`, `total`) that must stay distinct from each other, plus a Reader
+-- instance (`cfg`) that must stay distinct from both. Every op routes by name,
+-- so neither the shared effect kind (the two States) nor the differing kind (the
+-- Reader) confuses routing. base = cfg.ask = 100; count.set (count.get + base) =
+-- 1 + 100 = 101; total.set (total.get + count.get) = 0 + 101 = 101; result =
+-- count.get + total.get = 202. The runners wrap inner-to-outer: `reader` returns
+-- 202; `total` (state 0) wraps to (202, 101); `count` (state 1) wraps to
+-- ((202, 101), 101).
+prog : State U64 -> State U64 -> Reader U64 -> U64
+prog count total cfg =
+  let base = cfg.ask in
+  let u1   = count.set (count.get + base) in
+  let u2   = total.set (total.get + count.get) in
+  count.get + total.get
+
+main : ((U64, U64), U64)
+main = with count = state 1 in with total = state 0 in with cfg = reader 100 in prog count total cfg

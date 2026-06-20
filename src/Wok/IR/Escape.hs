@@ -83,9 +83,9 @@ dropHint = PN.rcDropName
 -- escape walker, under the STORE-ROUTE exemption ('m2bResumeEscapesStoreRoute'),
 -- treats the continuation argument of this extern as a NON-escape (the op-arm
 -- @resume@ handed to @__cont_store@ is MOVED into the cell, not leaked into
--- first-class data). This MUST match the hint key in
--- "Wok.Interp.RC.Prim"/"Wok.Interp.Prim" and the @onceSinkKeys@ entry in
--- "Wok.Pipeline". See the §7/§10.3 design note: the exemption is BOTH the Perceus
+-- first-class data). This MUST match the impl name key in
+-- "Wok.Interp.RC.Prim"/"Wok.Interp.Prim" and the @(module, name)@ entry in
+-- 'Wok.IR.PrimNames.onceSinkNames'. See the §7/§10.3 design note: the exemption is BOTH the Perceus
 -- COVERAGE seam (so the store-route arm is instrumented and heap-balanced) AND, as
 -- of M3 Task 4, the boundary GUARD admission ('m2bHandlerViolations' now uses the
 -- store-exempting form 'm2bResumeEscapesStoreRoute'). The cycle the exemption could
@@ -93,25 +93,15 @@ dropHint = PN.rcDropName
 -- ('Wok.IR.Reachable.m3CarrierWallViolations' statically + the runtime
 -- @__cont_store@ owned-set check), which landed alongside this relaxation.
 --
--- TRUST ANCHOR (code-review #6). @__cont_store@ is recognized HERE by HINT TEXT,
--- exactly as the RC intrinsics @__rc_dup@/@__rc_drop@ are ('dupHint'/'dropHint'
--- above), and NOT by extern identity ('Unique'). This is the established
--- convention for compiler-placed intrinsics: the elaborator/Perceus pass is the
--- only producer of @__cont_store@ in the IR these passes see, so a hint match is a
--- reliable identity match (no user binding named @__cont_store@ ever reaches
--- 'Wok.IR.Escape'/'Wok.IR.Reachable' --- it is a privileged @extern@ in
--- @Std.Control@, and an op-arm storing its @resume@ is grammar-checked). This
--- DIFFERS from the once-sink @__coro_susp@, which 'Wok.Pipeline' resolves by
--- @(module, name)@ extern identity ('onceSinkKeys'/'resolveTrusted'): there a USER
--- binding merely HINTED @__coro_susp@ is plausible (it is surface-reachable via
--- @start@), so identity is required to avoid trusting a look-alike. Threading the
--- resolved @__cont_store@ 'Unique' into these predicates would mean widening
--- 'Wok.IR.Reachable.firstOrderNoHandlerViolations' (and its caller
--- 'Wok.Interp.RC.Machine.runModuleRC', which takes only a 'CoreModule') to carry
--- the once-sink set --- invasive signature threading for no soundness gain over
--- the hint convention, so hint recognition is kept (matching @__rc_dup@/@__rc_drop@).
-contStoreHint :: Text
-contStoreHint = PN.contStoreName
+-- TRUST ANCHOR (code-review #6; backlog #12 §2.7). @__cont_store@ is recognized
+-- HERE by its QUALIFIED @(module, name)@ extern identity, matching the 'APrim'
+-- head the elaborator emits for a genuine @Std.Control.__cont_store@ reference.
+-- This is the SAME identity layer the once-sink @__coro_susp@ uses (see
+-- 'Wok.IR.PrimNames.onceSinkNames'): a user binding merely HINTED @__cont_store@
+-- resolves to an 'AVar' (never 'APrim'), so it can never be matched here.
+-- (@__cont_cell_new@ below is recognized the same way, by its 'APrim' identity;
+-- only the Perceus-SYNTHESIZED @__rc_dup@/@__rc_drop@ remain matched by HINT on
+-- an 'AVar' --- Caveat A.)
 
 -- ---------------------------------------------------------------------------
 -- Boxed-ness
@@ -388,6 +378,7 @@ escapeWalk scrutEscapes step = goE
       let hit a = case a of
             AVar n -> nameUniq n `Set.member` tracked
             ALit _ -> False
+            APrim _ -> False
       in case e of
         Ret a               -> hit a                     -- terminal escape
         Jump _ as           -> any hit as                -- terminal escape
@@ -419,6 +410,7 @@ escapesFrom = escapeWalk True step
     hit tracked a = case a of
       AVar n -> nameUniq n `Set.member` tracked
       ALit _ -> False
+      APrim _ -> False
     step tracked _ r = case r of
       -- Pure alias rename of a tracked value: follow it, do not count the
       -- occurrence as an escape. The new binder joins the tracked set.
@@ -584,6 +576,7 @@ captureEscapesBody u0 = escapeWalk False step (Set.singleton u0)
     hit tracked a = case a of
       AVar n -> nameUniq n `Set.member` tracked
       ALit _ -> False
+      APrim _ -> False
     anyHit tracked = any (hit tracked)
     step tracked _ r = case r of
       -- Alias rename of a tracked value: the new binder carries @u@ onward.
@@ -736,8 +729,8 @@ m2bResumeEscapesWalk exemptStore resume = go
 -- continuation move --- neither is recognized, so neither is exempted nor walled
 -- (it falls through to the ordinary escape, which REJECTS it).
 contStoreCell :: Unique -> Rhs -> Maybe Atom
-contStoreCell u (RApp (AVar hd) [cell, AVar k])
-  | nameHint hd == contStoreHint, nameUniq k == u = Just cell
+contStoreCell u (RApp (APrim qkey) [cell, AVar k])
+  | qkey == PN.contStoreKey, nameUniq k == u = Just cell
 contStoreCell _ _ = Nothing
 
 -- | True iff a handler is in the M2b RC-supported fragment: no op-arm resume
@@ -817,7 +810,6 @@ storeCalls :: Binder -> Expr -> [StoreCall]
 storeCalls resume = go Set.empty
   where
     u = binderUnique resume
-    cellNewHint = PN.contCellNewName
     -- The binder a @let b = ...@ adds to the fresh-local set, if its RHS is one of:
     --   (1) a direct @__cont_cell_new (..)@ allocation;
     --   (2) a pure ALIAS-RENAME @let b = AVar n@ of an already-fresh @n@;
@@ -827,16 +819,16 @@ storeCalls resume = go Set.empty
     -- --- the alias closure (2) is REQUIRED to recognize the corpus fresh-local shape
     -- (an alias of a fresh cell is still a fresh local).
     --
-    -- ADMIT-DIRECTION HINT (code-review #6). Case (1) recognizes @__cont_cell_new@ by
-    -- HINT TEXT ('cellNewHint'), with no extern-identity ('Unique') guard. Unlike the
-    -- once-sink @__coro_susp@ (which 'Wok.Pipeline' resolves by @(module, name)@
-    -- identity because a USER binding hinted @__coro_susp@ is surface-plausible), this
-    -- is safe by hint alone: @__cont_cell_new@ is an Embedded-only @Std.Control@
-    -- prelude @extern@ that users cannot rebind, so a hint match IS an identity match
-    -- here --- the SAME documented convention as the @__rc_dup@/@__rc_drop@ and
-    -- @__cont_store@ hint recognition (see 'dupHint'/'dropHint'/'contStoreHint'). It
-    -- only PROMOTES a cell to fresh (the safe ADMIT direction): a false hint match
-    -- cannot widen admission, since the cell still must clear the carrier-wall.
+    -- ADMIT-DIRECTION IDENTITY (code-review #6; backlog #12 §2.7). Case (1)
+    -- recognizes @__cont_cell_new@ by its QUALIFIED @(module, name)@ extern identity
+    -- ('PN.contCellNewKey'), matching the 'APrim' head the elaborator emits for a genuine
+    -- @Std.Control.__cont_cell_new@ reference --- the SAME identity layer as the
+    -- once-sink @__coro_susp@/@__cont_store@. A user binding hinted @__cont_cell_new@
+    -- resolves to an 'AVar' and is never matched. (Case (3)'s @__rc_dup@ is still
+    -- hint-on-'AVar': it is Perceus-SYNTHESIZED post-elaboration, never an extern, so
+    -- the compiler controls its name --- Caveat A.) Case (1) only PROMOTES a cell to
+    -- fresh (the safe ADMIT direction): a false match cannot widen admission, since
+    -- the cell still must clear the carrier-wall.
     --
     -- __RC_DUP ALIAS-FOLLOW (code-review #4). Because this wall runs on POST-Perceus
     -- IR, the @__cont_store@ cell operand may be a @__rc_dup@ of the fresh cell
@@ -846,8 +838,8 @@ storeCalls resume = go Set.empty
     -- @fresh@; a @__rc_dup@ of the baton (or any non-fresh value) is NOT promoted
     -- (the operand is not in @fresh@), so a dup'd baton store is still rejected.
     freshCellBinder fresh bd r = case r of
-      RApp (AVar hd) _
-        | nameHint hd == cellNewHint                    -> Just (binderUnique bd)
+      RApp (APrim k) _
+        | k == PN.contCellNewKey                        -> Just (binderUnique bd)
       RApp (AVar hd) [AVar n]
         | nameHint hd == dupHint
         , nameUniq n `Set.member` fresh                 -> Just (binderUnique bd)
@@ -859,6 +851,7 @@ storeCalls resume = go Set.empty
     -- @__cont_cell_new@, so this never admits one).
     cellIsFresh fresh (AVar n) = nameUniq n `Set.member` fresh
     cellIsFresh _     (ALit _) = False
+    cellIsFresh _     (APrim _) = False
     storeOf fresh r = case contStoreCell u r of
       Just cell -> [StoreCall cell (cellIsFresh fresh cell)]
       Nothing   -> []

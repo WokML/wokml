@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Two DIFFERENT named effect instances coexisting in one scope: a named State
+-- (`s`) and a named Reader (`r`). `r.ask` routes to the Reader instance while
+-- `s.get`/`s.set` route to the State instance -- routing is by the per-instance
+-- name, so the differing effect KINDS never collide. base = r.ask = 5; cur =
+-- s.get = 10; s.set (10 + 5) = 15; result = s.get = 15. The `state` runner wraps
+-- its result as (value, finalState); `reader` returns the value unchanged. So
+-- main = (15, 15).
+prog : State U64 -> Reader U64 -> U64
+prog s r =
+  let base = r.ask in
+  let cur  = s.get in
+  let u    = s.set (cur + base) in
+  s.get
+
+main : (U64, U64)
+main = with s = state 10 in with r = reader 5 in prog s r

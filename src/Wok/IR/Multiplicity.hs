@@ -43,6 +43,7 @@ addC _ _    = Many
 mentionsAtom :: Name -> Atom -> Bool
 mentionsAtom r (AVar n) = n == r
 mentionsAtom _ (ALit _) = False
+mentionsAtom _ (APrim _) = False
 
 mentionsAny :: Name -> [Atom] -> Bool
 mentionsAny r = any (mentionsAtom r)
@@ -51,20 +52,20 @@ mentionsAny r = any (mentionsAtom r)
 -- Type-free; the single soundness rule is that any occurrence of `r` that is NOT
 -- the head of a saturated application is an escape and yields Many.
 --
--- @onceSinks@ is the set of canonical 'Unique's of the prelude's trusted once-
--- sink @extern@ prims (the escape sinks that resume their continuation argument
--- at most once; currently just @__coro_susp@), resolved in the pipeline from the
--- elaborated global-name map BY EXTERN IDENTITY. The trusted-once relaxation
--- fires ONLY for an application head whose identity (its 'Unique') is in this
--- set; a USER binding merely HINTED @__coro_susp@ has a different 'Unique' and is
--- NOT in the set, so it is NOT trusted. An empty set (Std.Control not loaded, so
--- no genuine escape exists) means the relaxation never fires.
+-- @onceSinks@ is the set of qualified @(module, name)@ identities of the
+-- prelude's trusted once-sink @extern@ prims (the escape sinks that resume their
+-- continuation argument at most once; e.g. @(Std.Control, "__coro_susp")@), the
+-- static 'Wok.IR.PrimNames.onceSinkNames' in production. The trusted-once
+-- relaxation fires ONLY for an 'APrim' application head whose @(module, name)@ is
+-- in this set; a USER binding merely HINTED @__coro_susp@ resolves to an 'AVar'
+-- (never 'APrim') and is NOT trusted. An empty set means the relaxation never
+-- fires.
 --
 -- Back-compat shim: 'cardOf' is 'cardOfWithTrust' with an EMPTY trust map, i.e.
 -- the inter-procedural relaxation (clause B below) never fires. This preserves
 -- the original conservative, purely-intra-procedural behaviour for every caller
 -- (and unit test) that does not supply a trust map.
-cardOf :: Set Unique -> Name -> Expr -> Card
+cardOf :: Set (Text, Text) -> Name -> Expr -> Card
 cardOf onceSinks = cardOfWithTrust onceSinks Map.empty Map.empty
 
 -- | The same affine analysis as 'cardOf', closed over a @trustMap@ that records,
@@ -89,7 +90,7 @@ cardOf onceSinks = cardOfWithTrust onceSinks Map.empty Map.empty
 -- 'LetJoin'-bound in scope) still defaults to 'Many' (the recursive-join case),
 -- so the relaxation is confined to the known exit join and can never lower a
 -- genuine multi-shot below 'Many'.
-cardOfWithTrust :: Set Unique -> Map Unique [Card] -> Map JoinId Card -> Name -> Expr -> Card
+cardOfWithTrust :: Set (Text, Text) -> Map Unique [Card] -> Map JoinId Card -> Name -> Expr -> Card
 cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
   where
     go :: Map JoinId Card -> Expr -> Card
@@ -120,23 +121,22 @@ cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
     goAlt env (AltLit _ b)   = go env b
     goAlt env (AltDefault b) = go env b
 
-    -- Trusted-once axiom: handing the resume binder to a genuine prelude once-sink
-    -- @extern@ (currently @__coro_susp@) is One. The runtime guarantees the future
-    -- created from the continuation is resumed at most once. The prelude @start@
-    -- desugars to a suspend arm that hands @k@ to @__coro_susp@, so this clause is
-    -- LIVE whenever Std.Control's coro surface is used. The match is on the
-    -- resolved prim IDENTITY (its 'Unique') being in the trusted once-sink set,
-    -- NOT the hint text: a user-defined top-level @__coro_susp@ has a distinct
-    -- 'Unique' and is correctly NOT trusted. Do NOT broaden this relaxation beyond
-    -- the genuine escape-sink identities.
-    isCoroSusp f = Set.member (nameUniq f) onceSinks
-
     cardRhs rhs = case rhs of
       RApp (AVar f) as
         | f == r ->
             addC One (if mentionsAny r as then Many else Zero)
-      RApp (AVar f) as
-        | isCoroSusp f && mentionsAny r as -> One
+      -- Trusted-once axiom: handing the resume binder to a genuine prelude once-sink
+      -- @extern@ (e.g. @__coro_susp@) is One. The runtime guarantees the future
+      -- created from the continuation is resumed at most once. The prelude @start@
+      -- desugars to a suspend arm that hands @k@ to @__coro_susp@, so this clause is
+      -- LIVE whenever Std.Control's coro surface is used. The match is on the call
+      -- head being an 'APrim' whose qualified @(module, name)@ identity is in the
+      -- trusted once-sink set, NOT the hint text: a user-defined top-level
+      -- @__coro_susp@ resolves to an 'AVar' (never 'APrim') and is correctly NOT
+      -- trusted. Do NOT broaden this relaxation beyond the genuine escape-sink
+      -- identities.
+      RApp (APrim qkey) as
+        | Set.member qkey onceSinks && mentionsAny r as -> One
       -- B. Inter-procedural relaxation. If @f@ is a known top-level function and
       -- the resume binder @r@ is among its arguments, charge, for each argument
       -- position that is EXACTLY @AVar r@ (the continuation passed directly), the
@@ -252,7 +252,7 @@ opArmsInHandler (Handler (_, re) ops aj _ _) =
 -- 'Nothing' (tail position). It is seeded to 'Zero' so the arm's exit jump to the
 -- answer-join is not charged 'Many' (the answer-join's body cannot invoke this
 -- arm's resume binder). Without it EVERY value-position arm is falsely 'Many'.
-armCard :: Set Unique -> Map Unique [Card] -> Maybe JoinId -> OpArm -> Card
+armCard :: Set (Text, Text) -> Map Unique [Card] -> Maybe JoinId -> OpArm -> Card
 armCard onceSinks tm mAnswerJoin oa =
   cardOfWithTrust onceSinks tm seed (bndName (oaResume oa)) (oaBody oa)
   where seed = maybe Map.empty (\j -> Map.singleton j Zero) mAnswerJoin
@@ -274,7 +274,7 @@ armCard onceSinks tm mAnswerJoin oa =
 -- proof would require itself), so the param stays @Many@ — conservative and
 -- correct. Do NOT seed this from an optimistic (Zero/One) map; that would assume
 -- the very property under proof and could trust a genuine multishot.
-computeTrustMap :: Set Unique -> CoreModule -> Map Unique [Card]
+computeTrustMap :: Set (Text, Text) -> CoreModule -> Map Unique [Card]
 computeTrustMap onceSinks cm = fixpoint Map.empty
   where
     step tm = Map.fromList
@@ -287,10 +287,11 @@ computeTrustMap onceSinks cm = fixpoint Map.empty
       in if tm' == tm then tm else fixpoint tm'
 
 -- | The consumer: every multi-shot arm is an error. @onceSinks@ is the set of
--- canonical 'Unique's of the genuine once-sink @extern@ prims (see 'cardOf').
+-- qualified @(module, name)@ identities of the genuine once-sink @extern@ prims
+-- (see 'cardOf').
 -- The inter-procedural trust map is computed INTERNALLY (fixpoint from empty),
 -- so the external signature is unchanged.
-analyzeModule :: Set Unique -> CoreModule -> [MultiplicityError]
+analyzeModule :: Set (Text, Text) -> CoreModule -> [MultiplicityError]
 analyzeModule onceSinks cm =
   let tm = computeTrustMap onceSinks cm
   in [ MultishotResume (oaLabel oa) (oaOp oa)
@@ -308,7 +309,7 @@ renderMultiplicityError (MultishotResume lbl op) =
 -- | The proof artifact: one `label.op : 0|1|ω` line per arm, module order.
 -- @onceSinks@ is the same trusted escape-sink identity set 'analyzeModule' uses
 -- (resolved in the pipeline), so the dump agrees with what the law accepts.
-prettyMultiplicity :: Set Unique -> CoreModule -> Text
+prettyMultiplicity :: Set (Text, Text) -> CoreModule -> Text
 prettyMultiplicity onceSinks cm =
   let tm = computeTrustMap onceSinks cm
   in Tx.intercalate (Tx.pack "\n")

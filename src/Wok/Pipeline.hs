@@ -12,33 +12,21 @@ module Wok.Pipeline
   ( typecheckProgram
   , elaborateProgram
   , elaborateProgramFull
-  , elaborateProgramFullTrusted
   , elaborateCheckedFull
-  , onceSinkKeys
-  , stdControlModule
-    -- * Test support
-    -- | Exported ONLY for the M3-a once-sink red-check test (it injects a
-    -- REDUCED key list to witness that a trust key is load-bearing). Production
-    -- code goes through 'elaborateProgramFullTrusted', which fixes the keys to
-    -- 'onceSinkKeys'. Not for production use.
-  , elaborateProgramWithOnceSinks
   ) where
 
 import Control.Monad (foldM)
 import Data.Bifunctor (first)
-import Data.Maybe (mapMaybe)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as Tx
 
 import Wok.IR.Anf (CoreModule)
 import Wok.IR.Multiplicity (analyzeModule, renderMultiplicityError)
-import Wok.IR.Name (Name, Unique, nameUniq)
+import Wok.IR.PrimNames (onceSinkNames)
 import Wok.IR.Elaborate
   ( elaborateModule
   , elaborateModulesShared
-  , elaborateModulesSharedWithGlobals
   )
 import Wok.Loader (LoadedModule (..), ModuleName)
 import Wok.Reordering
@@ -122,10 +110,18 @@ elaborateProgram
   -> Either String CoreModule
 elaborateProgram entryName ms = do
   (resultMap, _warns) <- runPipelineFold entryName ms
+  -- Every value-level prelude @extern@ across all loaded modules, keyed by its
+  -- defining @(module, name)@ identity. 'elaborateModule' uses this to build the
+  -- entry module's 'ecPrims' so builtins are routed to 'APrim' (the same as the
+  -- whole-program path), not emitted as 'AVar' relying on a by-hint fallback.
+  let externKeys = Set.fromList
+        [ (modName, TC.tdName td)
+        | (modName, mr) <- Map.toList resultMap
+        , td <- mrDecls mr, TC.tdIsExtern td ]
   case Map.lookup entryName resultMap of
     Nothing -> Left ("elaborateProgram: entry module not found: " ++ Tx.unpack entryName)
     Just mr ->
-      Right (elaborateModule (mrEnvOut mr) (mrDecls mr))
+      Right (elaborateModule entryName externKeys (mrEnvOut mr) (mrDecls mr))
 
 -- | Elaborate ALL loaded modules into one whole-program CoreModule, sharing a
 -- single global-name map so cross-module references resolve consistently.
@@ -139,74 +135,19 @@ elaborateProgramFull entryName ms = do
              | (modName, mr) <- Map.toList resultMap ]
   Right (elaborateModulesShared mods)
 
--- | Whole-program elaboration, also returning the trusted ONCE-SINK identities:
--- the set of canonical 'Unique's of the GENUINE prelude once-sink @extern@ prims
--- (currently @(Std.Control, "__coro_susp")@), resolved from the elaborated
--- global-name map by DEFINING MODULE + name (extern identity), NOT by hint text.
--- A user binding merely hinted @__coro_susp@ lives in a different module and so
--- has a distinct identity — it is NOT in the set, hence NOT trusted (C2). The set
--- is empty when Std.Control is not loaded (no genuine escape exists).
-elaborateProgramFullTrusted
-  :: ModuleName
-  -> [LoadedModule]
-  -> Either String (CoreModule, Set Unique)
-elaborateProgramFullTrusted = elaborateProgramWithOnceSinks onceSinkKeys
-
--- | TEST SUPPORT ONLY (exported solely for the M3-a once-sink red-check; see the
--- export-list note). As 'elaborateProgramFullTrusted', but parameterized on the
--- once-sink key list, so the red-check can witness that a given trust key is
--- LOAD-BEARING (elaborate @m3-store-once@ with @onceSinkKeys@ MINUS @__cont_store@
--- and the @park@ arm's verdict must flip from @1@ to @\969@). Production resolves
--- the keys to the fixed 'onceSinkKeys' via 'elaborateProgramFullTrusted'.
--- Resolution stays by @(module, name)@ extern identity via 'resolveTrusted' —
--- never by hint text.
-elaborateProgramWithOnceSinks
-  :: [(Tx.Text, Tx.Text)]
-  -> ModuleName
-  -> [LoadedModule]
-  -> Either String (CoreModule, Set Unique)
-elaborateProgramWithOnceSinks keys entryName ms = do
-  (resultMap, _warns) <- runPipelineFold entryName ms
-  let mods = [ (modName, mrEnvOut mr, mrDecls mr)
-             | (modName, mr) <- Map.toList resultMap ]
-      (cm, globalByKey) = elaborateModulesSharedWithGlobals mods
-      onceSinks = resolveTrusted globalByKey keys
-  Right (cm, onceSinks)
-
--- | The defining module of the genuine prelude coro prims.
-stdControlModule :: Tx.Text
-stdControlModule = Tx.pack "Std.Control"
-
--- | The trusted once-sink @extern@ prims, by @(definingModule, name)@: an
--- @extern@ whose semantics is to consume its continuation argument at most once.
--- @__coro_susp@ is the coroutine escape sink (@start@ desugars to it);
--- @__cont_store@ (M3-a) is the stored/escaping-continuation move-in sink (a
--- scheduler op-arm hands its continuation to it to park it in a cell). This is
--- the C2 registry — a fixed set of prelude extern identities, resolved to
--- 'Unique's by extern identity in 'resolveTrusted' (never by hint text).
-onceSinkKeys :: [(Tx.Text, Tx.Text)]
-onceSinkKeys =
-  [ (stdControlModule, Tx.pack "__coro_susp")
-  , (stdControlModule, Tx.pack "__cont_store")
-  ]
-
--- | Resolve a set of @(module, name)@ extern keys to the canonical 'Unique's they
--- map to in the elaborated global map (silently dropping any not present, e.g.
--- when Std.Control is not loaded).
-resolveTrusted :: Map.Map (Tx.Text, Tx.Text) Name -> [(Tx.Text, Tx.Text)] -> Set Unique
-resolveTrusted globalByKey keys =
-  Set.fromList (mapMaybe (\k -> nameUniq <$> Map.lookup k globalByKey) keys)
-
 -- | Whole-program elaboration plus the one-shot multiplicity law: a multi-shot
 -- handler is rejected here as a compile error (stringified, like other v1
--- pipeline errors).
+-- pipeline errors). The trusted once-sink identities are the static
+-- 'Wok.IR.PrimNames.onceSinkNames' (qualified @(module, name)@ keys, matched
+-- against the 'APrim' heads the elaborator emits); a user binding merely hinted a
+-- sink name resolves to an 'AVar' and is correctly NOT trusted.
 elaborateCheckedFull
   :: ModuleName
   -> [LoadedModule]
   -> Either String CoreModule
 elaborateCheckedFull entryName ms = do
-  (cm, trusted) <- elaborateProgramFullTrusted entryName ms
-  case analyzeModule trusted cm of
+  cm <- elaborateProgramFull entryName ms
+  case analyzeModule onceSinkNames cm of
     []   -> Right cm
     errs -> Left (Tx.unpack
                     (Tx.intercalate (Tx.pack "\n")

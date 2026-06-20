@@ -10,6 +10,7 @@ import System.IO (hPutStrLn, stderr)
 
 import Wok.IR.Anf (prettyModuleTyped)
 import Wok.IR.Multiplicity (prettyMultiplicity)
+import Wok.IR.PrimNames (onceSinkNames)
 import qualified Wok.IR.Perceus as Perceus
 import Wok.IR.Reachable (pruneToReachable)
 import qualified Wok.Interp as Interp
@@ -79,9 +80,9 @@ runApp entry extras mode = do
       -- desugars to the genuine `__coro_susp` escape sink), so the dump agrees
       -- with what the one-shot law (`elaborateCheckedFull`) accepts. The trusted
       -- escape-sink identity is resolved by the pipeline.
-      ModeDumpMultiplicity -> case Pipeline.elaborateProgramFullTrusted entryName ms of
-        Left msg          -> hPutStrLn stderr msg >> exitFailure
-        Right (cm, trust) -> TIO.putStrLn (prettyMultiplicity trust cm)
+      ModeDumpMultiplicity -> case Pipeline.elaborateProgramFull entryName ms of
+        Left msg -> hPutStrLn stderr msg >> exitFailure
+        Right cm -> TIO.putStrLn (prettyMultiplicity onceSinkNames cm)
       -- Whole-program elaboration, then prune to the binds reachable from 'main'
       -- (a semantics-preserving dead-bind elimination: 'elaborateProgramFull'
       -- inlines the whole prelude, but only the reachable first-order corpus

@@ -45,7 +45,12 @@ data Lit = LInt Integer | LStr Text | LChar Char | LUnit
 
 -- | Trivial, pure, effect-free values: the ONLY things allowed as call args,
 -- constructor fields, scrutinees, jump args.
-data Atom = AVar Name | ALit Lit
+--
+-- 'APrim' carries the QUALIFIED identity @(Module, Name)@ of a prelude
+-- @extern@ (e.g. @("Std.Base", "+")@). The module disambiguates same-named
+-- externs across modules; runtime implementation lookup keys on the name part
+-- (Caveat B), and the trusted-sink recognizers key on the whole pair.
+data Atom = AVar Name | ALit Lit | APrim (Text, Text)
   deriving (Eq, Show)
 
 -- | Value-producing computations: the RHS of a strict Let. Never nested.
@@ -120,6 +125,7 @@ type HintTable = Map Text (Set Unique)
 collectAtom :: Atom -> HintTable -> HintTable
 collectAtom (AVar n) t = insertName n t
 collectAtom (ALit _) t = t
+collectAtom (APrim _) t = t
 
 insertName :: Name -> HintTable -> HintTable
 insertName n = Map.insertWith Set.union (nameHint n) (Set.singleton (nameUniq n))
@@ -198,6 +204,7 @@ renderLit LUnit = Tx.pack "()"
 renderAtom :: HintTable -> Atom -> Text
 renderAtom tbl (AVar n) = rn tbl n
 renderAtom _   (ALit l) = renderLit l
+renderAtom _   (APrim (_, n)) = n
 
 -- | Format a binder using a caller-supplied binder-renderer.
 -- The erased renderer ignores the type; the typed renderer appends \" : type\".
@@ -503,6 +510,7 @@ freeVarsRhs (RProj _ a)      = atomVars a
 atomVars :: Atom -> Set Unique
 atomVars (AVar n) = Set.singleton (nameUniq n)
 atomVars (ALit _) = Set.empty
+atomVars (APrim _) = Set.empty
 
 binderUnique :: Binder -> Unique
 binderUnique = nameUniq . bndName

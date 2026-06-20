@@ -119,17 +119,18 @@ dropHint = PN.rcDropName
 -- now-empty 'NContCell' exactly once. Its RESULT is a continuation: a resume
 -- binder (added to 'ctxResume' in the 'Let' rule) whose application is a MOVE-OUT
 -- (the runtime 'moveOutCont' frees the 'NCont' shell), so NO @__rc_drop@ is placed
--- on the resume path. MUST match the hint key in
--- "Wok.Interp.RC.Prim"/"Wok.Interp.Prim".
-contTakeHint :: Text
-contTakeHint = PN.contTakeName
+-- on the resume path. The elaborator routes a genuine @Std.Control.__cont_take@
+-- reference to an 'APrim' carrying this @(module, name)@ key (backlog #12 §2.7),
+-- so the recognizers match the 'APrim' head by identity --- a user binding hinted
+-- @__cont_take@ resolves to an 'AVar' and is never matched. MUST match the impl
+-- name key in "Wok.Interp.RC.Prim"/"Wok.Interp.Prim".
 
 -- | True iff the RHS is a saturated @__cont_take cell@ call (the M3 move-out): its
 -- result is a continuation that resumes as a move-out, and its cell argument is a
 -- borrow. The result binder is threaded into 'ctxResume'.
 isContTakeRhs :: Rhs -> Bool
-isContTakeRhs (RApp (AVar h) _) = nameHint h == contTakeHint
-isContTakeRhs _                 = False
+isContTakeRhs (RApp (APrim k) _) = k == PN.contTakeKey
+isContTakeRhs _                  = False
 
 -- | True iff @rhs@ binds a CONTINUATION resume binder, given the resume binders
 -- @resume@ already in scope: a @__cont_take cell@ call (M3 move-out) OR a pure
@@ -214,6 +215,7 @@ rhsMaxU (RProj _ a)      = atomMaxU a
 atomMaxU :: Atom -> Int
 atomMaxU (AVar n) = uOf n
 atomMaxU (ALit _) = -1
+atomMaxU (APrim _) = -1
 
 -- ---------------------------------------------------------------------------
 -- Boxed-ness
@@ -1099,8 +1101,8 @@ ownedOccs ctx delta rhs = case rhs of
   -- empties the cell in place, returning the held continuation; it does NOT move
   -- the cell out). So the cell stays owned and is dropped at its last use, which
   -- frees the now-empty cell once. Count nothing here.
-  RApp (AVar h) _
-    | nameHint h == contTakeHint -> Map.empty
+  RApp (APrim k) _
+    | k == PN.contTakeKey -> Map.empty
   RApp f as      -> count (resumeHead f ++ as)
   RCon _ as      -> count as
   RRecord _ flds -> count (map snd flds)
@@ -1146,8 +1148,8 @@ moveOperandUniques :: Rhs -> [Unique]
 moveOperandUniques rhs = case rhs of
   RAtom a        -> atomUs [a]
   -- M3 (Task 3): @__cont_take cell@ BORROWS its cell argument (see 'ownedOccs').
-  RApp (AVar h) _
-    | nameHint h == contTakeHint -> []
+  RApp (APrim k) _
+    | k == PN.contTakeKey -> []
   RApp _ as      -> atomUs as
   RCon _ as      -> atomUs as
   RRecord _ flds -> atomUs (map snd flds)
@@ -1971,8 +1973,8 @@ moveAtoms resume rhs = case rhs of
   -- 'ownedOccs' / 'moveOperandUniques' both exempt it, so the lint mirror MUST too,
   -- or it counts the cell as moved AT the take and then over-consumes on the pass's
   -- last-use @__rc_drop(cell)@.
-  RApp (AVar h) _
-    | nameHint h == contTakeHint -> []
+  RApp (APrim k) _
+    | k == PN.contTakeKey -> []
   RApp f as      -> resumeHead f ++ as
   RCon _ as      -> as
   RRecord _ flds -> map snd flds

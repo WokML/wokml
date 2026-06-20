@@ -21,7 +21,7 @@ module Wok.TypeChecking.Infer
   ) where
 
 import qualified Control.Monad.ST
-import Control.Monad (foldM, forM, forM_, unless, when)
+import Control.Monad (foldM, forM, forM_, msum, unless, when)
 import Control.Monad.Except (throwError)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.List (foldl')
@@ -1240,7 +1240,7 @@ inferPat (Abs.PApp modPath ap aps) = do
 inferPat (Abs.PCons headPat tailPat) = do
   (hT, hBinds, hNode) <- inferAtomPat headPat
   (tT, tBinds, tNode) <- inferPat tailPat
-  unify Nothing tT (TCon TcList [hT])
+  unify (patPos tailPat) tT (TCon TcList [hT])
   let ty = TCon TcList [hT]
   pure (ty, hBinds ++ tBinds, Ty.Tpat ty (Ty.TPCons hNode tNode))
 
@@ -1283,10 +1283,9 @@ inferAtomPat (Abs.APList []) = do
 inferAtomPat (Abs.APList (p : ps)) = do
   (firstT, firstBinds, firstNode) <- inferPat p
   restResults <- mapM inferPat ps
-  let restTs = map (\(t, _, _) -> t) restResults
-      restBinds = concatMap (\(_, b, _) -> b) restResults
+  let restBinds = concatMap (\(_, b, _) -> b) restResults
       restNodes = map (\(_, _, n) -> n) restResults
-  mapM_ (unify Nothing firstT) restTs
+  mapM_ (\(q, (t, _, _)) -> unify (patPos q) firstT t) (zip ps restResults)
   let ty = TCon TcList [firstT]
   pure (ty, firstBinds ++ restBinds, Ty.Tpat ty (Ty.TPList (firstNode : restNodes)))
 inferAtomPat (Abs.APParen p) = inferPat p
@@ -1708,8 +1707,8 @@ inferExprW mono (Abs.EIf c a b) = do
   (cT, cNode) <- inferExprW mono c
   (aT, aNode) <- inferExprW mono a
   (bT, bNode) <- inferExprW mono b
-  unify Nothing cT (TCon TcBool [])
-  unify Nothing aT bT
+  unify (expPos c) cT (TCon TcBool [])
+  unify (msum [expPos b, expPos a, expPos c]) aT bT
   pure (aT, Ty.Texp aT (Ty.TIf cNode aNode bNode))
 inferExprW mono (Abs.ETuple a others) = do
   results <- mapM (inferExprW mono) (a : others)
@@ -1723,7 +1722,7 @@ inferExprW _ (Abs.EList []) = do
   pure (ty, Ty.Texp ty (Ty.TList []))
 inferExprW mono (Abs.EList (x : xs)) = do
   (firstT, firstNode) <- inferExprW mono x
-  restNodes <- mapM (\e -> do { (t, n) <- inferExprW mono e; unify Nothing firstT t; pure n }) xs
+  restNodes <- mapM (\e -> do { (t, n) <- inferExprW mono e; unify (msum [expPos e, expPos x]) firstT t; pure n }) xs
   let ty = TCon TcList [firstT]
   pure (ty, Ty.Texp ty (Ty.TList (firstNode : restNodes)))
 inferExprW mono (Abs.ELam atomPats body) = do
@@ -2595,6 +2594,10 @@ expPos (Abs.EProj e _)                   = expPos e
 expPos (Abs.EProjC e _)                  = expPos e
 expPos (Abs.ELitI (Abs.WokInt (p, _)))   = Just p
 expPos (Abs.EParen e)                    = expPos e
+expPos (Abs.ECon (Abs.ConId (p, _)))     = Just p
+expPos (Abs.EIf c _ _)                   = expPos c
+expPos (Abs.EList (x : _))               = expPos x
+expPos (Abs.ETuple a _)                  = expPos a
 expPos _                                 = Nothing
 
 -- ---------------------------------------------------------------------------
@@ -2605,7 +2608,7 @@ expPos _                                 = Nothing
 inferAlt :: Map.Map Text (Type s) -> Type s -> Type s -> Abs.Alt -> TC s (Ty.TAlt (Type s))
 inferAlt mono sT rT (Abs.AltC pat body mw) = do
   (pT, binds, patNode) <- inferPat pat
-  unify Nothing sT pT
+  unify (patPos pat) sT pT
   let mono' = foldr (\(n, t) m -> Map.insert n t m) mono binds
   let withWhere k = case mw of
         Abs.NoWhere -> k mono' []
@@ -2613,7 +2616,7 @@ inferAlt mono sT rT (Abs.AltC pat body mw) = do
   (bodyT, bodyNode, whereNodes) <- withWhere $ \m declNodes -> do
     (t, n) <- inferExprW m body
     pure (t, n, declNodes)
-  unify Nothing rT bodyT
+  unify (msum [expPos body, patPos pat]) rT bodyT
   pure (Ty.TAlt patNode whereNodes bodyNode)
 
 -- | Process a local-decl group as a single mutually-recursive let.
@@ -2722,11 +2725,17 @@ checkComponentPat _ = throwError
              \for richer patterns use `case`"))
 
 atomPatPos :: Abs.AtomPat -> Abs.BNFC'Position
-atomPatPos (Abs.APVar (Abs.VarId (p, _)))   = Just p
-atomPatPos (Abs.APLitI (Abs.WokInt (p, _))) = Just p
-atomPatPos (Abs.APCon modPath)              = Just (modPathPos modPath)
-atomPatPos (Abs.APList (p : _))             = patPos p
-atomPatPos _                                = Nothing
+atomPatPos (Abs.APVar (Abs.VarId (p, _)))      = Just p
+atomPatPos (Abs.APLitI (Abs.WokInt (p, _)))    = Just p
+atomPatPos (Abs.APCon modPath)                 = Just (modPathPos modPath)
+atomPatPos (Abs.APList (p : _))                = patPos p
+atomPatPos (Abs.APTuple p _)                   = patPos p
+atomPatPos (Abs.APParen p)                     = patPos p
+atomPatPos (Abs.APAs inner _)                  = atomPatPos inner
+atomPatPos (Abs.PRecord (Abs.ConId (p, _)) _)  = Just p
+atomPatPos (Abs.PRecordOpen (Abs.ConId (p, _)) _ _) = Just p
+atomPatPos (Abs.PRecordWild (Abs.ConId (p, _)) _)   = Just p
+atomPatPos _                                   = Nothing
 
 -- | Best-effort source position for a pattern, drilling to the first
 -- position-carrying atom. Mirrors 'atomPatPos' for the nested case.
@@ -2963,7 +2972,8 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
       let evParams = [ (Solve.paramName (conClass c) i, c)
                      | c <- declared', CTGen i <- [conArg c] ]
       pure TypedDecl { tdName = name, tdScheme = declared
-                     , tdClauses = clauses, tdEvidence = evParams }
+                     , tdClauses = clauses, tdEvidence = evParams
+                     , tdIsExtern = False }
     Nothing -> do
       Level outer <- currentLevel
       mEscape <- hasOuterScopeVar outer tv
@@ -2997,7 +3007,8 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
                      | c <- residual, CTGen i <- [conArg c] ]
           gen' = gen { schemeConstraints = residual }
       pure TypedDecl { tdName = name, tdScheme = gen'
-                     , tdClauses = clauses, tdEvidence = evParams }
+                     , tdClauses = clauses, tdEvidence = evParams
+                     , tdIsExtern = False }
   where
     sameConstraint a b = conClass a == conClass b && conArg a == conArg b
     nubConstraints = Data.List.nubBy sameConstraint
@@ -3246,6 +3257,7 @@ data TypedDecl = TypedDecl
   , tdScheme   :: Scheme
   , tdClauses  :: [([TPat], TExpr)]
   , tdEvidence :: [(Text, Constraint)]   -- evidence params (name, constraint)
+  , tdIsExtern :: Bool                   -- True iff a prelude @extern@ (no body)
   }
   deriving (Show)
 
@@ -3501,7 +3513,8 @@ inferTopLetGroup origin externs localDecls = do
         [ let s = sigMap Map.! n
           in TypedDecl { tdName = n, tdScheme = s
                        , tdClauses = [([], Ty.Texp (schemeBody s) (Ty.TVar n))]
-                       , tdEvidence = [] }
+                       , tdEvidence = []
+                       , tdIsExtern = Set.member n externs }
         | n <- sigOnlyNames ]
   -- Every binding that has a declared signature -- bodyless OR with a body --
   -- is in scope as its declared scheme while peer equations are typechecked, so

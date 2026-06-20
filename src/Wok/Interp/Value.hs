@@ -150,6 +150,7 @@ maxIdRegion = (2 ^ (64 :: Int) - 1) `div` idRegionBound
 
 data RuntimeError
   = UnboundVar Text
+  | UnboundPrim Text
   | NotAFunction Text
   | NonExhaustiveCase Text
   | NoMatchingHandler Text Text
@@ -175,16 +176,21 @@ instance Exception CafFailure
 -- ---------------------------------------------------------------------------
 -- Atom resolution and binder helpers
 
--- | Resolve an atom: literal -> value; variable -> env by Unique, else prim
--- table by hint, else UnboundVar.
+-- | Resolve an atom: literal -> value; prim -> prim table by name; variable ->
+-- env by Unique, else UnboundVar. A builtin reaches the interpreter ONLY as an
+-- 'APrim' (the elaborator routes prelude @extern@s there by identity); a missing
+-- 'AVar' is a genuine unbound binder, NOT a same-named builtin -- there is no
+-- by-hint fallback (#12).
 resolveAtom :: PrimTable -> Scope -> Atom -> Either RuntimeError Value
 resolveAtom _     _  (ALit l) = Right (VLit l)
-resolveAtom prims sc (AVar n) =
+resolveAtom prims _  (APrim (_, name)) =
+  case Map.lookup name prims of
+    Just p  -> Right (VPrim p)
+    Nothing -> Left (UnboundPrim name)
+resolveAtom _     sc (AVar n) =
   case Map.lookup (nameUniq n) (scEnv sc) of
     Just v  -> Right v
-    Nothing -> case Map.lookup (nameHint n) prims of
-      Just p  -> Right (VPrim p)
-      Nothing -> Left (UnboundVar (nameHint n))
+    Nothing -> Left (UnboundVar (nameHint n))
 
 bindBinder :: Binder -> Value -> Env -> Env
 bindBinder b v = Map.insert (nameUniq (bndName b)) v

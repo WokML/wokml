@@ -78,6 +78,7 @@ exprUniques = goE
   where
     av (Anf.AVar n) = Set.singleton (Name.nameUniq n)
     av (Anf.ALit _) = Set.empty
+    av (Anf.APrim _) = Set.empty
     avs = Set.unions . map av
     goR r = case r of
       Anf.RAtom a          -> av a

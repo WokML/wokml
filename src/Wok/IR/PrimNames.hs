@@ -2,9 +2,10 @@
 -- intrinsic prims. These names are SPELLED in two roles that must stay in sync:
 --
 --   * the IR recognizers ('Wok.IR.Escape', 'Wok.IR.Perceus',
---     'Wok.IR.Reachable') match a call head's name HINT against them to identify
---     a compiler-internal call (a @__rc_dup@/@__rc_drop@ insertion, a
---     @__cont_store@/@__cont_take@/@__cont_cell_new@ move), and
+--     'Wok.IR.Reachable') identify a compiler-internal call from these names: the
+--     @__rc_dup@/@__rc_drop@ insertions by name HINT (Perceus-synthesized), the
+--     @__cont_store@/@__cont_take@/@__cont_cell_new@ moves by QUALIFIED
+--     @(module, name)@ extern identity on the 'APrim' head, and
 --   * the interpreter prim tables ('Wok.Interp.RC.Prim',
 --     'Wok.Interp.Prim') key their entries on them.
 --
@@ -13,13 +14,20 @@
 -- registered the old name, or vice versa). Centralizing them here makes a rename
 -- a single edit and a compile error at every stale call site.
 --
--- NOTE on the recognition convention: these are matched by HINT TEXT (the
--- established convention for compiler-placed intrinsics, since the elaborator/
--- Perceus pass is the only producer of these calls in the IR these passes see).
--- The genuine prelude once-sink @extern@s (e.g. @__coro_susp@) are resolved by
--- @(module, name)@ extern IDENTITY instead (see 'Wok.Pipeline.onceSinkKeys') and
--- are deliberately NOT centralized here --- identity resolution does not key on
--- the bare hint, so it cannot desync with these recognizers.
+-- NOTE on the recognition convention. TWO categories live here:
+--
+--   * @__rc_dup@/@__rc_drop@ are matched by HINT TEXT --- the established
+--     convention for compiler-SYNTHESIZED intrinsics, since the Perceus pass is
+--     the only producer of these calls in the IR these passes see (no user
+--     binding can forge them).
+--   * the prelude continuation @extern@s (@__coro_susp@, @__cont_store@,
+--     @__cont_take@, @__cont_cell_new@) are matched by QUALIFIED @(module, name)@
+--     extern IDENTITY, because a user binding hinted the same is surface-plausible.
+--     The elaborator routes those externs to an 'Wok.IR.Anf.APrim' carrying the
+--     @(module, name)@ key, so the recognizers match the 'APrim' head (the
+--     once-shot trust set 'onceSinkNames' covers @__coro_susp@/@__cont_store@; the
+--     cell move/take recognizers carry their own keys); a hinted user binding
+--     resolves to an 'AVar' and is never matched.
 module Wok.IR.PrimNames
   ( -- * RC intrinsics (Perceus-inserted)
     rcDupName
@@ -28,8 +36,19 @@ module Wok.IR.PrimNames
   , contCellNewName
   , contStoreName
   , contTakeName
+    -- * Trusted once-sink prelude externs
+  , contStoreModule
+  , coroSuspName
+  , onceSinkNames
+    -- * Qualified @(module, name)@ identity keys
+  , contCellNewKey
+  , contStoreKey
+  , contTakeKey
+  , coroSuspKey
   ) where
 
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 
@@ -52,3 +71,38 @@ contStoreName = Tx.pack "__cont_store"
 -- | @__cont_take cell@: MOVE the continuation OUT of @cell@ (M3 §4.1).
 contTakeName :: Text
 contTakeName = Tx.pack "__cont_take"
+
+-- | The defining module of the genuine prelude continuation-sink @extern@s.
+contStoreModule :: Text
+contStoreModule = Tx.pack "Std.Control"
+
+-- | @__coro_susp x k@: the coroutine escape sink (@start@ desugars to it). A
+-- genuine once-sink: it resumes its continuation argument at most once.
+coroSuspName :: Text
+coroSuspName = Tx.pack "__coro_susp"
+
+-- | The trusted once-sink prelude @extern@s, by qualified @(module, name)@
+-- identity. An op-arm handing its @resume@ DIRECTLY to one of these is certified
+-- one-shot. This single set drives BOTH the Multiplicity once-shot trust
+-- ('Wok.IR.Multiplicity') and the Escape/Reachable @__cont_store@ move-in
+-- recognizer ('Wok.IR.Escape.contStoreCell'). Because an 'APrim' carries the
+-- qualified identity and is emitted ONLY for a genuine prelude @extern@, a user
+-- binding hinted the same name resolves to an 'AVar' and is never matched here.
+onceSinkNames :: Set (Text, Text)
+onceSinkNames = Set.fromList [coroSuspKey, contStoreKey]
+
+-- | Qualified @(module, name)@ identity key for @__cont_cell_new@.
+contCellNewKey :: (Text, Text)
+contCellNewKey = (contStoreModule, contCellNewName)
+
+-- | Qualified @(module, name)@ identity key for @__cont_store@.
+contStoreKey :: (Text, Text)
+contStoreKey = (contStoreModule, contStoreName)
+
+-- | Qualified @(module, name)@ identity key for @__cont_take@.
+contTakeKey :: (Text, Text)
+contTakeKey = (contStoreModule, contTakeName)
+
+-- | Qualified @(module, name)@ identity key for @__coro_susp@.
+coroSuspKey :: (Text, Text)
+coroSuspKey = (contStoreModule, coroSuspName)

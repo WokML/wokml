@@ -753,6 +753,7 @@ type RCPrimTable = Map Text RCPrim
 -- those positions signals a genuinely unbound variable.
 resolveRCAtom :: RCScope -> Atom -> Either RuntimeError RCValue
 resolveRCAtom _  (ALit l) = Right (RVLit l)
+resolveRCAtom _  (APrim (_, name)) = Left (UnboundPrim name)  -- bare prim-as-value unsupported in RC M1
 resolveRCAtom sc (AVar n) =
   case Map.lookup (nameUniq n) (rscEnv sc) of
     Just v  -> Right v

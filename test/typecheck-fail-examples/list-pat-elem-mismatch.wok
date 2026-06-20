@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+bad : [U64] -> U64
+bad xs = case xs of
+  [0, True] -> 1
+  _         -> 0
+main : U64
+main = 0

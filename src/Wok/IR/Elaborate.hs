@@ -1,8 +1,7 @@
 module Wok.IR.Elaborate
   ( elaborateExprForTest      -- test seam: Env -> TExpr -> Expr
-  , elaborateModule           -- full module elaboration: Env -> [TypedDecl] -> CoreModule
+  , elaborateModule           -- full module elaboration: entryModule -> Env -> [TypedDecl] -> CoreModule
   , elaborateModulesShared    -- whole-program: [(moduleName, Env, [TypedDecl])] -> CoreModule
-  , elaborateModulesSharedWithGlobals  -- as above, also returning the (module,name) -> Name map
   ) where
 
 import Control.Monad.Reader
@@ -50,6 +49,10 @@ data ElabCtx = ElabCtx
   , ecGlobals     :: Map.Map Text Name   -- top-level/builtin names
   , ecEvidence    :: Map.Map Text Name   -- evidence-param name -> its dict binder
   , ecEvidenceIdx :: Set Int             -- in-scope quantified-constraint indices
+  , ecPrims       :: Map.Map Name (Text, Text)
+    -- ^ canonical 'Name' of each value-level prelude @extern@ -> its qualified
+    -- @(definingModule, name)@ key. A resolved GLOBAL whose 'Name' is in here is
+    -- emitted as 'APrim'; locals are never routed here.
   }
 
 -- | Elab is a reader over the elaboration context, built on top of Fresh.
@@ -81,9 +84,11 @@ resolveVar :: Text -> Elab Atom
 resolveVar t = do
   ctx <- ask
   case Map.lookup t (ecScope ctx) of
-    Just n  -> pure (AVar n)
+    Just n  -> pure (AVar n)           -- locals are NEVER routed to APrim
     Nothing -> case Map.lookup t (ecGlobals ctx) of
-      Just n  -> pure (AVar n)
+      Just n  -> case Map.lookup n (ecPrims ctx) of
+                   Just qkey -> pure (APrim qkey)   -- a prelude extern, by identity
+                   Nothing   -> pure (AVar n)
       Nothing -> AVar <$> bindFresh t
 
 -- ---------------------------------------------------------------------------
@@ -1107,13 +1112,32 @@ elabTopBind globals td = do
 -- | Elaborate every top-level binding in a module into a 'TopBind'.
 -- One canonical 'Name' is minted for every value-level global (from 'envVars'),
 -- so that the binding site and every reference share the same identity.
-elaborateModule :: Env -> [TypedDecl] -> CoreModule
-elaborateModule env tds =
+-- @entryModule@ is the entry module's name, used as the 'externKeyOf' default
+-- for any global with no recorded origin.
+-- @externKeys@ is the set of @(definingModule, name)@ keys of every value-level
+-- prelude @extern@ in scope; each matching global is routed to 'APrim' (built
+-- into 'ecPrims'), mirroring the whole-program 'elaborateModulesShared' path.
+elaborateModule :: Text -> Set (Text, Text) -> Env -> [TypedDecl] -> CoreModule
+elaborateModule entryModule externKeys env tds =
   runFresh $ do
     gpairs <- mapM (\t -> (,) t <$> freshName t) (Map.keys (envVars env))
     let globals = Map.fromList gpairs
+        -- Each global whose @(definingModule, name)@ key is a known prelude
+        -- @extern@ -> its canonical 'Name', so 'resolveVar' routes it to 'APrim'.
+        -- The defining module comes from 'envVarOrigin', which DOES record the
+        -- entry module's OWN names too (the loader keys them under the entry
+        -- module). So a prelude-as-entry @extern@ keys correctly; the
+        -- @entryModule@ default only fires for a name with no recorded origin,
+        -- which the identity-derivation helper 'externKeyOf' then treats as
+        -- entry-module-defined (in practice never, since the loader records
+        -- own-module origins).
+        ecPrims = Map.fromList
+          [ (freshN, key)
+          | (name, freshN) <- Map.toList globals
+          , let key = externKeyOf entryModule env name
+          , Set.member key externKeys ]
     binds <- mapM (\td -> runReaderT (elabTopBind globals td)
-                                     (ElabCtx env Map.empty globals Map.empty Set.empty))
+                                     (ElabCtx env Map.empty globals Map.empty Set.empty ecPrims))
                   (filter (not . isBodylessSig) tds)
     pure (CoreModule binds)
 
@@ -1131,50 +1155,60 @@ elaborateModule env tds =
 -- post-import environment and @envVarOrigin env@ maps each visible name to the
 -- module that defined it.
 elaborateModulesShared :: [(Text, Env, [TypedDecl])] -> CoreModule
-elaborateModulesShared = fst . elaborateModulesSharedWithGlobals
-
--- | As 'elaborateModulesShared', but also return the canonical-identity map
--- keyed by @(definingModule, name)@. A downstream pass that needs the IDENTITY
--- of a specific global (e.g. the multiplicity law needs the genuine
--- @(Std.Control, "__coro_susp")@ escape sink, NOT a user binding merely hinted
--- the same) reads it here instead of guessing from a hint.
-elaborateModulesSharedWithGlobals
-  :: [(Text, Env, [TypedDecl])] -> (CoreModule, Map.Map (Text, Text) Name)
-elaborateModulesSharedWithGlobals mods =
+elaborateModulesShared mods =
   runFresh $ do
     -- Every (definingModule, name) pair across all modules. A name is keyed by
     -- the module that DEFINES it (via envVarOrigin), defaulting to the module
     -- whose env we are reading when no origin is recorded (a module's own
     -- freshly introduced names).
     let qualifiedKeys =
-          [ (originKey, name)
+          [ externKeyOf modName env name
           | (modName, env, _) <- mods
           , name <- Map.keys (envVars env)
-          , let originKey = Map.findWithDefault modName name (envVarOrigin env)
           ]
     -- Mint one Name per distinct (origin, name) key.
     gpairs <- mapM (\k -> (,) k <$> freshName (snd k))
                    (dedup qualifiedKeys)
     let globalByKey = Map.fromList gpairs
-    binds <- concat <$> mapM (elabOne globalByKey) mods
-    pure (CoreModule binds, globalByKey)
+        -- Invert the extern resolution: each value-level prelude @extern@'s
+        -- canonical 'Name' -> its @(definingModule, name)@ key. Built from the
+        -- 'tdIsExtern'-marked decls (the typechecker's authority on what is an
+        -- extern), keyed through 'globalByKey' by extern IDENTITY. A user binding
+        -- merely HINTED an extern name has a distinct (origin, name) key, so it is
+        -- never in this map and is never routed to 'APrim'.
+        ecPrimsAll = Map.fromList
+          [ (globalByKey Map.! k, k)
+          | (modName, env, tds) <- mods, td <- tds, tdIsExtern td
+          , let k = externKeyOf modName env (tdName td)
+          , Map.member k globalByKey ]
+    binds <- concat <$> mapM (elabOne globalByKey ecPrimsAll) mods
+    pure (CoreModule binds)
   where
     dedup = Map.keys . Map.fromList . map (\k -> (k, ()))
     -- A module's view: each name it can see resolves to the canonical Name for
     -- (definingModule, name).
-    elabOne globalByKey (modName, env, tds) =
+    elabOne globalByKey ecPrimsAll (modName, env, tds) =
       let globals = Map.fromList
             [ (name, globalByKey Map.! key)
             | name <- Map.keys (envVars env)
-            , let key = (Map.findWithDefault modName name (envVarOrigin env), name)
+            , let key = externKeyOf modName env name
             ]
       in mapM (\td -> runReaderT (elabTopBind globals td)
-                                 (ElabCtx env Map.empty globals Map.empty Set.empty))
+                                 (ElabCtx env Map.empty globals Map.empty Set.empty ecPrimsAll))
               (filter (not . isBodylessSig) tds)
+
+-- | The @(definingModule, name)@ identity key for a value-level global. The
+-- defining module comes from 'envVarOrigin'; when no origin is recorded the
+-- @defaultModule@ is used (the entry module for the single-module path, or the
+-- module whose env we are reading for the whole-program path). This is the ONE
+-- rule for deriving a global's identity key; all extern routing keys through it.
+externKeyOf :: Text -> Env -> Text -> (Text, Text)
+externKeyOf defaultModule env name =
+  (Map.findWithDefault defaultModule name (envVarOrigin env), name)
 
 -- ---------------------------------------------------------------------------
 -- Public test seam
 
 elaborateExprForTest :: Env -> TExpr -> Expr
 elaborateExprForTest env e =
-  runFresh (runReaderT (elabTail e) (ElabCtx env Map.empty Map.empty Map.empty Set.empty))
+  runFresh (runReaderT (elabTail e) (ElabCtx env Map.empty Map.empty Map.empty Set.empty Map.empty))

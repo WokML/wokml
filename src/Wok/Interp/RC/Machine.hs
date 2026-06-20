@@ -20,6 +20,7 @@ import Wok.IR.Anf
   , Lit (..), OpArm (..), Rhs (..), TopBind (..), binderUnique, bndName
   , freeVarsExpr, hAnswerJoin )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
+import qualified Wok.IR.PrimNames as PN
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.Interp.RC.Prim (rcPrimTable)
 import Wok.Interp.RC.Value
@@ -267,15 +268,29 @@ callFn :: RCPrimTable -> RCScope -> Atom -> [RCValue] -> RCKont -> Store
        -> Either RuntimeError RCConfig
 callFn prims sc f args k s = case f of
   ALit _ -> Left (NotAFunction (Tx.pack "literal"))
+  APrim (_, name) ->
+    case Map.lookup name prims of
+      Just p  -> enterPrim prims p args k s
+      Nothing -> Left (UnboundPrim name)
   AVar n ->
     case Map.lookup (nameUniq n) (rscEnv sc) of
       -- BORROW: the function value sits at a NAMED call head, owned by its binder;
       -- the application reads it and Perceus drops it at its last use.
       Just fv -> enterRC True prims fv args k s
-      Nothing ->
-        case Map.lookup (nameHint n) prims of
-          Just p  -> enterPrim prims p args k s
-          Nothing -> Left (UnboundVar (nameHint n))
+      -- The general by-hint prim fallback is GONE (#12): a missing 'AVar' is a
+      -- loud 'UnboundVar', not a same-named builtin (which now reaches us only as
+      -- an 'APrim'). The ONE exception is the two Perceus-SYNTHESIZED RC
+      -- intrinsics @__rc_dup@/@__rc_drop@: the Perceus pass emits them as
+      -- 'AVar'-with-hint (post-elaboration, so they are never externs and cannot
+      -- be 'APrim' -- spec Caveat A), and no user binding can forge them, so they
+      -- are resolved by HINT here. A user binder merely hinted a surface prim
+      -- (e.g. @+@) is NOT one of these and still errors 'UnboundVar'.
+      Nothing
+        | nameHint n == PN.rcDupName || nameHint n == PN.rcDropName ->
+            case Map.lookup (nameHint n) prims of
+              Just p  -> enterPrim prims p args k s
+              Nothing -> Left (UnboundVar (nameHint n))
+        | otherwise -> Left (UnboundVar (nameHint n))
 
 -- | Apply a runtime value (a boxed closure) to args, continuing with @k@.
 -- Handles currying and over-application (over-application chains via 'KAppRC').
