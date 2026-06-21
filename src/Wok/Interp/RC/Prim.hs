@@ -2,13 +2,14 @@ module Wok.Interp.RC.Prim
   ( rcPrimTable
   ) where
 
+import Control.Monad.Trans.Except (throwE)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.RC.Value
-  ( RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
+  ( RC, liftRC, RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
   , Node (..), Cell (..), Store, alloc, deref, incref, dropAddr, writeNode
   , continuationOwned )
 import Wok.Interp.Value (RuntimeError (..))
@@ -55,36 +56,36 @@ prims =
 -- literal (literals are never counted). Threads the store.
 rcDup :: RCPrim
 rcDup = RCPrim PN.rcDupName 1 [] $ \args s -> case args of
-  [v@(RVBox a)] -> do s' <- incref a s; Right (PRDone v, s')
-  [v@(RVLit _)] -> Right (PRDone v, s)
+  [v@(RVBox a)] -> do s' <- incref a s; pure (PRDone v, s')
+  [v@(RVLit _)] -> pure (PRDone v, s)
   -- A shared-env recursive member: its single counted child is the env cell
   -- ('valueChildren'). Dup increfs the env (a no-op on the static empty-env
   -- sentinel); the group code label is static and never counted.
-  [v@(RVRecMember _ _ e)] -> do s' <- incref e s; Right (PRDone v, s')
+  [v@(RVRecMember _ _ e)] -> do s' <- incref e s; pure (PRDone v, s')
   -- A named effect-instance handle: an UNBOXED identity pair owning no counted
   -- cell ('valueChildren' is empty), so dup is inert (same as 'dropBoxed'). This
   -- fires once resume runs a captured frame that drops/dups the @self@ handle
   -- (M2b-1 Task 5); the abort path never reached it because the arm returned
   -- before the captured frame ran.
-  [v@(RVInst _ _)] -> Right (PRDone v, s)
-  _             -> Left (ArityError (Tx.pack "__rc_dup"))
+  [v@(RVInst _ _)] -> pure (PRDone v, s)
+  _             -> throwE (ArityError (Tx.pack "__rc_dup"))
 
 -- | @__rc_drop x@ decrefs the handle (freeing at zero, recursively) and returns
 -- unit; a no-op on a literal. Threads the store.
 rcDrop :: RCPrim
 rcDrop = RCPrim PN.rcDropName 1 [] $ \args s -> case args of
-  [RVBox a]   -> do s' <- dropAddr a s; Right (PRDone (RVLit LUnit), s')
-  [RVLit _]   -> Right (PRDone (RVLit LUnit), s)
+  [RVBox a]   -> do s' <- dropAddr a s; pure (PRDone (RVLit LUnit), s')
+  [RVLit _]   -> pure (PRDone (RVLit LUnit), s)
   -- A shared-env recursive member: drop decrefs the env (a no-op on the static
   -- empty-env sentinel), freeing it at zero and cascading its owned captures.
-  [RVRecMember _ _ e] -> do s' <- dropAddr e s; Right (PRDone (RVLit LUnit), s')
+  [RVRecMember _ _ e] -> do s' <- dropAddr e s; pure (PRDone (RVLit LUnit), s')
   -- A named effect-instance handle: an UNBOXED identity pair owning no counted
   -- cell ('valueChildren' is empty), so drop is inert (same as 'dropBoxed'). This
   -- fires once resume runs a captured frame that drops the @self@/instance handle
   -- (M2b-1 Task 5); the abort path never reached it because the arm returned
   -- before the captured frame ran.
-  [RVInst _ _] -> Right (PRDone (RVLit LUnit), s)
-  _           -> Left (ArityError (Tx.pack "__rc_drop"))
+  [RVInst _ _] -> pure (PRDone (RVLit LUnit), s)
+  _           -> throwE (ArityError (Tx.pack "__rc_drop"))
 
 -- ---------------------------------------------------------------------------
 -- The M3 stored-continuation cell primitives (spec §4.1)
@@ -124,9 +125,9 @@ contCellNew = RCPrim PN.contCellNewName 1 [] $ \args s -> case args of
   -- passed is both leak-free and reference-agreeing.
   [u] -> do
     s1 <- dropBoxed u s
-    let (a, s2) = alloc (NContCell Nothing) s1
-    Right (PRDone (RVBox a), s2)
-  _ -> Left (ArityError (Tx.pack "__cont_cell_new"))
+    (a, s2) <- alloc (NContCell Nothing) s1
+    pure (PRDone (RVBox a), s2)
+  _ -> throwE (ArityError (Tx.pack "__cont_cell_new"))
 
 -- | @__cont_store cell k@ MOVES the continuation @k@ into @cell@: it writes
 -- @NContCell (Just kAddr)@ at the cell, WITHOUT increfing @kAddr@ (the binder
@@ -197,11 +198,11 @@ contStore = RCPrim PN.contStoreName 2 [] $ \args s -> case args of
         case cNode kc of
           NCont prefix _
             | cellAddr `elem` continuationOwned prefix ->
-                Left (PrimError (Tx.pack
+                throwE (PrimError (Tx.pack
                   ("__cont_store: stored continuation counted-reaches its own cell \
                    \(would form an RC cycle); carrier-wall violation (M3 §4.3); addr "
                      <> show cellAddr)))
-          _ -> Right ()
+          _ -> pure ()
         -- MOVE-VS-BORROW PIN (code-review #13). The result MUST be the SAME cell
         -- address that was passed in: @__cont_store@ MOVES the continuation into the
         -- existing cell in place ('writeNode' preserves the cell's identity and rc)
@@ -221,24 +222,24 @@ contStore = RCPrim PN.contStoreName 2 [] $ \args s -> case args of
         s' <- writeNode cellAddr (NContCell (Just kAddr)) s
         c' <- deref cellAddr s'
         case cNode c' of
-          NContCell (Just a) | a == kAddr -> Right (PRDone (RVBox cellAddr), s')
+          NContCell (Just a) | a == kAddr -> pure (PRDone (RVBox cellAddr), s')
           other ->
-            Left (PrimError (Tx.pack
+            throwE (PrimError (Tx.pack
               ("__cont_store: in-place store post-condition violated (#13; writeNode did \
                \not land NContCell (Just " <> show kAddr <> ") at cell addr "
                <> show cellAddr <> "); got node " <> show other)))
       NContCell (Just _) ->
-        Left (PrimError (Tx.pack
+        throwE (PrimError (Tx.pack
           ("__cont_store: cell already holds a continuation (one-shot violation); addr "
              <> show cellAddr)))
-      _ -> Left (PrimError (Tx.pack
+      _ -> throwE (PrimError (Tx.pack
              ("__cont_store: not a continuation cell; addr " <> show cellAddr)))
   [RVBox _, k] ->
     -- The continuation must be a boxed NCont handle (the op-arm resume binder).
     -- A literal/closure/instance in this slot is an internal IR/elaboration error.
-    Left (PrimError (Tx.pack "__cont_store: continuation argument is not a boxed handle: "
+    throwE (PrimError (Tx.pack "__cont_store: continuation argument is not a boxed handle: "
                        <> renderArg k))
-  _ -> Left (ArityError (Tx.pack "__cont_store"))
+  _ -> throwE (ArityError (Tx.pack "__cont_store"))
 
 -- | @__cont_take cell@ MOVES the continuation OUT of @cell@: it reads the held
 -- addr, empties the cell (@NContCell Nothing@), and returns the addr boxed,
@@ -253,13 +254,13 @@ contTake = RCPrim PN.contTakeName 1 [] $ \args s -> case args of
     case cNode c of
       NContCell (Just kAddr) -> do
         s' <- writeNode cellAddr (NContCell Nothing) s
-        Right (PRDone (RVBox kAddr), s')
+        pure (PRDone (RVBox kAddr), s')
       NContCell Nothing ->
-        Left (PrimError (Tx.pack
+        throwE (PrimError (Tx.pack
           ("__cont_take: cell is empty (taken twice or never stored); addr " <> show cellAddr)))
-      _ -> Left (PrimError (Tx.pack
+      _ -> throwE (PrimError (Tx.pack
              ("__cont_take: not a continuation cell; addr " <> show cellAddr)))
-  _ -> Left (ArityError (Tx.pack "__cont_take"))
+  _ -> throwE (ArityError (Tx.pack "__cont_take"))
 
 -- | Render an unexpected non-box continuation argument for an error message.
 renderArg :: RCValue -> Text
@@ -272,7 +273,7 @@ renderArg (RVInst _ _)     = Tx.pack "instance handle"
 -- Pure value prims (store-passthrough)
 
 mkPrim :: Text -> Int -> ([RCValue] -> Either RuntimeError RCPrimResult) -> RCPrim
-mkPrim name arity fn = RCPrim name arity [] (\args s -> (\r -> (r, s)) <$> fn args)
+mkPrim name arity fn = RCPrim name arity [] (\args s -> (\r -> (r, s)) <$> liftRC (fn args))
 
 asInt :: RCValue -> Either RuntimeError Integer
 asInt (RVLit (LInt n)) = Right n
@@ -316,33 +317,36 @@ dollarP = mkPrim (Tx.pack "$") 2 $ \args -> case args of
 -- ---------------------------------------------------------------------------
 -- Boolean prims (store-threading: read boxed Bools, allocate the result)
 
--- | Deref a boxed boolean argument to a Haskell 'Bool'.
-asBool :: RCValue -> Store -> Either RuntimeError Bool
+-- | Deref a boxed boolean argument to a Haskell 'Bool'. Uses the interpreter-
+-- monad 'deref' (not the pure 'derefPure') so a boolean cell on the C heap (a
+-- @True@/@False@ @NCon@ allocated under the 'CHeap' backend, reached via a
+-- 'CAddr') is read correctly. On the abstract heap the behaviour is unchanged.
+asBool :: RCValue -> Store -> RC Bool
 asBool (RVBox a) s = do
   c <- deref a s
   case cNode c of
-    NCon t [] | t == Tx.pack "True"  -> Right True
-              | t == Tx.pack "False" -> Right False
-    _ -> Left (PrimError (Tx.pack "expected Bool"))
-asBool (RVLit _)           _ = Left (PrimError (Tx.pack "expected Bool, got a literal"))
-asBool RVRecMember{} _ = Left (PrimError (Tx.pack "expected Bool, got a closure handle"))
-asBool (RVInst _ _)  _ = Left (PrimError (Tx.pack "expected Bool, got an instance handle"))
+    NCon t [] | t == Tx.pack "True"  -> pure True
+              | t == Tx.pack "False" -> pure False
+    _ -> throwE (PrimError (Tx.pack "expected Bool"))
+asBool (RVLit _)           _ = throwE (PrimError (Tx.pack "expected Bool, got a literal"))
+asBool RVRecMember{} _ = throwE (PrimError (Tx.pack "expected Bool, got a closure handle"))
+asBool (RVInst _ _)  _ = throwE (PrimError (Tx.pack "expected Bool, got an instance handle"))
 
 -- | Allocate a boxed boolean constructor and return its handle.
-allocBool :: Bool -> Store -> (RCValue, Store)
-allocBool b s =
+allocBool :: Bool -> Store -> RC (RCValue, Store)
+allocBool b s = do
   let tag = if b then Tx.pack "True" else Tx.pack "False"
-      (a, s') = alloc (NCon tag []) s
-  in (RVBox a, s')
+  (a, s') <- alloc (NCon tag []) s
+  pure (RVBox a, s')
 
 -- | Comparison: U64 operands, freshly-allocated boxed Bool result.
 cmp :: Text -> (Integer -> Integer -> Bool) -> RCPrim
 cmp name op = RCPrim name 2 [] $ \args s -> case args of
   [a, b] -> do
-    x <- asInt a; y <- asInt b
-    let (v, s') = allocBool (op x y) s
-    Right (PRDone v, s')
-  _ -> Left (ArityError name)
+    x <- liftRC (asInt a); y <- liftRC (asInt b)
+    (v, s') <- allocBool (op x y) s
+    pure (PRDone v, s')
+  _ -> throwE (ArityError name)
 
 -- | Boolean operator: boxed Bool operands, freshly-allocated boxed Bool result.
 --
@@ -357,14 +361,14 @@ boolOp name op = RCPrim name 2 [] $ \args s -> case args of
     x <- asBool a s; y <- asBool b s
     s1 <- dropBoxed a s
     s2 <- dropBoxed b s1
-    let (v, s3) = allocBool (op x y) s2
-    Right (PRDone v, s3)
-  _ -> Left (ArityError name)
+    (v, s3) <- allocBool (op x y) s2
+    pure (PRDone v, s3)
+  _ -> throwE (ArityError name)
 
 -- | Drop a moved-in operand: decref a boxed handle (freeing recursively at
 -- zero); a no-op on a literal (literals are never counted). Threads the store.
-dropBoxed :: RCValue -> Store -> Either RuntimeError Store
+dropBoxed :: RCValue -> Store -> RC Store
 dropBoxed (RVBox a)          s = dropAddr a s
-dropBoxed (RVLit _)          s = Right s
+dropBoxed (RVLit _)          s = pure s
 dropBoxed (RVRecMember _ _ e) s = dropAddr e s
-dropBoxed (RVInst _ _)       s = Right s
+dropBoxed (RVInst _ _)       s = pure s

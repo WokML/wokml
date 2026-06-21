@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+
+-- Fallback (Task 3): a constructor with a string ('LStr') field. 'encodeSlot'
+-- returns 'Nothing' for an 'LStr', so the whole 'Tagged' 'NCon' falls back to
+-- the ABSTRACT heap even under the C backend (other encodable cells still route
+-- to C). The program must still render the correct result and return to its
+-- baseline with balanced stats.
+
+data Tagged = Tagged String U64
+
+tagOf : Tagged -> U64
+tagOf t = case t of Tagged s k -> k
+
+main = tagOf (Tagged "hi" 1)

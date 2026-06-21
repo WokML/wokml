@@ -1,0 +1,39 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-21-c-runtime-allocator-ncon.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 0: Thread IO through the RC interpreter to its public boundary",
+      "status": "completed",
+      "description": "**Goal:** Move the RC interpreter into `ExceptT RuntimeError IO`, heap still the pure `IntMap` (no C, no behavior change). Full Goal/Files/AC/Verify/Steps in the plan doc.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"src/Wok/Interp/RC/Machine.hs\", \"src/Wok/Interp/RC/Prim.hs\", \"app/Main.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"RC monad threaded through store ops + driver + prims\", \"entry points return IO (Either RuntimeError ...)\", \"no unsafePerformIO in RC/\", \"heap still IntMap, zero behavior change, full suite green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 1: C runtime + build wiring + FFI bindings + sanitizer test",
+      "status": "completed",
+      "description": "**Goal:** Byte-dumb C allocator (spec §4 ABI) compiled into the library, raw FFI bindings, Haskell round-trip test, sanitizer-clean standalone C test. Full Goal/Files/AC/Verify/Steps in the plan doc.\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\", \"runtime/test/wok_rc_test.c\", \"scripts/asan-runtime.sh\", \"src/Wok/Interp/RC/Heap.hs\", \"wok.cabal\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options='-p \\\"/wok-rc-heap/\\\"' 2>&1 | tail -10 && bash scripts/asan-runtime.sh\", \"acceptanceCriteria\": [\"wok_rc.c compiles clean under HPC-C flags\", \"static_asserts on struct sizes hold\", \"FFI round-trip alloc/set/get/dup/dec/free + stats correct\", \"asan-runtime.sh exits 0\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 2: Add the C-backed NCon path alongside the abstract store",
+      "status": "completed",
+      "blockedBy": [1, 2],
+      "description": "**Goal:** `NCon` cells alloc in the C heap when backend is `C` and all fields encodable; `incref`/`dropAddr`/`deref` learn the `CAddr` path with Haskell-driven cascade; abstract path retained for the oracle. Full Goal/Files/AC/Verify/Steps in the plan doc.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"src/Wok/Interp/RC/Machine.hs\", \"src/Wok/Interp/RC/Prim.hs\", \"app/Main.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"Addr sum + isStaticAddr\", \"Store carries HeapBackend + tag interning\", \"encodable NCon allocs in C, non-encodable falls back to HAddr\", \"deref/incref/dropAddr dispatch on Addr with cross-heap cascade\", \"corpus runs through CHeap with no regression\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 3: Differential oracle + targeted tests + sanitizers",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** Prove the C backend bit-for-bit correct: whole-corpus output + stats parity AbstractHeap-vs-CHeap, plus cross-heap / fallback / deep-cascade tests + sanitizer pass. USER-ORDERED GATE (non-skippable; user said 'prove correctness first'). Full Goal/Files/AC/Verify/Steps in the plan doc.\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options='-p \\\"/rc-c-backend-parity/\\\"' 2>&1 | tail -20 && bash scripts/asan-runtime.sh\", \"acceptanceCriteria\": [\"output parity AbstractHeap vs CHeap on whole corpus\", \"allocs/frees/peak parity + stLive==rcBaseline both backends\", \"cross-heap cascade test balanced + sanitizer-clean\", \"LStr fallback test correct + balanced\", \"100k deep-list frees to baseline\", \"asan-runtime.sh exits 0\"], \"userGate\": true, \"tags\": [\"user-gate\"], \"requiresUserSpecification\": false, \"requireEvidenceTokens\": [[\"abstract\", \"AbstractHeap\"], [\"c-backend\", \"CHeap\"]], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 4: Docs, memory, and cleanup",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** Record the pinned ABI as the codegen contract, mark the spec IMPLEMENTED, update project memory, remove scaffolding. Full Goal/Files/AC/Verify/Steps in the plan doc.\n\n```json:metadata\n{\"files\": [\"runtime/README.md\", \"docs/superpowers/specs/2026-06-21-c-runtime-allocator-ncon-design.md\"], \"verifyCommand\": \"cabal test 2>&1 | tail -5\", \"acceptanceCriteria\": [\"runtime/README.md documents the ABI as codegen contract\", \"spec status IMPLEMENTED\", \"memory file + MEMORY.md pointer added\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-21T-task0-complete"
+}

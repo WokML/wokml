@@ -105,9 +105,15 @@ library
         Wok.Interp.Prim
         Wok.Interp.Sched
         Wok.Interp.Machine
+        Wok.Interp.RC.Heap
         Wok.Interp.RC.Value
         Wok.Interp.RC.Prim
         Wok.Interp.RC.Machine
+    c-sources:        runtime/wok_rc.c
+    include-dirs:     runtime
+    cc-options:       -std=c17 -O3 -fstrict-aliasing -Wstrict-aliasing=2 -fwrapv
+                      -Werror -Wall -Wextra -Wpedantic -Wconversion
+                      -Wdouble-promotion -Wstrict-prototypes -Wformat-security
     autogen-modules:
         Paths_wok
     other-modules:
@@ -150,5 +156,6 @@ test-suite wok-tests
         filepath,
         directory,
         mtl,
+        transformers,
         text
     hs-source-dirs:   test

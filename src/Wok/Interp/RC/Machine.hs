@@ -5,12 +5,15 @@ module Wok.Interp.RC.Machine
   , runRC
   , runExprRC
   , runModuleRC
+  , runModuleRCWith
   , runModuleRCUnchecked
+  , runModuleRCUncheckedWith
   , RCRun (..)
   , renderRcStats
   ) where
 
 import Control.Monad (foldM)
+import Control.Monad.Trans.Except (ExceptT (..), throwE, runExceptT)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -41,21 +44,21 @@ data RCConfig
 data RCStep = RMore RCConfig | RDone RCValue Store
 
 -- | A single small-step. Halts on a return into the empty continuation.
-stepRC :: RCPrimTable -> RCConfig -> Either RuntimeError RCStep
-stepRC _     (RReturn v KDoneRC s) = Right (RDone v s)
+stepRC :: RCPrimTable -> RCConfig -> RC RCStep
+stepRC _     (RReturn v KDoneRC s) = pure (RDone v s)
 stepRC prims cfg                   = RMore <$> transition prims cfg
 
-transition :: RCPrimTable -> RCConfig -> Either RuntimeError RCConfig
+transition :: RCPrimTable -> RCConfig -> RC RCConfig
 transition prims (RReturn v k s)    = returnToRC prims v k s
 transition prims (REval expr sc k s) = evalExprRC prims expr sc k s
 
 -- ---------------------------------------------------------------------------
 -- Return: deliver a value to a continuation frame.
 
-returnToRC :: RCPrimTable -> RCValue -> RCKont -> Store -> Either RuntimeError RCConfig
-returnToRC _     _ KDoneRC                _ = Left (PrimError (Tx.pack "internal: returnToRC KDoneRC"))
+returnToRC :: RCPrimTable -> RCValue -> RCKont -> Store -> RC RCConfig
+returnToRC _     _ KDoneRC                _ = throwE (PrimError (Tx.pack "internal: returnToRC KDoneRC"))
 returnToRC _     v (KLetRC b body sc k)   s =
-  Right (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s)
+  pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s)
 -- OWNED: a 'KAppRC' over-application continuation holds an ANONYMOUS intermediate
 -- function value (the result of saturating the previous application) with no IR
 -- binder. The application is its sole owner, so it CONSUMES it (no Perceus drop
@@ -67,7 +70,7 @@ returnToRC prims v (KAppRC args k)        s = enterRC False prims v args k s
 -- continuation. (See 'KDropCellRC' and the deferred-consume note in 'enterRC'.)
 returnToRC _     v (KDropCellRC addr k)   s = do
   s' <- dropAddr addr s
-  Right (RReturn v k s')
+  pure (RReturn v k s')
 -- Normal completion of a handled computation (M2b-1 Task 3): run the return arm,
 -- binding the produced value to the return binder in the frame's captured scope.
 -- Mirrors the reference 'Wok.Interp.Machine.returnTo' 'KHandle' arm. The frame
@@ -76,43 +79,43 @@ returnToRC _     v (KDropCellRC addr k)   s = do
 -- pass instruments for its own last-use drops.
 returnToRC _     v (KHandleRC h _ hsc k)  s =
   let (rb, rbody) = hReturn h
-  in Right (REval rbody hsc { rscEnv = bindRCBinder rb v (rscEnv hsc) } k s)
+  in pure (REval rbody hsc { rscEnv = bindRCBinder rb v (rscEnv hsc) } k s)
 
 -- ---------------------------------------------------------------------------
 -- Eval
 
 evalExprRC :: RCPrimTable -> Expr -> RCScope -> RCKont -> Store
-           -> Either RuntimeError RCConfig
+           -> RC RCConfig
 evalExprRC prims expr sc k s = case expr of
   Ret a -> do
-    v <- resolveRCAtom sc a
-    Right (RReturn v k s)
+    v <- liftRC (resolveRCAtom sc a)
+    pure (RReturn v k s)
 
   Let b rhs body -> evalRhsRC prims b rhs body sc k s
 
   Case a alts -> do
-    v <- resolveRCAtom sc a
+    v <- liftRC (resolveRCAtom sc a)
     matchAltsRC v alts sc k s
 
   LetJoin j ps jb body ->
     let jp = RCJoin sc ps jb k
-    in Right (REval body sc { rscJoins = Map.insert j jp (rscJoins sc) } k s)
+    in pure (REval body sc { rscJoins = Map.insert j jp (rscJoins sc) } k s)
 
   Jump j args -> do
-    vs <- mapM (resolveRCAtom sc) args
+    vs <- liftRC (mapM (resolveRCAtom sc) args)
     case Map.lookup j (rscJoins sc) of
-      Nothing -> Left (UnboundVar (renderJoin j))
+      Nothing -> throwE (UnboundVar (renderJoin j))
       Just (RCJoin jsc ps jbody jk)
         -- A join's arity is fixed at definition; a Jump with a different count
         -- is an IR bug. Raise a loud ArityError rather than silently
         -- truncating via zip (mirrors the reference machine).
         | length vs /= length ps ->
-            Left (ArityError
+            throwE (ArityError
               (Tx.pack "jump to " <> renderJoin j <> Tx.pack ": expected "
                 <> Tx.pack (show (length ps)) <> Tx.pack " argument(s), got "
                 <> Tx.pack (show (length vs))))
         | otherwise ->
-            Right (REval jbody jsc { rscEnv = bindRCBinders ps vs (rscEnv jsc) } jk s)
+            pure (REval jbody jsc { rscEnv = bindRCBinders ps vs (rscEnv jsc) } jk s)
 
   LetRec defs body ->
     -- SHARED-ENV + CODE-POINTER representation (M2a-2 Task 3). A local group of
@@ -167,11 +170,11 @@ evalExprRC prims expr sc k s = case expr of
           | otherwise    =
               let fields = Map.fromList
                     [ (u, v) | u <- capList, Just v <- [Map.lookup u (rscEnv sc)] ]
-              in alloc (NEnv fields) sg
+              in allocPure (NEnv fields) sg
         groupEnv = foldl' (\e ((b, _, _), i) ->
                              bindRCBinder b (RVRecMember gAddr i envAddr) e)
                           (rscEnv sc) (zip defs [0 ..])
-    in Right (REval body sc { rscEnv = groupEnv } k sEnv)
+    in pure (REval body sc { rscEnv = groupEnv } k sEnv)
 
   Handle e h ->
     -- Install the counted handler frame (M2b-1 Task 3), mirroring the reference
@@ -189,46 +192,46 @@ evalExprRC prims expr sc k s = case expr of
         sc' = case hSelf h of
                 Just sb -> sc { rscEnv = bindRCBinder sb (RVInst (nameUniq (bndName sb)) tag) (rscEnv sc) }
                 Nothing -> sc
-    in Right (REval e sc' (KHandleRC h tag sc' k) s)
+    in pure (REval e sc' (KHandleRC h tag sc' k) s)
 
 evalRhsRC :: RCPrimTable -> Binder -> Rhs -> Expr -> RCScope -> RCKont -> Store
-          -> Either RuntimeError RCConfig
+          -> RC RCConfig
 evalRhsRC prims b rhs body sc k s = case rhs of
   RAtom a -> do
-    v <- resolveRCAtom sc a
+    v <- liftRC (resolveRCAtom sc a)
     cont v s
 
   RCon c as -> do
-    vs <- mapM (resolveRCAtom sc) as
-    let (a, s') = alloc (NCon c vs) s
+    vs <- liftRC (mapM (resolveRCAtom sc) as)
+    (a, s') <- alloc (NCon c vs) s
     cont (RVBox a) s'
 
   RRecord t flds -> do
-    vs <- mapM (\(l, a) -> (,) l <$> resolveRCAtom sc a) flds
-    let (a, s') = alloc (NRecord t (Map.fromList vs)) s
+    vs <- liftRC (mapM (\(l, a) -> (,) l <$> resolveRCAtom sc a) flds)
+    (a, s') <- alloc (NRecord t (Map.fromList vs)) s
     cont (RVBox a) s'
 
-  RLam ps e ->
-    let fvs     = freeVarsExpr e `Set.difference`
-                    Set.fromList (map binderUnique ps)
-        cenv    = Map.restrictKeys (rscEnv sc) fvs
-        (a, s') = alloc (mkClosure cenv ps e) s
-    in cont (RVBox a) s'
+  RLam ps e -> do
+    let fvs  = freeVarsExpr e `Set.difference`
+                 Set.fromList (map binderUnique ps)
+        cenv = Map.restrictKeys (rscEnv sc) fvs
+    (a, s') <- alloc (mkClosure cenv ps e) s
+    cont (RVBox a) s'
 
   RProj l a -> do
-    v <- resolveRCAtom sc a
+    v <- liftRC (resolveRCAtom sc a)
     case v of
       RVBox addr -> do
         c <- deref addr s
         case cNode c of
           NRecord _ m | Just fv <- Map.lookup l m -> cont fv s
-          _ -> Left (BadProjection l)
-      RVLit _           -> Left (BadProjection l)
-      RVRecMember{} -> Left (BadProjection l)
-      RVInst _ _    -> Left (BadProjection l)
+          _ -> throwE (BadProjection l)
+      RVLit _           -> throwE (BadProjection l)
+      RVRecMember{} -> throwE (BadProjection l)
+      RVInst _ _    -> throwE (BadProjection l)
 
   RApp f as -> do
-    vs <- mapM (resolveRCAtom sc) as
+    vs <- liftRC (mapM (resolveRCAtom sc) as)
     callFn prims sc f vs (KLetRC b body sc k) s
 
   -- An effect OPERATION (M2b-1 Task 4): the RC analogue of the reference
@@ -237,11 +240,11 @@ evalRhsRC prims b rhs body sc k s = case rhs of
   -- continuation 'KLetRC b body sc k' (so the captured @above@ prefix includes
   -- this 'Let' frame).
   ROp minst lbl op as -> do
-    vs      <- mapM (resolveRCAtom sc) as
-    mTarget <- resolveInstRC sc minst
+    vs      <- liftRC (mapM (resolveRCAtom sc) as)
+    mTarget <- liftRC (resolveInstRC sc minst)
     rcDispatchOp mTarget lbl op vs (KLetRC b body sc k) s
   where
-    cont v s' = Right (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
+    cont v s' = pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
 
 -- | Resolve the optional named-instance handle of an 'ROp' to its @(Unique, tag)@
 -- routing pair. 'Nothing' is ambient dispatch (route to the nearest covering
@@ -265,13 +268,13 @@ resolveInstRC sc (Just a) = do
 
 -- | Apply the function named by an atom to already-resolved argument values.
 callFn :: RCPrimTable -> RCScope -> Atom -> [RCValue] -> RCKont -> Store
-       -> Either RuntimeError RCConfig
+       -> RC RCConfig
 callFn prims sc f args k s = case f of
-  ALit _ -> Left (NotAFunction (Tx.pack "literal"))
+  ALit _ -> throwE (NotAFunction (Tx.pack "literal"))
   APrim (_, name) ->
     case Map.lookup name prims of
       Just p  -> enterPrim prims p args k s
-      Nothing -> Left (UnboundPrim name)
+      Nothing -> throwE (UnboundPrim name)
   AVar n ->
     case Map.lookup (nameUniq n) (rscEnv sc) of
       -- BORROW: the function value sits at a NAMED call head, owned by its binder;
@@ -289,8 +292,8 @@ callFn prims sc f args k s = case f of
         | nameHint n == PN.rcDupName || nameHint n == PN.rcDropName ->
             case Map.lookup (nameHint n) prims of
               Just p  -> enterPrim prims p args k s
-              Nothing -> Left (UnboundVar (nameHint n))
-        | otherwise -> Left (UnboundVar (nameHint n))
+              Nothing -> throwE (UnboundVar (nameHint n))
+        | otherwise -> throwE (UnboundVar (nameHint n))
 
 -- | Apply a runtime value (a boxed closure) to args, continuing with @k@.
 -- Handles currying and over-application (over-application chains via 'KAppRC').
@@ -303,7 +306,7 @@ callFn prims sc f args k s = case f of
 -- function value) that the application OWNS and must consume, since no IR binder
 -- (and therefore no Perceus drop) can reach it.
 enterRC :: Bool -> RCPrimTable -> RCValue -> [RCValue] -> RCKont -> Store
-        -> Either RuntimeError RCConfig
+        -> RC RCConfig
 enterRC borrowHead _ fv args k s = case fv of
   RVBox addr -> do
     c <- deref addr s
@@ -347,7 +350,7 @@ enterRC borrowHead _ fv args k s = case fv of
             -- owned by the static lifetime, so a call neither increfs them (as
             -- before) nor cascades them, and they are never consumed by the call.
             borrowOnly      = isStaticAddr addr
-            increfOwned st  = if borrowOnly then Right st
+            increfOwned st  = if borrowOnly then pure st
                               else foldM (flip incref) st ownedCaptured
             -- This call CONSUMES the cell iff it is an unnamed intermediate (not a
             -- borrowed named head) and not a borrow-only cell.
@@ -355,7 +358,7 @@ enterRC borrowHead _ fv args k s = case fv of
             -- IMMEDIATE consume: drop the cell now. Used ONLY where the cell's body
             -- does NOT run on this step (the LT partial-application path), so the
             -- cascade cannot race a still-borrowing body.
-            consumeCellNow st = if consumes then dropAddr addr st else Right st
+            consumeCellNow st = if consumes then dropAddr addr st else pure st
             -- DEFERRED consume: keep the cell alive THROUGH its own call, dropping it
             -- only when the body's result returns. The body borrows the cell's
             -- captures (an 'RVRecMember' capture's shared env is cascade-eligible on
@@ -366,7 +369,7 @@ enterRC borrowHead _ fv args k s = case fv of
         case compare na np of
           EQ -> do
             s'  <- increfOwned s
-            Right (REval body (RCScope (bindRCBinders ps args cenv) Map.empty) (deferConsume k) s')
+            pure (REval body (RCScope (bindRCBinders ps args cenv) Map.empty) (deferConsume k) s')
           LT -> do
             -- Partial application: allocate a fresh closure that SHARES the original's
             -- captures plus the supplied args (moved in from the caller). It keeps the
@@ -389,15 +392,15 @@ enterRC borrowHead _ fv args k s = case fv of
             -- balanced pairs, no transfer-by-omission. The body does NOT run here, so
             -- an IMMEDIATE consume is safe.
             let cenv' = bindRCBinders (take na ps) args cenv
-                (a', s') = alloc (NClosure cenv' (drop na ps) body capMode) s
-                sharedCaptureRefs = countedRefs (Map.elems cenv)
+            (a', s') <- alloc (NClosure cenv' (drop na ps) body capMode) s
+            let sharedCaptureRefs = countedRefs (Map.elems cenv)
             s''  <- foldM (flip incref) s' sharedCaptureRefs
             s''' <- consumeCellNow s''
-            Right (RReturn (RVBox a') k s''')
+            pure (RReturn (RVBox a') k s''')
           GT -> do
             let (use, over) = splitAt np args
             s'  <- increfOwned s
-            Right (REval body (RCScope (bindRCBinders ps use cenv) Map.empty)
+            pure (REval body (RCScope (bindRCBinders ps use cenv) Map.empty)
                      (KAppRC over (deferConsume k)) s')
       -- RESUME of a reified continuation (M2b-1 Task 5; spec §4.3 RESUME). Applying
       -- the boxed 'NCont' handle (the op-arm @resume@ binder) MOVES the captured
@@ -430,15 +433,15 @@ enterRC borrowHead _ fv args k s = case fv of
         case (hParam h, args) of
           (Nothing, [v]) ->
             let hsc' = answerRebindRC h k hsc
-            in Right (RReturn v (spliceKont prefix (KHandleRC h hTag hsc' k)) s')
+            in pure (RReturn v (spliceKont prefix (KHandleRC h hTag hsc' k)) s')
           (Just pb, [newParam, result]) ->
             let hsc'  = hsc { rscEnv = bindRCBinder pb newParam (rscEnv hsc) }
                 hsc'' = answerRebindRC h k hsc'
                 k'    = spliceKont prefix (KHandleRC h hTag hsc'' k)
-            in Right (RReturn result k' s')
-          _ -> Left (ArityError (Tx.pack "resume arity does not match handler parameter"))
-      _ -> Left (NotAFunction (Tx.pack "applied a non-closure heap node"))
-  RVLit _ -> Left (NotAFunction (Tx.pack "applied a literal"))
+            in pure (RReturn result k' s')
+          _ -> throwE (ArityError (Tx.pack "resume arity does not match handler parameter"))
+      _ -> throwE (NotAFunction (Tx.pack "applied a non-closure heap node"))
+  RVLit _ -> throwE (NotAFunction (Tx.pack "applied a literal"))
   RVRecMember gAddr i envAddr -> do
     -- BORROW-ON-CALL of a shared-env recursive member (M2a-2 Task 3). Calling an
     -- 'RVRecMember' is a pure READ: the member handle is never consumed and its
@@ -458,7 +461,7 @@ enterRC borrowHead _ fv args k s = case fv of
         -- to deref is a genuine use-after-free / dangling pointer: surface it as a
         -- 'Left' rather than laundering it into 'Map.empty' (which would turn a
         -- freed-env UAF into a silent wrong value via a spurious 'UnboundVar').
-        envFields <- case deref envAddr s of
+        envFields <- liftRC $ case derefPure envAddr s of
                        Right c | NEnv m <- cNode c -> Right m
                        _ | envAddr == emptyEnvSentinelAddr -> Right Map.empty
                        Left e                              -> Left e
@@ -485,9 +488,9 @@ enterRC borrowHead _ fv args k s = case fv of
             -- left untouched here.
             deferEnv kont = if borrowHead then kont else KDropCellRC envAddr kont
         case compare na np of
-          EQ -> Right (REval body (RCScope (callEnv args) Map.empty) (deferEnv k) s)
+          EQ -> pure (REval body (RCScope (callEnv args) Map.empty) (deferEnv k) s)
           GT -> let (use, over) = splitAt np args
-                in Right (REval body (RCScope (callEnv use) Map.empty) (KAppRC over (deferEnv k)) s)
+                in pure (REval body (RCScope (callEnv use) Map.empty) (KAppRC over (deferEnv k)) s)
           LT -> do
             -- Partial application: allocate an ordinary closure that captures the
             -- already-supplied args (bound to the consumed params), the siblings,
@@ -526,19 +529,19 @@ enterRC borrowHead _ fv args k s = case fv of
             let cenv = Map.unions
                          [ Map.fromList (zip (map binderUnique (take na ps)) args)
                          , sibs, envFields ]
-                (a', s') = alloc (NClosure cenv (drop na ps) body BorrowCaptures) s
-                capRefs  = countedRefs (Map.elems sibs ++ Map.elems envFields)
+            (a', s') <- alloc (NClosure cenv (drop na ps) body BorrowCaptures) s
+            let capRefs  = countedRefs (Map.elems sibs ++ Map.elems envFields)
             s''  <- foldM (flip incref) s' capRefs
-            s''' <- if borrowHead then Right s'' else dropAddr envAddr s''
-            Right (RReturn (RVBox a') k s''')
-      _ -> Left (NotAFunction (Tx.pack "RVRecMember group addr is not NGroupCode"))
-  RVInst _ _ -> Left (NotAFunction (Tx.pack "applied an instance handle"))
+            s''' <- if borrowHead then pure s'' else dropAddr envAddr s''
+            pure (RReturn (RVBox a') k s''')
+      _ -> throwE (NotAFunction (Tx.pack "RVRecMember group addr is not NGroupCode"))
+  RVInst _ _ -> throwE (NotAFunction (Tx.pack "applied an instance handle"))
 
 -- | Apply a primitive to args, accumulating for currying and threading the
 -- store. Mirrors the reference 'enter' prim branch, sans the 'PRDrive'
 -- scheduler seam (absent in the no-handler fragment).
 enterPrim :: RCPrimTable -> RCPrim -> [RCValue] -> RCKont -> Store
-          -> Either RuntimeError RCConfig
+          -> RC RCConfig
 enterPrim prims p args k s =
   let combined = rpArgs p ++ args in
   if length combined < rpArity p
@@ -547,13 +550,13 @@ enterPrim prims p args k s =
       -- never partially applies a prim, but support it for parity: there is no
       -- prim value in 'RCValue', so an under-saturated prim cannot be returned
       -- as a value. Raise a loud error rather than silently dropping args.
-      Left (ArityError (rpName p <> Tx.pack ": partial application of a primitive is unsupported in rc M1"))
+      throwE (ArityError (rpName p <> Tx.pack ": partial application of a primitive is unsupported in rc M1"))
     else do
       let (use, over) = splitAt (rpArity p) combined
       (r, s') <- rpFn p use s
       case r of
         PRDone v
-          | null over -> Right (RReturn v k s')
+          | null over -> pure (RReturn v k s')
           -- OWNED: the prim returned a function value we now over-apply; it is an
           -- anonymous intermediate the application consumes (no Perceus drop).
           | otherwise -> enterRC False prims v over k s'
@@ -567,36 +570,36 @@ enterPrim prims p args k s =
 -- Case matching (deref the scrutinee handle, match over the NCon node)
 
 matchAltsRC :: RCValue -> [Alt] -> RCScope -> RCKont -> Store
-            -> Either RuntimeError RCConfig
+            -> RC RCConfig
 matchAltsRC v alts sc k s = case v of
   RVBox addr -> do
     c <- deref addr s
     goNode (cNode c)
   RVLit l -> goLit l
-  RVRecMember{} -> Left (NonExhaustiveCase (Tx.pack "<closure>"))
-  RVInst _ _    -> Left (NonExhaustiveCase (Tx.pack "<instance>"))
+  RVRecMember{} -> throwE (NonExhaustiveCase (Tx.pack "<closure>"))
+  RVInst _ _    -> throwE (NonExhaustiveCase (Tx.pack "<instance>"))
   where
     -- Boxed scrutinee: match constructor alts against the NCon node; literal
     -- alts and default still apply (a literal alt simply never matches a node).
     goNode node = go alts
       where
-        go [] = Left (NonExhaustiveCase (nodeTag node))
+        go [] = throwE (NonExhaustiveCase (nodeTag node))
         go (AltCon c bs e : rest) = case node of
           NCon c' vs | c' == c && length bs == length vs ->
-            Right (REval e sc { rscEnv = bindRCBinders bs vs (rscEnv sc) } k s)
+            pure (REval e sc { rscEnv = bindRCBinders bs vs (rscEnv sc) } k s)
           _ -> go rest
         go (AltLit _ _ : rest) = go rest   -- a boxed node never equals a literal
-        go (AltDefault e : _)  = Right (REval e sc k s)
+        go (AltDefault e : _)  = pure (REval e sc k s)
 
     -- Literal scrutinee: only literal alts and default apply.
     goLit l = go alts
       where
-        go [] = Left (NonExhaustiveCase (litText l))
+        go [] = throwE (NonExhaustiveCase (litText l))
         go (AltLit l' e : rest)
-          | l' == l   = Right (REval e sc k s)
+          | l' == l   = pure (REval e sc k s)
           | otherwise = go rest
         go (AltCon{} : rest) = go rest      -- a literal never equals a node
-        go (AltDefault e : _) = Right (REval e sc k s)
+        go (AltDefault e : _) = pure (REval e sc k s)
 
 nodeTag :: Node -> Text
 nodeTag (NCon t _)    = t
@@ -712,40 +715,41 @@ lookupOpArmRC lbl op h =
 -- the shell is discarded WITHOUT freeing the owned set.
 rcDispatchOp
   :: Maybe (Unique, Int) -> Text -> Text -> [RCValue] -> RCKont -> Store
-  -> Either RuntimeError RCConfig
+  -> RC RCConfig
 rcDispatchOp mTarget lbl op vs kCur s =
   case rcFindHandler mTarget lbl op kCur of
-    Nothing -> Left (NoMatchingHandler lbl op)
+    Nothing -> throwE (NoMatchingHandler lbl op)
     Just (above, h, hTag, hsc, kBelow) ->
       case lookupOpArmRC lbl op h of
-        Nothing -> Left (NoMatchingHandler lbl op)
-        Just oa ->
-          let prefix      = above KDoneRC
-              (cAddr, s') = alloc (NCont prefix (h, hTag, hsc)) s
-              env1 = bindRCBinders (oaArgs oa) vs (rscEnv hsc)
+        Nothing -> throwE (NoMatchingHandler lbl op)
+        Just oa -> do
+          let prefix = above KDoneRC
+          (cAddr, s') <- alloc (NCont prefix (h, hTag, hsc)) s
+          let env1 = bindRCBinders (oaArgs oa) vs (rscEnv hsc)
               env2 = bindRCBinder (oaResume oa) (RVBox cAddr) env1
-          in Right (REval (oaBody oa) (RCScope env2 (rscJoins hsc)) kBelow s')
+          pure (REval (oaBody oa) (RCScope env2 (rscJoins hsc)) kBelow s')
 
 -- ---------------------------------------------------------------------------
 -- Drivers
 
 -- | Run a configuration to a final value, threading the store.
-runRC :: RCPrimTable -> RCConfig -> Either RuntimeError (RCValue, Store)
+runRC :: RCPrimTable -> RCConfig -> RC (RCValue, Store)
 runRC prims = loop
   where
     loop cfg = do
       st <- stepRC prims cfg
       case st of
-        RDone v s -> Right (v, s)
+        RDone v s -> pure (v, s)
         RMore c   -> loop c
 
--- | Pure test seam: evaluate an Expr in a given environment over a starting
--- store, returning the result value and the final store. The starting store is
+-- | Test seam: evaluate an Expr in a given environment over a starting store,
+-- returning the result value and the final store. The starting store is
 -- supplied by the caller (typically 'emptyStore' or a store pre-loaded with a
--- static globals region).
-runExprRC :: RCPrimTable -> REnv -> Store -> Expr -> Either RuntimeError (RCValue, Store)
+-- static globals region). Runs the RC loop and discharges the 'ExceptT'/'IO' at
+-- this public boundary.
+runExprRC :: RCPrimTable -> REnv -> Store -> Expr -> IO (Either RuntimeError (RCValue, Store))
 runExprRC prims env s e =
-  runRC prims (REval e (RCScope env Map.empty) KDoneRC s)
+  runExceptT (runRC prims (REval e (RCScope env Map.empty) KDoneRC s))
 
 -- ---------------------------------------------------------------------------
 -- Whole-module entry
@@ -793,8 +797,16 @@ data RCRun = RCRun
 -- threading the store, and the resulting value bound into the env (eager, in
 -- bind order; a CAF may reference earlier globals and any function). 'main'
 -- itself is a 0-arity bind but is run explicitly below, not at load time.
-runModuleRC :: CoreModule -> Either RuntimeError RCRun
-runModuleRC cm = do
+runModuleRC :: CoreModule -> IO (Either RuntimeError RCRun)
+runModuleRC = runModuleRCWith AbstractHeap
+
+-- | 'runModuleRC' parameterized by the heap backend. 'AbstractHeap' (the
+-- default, used by 'runModuleRC' and the whole test suite) keeps every cell in
+-- the abstract 'IntMap' store; 'CHeap' routes encodable 'NCon's to the supplied
+-- C runtime context. The caller owns the C heap's lifetime (create it with
+-- 'Wok.Interp.RC.Heap.wokHeapNew' before, free it with @wokHeapFree@ after).
+runModuleRCWith :: HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
+runModuleRCWith backend cm =
   -- 0. Boundary guard. The RC interpreter supports the handler-free fragment
   --    (closures/'RLam' are admitted as of M1.5; 'Handle'/'ROp' effect features
   --    remain out of scope, as does a standalone closure capturing a 'LetRec'
@@ -804,14 +816,13 @@ runModuleRC cm = do
   --    pre-filter the corpus on the same predicate, so this is a no-op for
   --    in-scope programs.)
   case firstOrderNoHandlerViolations cm of
-    []         -> Right ()
+    [] -> runModuleRCUncheckedWith backend cm
     violations ->
-      Left (PrimError
+      pure (Left (PrimError
         (Tx.pack
            "RC interpreter: code reachable from 'main' uses an unsupported \
            \feature:\n"
-          <> Tx.intercalate (Tx.pack "\n") violations))
-  runModuleRCUnchecked cm
+          <> Tx.intercalate (Tx.pack "\n") violations)))
 
 -- | The post-guard whole-module runner: identical to 'runModuleRC' but WITHOUT
 -- the 'firstOrderNoHandlerViolations' boundary guard. 'runModuleRC' is exactly
@@ -822,15 +833,22 @@ runModuleRC cm = do
 -- accounting (heap-empty oracle) directly. It is NOT a production entry point;
 -- nothing in the compiler calls it. Callers are responsible for ensuring the
 -- module is in the supported fragment.
-runModuleRCUnchecked :: CoreModule -> Either RuntimeError RCRun
-runModuleRCUnchecked (CoreModule binds) = do
+runModuleRCUnchecked :: CoreModule -> IO (Either RuntimeError RCRun)
+runModuleRCUnchecked = runModuleRCUncheckedWith AbstractHeap
+
+-- | 'runModuleRCUnchecked' parameterized by the heap backend (see
+-- 'runModuleRCWith'). 'runModuleRCUnchecked' is the 'AbstractHeap' specialization.
+runModuleRCUncheckedWith :: HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
+runModuleRCUncheckedWith backend (CoreModule binds) = runExceptT $ do
   -- 1. Reserve a static address for every top-level bind, building the knotted
   --    static env (every global maps to its handle before any body runs) and a
-  --    store pre-loaded with placeholder static cells.
+  --    store pre-loaded with placeholder static cells. The store carries the
+  --    selected heap backend, so all subsequent 'alloc's dispatch accordingly.
   let (knotEnv, addrs, s0) = reserveStatic binds
+      s0b                  = s0 { stBackend = backend }
   -- 2. Install function closures and force constant (CAF) bodies into the store,
   --    threading it left-to-right; the env is refined with CAF result values.
-  (staticEnv, s1) <- installBinds rcPrimTable knotEnv binds s0 knotEnv addrs
+  (staticEnv, s1) <- installBinds rcPrimTable knotEnv binds s0b knotEnv addrs
   -- 3. Snapshot the live-cell count AFTER all top-level binds are installed.
   --    Any cells already live at this point are immortal value-CAF results.
   --    This is the baseline: main's dynamic work should return stLive to exactly
@@ -839,17 +857,17 @@ runModuleRCUnchecked (CoreModule binds) = do
   -- 4. Locate and run 'main' (must be 0-arity), starting from the loaded store.
   case [ tb | tb@(TopBind n _ _) <- binds, nameHint n == Tx.pack "main" ] of
     (TopBind _ [] body : _) -> do
-      (v, s2) <- runExprRC rcPrimTable staticEnv s1 body
-      txt <- renderRCValue s2 v
+      (v, s2) <- ExceptT (runExprRC rcPrimTable staticEnv s1 body)
+      txt <- renderRCValueRC s2 v
       -- 5. Drop the result via its COUNTED children ('valueChildren'): an 'RVBox'
       --    releases its node, an 'RVRecMember' releases its shared 'NEnv', and a
       --    literal has none. 'dropAddr' no-ops on static/immortal addresses, so a
       --    static handle and a value-CAF result need no special-casing. Then read
       --    the final dynamic-heap stats.
       s3 <- foldM (flip dropAddr) s2 (valueChildren v)
-      Right (RCRun txt (stStats s3) baseline)
-    (TopBind{} : _) -> Left (ArityError (Tx.pack "main must take no arguments"))
-    []              -> Left (UnboundVar (Tx.pack "main"))
+      pure (RCRun txt (stStats s3) baseline)
+    (TopBind{} : _) -> throwE (ArityError (Tx.pack "main must take no arguments"))
+    []              -> throwE (UnboundVar (Tx.pack "main"))
 
 -- | Pre-assign a static address to every top-level bind, returning: the knotted
 -- env that maps each bind's 'Unique' to its static handle, the per-bind address
@@ -881,7 +899,7 @@ installBinds
   -> Store         -- ^ store carrying the reserved placeholder cells
   -> REnv          -- ^ accumulator env (refined with CAF results)
   -> [Addr]        -- ^ static address reserved for each bind, in order
-  -> Either RuntimeError (REnv, Store)
+  -> RC (REnv, Store)
 installBinds prims knotEnv = go
   where
     go (TopBind n ps body : bs) s env (a : as)
@@ -891,7 +909,7 @@ installBinds prims knotEnv = go
       | nameHint n == Tx.pack "main" =
           go bs s env as
       | otherwise = do
-          (v, s') <- runExprRC prims env s body
+          (v, s') <- ExceptT (runExprRC prims env s body)
           -- F2: write the forced CAF result back into its RESERVED static cell.
           -- Function binds are installed as 'NClosure' capturing the UNREFINED
           -- 'knotEnv', which maps this CAF's 'Unique' to its static handle
@@ -926,17 +944,28 @@ installBinds prims knotEnv = go
           -- group drop must never decref a cell the group does not own). Function
           -- closures already captured the static handle via 'knotEnv'; this aligns
           -- the accumulator env (which seeds main's runtime scope) with it.
-          let (s'', envV) = case v of
-                RVBox dynAddr | not (isStaticAddr dynAddr) ->
-                  case deref dynAddr s' of
-                    Right c -> (writeStatic a (cNode c) s', RVBox a)
-                    Left _  -> (s', v)
-                _ -> (s', v)
+          -- Reconstruct the forced node via the interpreter-monad 'deref' so a
+          -- C-heap CAF result (an 'NCon' on the C heap, reached via a 'CAddr')
+          -- is read too. 'writeStatic' copies that node into the abstract static
+          -- cell at 'a' (an uncounted alias sharing the dynamic value's child
+          -- handles --- 'HAddr' or 'CAddr' alike), so a forward-referencing
+          -- closure that resolves the global through 'knotEnv' (= 'RVBox a') sees
+          -- the real value. The env then binds the STATIC handle ('RVBox a'), as
+          -- for an abstract CAF (F6). A non-box (literal) result has no node.
+          -- The deref failure is PROPAGATED (no swallow-and-bind fallback). The
+          -- old code caught a 'Left' here and fell back to binding the dynamic
+          -- counted handle 'v' --- but that could double-free (per the prior F6
+          -- fix, a captor cascading into the CAF's dynamic cell). A deref failure
+          -- of a just-forced CAF result is a REAL error and should abort the run.
+          (s'', envV) <- case v of
+            RVBox dynAddr | not (isStaticAddr dynAddr) ->
+              (\c -> (writeStatic a (cNode c) s', RVBox a)) <$> deref dynAddr s'
+            _ -> pure (s', v)
           go bs s'' (Map.insert (nameUniq n) envV env) as
-    go [] s env [] = Right (env, s)
+    go [] s env [] = pure (env, s)
     -- The bind list and address list are built together in 'reserveStatic', so
     -- they always have equal length; a mismatch is an internal invariant break.
-    go _ _ _ _ = Left (PrimError (Tx.pack "internal: runModuleRC bind/addr length mismatch"))
+    go _ _ _ _ = throwE (PrimError (Tx.pack "internal: runModuleRC bind/addr length mismatch"))
 
 -- | A stable, line-oriented dump of an 'RCRun's dynamic-heap accounting, used by
 -- the @--dump-rc-stats@ CLI mode and its golden (Suite B, Task 9). Pins the

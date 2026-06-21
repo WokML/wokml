@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+
+-- Deep list through the C backend (Task 3): build a spine of 100000 'Cons' cells
+-- (each a C-heap 'NCon' with an encodable U64 head and an HBOX tail), sum it, and
+-- free it. The drop cascade is an ITERATIVE Haskell worklist (not host
+-- recursion), so reclaiming a 100000-cell C-heap spine must return 'stLive' to
+-- the baseline without overflowing the Haskell stack. Kept out of the
+-- auto-discovered golden corpus (its own directory) so it is not golden-pinned.
+
+data List = Nil | Cons U64 List
+
+build : U64 -> List
+build n = case n of
+  0 -> Nil
+  _ -> Cons n (build (n - 1))
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil       -> 0
+  Cons y ys -> y + sumList ys
+
+main = sumList (build 100000)

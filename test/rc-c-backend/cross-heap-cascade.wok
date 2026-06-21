@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+
+-- Cross-heap cascade (Task 3): a constructor that HOLDS a closure AND a closure
+-- that CAPTURES a constructor, exercised together. Under the C backend the
+-- constructor cells ('Box', 'Wrap') allocate on the C heap (all fields are
+-- encodable: a U64 and an HBOX pointer to the abstract-heap closure). The
+-- closure 'f' captures 'b' (a C-heap 'Box' cell). Consuming the value runs a
+-- drop cascade that must route each child across the heap boundary (a C 'Wrap'
+-- cell -> its abstract closure child -> the closure's captured C 'Box' child)
+-- and return the heap to its baseline with balanced stats.
+
+data Box  = Box U64
+data Wrap = Wrap (U64 -> U64)
+
+unbox : Box -> U64
+unbox b = case b of Box v -> v
+
+apply : Wrap -> U64 -> U64
+apply w n = case w of Wrap g -> g n
+
+main =
+  let b = Box 7 in
+  let f = \n -> n + unbox b in
+  let w = Wrap f in
+  apply w 5

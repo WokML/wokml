@@ -1,5 +1,6 @@
 module Main where
 
+import qualified Control.Exception
 import Data.List (sortBy)
 import Data.Ord (comparing)
 import qualified Data.Text as Tx
@@ -14,7 +15,9 @@ import Wok.IR.PrimNames (onceSinkNames)
 import qualified Wok.IR.Perceus as Perceus
 import Wok.IR.Reachable (pruneToReachable)
 import qualified Wok.Interp as Interp
+import qualified Wok.Interp.RC.Heap as Heap
 import qualified Wok.Interp.RC.Machine as RCM
+import Wok.Interp.RC.Value (HeapBackend (..))
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
 import qualified Wok.TypeChecking as TC
@@ -91,8 +94,14 @@ runApp entry extras mode = do
       -- golden harness so the CLI output and the golden agree byte-for-byte.
       ModeDumpRcStats -> case Pipeline.elaborateProgramFull entryName ms of
         Left msg  -> hPutStrLn stderr msg >> exitFailure
-        Right cm  ->
-          case RCM.runModuleRC (Perceus.insertRC (pruneToReachable cm)) of
+        Right cm  -> do
+          -- Bracket the C heap so a thrown exception between new and free does
+          -- not leak it; the free still runs after the run on the normal path.
+          rcResult <- Control.Exception.bracket
+            Heap.wokHeapNew
+            Heap.wokHeapFree
+            (\hp -> RCM.runModuleRCWith (CHeap hp) (Perceus.insertRC (pruneToReachable cm)))
+          case rcResult of
             Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure
             Right run -> TIO.putStr (RCM.renderRcStats run)
       ModeRun -> case Pipeline.elaborateCheckedFull entryName ms of

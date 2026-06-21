@@ -1,6 +1,10 @@
 module Wok.Interp.RC.Value
-  ( -- * Address
-    Addr
+  ( -- * Interpreter monad
+    RC
+  , liftRC
+    -- * Address
+  , Addr (..)
+  , HeapBackend (..)
     -- * Runtime values
   , RCValue (..)
   , REnv
@@ -15,6 +19,7 @@ module Wok.Interp.RC.Value
   , kontDepth
   , continuationOwned
   , moveOutCont
+  , moveOutContPure
   , spliceKont
     -- * Heap nodes
   , Node (..)
@@ -29,11 +34,14 @@ module Wok.Interp.RC.Value
   , Store (..)
   , emptyStore
   , alloc
+  , allocPure
   , allocStatic
   , writeStatic
   , writeNode
+  , writeNodePure
   , isStaticAddr
   , deref
+  , derefPure
   , mkClosure
   , closureOwnedBoxed
     -- * Static sentinel
@@ -41,7 +49,9 @@ module Wok.Interp.RC.Value
   , initSentinel
     -- * Reference-count operations
   , incref
+  , increfPure
   , dropAddr
+  , dropAddrPure
     -- * Primitives
   , RCPrim (..)
   , RCPrimResult (..)
@@ -52,8 +62,16 @@ module Wok.Interp.RC.Value
   , bindRCBinders
     -- * Rendering
   , renderRCValue
+  , renderRCValueRC
+    -- * Slot encoding (C-heap NCon field packing)
+  , encodeSlot
+  , decodeSlot
   ) where
 
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (ExceptT, except)
+import Data.Bits (toIntegralSized)
+import Data.Int (Int64)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.IntSet (IntSet)
@@ -63,6 +81,10 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
+import Data.Word (Word32, Word64)
+import Foreign.Ptr (Ptr, ptrToWordPtr, wordPtrToPtr, WordPtr (..))
+import Wok.Interp.RC.Heap (WokObj, WokHeap)
+import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.Value (RuntimeError (..))
 import Wok.IR.Anf
   ( Atom (..), Binder (..), Expr, Handler (..), Lit (..), binderUnique, freeVarsExpr )
@@ -70,10 +92,36 @@ import Wok.IR.Escape (dropTargets, nonHeadOccs)
 import Wok.IR.Name (JoinId, Unique, nameHint, nameUniq)
 
 -- ---------------------------------------------------------------------------
+-- Interpreter monad
+
+-- | The RC interpreter monad: explicit error over IO. The heap is still the pure
+-- 'IntMap' inside 'Store'; the 'IO' base is the home a later task's FFI calls
+-- (constructor cells on a real malloc-backed C heap) will live in. Today every
+-- store op is a pure computation lifted into this monad with 'liftRC' or 'pure',
+-- so there is no behaviour change.
+type RC a = ExceptT RuntimeError IO a
+
+-- | Lift a pure-store result (the @Either RuntimeError@ shape the underlying
+-- algebra still produces) into the interpreter monad.
+liftRC :: Either RuntimeError a -> RC a
+liftRC = except
+
+-- ---------------------------------------------------------------------------
 -- Addresses and values
 
--- | A heap address: a monotonically-assigned integer index into the 'Store'.
-type Addr = Int
+-- | A heap address. Either an index into the abstract 'IntMap' heap ('HAddr',
+-- the long-standing pure store --- non-negative for the dynamic heap, negative
+-- for the static immortal region) OR a raw pointer to a cell in the C runtime
+-- heap ('CAddr', allocated by 'Wok.Interp.RC.Heap.wokAlloc' when the backend is
+-- 'CHeap' and an 'NCon's fields are all encodable).
+--
+-- A 'CAddr' never enters the 'IntMap'/'IntSet' of the abstract store; the C
+-- runtime owns its lifetime (refcount, free). Cross-heap edges are possible (a C
+-- cell may hold an 'HAddr' child via the @HBOX@ slot tag, and an abstract cell
+-- may hold a 'CAddr' child via 'RVBox'); the drop cascade routes each child by
+-- its 'Addr' kind, so the two heaps interoperate.
+data Addr = HAddr Int | CAddr (Ptr WokObj)
+  deriving (Eq, Ord, Show)
 
 -- | Runtime values in the RC interpreter. Either an unboxed literal, a
 -- boxed pointer to a heap 'Node', or a member handle into a shared-env
@@ -340,22 +388,29 @@ continuationOwned = dedup . go
 -- @__rc_drop@/move instructions fire as the spliced frames run. Contrast
 -- 'dropAddr'/'cascadeChildren', which frees the owned set ('continuationOwned').
 -- A defensive @rc /= 1@ check turns a slipped multi-shot into a loud error rather
--- than a silent use-after-free.
-moveOutCont :: Addr -> Store -> Either RuntimeError (RCKont, (Handler, Int, RCScope), Store)
-moveOutCont a s = do
-  c <- deref a s
+-- than a silent use-after-free. The interpreter monad form; 'moveOutContPure' is
+-- the pure core.
+moveOutCont :: Addr -> Store -> RC (RCKont, (Handler, Int, RCScope), Store)
+moveOutCont a s = liftRC (moveOutContPure a s)
+
+-- | The pure core of 'moveOutCont'. An 'NCont' cell is never C-eligible (it is
+-- not an 'NCon'), so it always lives on the abstract heap; a 'CAddr' here is an
+-- internal routing error.
+moveOutContPure :: Addr -> Store -> Either RuntimeError (RCKont, (Handler, Int, RCScope), Store)
+moveOutContPure (CAddr _) _ = Left (PrimError (Tx.pack "resume: continuation cannot live on the C heap"))
+moveOutContPure a@(HAddr i) s = do
+  c <- derefPure a s
   case cNode c of
     NCont prefix hinfo
       | cRc c == 1 ->
-          let st = stStats s
-              s' = s { stCells = IM.delete a (stCells s)
-                     , stDead  = IS.insert a (stDead s)
-                     , stStats = st { stFrees = stFrees st + 1, stLive = stLive st - 1 } }
+          let s' = s { stCells = IM.delete i (stCells s)
+                     , stDead  = IS.insert i (stDead s)
+                     , stStats = recordFree (stStats s) }
           in Right (prefix, hinfo, s')
       | otherwise ->
           Left (PrimError (Tx.pack ("internal: resume of a continuation with rc=" <> show (cRc c)
-                                     <> " (one-shot violation); addr " <> show a)))
-    _ -> Left (PrimError (Tx.pack ("resume of non-continuation addr " <> show a)))
+                                     <> " (one-shot violation); addr " <> show i)))
+    _ -> Left (PrimError (Tx.pack ("resume of non-continuation addr " <> show i)))
 
 -- | Splice (M2b-1 Task 5): replace the innermost 'KDoneRC' marker of a captured
 -- prefix with the given tail. The prefix (built by @rcDispatchOp@ as @above
@@ -472,6 +527,18 @@ data Stats = Stats
   }
   deriving (Eq, Show)
 
+-- | Record one allocation: bump total allocs and the live count, raising the
+-- high-water peak. The single source of truth for alloc-stat math (shared by
+-- the abstract and C heap paths so their totals stay byte-identical).
+recordAlloc :: Stats -> Stats
+recordAlloc g = let live = stLive g + 1
+                in g { stAllocs = stAllocs g + 1, stLive = live, stPeak = max (stPeak g) live }
+
+-- | Record one free: bump total frees and drop the live count. Shared by the
+-- abstract and C heap free paths.
+recordFree :: Stats -> Stats
+recordFree g = g { stFrees = stFrees g + 1, stLive = stLive g - 1 }
+
 -- ---------------------------------------------------------------------------
 -- The owned heap
 
@@ -490,11 +557,27 @@ data Stats = Stats
 -- excluded from stLive" exactly as the design spec requires.
 data Store = Store
   { stCells      :: IntMap Cell
-  , stNext       :: Addr        -- ^ next dynamic address (>= 0), counts upward
-  , stNextStatic :: Addr        -- ^ next static address (< 0), counts downward
+  , stNext       :: Int         -- ^ next dynamic abstract address (>= 0), counts upward
+  , stNextStatic :: Int         -- ^ next static abstract address (< 0), counts downward
   , stDead       :: IntSet
   , stStats      :: Stats
+  , stBackend    :: HeapBackend
+    -- ^ the heap an 'NCon' allocates into (see 'alloc'). 'AbstractHeap' (the
+    -- default) keeps everything in the 'IntMap'; 'CHeap' routes encodable 'NCon's
+    -- to the C runtime ('CAddr'). All OTHER node kinds always use the abstract heap.
+  , stTagFwd     :: Map Text Word32
+    -- ^ constructor-name -> tag-id, the forward half of the interning bijection
+    -- used to give each constructor a stable small integer for the C 'wokAlloc'
+    -- tag word (which the C runtime stores verbatim and 'deref' reverses).
+  , stTagRev     :: IntMap Text
+    -- ^ tag-id -> constructor-name, the reverse half (keyed by the id as 'Int').
   }
+
+-- | Which heap an 'NCon' is allocated into. 'AbstractHeap' is the default and is
+-- the only backend the test suite and the differential oracle's reference side
+-- use; 'CHeap' carries the live C runtime context pointer that an encodable
+-- 'NCon' allocates into.
+data HeapBackend = AbstractHeap | CHeap (Ptr WokHeap)
 
 -- ---------------------------------------------------------------------------
 -- Static empty-env sentinel
@@ -508,7 +591,7 @@ data Store = Store
 -- the sentinel there via 'initSentinel'. Any subsequent 'allocStatic' call
 -- starts from -2, so the sentinel address is stable.
 emptyEnvSentinelAddr :: Addr
-emptyEnvSentinelAddr = -1
+emptyEnvSentinelAddr = HAddr (-1)
 
 -- | Install the empty-env sentinel into a store. Call this on 'emptyStore'
 -- before use (e.g. in @runModuleRC@). Writes 'NEnv Map.empty' at
@@ -530,28 +613,133 @@ initSentinel s =
 -- not need or expect the sentinel to be present. Tests that exercise
 -- 'RVRecMember'/'NEnv' should call @initSentinel emptyStore@ instead.
 emptyStore :: Store
-emptyStore = Store IM.empty 0 (-1) IS.empty (Stats 0 0 0 0)
+emptyStore = Store
+  { stCells      = IM.empty
+  , stNext       = 0
+  , stNextStatic = -1
+  , stDead       = IS.empty
+  , stStats      = Stats 0 0 0 0
+  , stBackend    = AbstractHeap
+  , stTagFwd     = Map.empty
+  , stTagRev     = IM.empty
+  }
+
+-- | Intern a constructor name to its stable tag-id, allocating a fresh id on
+-- first sight. Returns the id and the (possibly extended) store. The bijection
+-- is monotonic and total over every constructor that has ever been allocated in
+-- the C heap, so 'tagName' can always reverse a live cell's tag.
+internTag :: Text -> Store -> (Word32, Store)
+internTag con s = case Map.lookup con (stTagFwd s) of
+  Just w  -> (w, s)
+  Nothing ->
+    let w = fromIntegral (Map.size (stTagFwd s))
+    in ( w
+       , s { stTagFwd  = Map.insert con w (stTagFwd s)
+           , stTagRev  = IM.insert (fromIntegral w) con (stTagRev s)
+           } )
+
+-- | Reverse the interning bijection: tag-id -> constructor name. A 'CAddr' cell
+-- can only have been allocated through 'internTag' (which records the reverse
+-- entry), so a live C cell's tag is always present; an absent id is an internal
+-- corruption and fails loudly rather than fabricating a name.
+tagName :: Word32 -> Store -> Text
+tagName w s = IM.findWithDefault (error "tagName: unknown tag id") (fromIntegral w) (stTagRev s)
+
+-- ---------------------------------------------------------------------------
+-- C-heap slot encode/decode (the §5 encoding; the single source of truth that
+-- decides whether an 'NCon' field is C-eligible).
+--
+-- 'encodeSlot' returns 'Nothing' for any value that cannot be packed into a
+-- 64-bit @(tag, payload)@ slot, which makes the whole 'NCon' fall back to the
+-- abstract heap (see 'allocNCon'). 'decodeSlot' is its exact inverse on the
+-- encodable shapes.
+
+-- | Pack an 'RCValue' into a C slot @(slotTag, payload)@, or 'Nothing' if the
+-- value is not C-encodable (a string literal, a bignum 'LInt' too wide for
+-- 'Int64', a closure-member handle, or an instance handle).
+--
+-- A negative (static) 'HAddr' round-trips through @HBOX@ via two's-complement:
+-- @fromIntegral (i :: Int) :: Word64@ then @fromIntegral :: Word64 -> Int@ is the
+-- identity for all 'Int' (the payload is the full 64-bit pattern; 'decodeSlot'
+-- reverses it), so a constructor field pointing at a global is preserved exactly.
+encodeSlot :: RCValue -> Maybe (Word64, Word64)
+encodeSlot (RVLit (LInt n))  = (\w -> (H.wsLitInt, fromIntegral (w :: Int64))) <$> toIntegralSized n
+encodeSlot (RVLit (LChar c)) = Just (H.wsLitChar, fromIntegral (fromEnum c))
+encodeSlot (RVLit LUnit)     = Just (H.wsLitUnit, 0)
+encodeSlot (RVBox (CAddr p)) = Just (H.wsCBox, fromIntegral (ptrToWordPtr p))
+-- HBOX round-trip ('HAddr' 'Int' <-> 'Word64') assumes a 64-bit 'Int' (the
+-- supported platform); a 32-bit-'Int' target would need a width guard here and in
+-- 'decodeSlot's @wsHBox@ branch.
+encodeSlot (RVBox (HAddr i)) = Just (H.wsHBox, fromIntegral i)
+encodeSlot _                 = Nothing
+
+-- | The exact inverse of 'encodeSlot' on the encodable shapes. A slot tag the
+-- encoder never emits is an internal corruption and fails loudly.
+decodeSlot :: (Word64, Word64) -> RCValue
+decodeSlot (t, p)
+  | t == H.wsLitInt  = RVLit (LInt (fromIntegral (fromIntegral p :: Int64)))
+  | t == H.wsLitChar = RVLit (LChar (decodeChar p))
+  | t == H.wsLitUnit = RVLit LUnit
+  | t == H.wsCBox    = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral p))))
+  | t == H.wsHBox    = RVBox (HAddr (fromIntegral (fromIntegral p :: Int64)))
+  | otherwise        = error "decodeSlot: unknown slot tag"
+  where
+    -- Guard the codepoint so an out-of-range payload yields a CLEAR invariant
+    -- error (matching the "unknown slot tag" style above) rather than the opaque
+    -- 'Prelude.toEnum: bad argument'. 'decodeSlot' stays total and pure: the
+    -- encoder never emits an out-of-range char, so this can't happen on real data
+    -- (no Either ripple, per the repo no-error-handling-for-can't-happen rule).
+    decodeChar w
+      | w <= 0x10FFFF && not (w >= 0xD800 && w <= 0xDFFF) = toEnum (fromIntegral w)
+      | otherwise = error "decodeSlot: WS_LIT_CHAR payload out of Char range"
 
 -- | True for a static (immortal, uncounted) address. Static cells are
--- allocated by 'allocStatic' at negative addresses; the dynamic heap uses
--- non-negative addresses.
+-- allocated by 'allocStatic' at negative abstract-heap addresses; the dynamic
+-- abstract heap uses non-negative addresses. A C-heap cell ('CAddr') is always
+-- dynamic (the C runtime has no static region), so it is never static.
 isStaticAddr :: Addr -> Bool
-isStaticAddr a = a < 0
+isStaticAddr (HAddr i) = i < 0
+isStaticAddr (CAddr _) = False
 
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
-alloc :: Node -> Store -> (Addr, Store)
-alloc n s =
-  let a    = stNext s
-      st   = stStats s
-      live = stLive st + 1
-      st'  = st { stAllocs = stAllocs st + 1
-                , stLive   = live
-                , stPeak   = max (stPeak st) live }
-  in ( a
+--
+-- BACKEND DISPATCH. Only an 'NCon' is ever C-eligible: under a 'CHeap' backend,
+-- an 'NCon' whose every field is encodable allocates in the C runtime ('CAddr');
+-- a non-encodable field, or any other node kind, falls back to the abstract
+-- 'IntMap' heap ('HAddr', via 'allocPure'). The abstract path is unchanged from
+-- the Task-0 pure core, so store-algebra unit tests that call 'allocPure'
+-- directly keep working.
+alloc :: Node -> Store -> RC (Addr, Store)
+alloc (NCon con vs) s = allocNCon con vs s
+alloc n             s = pure (allocPure n s)
+
+-- | Allocate an 'NCon', routing to the C heap when the backend is 'CHeap' and
+-- every field is encodable; otherwise the abstract heap. The C path's
+-- statistics bump MIRRORS 'allocPure' EXACTLY (one alloc, live + 1, peak
+-- high-water) so the abstract-vs-C totals match in the differential oracle.
+allocNCon :: Text -> [RCValue] -> Store -> RC (Addr, Store)
+allocNCon con vs s = case stBackend s of
+  AbstractHeap -> pure (allocPure (NCon con vs) s)
+  CHeap hp -> case traverse encodeSlot vs of
+    Nothing      -> pure (allocPure (NCon con vs) s)
+    Just encoded -> do
+      let (tid, s1) = internTag con s
+      p <- liftIO (H.wokAlloc hp tid (fromIntegral (length vs)))
+      liftIO $ mapM_ (\(i, (t, pl)) -> H.wokSlotSet p (fromIntegral i) t pl)
+                     (zip [0 :: Int ..] encoded)
+      pure (CAddr p, s1 { stStats = recordAlloc (stStats s1) })
+
+-- | The pure core of 'alloc': always allocates on the abstract 'IntMap' heap,
+-- returning an 'HAddr'. The backend-aware 'alloc' wrapper decides whether an
+-- 'NCon' goes to C instead.
+allocPure :: Node -> Store -> (Addr, Store)
+allocPure n s =
+  let a = stNext s
+  in ( HAddr a
      , s { stCells = IM.insert a (Cell 1 n) (stCells s)
          , stNext  = a + 1
-         , stStats = st'
+         , stStats = recordAlloc (stStats s)
          }
      )
 
@@ -567,7 +755,7 @@ alloc n s =
 allocStatic :: Node -> Store -> (Addr, Store)
 allocStatic n s =
   let a = stNextStatic s
-  in ( a
+  in ( HAddr a
      , s { stCells       = IM.insert a (Cell 1 n) (stCells s)
          , stNextStatic  = a - 1
          }
@@ -580,18 +768,27 @@ allocStatic n s =
 -- (non-negative) address; doing so silently overwrites a counted cell, so the
 -- caller ('runModuleRC') only ever passes reserved static addresses.
 writeStatic :: Addr -> Node -> Store -> Store
-writeStatic a n s = s { stCells = IM.insert a (Cell 1 n) (stCells s) }
+writeStatic (HAddr i) n s = s { stCells = IM.insert i (Cell 1 n) (stCells s) }
+writeStatic (CAddr _) _ _ = error "writeStatic: a C-heap address is never static"
 
 -- | Overwrite the NODE payload of an existing cell while PRESERVING its reference
 -- count (and statistics). Used by the M3 continuation-cell move primitives
 -- (@__cont_store@/@__cont_take@) to transition an 'NContCell' between
 -- @Nothing@ (empty) and @Just a@ (holding) in place, since those are MOVES, not
 -- allocations: the cell keeps its identity and its refcount across the fill/empty.
--- 'Left' if the address is dead or dangling (the cell must already exist).
-writeNode :: Addr -> Node -> Store -> Either RuntimeError Store
-writeNode a n s = do
-  c <- deref a s
-  Right s { stCells = IM.insert a c { cNode = n } (stCells s) }
+-- 'Left'/'throwE' if the address is dead or dangling (the cell must already
+-- exist). The interpreter monad form; 'writeNodePure' is the pure core.
+writeNode :: Addr -> Node -> Store -> RC Store
+writeNode a n s = liftRC (writeNodePure a n s)
+
+-- | The pure core of 'writeNode'. Operates on the abstract heap only: the M3
+-- continuation-cell ('NContCell') moves it serves are never C-eligible (an
+-- 'NContCell' is not an 'NCon'), so a 'CAddr' here is an internal error.
+writeNodePure :: Addr -> Node -> Store -> Either RuntimeError Store
+writeNodePure (CAddr _) _ _ = Left (PrimError (Tx.pack "writeNode: unexpected C-heap address"))
+writeNodePure a@(HAddr i) n s = do
+  c <- derefPure a s
+  Right s { stCells = IM.insert i c { cNode = n } (stCells s) }
 
 -- ---------------------------------------------------------------------------
 -- Closure construction
@@ -629,59 +826,182 @@ closureOwnedBoxed (NClosure env _ _ OwnCaptures) =
 closureOwnedBoxed (NClosure _ _ _ BorrowCaptures) = []
 closureOwnedBoxed _ = []
 
--- | Dereference an address. Returns 'Left' if the address has been freed
--- (use-after-free) or was never allocated (dangling pointer).
-deref :: Addr -> Store -> Either RuntimeError Cell
-deref a s
-  | IS.member a (stDead s) =
-      Left (PrimError (Tx.pack ("use-after-free: addr " <> show a)))
+-- | Dereference an address. Errors ('throwE') if an abstract address has been
+-- freed (use-after-free) or was never allocated (dangling pointer). A 'CAddr'
+-- reconstructs an @NCon Text [RCValue]@ by reading the C cell's tag, arity, and
+-- slots (the @rc@ field is set to 0 because readers never consult it for a C
+-- cell --- its real count lives in the C runtime). The interpreter monad form;
+-- 'derefPure' is the abstract-heap pure core used by the store-aware renderers
+-- and the store-algebra unit tests.
+deref :: Addr -> Store -> RC Cell
+deref (CAddr p)   s = liftIO (readCCell p s)
+deref a@(HAddr _) s = liftRC (derefPure a s)
+
+-- | Reconstruct the 'Cell' of a C-heap 'NCon' from its tag/arity/slots. Shared
+-- by 'deref' and the C-cell free cascade in 'dropAddr'.
+--
+-- THE @cRc@ FIELD IS A MEANINGLESS PLACEHOLDER (always 0) for a C cell: the real
+-- reference count lives in the C runtime (the @rc@ word of the @WokObj@). NO
+-- reader may consult the @cRc@ of a 'CAddr'-derived 'Cell' --- it would read the
+-- fixed 0, not the true count. The abstract-only consumers that DO read @cRc@
+-- ('moveOutContPure', 'increfPure', 'dropAddrStepPure') all reject a 'CAddr'
+-- BEFORE reaching the @cRc@ read, so the placeholder is never observed.
+readCCell :: Ptr WokObj -> Store -> IO Cell
+readCCell p s = do
+  tid <- H.wokTag p
+  raw <- readCSlots p
+  pure (Cell 0 (NCon (tagName tid s) (map decodeSlot raw)))
+
+-- | Read every slot of a C cell as @[(tag, payload)]@. Uses an explicit @take@
+-- over the arity rather than @[0 .. ar - 1]@: 'wokArity' is a 'Word32', so a
+-- nullary constructor (@ar == 0@) would make @ar - 1@ underflow to 'maxBound'
+-- and enumerate four billion slots --- a hang. @take 0@ is correctly empty.
+readCSlots :: Ptr WokObj -> IO [(Word64, Word64)]
+readCSlots p = do
+  ar <- H.wokArity p
+  mapM (H.wokSlotGet p) (take (fromIntegral ar) [0 ..])
+
+-- | The pure core of 'deref' over the ABSTRACT heap. A 'CAddr' is reconstructed
+-- by the IO 'deref' wrapper (the C runtime is read in 'IO'); reaching this pure
+-- core with a 'CAddr' is an internal routing error.
+derefPure :: Addr -> Store -> Either RuntimeError Cell
+derefPure (CAddr _) _ = Left (PrimError (Tx.pack "deref: C-heap address has no pure reconstruction"))
+derefPure (HAddr i) s
+  | IS.member i (stDead s) =
+      Left (PrimError (Tx.pack ("use-after-free: addr " <> show i)))
   | otherwise =
-      case IM.lookup a (stCells s) of
+      case IM.lookup i (stCells s) of
         Just c  -> Right c
-        Nothing -> Left (PrimError (Tx.pack ("dangling addr " <> show a)))
+        Nothing -> Left (PrimError (Tx.pack ("dangling addr " <> show i)))
 
 -- ---------------------------------------------------------------------------
 -- Reference-count operations
 
--- | Increment the reference count of a live cell. Returns 'Left' if the
--- address is dead or dangling. A NO-OP on static (negative) addresses: cells in
--- the immortal region are uncounted, so dup/drop of a global handle is inert.
-incref :: Addr -> Store -> Either RuntimeError Store
-incref a s
+-- | Increment the reference count of a live cell. Errors ('throwE') if an
+-- abstract address is dead or dangling. A NO-OP on static (negative) abstract
+-- addresses: immortal cells are uncounted, so dup/drop of a global handle is
+-- inert. A 'CAddr' increfs directly in the C runtime (@wok_dup@), leaving the
+-- store unchanged. The interpreter monad form; 'increfPure' is the abstract-heap
+-- pure core.
+incref :: Addr -> Store -> RC Store
+incref (CAddr p)   s = liftIO (H.wokDup p) >> pure s
+incref a@(HAddr _) s = liftRC (increfPure a s)
+
+-- | The pure core of 'incref' over the ABSTRACT heap. A 'CAddr' is increfed by
+-- the IO 'incref' wrapper (a direct @wok_dup@); reaching this pure core with one
+-- is an internal routing error.
+increfPure :: Addr -> Store -> Either RuntimeError Store
+increfPure (CAddr _) _ = Left (PrimError (Tx.pack "incref: C-heap address has no pure incref"))
+increfPure a@(HAddr i) s
   | isStaticAddr a = Right s
   | otherwise = do
-      c <- deref a s
-      Right s { stCells = IM.insert a c { cRc = cRc c + 1 } (stCells s) }
+      c <- derefPure a s
+      Right s { stCells = IM.insert i c { cRc = cRc c + 1 } (stCells s) }
 
 -- | Decrement the reference count of a cell. When the count reaches zero the
 -- cell is freed and its boxed children are recursively decremented.
 --
 -- The traversal is ITERATIVE (worklist), not host-recursive, so arbitrarily
--- deep structures do not cause a stack overflow.
-dropAddr :: Addr -> Store -> Either RuntimeError Store
+-- deep structures do not cause a stack overflow. The worklist genuinely MIXES
+-- 'Addr' kinds: a C cell can hold an 'HAddr' child and an abstract cell can hold
+-- a 'CAddr' child (cross-heap edges), so the RC monad owns the loop and
+-- dispatches each address by its kind --- 'HAddr' through the pure one-step
+-- helper 'dropAddrStepPure' (which preserves the exact abstract dec/free/stats/
+-- 'stDead'/cascade semantics), 'CAddr' through the C runtime (@wok_dec@, then on
+-- reaching zero, decode its slots for the cascade children and @wok_free@). A
+-- freed C cell's children are found by the SAME 'countedRefs' the abstract path
+-- uses, so cross-heap edges route themselves.
+dropAddr :: Addr -> Store -> RC Store
 dropAddr a0 s0 = go [a0] s0
   where
+    go [] s = pure s
+    go (CAddr p : rest) s = do
+      newrc <- liftIO (H.wokDec p)
+      if newrc /= 0
+        then go rest s
+        else do
+          -- About to free: decode the children for the cascade BEFORE freeing,
+          -- then return the C cell to the runtime. The children are an ordinary
+          -- 'countedRefs' set (CAddr + non-static HAddr), routed by 'go'.
+          --
+          -- WHY 'countedRefs' HERE IS THE CORRECT CASCADE (and 'cascadeChildren' is
+          -- not needed). A 'CAddr' is ALWAYS an 'NCon' ('allocNCon' is the only
+          -- 'CAddr' producer), and for an 'NCon',
+          --   cascadeChildren (NCon _ vs) == countedRefs (nodeValues (NCon _ vs))
+          --                               == countedRefs vs,
+          -- so 'countedRefs' over the decoded slots IS the cascade for the only
+          -- C-eligible node. The special routing 'cascadeChildren' adds (the 'NCont'
+          -- owned-set path) never applies to a 'CAddr'. If some OTHER node kind ever
+          -- becomes C-eligible AND needs that special routing, this branch must be
+          -- revisited to call 'cascadeChildren' on a reconstructed node instead.
+          raw <- liftIO (readCSlots p)
+          let kids = countedRefs (map decodeSlot raw)
+          hp <- heapPtr s
+          liftIO (H.wokFree hp p)
+          go (kids ++ rest) (bumpFreeStats s)
+    go (a@(HAddr _) : rest) s = do
+      (mkids, s') <- liftRC (dropAddrStepPure a s)
+      case mkids of
+        Nothing   -> go rest s'         -- just decremented (rc > 1) or static no-op
+        Just kids -> go (kids ++ rest) s'
+
+-- | The C-heap free-stats bump, mirroring the abstract path's free accounting in
+-- 'dropAddrStepPure' (frees + 1, live - 1). The C runtime keeps its own
+-- independent stat counters; this keeps the store-level 'Stats' identical to the
+-- abstract path so the differential oracle can diff abstract-vs-C totals.
+bumpFreeStats :: Store -> Store
+bumpFreeStats s = s { stStats = recordFree (stStats s) }
+
+-- | Extract the live C heap context from the store, or fail if the backend is
+-- 'AbstractHeap'. A 'CAddr' can only have been produced under a 'CHeap' backend,
+-- so reaching here with 'AbstractHeap' is an internal invariant break.
+heapPtr :: Store -> RC (Ptr WokHeap)
+heapPtr s = case stBackend s of
+  CHeap hp     -> pure hp
+  AbstractHeap -> liftRC (Left (PrimError (Tx.pack "internal: CAddr freed under AbstractHeap backend")))
+
+-- | One step of the abstract-heap drop worklist. Given a single 'HAddr',
+-- returns @Nothing@ if it only decremented (rc > 1) or was a static no-op, or
+-- @Just kids@ if it freed the cell and these are its cascade children (which may
+-- include 'CAddr's, e.g. an abstract cell holding a C child). Preserves the
+-- exact dec/free/stats/'stDead'/cascade semantics of the original
+-- 'dropAddrPure'; the unified 'dropAddr' loop and the pure 'dropAddrPure' loop
+-- both drive it.
+dropAddrStepPure :: Addr -> Store -> Either RuntimeError (Maybe [Addr], Store)
+dropAddrStepPure (CAddr _) _ = Left (PrimError (Tx.pack "dropAddrStepPure: C-heap address is not an abstract step"))
+dropAddrStepPure a@(HAddr i) s
+  -- Static (immortal) cells are uncounted: a drop of a global handle, or of a
+  -- dynamic field that points at a global, is inert. Skip it (no cascade).
+  | isStaticAddr a = Right (Nothing, s)
+  | IS.member i (stDead s) =
+      Left (PrimError (Tx.pack ("double-free: addr " <> show i)))
+  | otherwise =
+      case IM.lookup i (stCells s) of
+        Nothing -> Left (PrimError (Tx.pack ("drop of dangling addr " <> show i)))
+        Just c
+          | cRc c <= 1 ->  -- rc about to reach 0 -> free
+              let kids = cascadeChildren (cNode c)
+                  s'   = s { stCells = IM.delete i (stCells s)
+                           , stDead  = IS.insert i (stDead s)
+                           , stStats = recordFree (stStats s) }
+              in Right (Just kids, s')
+          | otherwise ->
+              Right (Nothing, s { stCells = IM.insert i c { cRc = cRc c - 1 } (stCells s) })
+
+-- | The pure core of 'dropAddr' for an ALL-'HAddr' worklist (no C-heap children
+-- reachable). Drives 'dropAddrStepPure' in a pure loop. Used by the store-algebra
+-- unit tests, which run on the abstract heap exclusively. A 'CAddr' encountered
+-- here (only possible if an abstract cell held a C child, which never arises in
+-- the pure-test fragment) is an internal error.
+dropAddrPure :: Addr -> Store -> Either RuntimeError Store
+dropAddrPure a0 s0 = go [a0] s0
+  where
     go [] s = Right s
-    go (a : rest) s
-      -- Static (immortal) cells are uncounted: a drop of a global handle, or of
-      -- a dynamic field that points at a global, is inert. Skip it.
-      | isStaticAddr a = go rest s
-      | IS.member a (stDead s) =
-          Left (PrimError (Tx.pack ("double-free: addr " <> show a)))
-      | otherwise =
-          case IM.lookup a (stCells s) of
-            Nothing -> Left (PrimError (Tx.pack ("drop of dangling addr " <> show a)))
-            Just c
-              | cRc c <= 1 ->  -- rc about to reach 0 -> free
-                  let kids = cascadeChildren (cNode c)
-                      st   = stStats s
-                      s'   = s { stCells = IM.delete a (stCells s)
-                               , stDead  = IS.insert a (stDead s)
-                               , stStats = st { stFrees = stFrees st + 1
-                                              , stLive  = stLive  st - 1 } }
-                  in go (kids ++ rest) s'
-              | otherwise ->
-                  go rest s { stCells = IM.insert a c { cRc = cRc c - 1 } (stCells s) }
+    go (a : rest) s = do
+      (mkids, s') <- dropAddrStepPure a s
+      case mkids of
+        Nothing   -> go rest s'
+        Just kids -> go (kids ++ rest) s'
 
 -- | Flatten all 'RCValue' fields of a 'Node' into a list. The drop cascade
 -- ('dropAddr') and the capture-incref ('closureOwnedBoxed') both route through
@@ -727,7 +1047,7 @@ data RCPrim = RCPrim
   { rpName  :: Text
   , rpArity :: Int
   , rpArgs  :: [RCValue]
-  , rpFn    :: [RCValue] -> Store -> Either RuntimeError (RCPrimResult, Store)
+  , rpFn    :: [RCValue] -> Store -> RC (RCPrimResult, Store)
   }
 
 -- | A saturated primitive either produces a value or asks the machine to apply
@@ -772,66 +1092,82 @@ bindRCBinders bs vs env = foldl' (\e (b, v) -> bindRCBinder b v e) env (zip bs v
 -- EXACTLY (required for the differential oracle). A dangling/dead handle
 -- surfaces as a 'Left' rather than silently rendering garbage.
 
-renderRCValue :: Store -> RCValue -> Either RuntimeError Text
-renderRCValue _ (RVLit l)           = Right (renderLit l)
-renderRCValue s (RVBox a)           = do
-  c <- deref a s
-  renderNode s (cNode c)
-renderRCValue _ RVRecMember{} = Right (Tx.pack "<closure>")
-renderRCValue _ (RVInst _ _)  = Right (Tx.pack "<instance>")
+-- | Render a value, threading a deref action so the same logic serves both the
+-- pure abstract path ('derefPure', @Either RuntimeError@) and the IO C-aware path
+-- ('deref', 'RC'). The two public renderers below are thin instantiations of this
+-- one; keeping a single body means the abstract and C-backed outputs cannot drift
+-- (the @rc-c-backend-parity@ output assertions would catch any divergence).
+renderValueWith :: Monad m => (Addr -> Store -> m Cell) -> Store -> RCValue -> m Text
+renderValueWith drf = goVal
+  where
+    goVal _ (RVLit l)       = pure (renderLit l)
+    goVal s (RVBox a)       = do
+      c <- drf a s
+      goNode s (cNode c)
+    goVal _ RVRecMember{}   = pure (Tx.pack "<closure>")
+    goVal _ (RVInst _ _)    = pure (Tx.pack "<instance>")
 
-renderNode :: Store -> Node -> Either RuntimeError Text
-renderNode _ (NCon t []) | t == Tx.pack "Nil" = Right (Tx.pack "[]")
-renderNode s (NCon t [h, tl]) | t == Tx.pack "Cons" = renderList s h tl
-renderNode s (NCon tag vs)
-  | Just n <- tupleArity tag, length vs == n = do
-      parts <- mapM (renderRCValue s) vs
-      Right (Tx.pack "(" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack ")")
-renderNode _ (NCon c []) = Right c
-renderNode s (NCon c vs) = do
-  parts <- mapM (renderRCValue s) vs
-  Right (c <> Tx.pack "(" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack ")")
-renderNode s (NRecord t m) = do
-  parts <- mapM (\(l, fv) -> do tv <- renderRCValue s fv
-                                Right (l <> Tx.pack " = " <> tv)) (Map.toList m)
-  Right (t <> Tx.pack " { " <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack " }")
-renderNode _ NClosure{}      = Right (Tx.pack "<closure>")
-renderNode _ (NGroupCode _)  = Right (Tx.pack "<closure>")
-renderNode _ (NEnv _)        = Right (Tx.pack "<env>")
-renderNode _ (NCont _ _)     = Right (Tx.pack "<continuation>")
-renderNode _ (NContCell _)   = Right (Tx.pack "<cont-cell>")
+    goNode _ (NCon t []) | t == Tx.pack "Nil" = pure (Tx.pack "[]")
+    goNode s (NCon t [h, tl]) | t == Tx.pack "Cons" = goList s h tl
+    goNode s (NCon tag vs)
+      | Just n <- tupleArity tag, length vs == n = do
+          parts <- mapM (goVal s) vs
+          pure (Tx.pack "(" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack ")")
+    goNode _ (NCon c []) = pure c
+    goNode s (NCon c vs) = do
+      parts <- mapM (goVal s) vs
+      pure (c <> Tx.pack "(" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack ")")
+    goNode s (NRecord t m) = do
+      parts <- mapM (\(l, fv) -> do tv <- goVal s fv
+                                    pure (l <> Tx.pack " = " <> tv)) (Map.toList m)
+      pure (t <> Tx.pack " { " <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack " }")
+    goNode _ NClosure{}      = pure (Tx.pack "<closure>")
+    goNode _ (NGroupCode _)  = pure (Tx.pack "<closure>")
+    goNode _ (NEnv _)        = pure (Tx.pack "<env>")
+    goNode _ (NCont _ _)     = pure (Tx.pack "<continuation>")
+    goNode _ (NContCell _)   = pure (Tx.pack "<cont-cell>")
+
+    -- Render a proper Cons/Nil list as @[a, b, c]@. An improper tail renders the
+    -- remainder after a @|@ so malformed lists are still total and visible.
+    goList s h0 tl0 = do
+      hd <- goVal s h0
+      spine [hd] tl0
+      where
+        spine acc v = case v of
+          RVBox a -> do
+            c <- drf a s
+            case cNode c of
+              NCon t [] | t == Tx.pack "Nil" ->
+                pure (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc) <> Tx.pack "]")
+              NCon t [h, tl] | t == Tx.pack "Cons" -> do
+                hd <- goVal s h
+                spine (hd : acc) tl
+              _ -> improper acc v
+          RVLit _       -> improper acc v
+          RVRecMember{} -> improper acc v
+          RVInst _ _    -> improper acc v
+        improper acc v = do
+          rest <- goVal s v
+          pure (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc)
+                   <> Tx.pack " | " <> rest <> Tx.pack "]")
+
+-- | Render a value over the ABSTRACT heap (pure, @Either RuntimeError@). Retained
+-- with this exact type for the store-algebra unit tests, which run on the abstract
+-- heap exclusively.
+renderRCValue :: Store -> RCValue -> Either RuntimeError Text
+renderRCValue = renderValueWith derefPure
+
+-- | Render a value in the interpreter monad, using the IO 'deref' so it can
+-- reconstruct a 'CAddr' (C-heap) cell. 'runModuleRC' uses this so a C-backed run
+-- renders byte-identical output to the abstract run.
+renderRCValueRC :: Store -> RCValue -> RC Text
+renderRCValueRC = renderValueWith deref
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)
 renderLit (LStr str) = Tx.pack (show str)
 renderLit (LChar c) = Tx.pack (show c)
 renderLit LUnit     = Tx.pack "()"
-
--- | Render a proper Cons/Nil list as @[a, b, c]@. An improper tail renders the
--- remainder after a @|@ so malformed lists are still total and visible. Mirrors
--- 'Wok.Interp.Value.renderList', derefing each spine handle.
-renderList :: Store -> RCValue -> RCValue -> Either RuntimeError Text
-renderList s h0 tl0 = do
-  hd <- renderRCValue s h0
-  go [hd] tl0
-  where
-    go acc v = case v of
-      RVBox a -> do
-        c <- deref a s
-        case cNode c of
-          NCon t [] | t == Tx.pack "Nil" ->
-            Right (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc) <> Tx.pack "]")
-          NCon t [h, tl] | t == Tx.pack "Cons" -> do
-            hd <- renderRCValue s h
-            go (hd : acc) tl
-          _ -> improper acc v
-      RVLit _           -> improper acc v
-      RVRecMember{} -> improper acc v
-      RVInst _ _    -> improper acc v
-    improper acc v = do
-      rest <- renderRCValue s v
-      Right (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc)
-               <> Tx.pack " | " <> rest <> Tx.pack "]")
 
 -- | If the tag is @TupleN@, return N.
 tupleArity :: Text -> Maybe Int

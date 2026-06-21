@@ -10,6 +10,7 @@ import Test.QuickCheck
   , frequency, conjoin, property, cover, checkCoverage, (.&&.) )
 import qualified Test.QuickCheck as QC
 import Control.Monad.State.Strict (StateT, runStateT, state, lift)
+import Control.Monad.Trans.Except (runExceptT)
 
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Map.Strict as Map
@@ -48,6 +49,9 @@ import qualified Wok.Interp.Machine as IM
 import qualified Wok.Interp.RC.Value as St
 import qualified Wok.Interp.RC.Prim as RCP
 import qualified Wok.Interp.RC.Machine as RCM
+import qualified Wok.Interp.RC.Heap as Heap
+import Data.Word (Word32, Word64)
+import Data.Int (Int64)
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
 import qualified Wok.IR.Perceus as Perceus
@@ -194,6 +198,7 @@ main = do
     , rcDropTests
     , rcIncrefTests
     , rcM3NodeTests
+    , wokRcHeapTests
     , rcMachineTests
     , rcModuleTests
     , rcLetRecTests
@@ -261,6 +266,13 @@ main = do
         ]
     , rcTeethTests perceusFiles
     , rcDeepListTests
+    -- C-backend differential oracle (Task 3): the WHOLE in-scope corpus run
+    -- through both the abstract heap and the C heap, asserting output + alloc-stat
+    -- parity; plus targeted cross-heap/fallback/deep tests and the slot
+    -- encode/decode round-trip property.
+    , rcCBackendParity (perceusFiles ++ rcM2bFiles)
+    , rcCBackendTargeted
+    , rcCBackendSlotProperty
     , rcPropertyTests
     , rcM2a1PropertyTests
     , rcM2bPropertyTests
@@ -6557,19 +6569,19 @@ rcStoreTests :: TestTree
 rcStoreTests = testGroup "rc store"
   [ testCase "alloc gives fresh addrs and counts" $ do
       let s0 = St.emptyStore
-          (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) s0
-          (b, s2) = St.alloc (St.NCon (T.pack "Nil") []) s1
-      a @?= 0
-      b @?= 1
+          (a, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (b, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+      a @?= St.HAddr 0
+      b @?= St.HAddr 1
       St.stLive (St.stStats s2) @?= 2
       St.stAllocs (St.stStats s2) @?= 2
   , testCase "deref reads a live cell" $ do
-      let (a, s1) = St.alloc (St.NCon (T.pack "True") []) St.emptyStore
-      case St.deref a s1 of
+      let (a, s1) = St.allocPure (St.NCon (T.pack "True") []) St.emptyStore
+      case St.derefPure a s1 of
         Right c -> St.cNode c @?= St.NCon (T.pack "True") []
         Left e  -> assertFailure ("unexpected: " <> show e)
   , testCase "deref of absent addr fails" $
-      case St.deref 99 St.emptyStore of
+      case St.derefPure (St.HAddr 99) St.emptyStore of
         Left _  -> pure ()
         Right _ -> assertFailure "expected failure on absent addr"
   ]
@@ -6577,39 +6589,39 @@ rcStoreTests = testGroup "rc store"
 rcDropTests :: TestTree
 rcDropTests = testGroup "rc drop"
   [ testCase "drop frees a unique leaf" $ do
-      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
-      case St.dropAddr a s1 of
+      let (a, s1) = St.allocPure (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.dropAddrPure a s1 of
         Right s2 -> do
           St.stFrees (St.stStats s2) @?= 1
           St.stLive  (St.stStats s2) @?= 0
-          case St.deref a s2 of
+          case St.derefPure a s2 of
             Left _  -> pure ()
             Right _ -> assertFailure "UAF not trapped"
         Left e -> assertFailure (show e)
   , testCase "double free is trapped" $ do
-      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
-      case St.dropAddr a s1 of
+      let (a, s1) = St.allocPure (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.dropAddrPure a s1 of
         Right s2 ->
-          case St.dropAddr a s2 of
+          case St.dropAddrPure a s2 of
             Left _  -> pure ()
             Right _ -> assertFailure "double-free not trapped"
         Left e -> assertFailure (show e)
   , testCase "drop recursively frees children" $ do
-      let (h, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
-          (t, s2) = St.alloc (St.NCon (T.pack "Nil") []) s1
-          (c, s3) = St.alloc (St.NCon (T.pack "Cons") [St.RVBox h, St.RVBox t]) s2
-      case St.dropAddr c s3 of
+      let (h, s1) = St.allocPure (St.NCon (T.pack "Nil") []) St.emptyStore
+          (t, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (c, s3) = St.allocPure (St.NCon (T.pack "Cons") [St.RVBox h, St.RVBox t]) s2
+      case St.dropAddrPure c s3 of
         Right s4 -> St.stLive (St.stStats s4) @?= 0
         Left e   -> assertFailure (show e)
   , testCase "deep list drops iteratively (no stack overflow)" $ do
       let n = 200000 :: Int
           -- NOTE: build is GHC-stack-recursive (GHC grows its stack); this test isolates dropAddr's EXPLICIT iterativeness, not the builder's.
-          build 0 s = St.alloc (St.NCon (T.pack "Nil") []) s
+          build 0 s = St.allocPure (St.NCon (T.pack "Nil") []) s
           build k s =
             let (rest, s') = build (k - 1) s
-            in St.alloc (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt (fromIntegral k)), St.RVBox rest]) s'
+            in St.allocPure (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt (fromIntegral k)), St.RVBox rest]) s'
           (top, s1) = build n St.emptyStore
-      case St.dropAddr top s1 of
+      case St.dropAddrPure top s1 of
         Right s2 -> St.stLive (St.stStats s2) @?= 0
         Left e   -> assertFailure (show e)
   ]
@@ -6617,34 +6629,34 @@ rcDropTests = testGroup "rc drop"
 rcIncrefTests :: TestTree
 rcIncrefTests = testGroup "rc incref"
   [ testCase "incref bumps rc from 1 to 2" $ do
-      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
-      case St.incref a s1 of
+      let (a, s1) = St.allocPure (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.increfPure a s1 of
         Right s2 ->
-          case St.deref a s2 of
+          case St.derefPure a s2 of
             Right c -> St.cRc c @?= 2
             Left e  -> assertFailure ("deref after incref: " <> show e)
         Left e -> assertFailure ("incref failed: " <> show e)
   , testCase "incref on dead addr returns Left" $ do
-      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
-      case St.dropAddr a s1 of
+      let (a, s1) = St.allocPure (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.dropAddrPure a s1 of
         Right s2 ->
-          case St.incref a s2 of
+          case St.increfPure a s2 of
             Left _  -> pure ()
             Right _ -> assertFailure "incref of dead addr should return Left"
         Left e -> assertFailure ("drop failed: " <> show e)
   , testCase "incref then two drops frees exactly once" $ do
-      let (a, s1) = St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
-      case St.incref a s1 of
+      let (a, s1) = St.allocPure (St.NCon (T.pack "Nil") []) St.emptyStore
+      case St.increfPure a s1 of
         Left e -> assertFailure ("incref failed: " <> show e)
         Right s2 ->
-          case St.dropAddr a s2 of
+          case St.dropAddrPure a s2 of
             Left e  -> assertFailure ("first drop failed: " <> show e)
             Right s3 -> do
               St.stFrees (St.stStats s3) @?= 0
-              case St.deref a s3 of
+              case St.derefPure a s3 of
                 Left e  -> assertFailure ("cell freed too early: " <> show e)
                 Right _ ->
-                  case St.dropAddr a s3 of
+                  case St.dropAddrPure a s3 of
                     Left e  -> assertFailure ("second drop failed: " <> show e)
                     Right s4 -> do
                       St.stFrees (St.stStats s4) @?= 1
@@ -6671,33 +6683,33 @@ rcM3NodeTests = testGroup "rc m3 node"
       let s0          = St.emptyStore
           baseline    = St.stLive (St.stStats s0)
           cont        = St.NCont St.KDoneRC (m2b2NoParamHandler, 0, St.emptyRCScope)
-          (contAddr, s1) = St.alloc cont s0
-          (cellAddr, s2) = St.alloc (St.NContCell (Just contAddr)) s1
+          (contAddr, s1) = St.allocPure cont s0
+          (cellAddr, s2) = St.allocPure (St.NContCell (Just contAddr)) s1
       -- The cell counts the continuation as its single child.
       St.cascadeChildren (St.NContCell (Just contAddr)) @?= [contAddr]
       St.stLive (St.stStats s2) @?= baseline + 2
-      case St.dropAddr cellAddr s2 of
+      case St.dropAddrPure cellAddr s2 of
         Left e  -> assertFailure ("cell drop failed: " <> show e)
         Right s3 -> do
           -- Both the cell and the held continuation are freed; heap balanced.
           St.stLive (St.stStats s3) @?= baseline
           St.stFrees (St.stStats s3) - St.stFrees (St.stStats s2) @?= 2
           -- The continuation cell is gone (a second free would be a double-free).
-          case St.deref contAddr s3 of
+          case St.derefPure contAddr s3 of
             Left _  -> pure ()
             Right _ -> assertFailure "held continuation was not freed"
-          case St.deref cellAddr s3 of
+          case St.derefPure cellAddr s3 of
             Left _  -> pure ()
             Right _ -> assertFailure "cell was not freed"
   , testCase "empty cell drops cleanly with no children" $ do
       let s0       = St.emptyStore
           baseline = St.stLive (St.stStats s0)
-          (cellAddr, s1) = St.alloc (St.NContCell Nothing) s0
+          (cellAddr, s1) = St.allocPure (St.NContCell Nothing) s0
       -- An empty cell has no children.
       St.cascadeChildren (St.NContCell Nothing) @?= []
       St.nodeValues (St.NContCell Nothing) @?= []
       St.stLive (St.stStats s1) @?= baseline + 1
-      case St.dropAddr cellAddr s1 of
+      case St.dropAddrPure cellAddr s1 of
         Left e  -> assertFailure ("empty cell drop failed: " <> show e)
         Right s2 -> do
           St.stLive (St.stStats s2) @?= baseline
@@ -6711,24 +6723,24 @@ rcM3NodeTests = testGroup "rc m3 node"
       let s0          = St.emptyStore
           baseline    = St.stLive (St.stStats s0)
           -- Allocate the owned value (e.g. the handler parameter's heap value).
-          (ownedAddr, s1) = St.alloc (St.NCon (T.pack "Owned") []) s0
+          (ownedAddr, s1) = St.allocPure (St.NCon (T.pack "Owned") []) s0
           pb          = Binder (Name (T.pack "s") (Unique 8200)) Unrestricted m2bBoxTy
           h           = m2b2ParamHandler pb
           hsc         = St.RCScope (Map.fromList [(Unique 8200, St.RVBox ownedAddr)]) Map.empty
           prefix      = St.KHandleRC h 0 hsc St.KDoneRC
           cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
-          (contAddr, s2) = St.alloc cont s1
-          (cellAddr, s3) = St.alloc (St.NContCell (Just contAddr)) s2
+          (contAddr, s2) = St.allocPure cont s1
+          (cellAddr, s3) = St.allocPure (St.NContCell (Just contAddr)) s2
       -- Sanity: the continuation's owned set is exactly the owned value.
       St.continuationOwned prefix @?= [ownedAddr]
       St.stLive (St.stStats s3) @?= baseline + 3
-      case St.dropAddr cellAddr s3 of
+      case St.dropAddrPure cellAddr s3 of
         Left e  -> assertFailure ("cell drop failed: " <> show e)
         Right s4 -> do
           -- cell + NCont shell + owned value all freed: heap balanced.
           St.stLive (St.stStats s4) @?= baseline
           St.stFrees (St.stStats s4) - St.stFrees (St.stStats s3) @?= 3
-          case St.deref ownedAddr s4 of
+          case St.derefPure ownedAddr s4 of
             Left _  -> pure ()
             Right _ -> assertFailure "owned value was not freed through the cell cascade"
   ]
@@ -6805,7 +6817,8 @@ rcM3AdmitTests = testGroup "rc-m3 admit (store route through CHECKED runModuleRC
   , testCase "01-store-resume: heap-balanced through the CHECKED runModuleRC" $ do
       cm <- elaboratedModuleOf "test/rc-m3/01-store-resume.wok"
       let pruned = pruneToReachable cm
-      case (Interp.runModule pruned, RCM.runModuleRC (Perceus.insertRC pruned)) of
+      rc <- RCM.runModuleRC (Perceus.insertRC pruned)
+      case (Interp.runModule pruned, rc) of
         (Right v, Right run) -> do
           -- Production runner agrees with the reference AND returns to baseline.
           Interp.renderValue v @?= RCM.rcOutput run
@@ -6876,10 +6889,10 @@ rcM3CarrierWallTests = testGroup "m3 cycle red-check (carrier-wall is load-beari
       -- 'dropAddr's 'stDead' guard. This proves the surviving cycle is a real
       -- memory-safety fault, so the check is load-bearing.
       let (s2, contAddr, _h, _prefix, cellAddr) = buildCycleStore
-      case St.writeNode cellAddr (St.NContCell (Just contAddr)) s2 of
+      case St.writeNodePure cellAddr (St.NContCell (Just contAddr)) s2 of
         Left e   -> assertFailure ("setup writeNode failed: " <> show e)
         Right s3 ->
-          case St.dropAddr cellAddr s3 of
+          case St.dropAddrPure cellAddr s3 of
             Left (IV.PrimError m)
               | T.pack "double-free" `T.isInfixOf` m -> pure ()   -- the cycle bites
             Left e  -> assertFailure
@@ -6894,8 +6907,9 @@ rcM3CarrierWallTests = testGroup "m3 cycle red-check (carrier-wall is load-beari
       let (s2, contAddr, _h, _prefix, cellAddr) = buildCycleStore
       case Map.lookup (T.pack "__cont_store") RCP.rcPrimTable of
         Nothing -> assertFailure "rcPrimTable is missing __cont_store"
-        Just p  ->
-          case St.rpFn p [St.RVBox cellAddr, St.RVBox contAddr] s2 of
+        Just p  -> do
+          res <- runExceptT (St.rpFn p [St.RVBox cellAddr, St.RVBox contAddr] s2)
+          case res of
             Left (IV.PrimError m)
               | T.pack "carrier-wall" `T.isInfixOf` m -> pure ()   -- rejected as designed
             Left e  -> assertFailure
@@ -7021,13 +7035,13 @@ carrierWallDupHandlerWith srcFresh =
 buildCycleStore :: (St.Store, St.Addr, Anf.Handler, St.RCKont, St.Addr)
 buildCycleStore =
   let s0          = St.emptyStore
-      (cellAddr, s1) = St.alloc (St.NContCell Nothing) s0
+      (cellAddr, s1) = St.allocPure (St.NContCell Nothing) s0
       pb          = Binder (Name (T.pack "baton") (Unique 8300)) Unrestricted m2bBoxTy
       h           = m2b2ParamHandler pb
       hsc         = St.RCScope (Map.fromList [(Unique 8300, St.RVBox cellAddr)]) Map.empty
       prefix      = St.KHandleRC h 0 hsc St.KDoneRC
       cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
-      (contAddr, s2) = St.alloc cont s1
+      (contAddr, s2) = St.allocPure cont s1
   in (s2, contAddr, h, prefix, cellAddr)
 
 -- | A handler whose 'tick' op-arm stores 'resume' into a cell that is a FREE
@@ -7183,20 +7197,22 @@ rcM3TwoCellCycleSubsumedTests =
       let (s2, cellA, cellB, contA, contB) = buildTwoCellCycle
       case Map.lookup (T.pack "__cont_store") RCP.rcPrimTable of
         Nothing -> assertFailure "rcPrimTable is missing __cont_store"
-        Just storeP ->
+        Just storeP -> do
           -- leg 1: store contA into cellA. single-level: cellA `elem` owned(contA)?
-          case St.rpFn storeP [St.RVBox cellA, St.RVBox contA] s2 of
+          leg1 <- runExceptT (St.rpFn storeP [St.RVBox cellA, St.RVBox contA] s2)
+          case leg1 of
             Left e -> assertFailure
               ("leg1 should pass the single-level check (cellA is NOT in contA's owned set), got: "
                 <> show e)
-            Right (_, s3) ->
-              case St.rpFn storeP [St.RVBox cellB, St.RVBox contB] s3 of
+            Right (_, s3) -> do
+              leg2 <- runExceptT (St.rpFn storeP [St.RVBox cellB, St.RVBox contB] s3)
+              case leg2 of
                 Left e -> assertFailure
                   ("leg2 should pass the single-level check (cellB is NOT in contB's owned set), got: "
                     <> show e)
                 Right (_, s4) ->
                   -- The cycle is now LIVE; dropping cellA double-frees (caught loudly by stDead).
-                  case St.dropAddr cellA s4 of
+                  case St.dropAddrPure cellA s4 of
                     Left (IV.PrimError m)
                       | T.pack "double-free" `T.isInfixOf` m -> pure ()  -- the surviving cycle bites
                     Left e  -> assertFailure
@@ -7232,20 +7248,20 @@ rcM3TwoCellCycleSubsumedTests =
 buildTwoCellCycle :: (St.Store, St.Addr, St.Addr, St.Addr, St.Addr)
 buildTwoCellCycle =
   let s0            = St.emptyStore
-      (cellA, s1)   = St.alloc (St.NContCell Nothing) s0
-      (cellB, s2)   = St.alloc (St.NContCell Nothing) s1
+      (cellA, s1)   = St.allocPure (St.NContCell Nothing) s0
+      (cellB, s2)   = St.allocPure (St.NContCell Nothing) s1
       -- contA owns cellB (its nested-handler param value is RVBox cellB).
       pbA           = Binder (Name (T.pack "pa") (Unique 8700)) Unrestricted m2bBoxTy
       hA            = m2b2ParamHandler pbA
       hscA          = St.RCScope (Map.fromList [(Unique 8700, St.RVBox cellB)]) Map.empty
       prefixA       = St.KHandleRC hA 0 hscA St.KDoneRC
-      (contA, s3)   = St.alloc (St.NCont prefixA (m2b2NoParamHandler, 0, St.emptyRCScope)) s2
+      (contA, s3)   = St.allocPure (St.NCont prefixA (m2b2NoParamHandler, 0, St.emptyRCScope)) s2
       -- contB owns cellA.
       pbB           = Binder (Name (T.pack "pb") (Unique 8710)) Unrestricted m2bBoxTy
       hB            = m2b2ParamHandler pbB
       hscB          = St.RCScope (Map.fromList [(Unique 8710, St.RVBox cellA)]) Map.empty
       prefixB       = St.KHandleRC hB 0 hscB St.KDoneRC
-      (contB, s4)   = St.alloc (St.NCont prefixB (m2b2NoParamHandler, 0, St.emptyRCScope)) s3
+      (contB, s4)   = St.allocPure (St.NCont prefixB (m2b2NoParamHandler, 0, St.emptyRCScope)) s3
   in (s4, cellA, cellB, contA, contB)
 
 -- | A handler whose op-arm stores its 'resume' into a cell that is a FREE VARIABLE
@@ -7325,8 +7341,8 @@ rcM3RawVsNamedOwnedSetTests =
 buildRawAndNamedOwned :: (St.Store, St.Addr, St.RCKont)
 buildRawAndNamedOwned =
   let s0          = St.emptyStore
-      (aAddr, s1) = St.alloc (St.NCon (T.pack "Owned") []) s0   -- rc 1
-      s2          = either (error . show) id (St.incref aAddr s1)  -- rc 2 (the dup)
+      (aAddr, s1) = St.allocPure (St.NCon (T.pack "Owned") []) s0   -- rc 1
+      s2          = either (error . show) id (St.increfPure aAddr s1)  -- rc 2 (the dup)
       -- KLetRC frame: body = Ret (AVar x) makes x a non-head MOVE occurrence, so x
       -- (bound to RVBox aAddr) is in the frame's owned set --- the NAMED (Just u, A).
       xName       = Name (T.pack "x") (Unique 8801)
@@ -7341,7 +7357,7 @@ buildRawAndNamedOwned =
 -- | Free each address in a list in order (the owned-set cascade does exactly this:
 -- one 'dropAddr' per owned-set entry). 'Left' on the first error.
 freeEach :: [St.Addr] -> St.Store -> Either IV.RuntimeError St.Store
-freeEach addrs s0 = foldl (\acc a -> acc >>= St.dropAddr a) (Right s0) addrs
+freeEach addrs s0 = foldl (\acc a -> acc >>= St.dropAddrPure a) (Right s0) addrs
 
 -- ---------------------------------------------------------------------------
 -- M3 Task 5: the DOUBLE-RESUME red-check (the 'moveOutCont' rc==1 floor is
@@ -7388,11 +7404,11 @@ rcM3DoubleResumeTests = testGroup "m3 double-resume red-check (rc==1 floor is lo
       -- once. Heap returns to baseline (the floor does NOT over-reject).
       let (s0, contAddr, ownedAddr, _prefix) = buildDoubleResumeNCont
           baseline = St.stLive (St.stStats s0)
-      case St.moveOutCont contAddr s0 of
+      case St.moveOutContPure contAddr s0 of
         Left e -> assertFailure ("a legitimate single resume must succeed at rc==1: " <> show e)
         Right (_prefix', _hinfo, s1) ->
           -- The spliced frames run and free the owned set exactly once.
-          case St.dropAddr ownedAddr s1 of
+          case St.dropAddrPure ownedAddr s1 of
             Left e  -> assertFailure ("owned-set free after one resume must succeed: " <> show e)
             Right s2 -> St.stLive (St.stStats s2) @?= baseline - 2  -- shell + owned freed
 
@@ -7402,10 +7418,10 @@ rcM3DoubleResumeTests = testGroup "m3 double-resume red-check (rc==1 floor is lo
       -- attempt, BEFORE any frame is spliced or any owned value is freed --- a
       -- loud, local "one-shot violation" rather than a silent double-free.
       let (s0, contAddr, _ownedAddr, _prefix) = buildDoubleResumeNCont
-      case St.incref contAddr s0 of
+      case St.increfPure contAddr s0 of
         Left e   -> assertFailure ("setup incref failed: " <> show e)
         Right s1 ->
-          case St.moveOutCont contAddr s1 of
+          case St.moveOutContPure contAddr s1 of
             Left e
               | rcMemSafetyFault e -> pure ()   -- the floor caught it loudly
               | otherwise -> assertFailure
@@ -7425,13 +7441,13 @@ rcM3DoubleResumeTests = testGroup "m3 double-resume red-check (rc==1 floor is lo
       -- resume site (it surfaces later as a double-free / heap imbalance), which is
       -- precisely what the rc==1 floor (caught above) prevents up front.
       let (s0, contAddr, ownedAddr, _prefix) = buildDoubleResumeNCont
-      case St.moveOutCont contAddr s0 of
+      case St.moveOutContPure contAddr s0 of
         Left e -> assertFailure ("resume #1 must succeed at rc==1: " <> show e)
         Right (_prefix', _hinfo, s1) ->
-          case St.dropAddr ownedAddr s1 of      -- resume #1's spliced frames free the owned set
+          case St.dropAddrPure ownedAddr s1 of      -- resume #1's spliced frames free the owned set
             Left e  -> assertFailure ("owned-set free after resume #1 must succeed: " <> show e)
             Right s2 ->
-              case St.dropAddr ownedAddr s2 of   -- resume #2 (double-resume) frees it AGAIN
+              case St.dropAddrPure ownedAddr s2 of   -- resume #2 (double-resume) frees it AGAIN
                 Left (IV.PrimError m)
                   | T.pack "double-free" `T.isInfixOf` m -> pure ()   -- the corruption bites
                 Left e  -> assertFailure
@@ -7448,13 +7464,13 @@ rcM3DoubleResumeTests = testGroup "m3 double-resume red-check (rc==1 floor is lo
 buildDoubleResumeNCont :: (St.Store, St.Addr, St.Addr, St.RCKont)
 buildDoubleResumeNCont =
   let s0             = St.emptyStore
-      (ownedAddr, s1) = St.alloc (St.NCon (T.pack "Owned") []) s0
+      (ownedAddr, s1) = St.allocPure (St.NCon (T.pack "Owned") []) s0
       pb             = Binder (Name (T.pack "s") (Unique 8500)) Unrestricted m2bBoxTy
       h              = m2b2ParamHandler pb
       hsc            = St.RCScope (Map.fromList [(Unique 8500, St.RVBox ownedAddr)]) Map.empty
       prefix         = St.KHandleRC h 0 hsc St.KDoneRC
       cont           = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
-      (contAddr, s2) = St.alloc cont s1
+      (contAddr, s2) = St.allocPure cont s1
   in (s2, contAddr, ownedAddr, prefix)
 
 -- ---------------------------------------------------------------------------
@@ -7476,7 +7492,7 @@ rcBnd n = Anf.Binder n Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])
 -- count. A 'Left' anywhere is reported as a test failure.
 runAndAccount :: Anf.Expr -> IO (Text, Int)
 runAndAccount e =
-  case RCM.runExprRC RCP.rcPrimTable Map.empty (St.initSentinel St.emptyStore) e of
+  RCM.runExprRC RCP.rcPrimTable Map.empty (St.initSentinel St.emptyStore) e >>= \case
     Left err -> assertFailure ("rc run failed: " <> show err)
     Right (v, s) ->
       case St.renderRCValue s v of
@@ -7484,15 +7500,47 @@ runAndAccount e =
         Right txt ->
           case v of
             St.RVBox a ->
-              case St.dropAddr a s of
+              case St.dropAddrPure a s of
                 Left err -> assertFailure ("result drop failed: " <> show err)
                 Right s' -> pure (txt, St.stLive (St.stStats s'))
             St.RVLit _           -> pure (txt, St.stLive (St.stStats s))
             St.RVRecMember _ _ envA ->
-              case St.dropAddr envA s of
+              case St.dropAddrPure envA s of
                 Left err -> assertFailure ("result drop failed: " <> show err)
                 Right s' -> pure (txt, St.stLive (St.stStats s'))
             St.RVInst _ _        -> pure (txt, St.stLive (St.stStats s))
+
+wokRcHeapTests :: TestTree
+wokRcHeapTests = testGroup "wok-rc-heap (raw C runtime FFI)"
+  [ testCase "alloc/set/get/dup/dec/free round-trip + stats" $ do
+      h <- Heap.wokHeapNew
+      p <- Heap.wokAlloc h 7 2
+      Heap.wokSlotSet p 0 Heap.wsLitInt 42
+      Heap.wokSlotSet p 1 Heap.wsLitUnit 0
+      t  <- Heap.wokTag p
+      ar <- Heap.wokArity p
+      s0 <- Heap.wokSlotGet p 0
+      s1 <- Heap.wokSlotGet p 1
+      assertEqual "tag" (7 :: Word32) t
+      assertEqual "arity" (2 :: Word32) ar
+      assertEqual "slot0" (Heap.wsLitInt, 42 :: Word64) s0
+      assertEqual "slot1" (Heap.wsLitUnit, 0 :: Word64) s1
+      Heap.wokDup p
+      rc1 <- Heap.wokDec p
+      assertEqual "rc after dup+dec" (1 :: Word64) rc1
+      rc0 <- Heap.wokDec p
+      assertEqual "rc at zero" (0 :: Word64) rc0
+      Heap.wokFree h p
+      allocs <- Heap.wokStatAllocs h
+      frees  <- Heap.wokStatFrees h
+      live   <- Heap.wokStatLive h
+      peak   <- Heap.wokStatPeak h
+      assertEqual "allocs" (1 :: Word64) allocs
+      assertEqual "frees"  (1 :: Word64) frees
+      assertEqual "live"   (0 :: Int64) live
+      assertEqual "peak"   (1 :: Int64) peak
+      Heap.wokHeapFree h
+  ]
 
 rcMachineTests :: TestTree
 rcMachineTests = testGroup "rc machine"
@@ -7539,7 +7587,8 @@ rcMachineTests = testGroup "rc machine"
       -- succeeds, is heap-balanced, and matches the reference interpreter.
       firstOrderNoHandlerViolations (cmWith True True) @?= []
       let escCm = pruneToReachable (cmWith True True)
-      case (Interp.runModule escCm, RCM.runModuleRCUnchecked (Perceus.insertRC escCm)) of
+      rc <- RCM.runModuleRCUnchecked (Perceus.insertRC escCm)
+      case (Interp.runModule escCm, rc) of
         (Right v, Right run) -> do
           Interp.renderValue v @?= RCM.rcOutput run
           let st = RCM.rcStats run; bl = RCM.rcBaseline run
@@ -7723,9 +7772,9 @@ rcMachineTests = testGroup "rc machine"
                                (Anf.RApp (Anf.AVar dropName) [Anf.AVar fName])
                                (Anf.Ret (Anf.AVar yName)))
           s0          = St.emptyStore
-          (yAddr, s1) = St.alloc (St.NCon (T.pack "Y") []) s0
+          (yAddr, s1) = St.allocPure (St.NCon (T.pack "Y") []) s0
           env         = Map.fromList [(yU, St.RVBox yAddr)]
-      case RCM.runExprRC RCP.rcPrimTable env s1 e of
+      RCM.runExprRC RCP.rcPrimTable env s1 e >>= \case
         Left err     -> assertFailure ("expected success, got: " <> show err)
         Right (v, sf) -> do
           -- y must still be live (not freed by the closure drop)
@@ -7783,7 +7832,7 @@ test_closureInstrumentationHeapEmpty =
   testCase "closure instrumentation: build+call is heap-empty" $
     case Perceus.insertRC closureModule of
       Anf.CoreModule (Anf.TopBind _ _ body0 : _) ->
-        case RCM.runExprRC RCP.rcPrimTable Map.empty St.emptyStore body0 of
+        RCM.runExprRC RCP.rcPrimTable Map.empty St.emptyStore body0 >>= \case
           Left err      -> assertFailure ("run failed: " <> show err)
           Right (_, st) -> St.stLive (St.stStats st) @?= 0
       Anf.CoreModule [] -> assertFailure "insertRC dropped the module's binds"
@@ -7822,7 +7871,7 @@ rcModuleTests = testGroup "rc module"
       --             ys = id2 xs                -- call the static global
       --             _  = __rc_drop ys          -- frees the list (ys aliases xs)
       --         in 0                           -- => 0, dynamic heap empty
-      let (txt, st, bl) = runFresh $ do
+      let cm = runFresh $ do
             -- global function 'id2'
             nId  <- freshName (T.pack "id2")
             nIdX <- freshName (T.pack "x")
@@ -7844,7 +7893,7 @@ rcModuleTests = testGroup "rc module"
                   (Anf.Ret (Anf.ALit (Anf.LInt 0)))))))
                 mainBind = rcTop nMain [] mainBody
             pure (Anf.CoreModule [idBind, mainBind])
-            >>= \cm -> case RCM.runModuleRC cm of
+      (txt, st, bl) <- RCM.runModuleRC cm >>= \case
                          Left err  -> error ("runModuleRC failed: " <> show err)
                          Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
       txt @?= T.pack "0"
@@ -7858,7 +7907,7 @@ rcModuleTests = testGroup "rc module"
   , testCase "boxed result is dropped by runModuleRC; heap empties" $ do
       -- main = Cons 1 (Cons 2 Nil)         -- returns a boxed list directly;
       --                                     -- runModuleRC renders THEN drops it.
-      let (txt, st, bl) = runFresh $ do
+      let cm = runFresh $ do
             nMain <- freshName (T.pack "main")
             nNil  <- freshName (T.pack "n"); nC2 <- freshName (T.pack "c2")
             nXs   <- freshName (T.pack "xs")
@@ -7870,7 +7919,7 @@ rcModuleTests = testGroup "rc module"
                     (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nC2])
                   (Anf.Ret (Anf.AVar nXs))))
             pure (Anf.CoreModule [rcTop nMain [] mainBody])
-            >>= \cm -> case RCM.runModuleRC cm of
+      (txt, st, bl) <- RCM.runModuleRC cm >>= \case
                          Left err  -> error ("runModuleRC failed: " <> show err)
                          Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
       txt @?= T.pack "[1, 2]"
@@ -7881,10 +7930,10 @@ rcModuleTests = testGroup "rc module"
 
   , testCase "literal result, no allocation: empty heap, zero allocs" $ do
       -- main = 99                           -- => 99, no allocation, no drop
-      let (txt, st, bl) = runFresh $ do
+      let cm = runFresh $ do
             nMain <- freshName (T.pack "main")
             pure (Anf.CoreModule [rcTop nMain [] (Anf.Ret (Anf.ALit (Anf.LInt 99)))])
-            >>= \cm -> case RCM.runModuleRC cm of
+      (txt, st, bl) <- RCM.runModuleRC cm >>= \case
                          Left err  -> error ("runModuleRC failed: " <> show err)
                          Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
       txt @?= T.pack "99"
@@ -7894,7 +7943,7 @@ rcModuleTests = testGroup "rc module"
       St.stAllocs st @?= (0 :: Int)
 
   , testCase "missing main is a loud error" $
-      case RCM.runModuleRC (Anf.CoreModule []) of
+      RCM.runModuleRC (Anf.CoreModule []) >>= \case
         Left _  -> pure ()
         Right _ -> assertFailure "expected runModuleRC to reject a module with no main"
 
@@ -7915,7 +7964,7 @@ rcModuleTests = testGroup "rc module"
       -- The 'b' allocation leaks in this synthetic test; that is expected and
       -- acceptable here because the heap-balance invariant is fully covered by
       -- the corpus programs 26-30 which use correctly typed source programs.
-      let txt = runFresh $ do
+      let cm = runFresh $ do
             nApply <- freshName (T.pack "apply")
             nF     <- freshName (T.pack "f")
             nX     <- freshName (T.pack "x")
@@ -7940,8 +7989,8 @@ rcModuleTests = testGroup "rc module"
                     (Anf.RApp (Anf.AVar nApply) [Anf.AVar nLam, Anf.AVar nB])
                   (Anf.Ret (Anf.AVar nR)))))
                 mainBind = rcTop nMain [] mainBody
-                cm = Anf.CoreModule [applyBind, mainBind]
-            case RCM.runModuleRC (Perceus.insertRC cm) of
+            pure (Anf.CoreModule [applyBind, mainBind])
+      txt <- RCM.runModuleRC (Perceus.insertRC cm) >>= \case
               Left err  -> error ("runModuleRC failed: " <> show err)
               Right run -> pure (RCM.rcOutput run)
       txt @?= T.pack "7"
@@ -7966,7 +8015,7 @@ rcModuleTests = testGroup "rc module"
       -- After installation, baseline = 1 (the Tuple2 cell is live).
       -- main allocates nothing and returns a literal, so stLive stays at 1.
       -- Oracle: baseline == 1, stLive == 1 (== baseline), no leak on top.
-      let (txt, st, bl) = runFresh $ do
+      let cm = runFresh $ do
             nPair  <- freshName (T.pack "pair")
             nPairV <- freshName (T.pack "pairV")  -- local binder inside the CAF body
             nMain  <- freshName (T.pack "main")
@@ -7978,7 +8027,7 @@ rcModuleTests = testGroup "rc module"
                                (Anf.Ret (Anf.AVar nPairV)))
                 mainBind = rcTop nMain [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
             pure (Anf.CoreModule [pairBind, mainBind])
-            >>= \cm -> case RCM.runModuleRC cm of
+      (txt, st, bl) <- RCM.runModuleRC cm >>= \case
                          Left err  -> error ("runModuleRC failed: " <> show err)
                          Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
       txt @?= T.pack "0"
@@ -7996,7 +8045,7 @@ rcModuleTests = testGroup "rc module"
       -- After installation, baseline = 3.
       -- main allocates nothing; stLive stays at 3.
       -- Oracle: baseline == 3, stLive == 3 (== baseline), no leak on top.
-      let (txt, st, bl) = runFresh $ do
+      let cm = runFresh $ do
             nXs   <- freshName (T.pack "xs")
             nMain <- freshName (T.pack "main")
             nNil  <- freshName (T.pack "nil")
@@ -8013,7 +8062,7 @@ rcModuleTests = testGroup "rc module"
                            (Anf.Ret (Anf.AVar nC1)))))
                 mainBind = rcTop nMain [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
             pure (Anf.CoreModule [xsBind, mainBind])
-            >>= \cm -> case RCM.runModuleRC cm of
+      (txt, st, bl) <- RCM.runModuleRC cm >>= \case
                          Left err  -> error ("runModuleRC failed: " <> show err)
                          Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
       txt @?= T.pack "0"
@@ -8161,7 +8210,7 @@ rcLetRecTests = testGroup "rc letrec"
   -- __rc_drop per member. main allocates nothing dynamic, so the ONLY live cells
   -- after main are the two immortal CAF cells: stLive must equal the baseline.
   , testCase "covered letrec group capturing a value-CAF: no double-free, stLive==baseline" $ do
-      let (txt, st, bl) = runFresh $ do
+      let cm = runFresh $ do
             nCaf  <- freshName (T.pack "caf")
             nCafV <- freshName (T.pack "cafV")
             nNil  <- freshName (T.pack "nil")
@@ -8185,8 +8234,8 @@ rcLetRecTests = testGroup "rc letrec"
                     ]
                     (Anf.Ret (Anf.ALit (Anf.LInt 0)))
                 mainBind = rcTop nMain [] mainBody
-                cm = Anf.CoreModule [cafBind, mainBind]
-            case RCM.runModuleRC (Perceus.insertRC cm) of
+            pure (Anf.CoreModule [cafBind, mainBind])
+      (txt, st, bl) <- RCM.runModuleRC (Perceus.insertRC cm) >>= \case
               Left err  -> error ("runModuleRC failed: " <> show err)
               Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run)
       txt @?= T.pack "0"
@@ -8272,7 +8321,7 @@ rcLetRecTests = testGroup "rc letrec"
       -- (b) runnable heap-empty oracle on the LEAKING (sel=0) path: w must be
       -- dropped inside g on the non-forwarding arm. baseline == 0 (no value-CAFs);
       -- before the fix this leaks the [1,2,3] spine (stLive == 3 > 0).
-      case RCM.runModuleRC (Perceus.insertRC cm0) of
+      RCM.runModuleRC (Perceus.insertRC cm0) >>= \case
         Left err  -> assertFailure ("runModuleRC failed: " <> show err)
         Right run -> do
           let st = RCM.rcStats run
@@ -8347,7 +8396,7 @@ rcLetRecTests = testGroup "rc letrec"
         [] (Perceus.balanceLint cm)
       -- (b) runnable heap-empty oracle: the result Pair shares w, so without the
       -- dup the result-drop double-frees w. baseline == 0 (no value-CAFs).
-      case RCM.runModuleRC (Perceus.insertRC cm) of
+      RCM.runModuleRC (Perceus.insertRC cm) >>= \case
         Left err  -> assertFailure ("runModuleRC failed: " <> show err)
         Right run -> do
           let st = RCM.rcStats run
@@ -8384,7 +8433,7 @@ rcLetRecTests = testGroup "rc letrec"
       let yU          = Unique 9001
           yName       = Name.Name (T.pack "y") yU
           s0          = St.emptyStore
-          (yAddr, s1) = St.alloc (St.NCon (T.pack "Y") []) s0
+          (yAddr, s1) = St.allocPure (St.NCon (T.pack "Y") []) s0
           env         = Map.fromList [(yU, St.RVBox yAddr)]
           -- Build the LetRec expression using freshly minted names.
           -- y is in 'env' but NOT free in either member's body.
@@ -8413,7 +8462,7 @@ rcLetRecTests = testGroup "rc letrec"
                     (Anf.Let (rcBnd nU3)
                        (Anf.RApp (Anf.AVar rcDropName) [Anf.AVar nR])
                     (Anf.Ret (Anf.AVar yName))))))
-      case RCM.runExprRC RCP.rcPrimTable env s1 e of
+      RCM.runExprRC RCP.rcPrimTable env s1 e >>= \case
         Left err      -> assertFailure ("expected success, got: " <> show err)
         Right (v, sf) -> do
           -- y must still be live after the group drop; stLive >= 1 means y's
@@ -8423,7 +8472,7 @@ rcLetRecTests = testGroup "rc letrec"
           case v of
             St.RVBox a -> do
               a @?= yAddr
-              case St.deref yAddr sf of
+              case St.derefPure yAddr sf of
                 Left err2 -> assertFailure ("deref y after group drop failed: " <> show err2)
                 Right _   -> pure ()
             other -> assertFailure ("expected RVBox y, got " <> show other)
@@ -8443,7 +8492,7 @@ rcLetRecTests = testGroup "rc letrec"
   -- a static handle, never counted). The point is that the group is now COVERED
   -- and instrumented (pre-Phase-2 it was passed through unchanged).
   , testCase "non-escaping LetRec capturing one enclosing local: covered, heap==baseline, lint clean" $ do
-      let (txt, st, bl, lintOut) = runFresh $ do
+      let cm = runFresh $ do
             nCaf <- freshName (T.pack "caf")
             nMain <- freshName (T.pack "main")
             nB   <- freshName (T.pack "b")
@@ -8465,8 +8514,8 @@ rcLetRecTests = testGroup "rc letrec"
                       [ (bndU nF, [bndU nX], memberBody) ]
                       (Anf.Let (bndU nR) (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 5)])
                         (Anf.Ret (Anf.AVar nR))))
-                cm = Anf.CoreModule [cafBind, rcTop nMain [] mainBody]
-            case RCM.runModuleRC (Perceus.insertRC cm) of
+            pure (Anf.CoreModule [cafBind, rcTop nMain [] mainBody])
+      (txt, st, bl, lintOut) <- RCM.runModuleRC (Perceus.insertRC cm) >>= \case
               Left err  -> error ("runModuleRC failed: " <> show err)
               Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run,
                                  Perceus.balanceLint cm)
@@ -8490,7 +8539,7 @@ rcLetRecTests = testGroup "rc letrec"
   --        in let r = f 5
   --           in r                             -- => 7, both members drop at exit
   , testCase "shared LetRec capture (two members, one b): multiset dup, heap==baseline, lint clean" $ do
-      let (txt, st, bl, lintOut) = runFresh $ do
+      let cm = runFresh $ do
             nCaf <- freshName (T.pack "caf")
             nMain <- freshName (T.pack "main")
             nB   <- freshName (T.pack "b")
@@ -8515,8 +8564,8 @@ rcLetRecTests = testGroup "rc letrec"
                       ]
                       (Anf.Let (bndU nR) (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 5)])
                         (Anf.Ret (Anf.AVar nR))))
-                cm = Anf.CoreModule [cafBind, rcTop nMain [] mainBody]
-            case RCM.runModuleRC (Perceus.insertRC cm) of
+            pure (Anf.CoreModule [cafBind, rcTop nMain [] mainBody])
+      (txt, st, bl, lintOut) <- RCM.runModuleRC (Perceus.insertRC cm) >>= \case
               Left err  -> error ("runModuleRC failed: " <> show err)
               Right run -> pure (RCM.rcOutput run, RCM.rcStats run, RCM.rcBaseline run,
                                  Perceus.balanceLint cm)
@@ -8536,7 +8585,7 @@ rcLetRecTests = testGroup "rc letrec"
   -- (the single env-drop frees the env, whose cascade frees the captured Box once),
   -- (3) a clean 'balanceLint'.
   , testCase "M2a-2 capturing non-escaping group: shared env dropped EXACTLY once" $ do
-      let (pretty, st, bl, lintOut) = runFresh $ do
+      let cm = runFresh $ do
             nB   <- freshName (T.pack "b")
             nMain <- freshName (T.pack "main")
             nF   <- freshName (T.pack "f");  nG <- freshName (T.pack "g")
@@ -8566,8 +8615,8 @@ rcLetRecTests = testGroup "rc letrec"
                       , (bndU nG, [bndU nGK], gBody) ]
                       (Anf.Let (bndU nR) (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 2)])
                         (Anf.Ret (Anf.AVar nR))))
-                cm = Anf.CoreModule [rcTop nMain [] mainBody]
-            case RCM.runModuleRC (Perceus.insertRC cm) of
+            pure (Anf.CoreModule [rcTop nMain [] mainBody])
+      (pretty, st, bl, lintOut) <- RCM.runModuleRC (Perceus.insertRC cm) >>= \case
               Left err  -> error ("runModuleRC failed: " <> show err)
               Right run -> pure ( Perceus.prettyPerceus cm
                                 , RCM.rcStats run, RCM.rcBaseline run, Perceus.balanceLint cm )
@@ -8623,7 +8672,8 @@ rcLetRecTests = testGroup "rc letrec"
       -- SOUND (the returned member transfers the single env handle out).
       firstOrderNoHandlerViolations (cmWith True) @?= []
       let escCm = pruneToReachable (cmWith True)
-      case (Interp.runModule escCm, RCM.runModuleRCUnchecked (Perceus.insertRC escCm)) of
+      rc <- RCM.runModuleRCUnchecked (Perceus.insertRC escCm)
+      case (Interp.runModule escCm, rc) of
         (Right v, Right run) -> do
           Interp.renderValue v @?= RCM.rcOutput run
           let st = RCM.rcStats run; bl = RCM.rcBaseline run
@@ -9055,7 +9105,8 @@ rcM2a1AliasTests = testGroup "m2a-1 alias-of-sibling (exempt-ness through aliase
   , testCase "alias-sibling DROP #10: RC run agrees with the reference value" $ do
       cm <- elaboratedModuleOf "test/rc-m2a1/40-alias-sibling-drop.wok"
       let pruned = pruneToReachable cm
-      case (Interp.runModule pruned, RCM.runModuleRCUnchecked (Perceus.insertRC pruned)) of
+      rc <- RCM.runModuleRCUnchecked (Perceus.insertRC pruned)
+      case (Interp.runModule pruned, rc) of
         (Right v, Right run) ->
           Interp.renderValue v @?= RCM.rcOutput run
         (refRes, rcRes) ->
@@ -9110,7 +9161,8 @@ rcM2a1SiblingDropTests = testGroup "m2a-1 sibling-in-cell local drop (no cascade
   , testCase "sibling-in-con DROP #18: RC run agrees with the reference value" $ do
       cm <- elaboratedModuleOf "test/rc-m2a1/48-sibling-con-drop.wok"
       let pruned = pruneToReachable cm
-      case (Interp.runModule pruned, RCM.runModuleRCUnchecked (Perceus.insertRC pruned)) of
+      rc <- RCM.runModuleRCUnchecked (Perceus.insertRC pruned)
+      case (Interp.runModule pruned, rc) of
         (Right v, Right run) ->
           Interp.renderValue v @?= RCM.rcOutput run
         (refRes, rcRes) ->
@@ -9202,7 +9254,8 @@ borrowOnCallTwiceBalanced = do
       assertEqual "f is dropped exactly once (at last use)"
         1 (countRcIntrinsicFor (T.pack "__rc_drop") (Unique 3) ib)
     [] -> assertFailure "instrumented module dropped main"
-  case (Interp.runModule pruned, RCM.runModuleRC instrumented) of
+  rc <- RCM.runModuleRC instrumented
+  case (Interp.runModule pruned, rc) of
     (Right v, Right run) -> do
       assertEqual "value" (Interp.renderValue v) (RCM.rcOutput run)
       assertEqual "heap empty" (St.stLive (RCM.rcStats run)) (RCM.rcBaseline run)
@@ -9280,7 +9333,7 @@ sharedEnvBareMemberResult = do
             (Ret (AVar nEven)))
       cm     = CoreModule [TopBind (nm "main" 100) [] body]
       pruned = pruneToReachable cm
-  case RCM.runModuleRCUnchecked (Perceus.insertRC pruned) of
+  RCM.runModuleRCUnchecked (Perceus.insertRC pruned) >>= \case
     Left err  -> assertFailure ("runModuleRCUnchecked failed: " <> show err)
     Right run -> do
       let st = RCM.rcStats run
@@ -9332,7 +9385,8 @@ sharedEnvCaptureFreeMutual = do
   assertBool "non-escaping capture-free group must pass the boundary"
     (null (firstOrderNoHandlerViolations pruned))
   let instrumented = Perceus.insertRC pruned
-  case (Interp.runModule pruned, RCM.runModuleRC instrumented) of
+  rc <- RCM.runModuleRC instrumented
+  case (Interp.runModule pruned, rc) of
     (Right v, Right run) -> do
       let st = RCM.rcStats run
           bl = RCM.rcBaseline run
@@ -9357,7 +9411,7 @@ sharedEnvCaptureFreeMutual = do
 sharedEnvSentinelIsEmptyEnv :: Assertion
 sharedEnvSentinelIsEmptyEnv = do
   let s = St.initSentinel St.emptyStore
-  case St.deref St.emptyEnvSentinelAddr s of
+  case St.derefPure St.emptyEnvSentinelAddr s of
     Right c -> case St.cNode c of
       St.NEnv m -> assertEqual "sentinel holds the empty env" Map.empty m
       other     -> assertFailure ("sentinel must be NEnv empty, got " <> show other)
@@ -9406,7 +9460,7 @@ sharedEnvCapturingOneEnv = do
               (Let (bnd "_d" 7 intTy) (RApp (AVar rcDropName) [AVar nF])
                 (Ret (AVar (nm "r" 6))))))
       s0 = St.initSentinel St.emptyStore
-  case RCM.runExprRC RCP.rcPrimTable Map.empty s0 e of
+  RCM.runExprRC RCP.rcPrimTable Map.empty s0 e >>= \case
     Left err -> assertFailure ("rc run failed: " <> show err)
     Right (v, s) -> do
       txt <- either (assertFailure . show) pure (St.renderRCValue s v)
@@ -9457,7 +9511,7 @@ sharedEnvPartialApplication = do
               (Let (bnd "_d" 8 intTy) (RApp (AVar rcDropName) [AVar (nm "p" 6)])
                 (Ret (AVar (nm "r" 7))))))
       s0 = St.initSentinel St.emptyStore
-  case RCM.runExprRC RCP.rcPrimTable Map.empty s0 e of
+  RCM.runExprRC RCP.rcPrimTable Map.empty s0 e >>= \case
     Left err -> assertFailure ("rc run failed: " <> show err)
     Right (v, s) -> do
       txt <- either (assertFailure . show) pure (St.renderRCValue s v)
@@ -9475,7 +9529,7 @@ sharedEnvPartialApplication = do
 assertHeapEmpty :: FilePath -> Assertion
 assertHeapEmpty path = do
   cm <- elaboratedModuleOf path
-  case RCM.runModuleRCUnchecked (Perceus.insertRC (pruneToReachable cm)) of
+  RCM.runModuleRCUnchecked (Perceus.insertRC (pruneToReachable cm)) >>= \case
     Left err  -> assertFailure ("runModuleRCUnchecked failed: " <> show err)
     Right run -> do
       let st = RCM.rcStats run
@@ -9496,7 +9550,8 @@ assertRcAgrees :: FilePath -> Assertion
 assertRcAgrees path = do
   cm <- elaboratedModuleOf path
   let pruned = pruneToReachable cm
-  case (Interp.runModule pruned, RCM.runModuleRCUnchecked (Perceus.insertRC pruned)) of
+  rc <- RCM.runModuleRCUnchecked (Perceus.insertRC pruned)
+  case (Interp.runModule pruned, rc) of
     (Right v, Right run) -> do
       Interp.renderValue v @?= RCM.rcOutput run
       let st = RCM.rcStats run
@@ -9640,7 +9695,7 @@ rcDifferentialHarness path = do
           -- first-order corpus actually runs.
           let pruned = pruneToReachable cm
               refRes = Interp.runModule pruned
-              rcRes  = RCM.runModuleRC (Perceus.insertRC pruned)
+          rcRes <- RCM.runModuleRC (Perceus.insertRC pruned)
           case (refRes, rcRes) of
             (Right v, Right run) ->
               Interp.renderValue v @?= RCM.rcOutput run
@@ -9685,7 +9740,7 @@ rcDeepListTests :: TestTree
 rcDeepListTests = testGroup "rc deep-list"
   [ testCase ("frees == N + 1 at scale (N = " <> show deepListN <> ")") $ do
       instrumented <- rcStatsPrepare "test/rc-deep-list/scale.wok"
-      case RCM.runModuleRC instrumented of
+      RCM.runModuleRC instrumented >>= \case
         Left rerr -> assertFailure ("RC interpreter failed: " <> show rerr)
         Right run -> do
           let st       = RCM.rcStats run
@@ -9705,6 +9760,228 @@ rcDeepListTests = testGroup "rc deep-list"
   where
     deepListN :: Int
     deepListN = 50000
+
+-- ---------------------------------------------------------------------------
+-- C-backend differential oracle (Task 3): the abstract heap is the trusted
+-- reference; the C heap is the new implementation under test. For the WHOLE
+-- in-scope corpus we run the SAME prepared module through both backends and
+-- assert byte-identical observable behaviour:
+--
+--   * 'rcOutput'  (the rendered result) is byte-identical, and
+--   * the four heap-accounting numbers ('stAllocs'/'stFrees'/'stPeak', plus the
+--     'stLive == rcBaseline' baseline invariant) agree.
+--
+-- Allocation-stat parity is the load-bearing signal: the abstract and C heaps
+-- share ONE 'recordAlloc'/'recordFree' so equal counts mean the C path took the
+-- same alloc/free decisions on the same cells (no silent leak, no over-free).
+-- Both backends see the same Perceus-instrumented program, so a divergence is a
+-- backend bug, not a dup/drop placement difference.
+--
+-- The harness reuses the differential/stats front end EXACTLY (load -> elaborate
+-- -> 'firstOrderNoHandlerViolations' scope guard -> 'pruneToReachable' ->
+-- 'Perceus.insertRC'), so the parity group compares like with like over the same
+-- in-scope programs the abstract corpus groups already run.
+
+-- | Shared front end for the C-backend parity group: load -> elaborate -> M1
+-- scope guard -> prune-to-reachable -> insertRC, identical to 'rcStatsPrepare'
+-- and the differential harness so the parity comparison runs the same program.
+rcParityPrepare :: FilePath -> IO Anf.CoreModule
+rcParityPrepare = rcStatsPrepare
+
+-- | The C-backend differential oracle over the whole in-scope corpus. For each
+-- program, run the prepared module through BOTH the abstract heap and a fresh C
+-- heap and assert output + allocation-stat parity, plus the C run's heap-empty
+-- baseline invariant. The C heap is created and freed per program so each runs
+-- on a clean allocator (the post-run 'stLive == rcBaseline' check still holds
+-- for CAF-baseline programs; 'wokHeapFree' may emit a cosmetic stderr "live
+-- cells" note for those immortal cells, which is expected and not a failure).
+rcCBackendParity :: [FilePath] -> TestTree
+rcCBackendParity files = testGroup "rc-c-backend-parity"
+  [ testCase (takeBaseName f) (rcParityHarness f)
+  | f <- files
+  ]
+
+-- | The single shared core for BOTH C-backend groups: prepare the module, run it
+-- through the abstract heap, then through a FRESH C heap, read the C heap's OWN
+-- allocation counter ('Heap.wokStatAllocs') BEFORE freeing it, and return the raw
+-- @(abstractResult, cResult, cHeapAllocs)@. The C heap is freed via 'finally' so a
+-- thrown exception during the C run cannot leak the 'Ptr WokHeap'; the counter is
+-- read before the free on the success path.
+withBothBackends
+  :: FilePath
+  -> IO ( Either IV.RuntimeError RCM.RCRun
+        , Either IV.RuntimeError RCM.RCRun
+        , Word64 )
+withBothBackends path = do
+  cm   <- rcParityPrepare path
+  absR <- RCM.runModuleRCWith St.AbstractHeap cm
+  hp   <- Heap.wokHeapNew
+  (cR, cAllocs) <- (do c <- RCM.runModuleRCWith (St.CHeap hp) cm
+                       a <- Heap.wokStatAllocs hp
+                       pure (c, a))
+                   `Control.Exception.finally` Heap.wokHeapFree hp
+  pure (absR, cR, cAllocs)
+
+-- | Run one corpus program through both backends and assert parity.
+rcParityHarness :: FilePath -> Assertion
+rcParityHarness path = do
+  (absR, cR, _cAllocs) <- withBothBackends path
+  case (absR, cR) of
+    (Right a, Right c) -> do
+      assertEqual (path <> ": output parity")
+        (RCM.rcOutput a) (RCM.rcOutput c)
+      assertEqual (path <> ": allocs parity")
+        (St.stAllocs (RCM.rcStats a)) (St.stAllocs (RCM.rcStats c))
+      assertEqual (path <> ": frees parity")
+        (St.stFrees (RCM.rcStats a)) (St.stFrees (RCM.rcStats c))
+      assertEqual (path <> ": peak parity")
+        (St.stPeak (RCM.rcStats a)) (St.stPeak (RCM.rcStats c))
+      -- Both backends must agree on the immortal baseline, and the C run must
+      -- return its live count to exactly that baseline (no leak, no over-free).
+      assertEqual (path <> ": baseline parity")
+        (RCM.rcBaseline a) (RCM.rcBaseline c)
+      assertEqual (path <> ": no leak (C) -- stLive returns to baseline")
+        (RCM.rcBaseline c) (St.stLive (RCM.rcStats c))
+    (Left e, _) ->
+      assertFailure (path <> ": abstract backend FAILED: " <> show e)
+    (_, Left e) ->
+      assertFailure (path <> ": C backend FAILED: " <> show e)
+
+-- ---------------------------------------------------------------------------
+-- C-backend targeted tests (Task 3): source programs that ISOLATE the cross-heap
+-- edges the auto-discovered corpus does not --- a C cell pointing at an abstract
+-- cell and vice versa, the LStr fallback, and a deep spine through the C heap.
+-- Each program lives in 'test/rc-c-backend' (its own directory, NOT
+-- auto-discovered into the golden corpus) and is prepared by the SAME front end
+-- as the parity group (load -> elaborate -> guard -> prune -> 'Perceus.insertRC'),
+-- so the dup/drop instrumentation is the production pass, not a hand placement.
+--
+-- Each test runs the program through BOTH backends and asserts (a) the correct
+-- output, (b) abstract/C stat parity, and (c) the C run returns to its baseline.
+-- Parity against the abstract reference is what proves the C path is genuinely
+-- exercised and correct (a vacuous all-abstract fallback would still differ from
+-- the abstract run only in WHERE cells live, never in the counts --- but the
+-- non-trivial alloc count asserted per test pins that real cells were built).
+
+-- | Run a source file through both backends (fresh C heap, freed after) and
+-- return @(output, abstractStats, cStats, baseline, cHeapAllocs)@.
+--
+-- @cHeapAllocs@ is the C heap's OWN allocation counter ('Heap.wokStatAllocs'),
+-- read off @hp@ BEFORE it is freed. It is NOT the mirrored Haskell @stStats@
+-- counter (which is bumped identically on the C and the abstract-fallback path);
+-- it counts only 'NCon's that genuinely landed on the C runtime heap. Asserting
+-- on it is what proves the C path was actually exercised rather than silently
+-- all-falling-back to the abstract store.
+runBothBackends :: FilePath -> IO (Text, St.Stats, St.Stats, Int, Word64)
+runBothBackends path = do
+  (absR, cR, cAllocs) <- withBothBackends path
+  case (absR, cR) of
+    (Right a, Right c) ->
+      pure (RCM.rcOutput c, RCM.rcStats a, RCM.rcStats c, RCM.rcBaseline c, cAllocs)
+    (Left e, _) ->
+      assertFailure ("abstract backend FAILED (" <> path <> "): " <> show e)
+        >> error "unreachable: assertFailure throws"
+    (_, Left e) ->
+      assertFailure ("C backend FAILED (" <> path <> "): " <> show e)
+        >> error "unreachable: assertFailure throws"
+
+-- | Assert abstract/C stat parity plus the C run's baseline invariant. The
+-- @minAllocs@ floor pins that the program actually built cells (so the test is
+-- not vacuously balanced on an empty heap).
+assertParityBalanced :: String -> Int -> St.Stats -> St.Stats -> Int -> Assertion
+assertParityBalanced label minAllocs absSt cSt bl = do
+  assertEqual (label <> ": allocs parity") (St.stAllocs absSt) (St.stAllocs cSt)
+  assertEqual (label <> ": frees parity")  (St.stFrees absSt)  (St.stFrees cSt)
+  assertEqual (label <> ": peak parity")   (St.stPeak absSt)   (St.stPeak cSt)
+  assertBool  (label <> ": built a non-trivial number of cells")
+    (St.stAllocs cSt >= minAllocs)
+  assertEqual (label <> ": stLive returns to baseline (C)") bl (St.stLive cSt)
+  assertEqual (label <> ": allocs - frees == baseline (C)")
+    bl (St.stAllocs cSt - St.stFrees cSt)
+
+rcCBackendTargeted :: TestTree
+rcCBackendTargeted = testGroup "rc-c-backend-targeted"
+  [ -- Cross-heap cascade: a 'Wrap' NCon HOLDS a closure (HBOX child into the
+    -- abstract heap) and that closure CAPTURES a 'Box' NCon (a C-heap child).
+    -- The drop cascade must cross the heap boundary in both directions and
+    -- return the heap to baseline with balanced stats and no sanitizer error.
+    -- (>= 3 cells: the Box NCon, the closure, and the Wrap NCon.)
+    testCase "cross-heap cascade (NCon holds closure; closure captures NCon)" $ do
+      (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/cross-heap-cascade.wok"
+      assertEqual "result is n + captured (5 + 7)" (T.pack "12") txt
+      assertEqual "no value-CAF baseline for this program" 0 bl
+      assertParityBalanced "cross-heap cascade" 3 absSt cSt bl
+      -- Non-vacuity: 'Box' and 'Wrap' are encodable NCons that MUST route to the
+      -- C heap. Read off the C heap's OWN counter (not the mirrored stStats) to
+      -- prove the C path actually fired -- this fails if 'allocNCon's CHeap branch
+      -- silently all-falls-back to the abstract store.
+      assertBool "C heap genuinely exercised (NCon routed to CAddr)" (cAllocs > 0)
+
+  , -- Fallback: a 'Tagged' NCon with an 'LStr' field. 'encodeSlot' rejects the
+    -- 'LStr', so this NCon falls back to the ABSTRACT heap under the C backend;
+    -- the result and the heap accounting must still match the abstract reference.
+    testCase "LStr fallback (constructor with a string field stays abstract)" $ do
+      (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/fallback-lstr.wok"
+      assertEqual "result is the U64 field (1)" (T.pack "1") txt
+      assertEqual "no value-CAF baseline for this program" 0 bl
+      assertParityBalanced "LStr fallback" 1 absSt cSt bl
+      -- Non-vacuity (fallback proof): the ONLY constructor this program builds is
+      -- 'Tagged "hi" 1', whose 'LStr' field is non-encodable, so the whole NCon
+      -- falls back to the ABSTRACT heap. Nothing is C-eligible, so the C heap's
+      -- OWN allocation counter must be exactly zero -- direct proof the fallback
+      -- fired (the cell lives on the abstract store, not the C runtime).
+      assertEqual "LStr-bearing NCon fell back to abstract heap; nothing on C"
+        (0 :: Word64) cAllocs
+
+  , -- Deep list (100000 C-heap Cons cells): build and consume a long spine
+    -- through the C backend. The drop cascade is an iterative Haskell worklist,
+    -- so 'stLive' must return to baseline without a host-stack overflow.
+    -- (>= 100001 cells: 100000 Cons + 1 Nil.)
+    testCase "deep list (100000 C-heap cons cells) frees to baseline" $ do
+      (_, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/deep-list.wok"
+      assertEqual "no value-CAF baseline for this program" 0 bl
+      assertParityBalanced "deep list" 100001 absSt cSt bl
+      -- Non-vacuity: the 100000 'Cons' cells (and the single nullary 'Nil', also an
+      -- encodable NCon) MUST all route to the C heap. Assert the C heap's OWN
+      -- counter took the whole spine. '>= 100000' is the safe floor; the exact
+      -- total is 100001 (100000 Cons + 1 Nil), verified live and pinned here.
+      assertBool "deep list routed to C heap" (cAllocs >= 100000)
+      assertEqual "deep list: every NCon on C (100000 Cons + 1 Nil)"
+        (100001 :: Word64) cAllocs
+  ]
+
+-- ---------------------------------------------------------------------------
+-- C-backend slot encode/decode round-trip property (Task 3 step 5).
+--
+-- 'encodeSlot' packs an 'RCValue' into a 64-bit @(tag, payload)@ slot when it is
+-- C-encodable; 'decodeSlot' is its exact inverse on those shapes. The property
+-- pins that inverse for the generable encodable values: an 'Int64'-range integer
+-- literal, a char literal, unit, and an abstract-heap box ('HAddr'). A 'CAddr' is
+-- a raw runtime pointer (not purely generable) and is excluded.
+
+-- | An 'RCValue' restricted to the C-encodable shapes the property round-trips.
+newtype EncodableRCValue = EncodableRCValue St.RCValue
+  deriving (Eq, Show)
+
+instance QC.Arbitrary EncodableRCValue where
+  arbitrary = EncodableRCValue <$> QC.oneof
+    [ -- 'LInt' must fit in Int64 (the encoder rejects wider bignums), so draw the
+      -- payload from the full Int64 range.
+      St.RVLit . Anf.LInt . toInteger
+        <$> QC.choose (minBound :: Int64, maxBound :: Int64)
+    , St.RVLit . Anf.LChar <$> QC.arbitrary
+    , pure (St.RVLit Anf.LUnit)
+      -- 'HAddr' is an abstract-heap index; the payload round-trips through
+      -- Word64/Int64 for any Int, so draw the full Int range.
+    , St.RVBox . St.HAddr . fromIntegral
+        <$> QC.choose (minBound :: Int64, maxBound :: Int64)
+    ]
+
+rcCBackendSlotProperty :: TestTree
+rcCBackendSlotProperty = testGroup "rc-c-backend-slot"
+  [ testProperty "encodeSlot/decodeSlot round-trips encodable RCValues" $
+      \(EncodableRCValue v) -> Just v == fmap St.decodeSlot (St.encodeSlot v)
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Suite B: heap accounting + --dump-rc-stats golden (Task 9)
@@ -9760,7 +10037,7 @@ rcStatsPrepare path = do
 rcStatsHarness :: FilePath -> Assertion
 rcStatsHarness path = do
   instrumented <- rcStatsPrepare path
-  case RCM.runModuleRC instrumented of
+  RCM.runModuleRC instrumented >>= \case
     Left rerr -> assertFailure ("RC interpreter failed: " <> show rerr)
     Right run -> do
       let st       = RCM.rcStats run
@@ -9774,7 +10051,7 @@ rcStatsHarness path = do
 rcStatsDumpHarness :: FilePath -> IO BL.ByteString
 rcStatsDumpHarness path = do
   instrumented <- rcStatsPrepare path
-  case RCM.runModuleRC instrumented of
+  RCM.runModuleRC instrumented >>= \case
     Left rerr -> pure (BL.pack ("RC interpreter failed: " <> show rerr <> "\n"))
     Right run -> pure (BL.pack (T.unpack (RCM.renderRcStats run)))
 
@@ -9856,7 +10133,7 @@ teethLeakDetected mut path = do
   mcm <- teethPrepareMutated mut path
   case mcm of
     Nothing -> pure False
-    Just cm -> case RCM.runModuleRC cm of
+    Just cm -> RCM.runModuleRC cm >>= \case
       Left _    -> pure False  -- a run failure is not the leak signal we assert
       Right run ->
         let st       = RCM.rcStats run
@@ -9871,9 +10148,9 @@ teethRunFailDetected mut path = do
   mcm <- teethPrepareMutated mut path
   case mcm of
     Nothing -> pure False
-    Just cm -> pure (case RCM.runModuleRC cm of
-                       Left _  -> True
-                       Right _ -> False)
+    Just cm -> RCM.runModuleRC cm >>= \case
+                 Left _  -> pure True
+                 Right _ -> pure False
 
 -- | Does the mutation make the oracle catch UNSOUNDNESS on this file --- EITHER
 -- the RC run trips a 'Left' (UAF/double-free), OR 'Perceus.lintInstrumented'
@@ -9934,15 +10211,15 @@ rcPropertyTests =
 -- diagnosable without re-running by hand).
 prop_rcDifferential :: Property
 prop_rcDifferential =
-  forAllShrink genProgram shrinkProgram $ \cm ->
+  forAllShrink genProgram shrinkProgram $ \cm -> QC.ioProperty $ do
+    rcRes <- RCM.runModuleRC (Perceus.insertRC cm)
     let refRes = Interp.runModule cm
-        rcRes  = RCM.runModuleRC (Perceus.insertRC cm)
         report =
           "instrumented ANF:\n"
             <> T.unpack (Perceus.prettyPerceus cm)
             <> "\n\nreference: " <> showRes (fmap Interp.renderValue refRes)
             <> "\nrc:        " <> showRcRes rcRes
-    in counterexample report $
+    pure $ counterexample report $
          case (refRes, rcRes) of
            (Right v, Right run) ->
              let outOk      = Interp.renderValue v == RCM.rcOutput run
@@ -12054,17 +12331,17 @@ rcM2a2NestedCaptureRejected = do
   -- it were admitted. Run each unchecked and assert the RC interpreter FAILS (or
   -- leaves the heap imbalanced) --- so the rejection is load-bearing, not vacuous.
   let wouldFaultUnchecked cm =
-        case RCM.runModuleRCUnchecked (Perceus.insertRC cm) of
-          Left _    -> True
-          Right run -> St.stLive (RCM.rcStats run) /= RCM.rcBaseline run
-  assertBool "CLAIM 1 would double-free if admitted (rejection is load-bearing)"
-    (wouldFaultUnchecked claim1Cm)
-  assertBool "CLAIM 2 would double-free if admitted (rejection is load-bearing)"
-    (wouldFaultUnchecked claim2Cm)
-  assertBool "CLAIM 3 would double-free if admitted (rejection is load-bearing)"
-    (wouldFaultUnchecked claim3Cm)
-  assertBool "CLAIM 4 would double-free/UAF if admitted (rejection is load-bearing)"
-    (wouldFaultUnchecked claim4Cm)
+        RCM.runModuleRCUnchecked (Perceus.insertRC cm) >>= \case
+          Left _    -> pure True
+          Right run -> pure (St.stLive (RCM.rcStats run) /= RCM.rcBaseline run)
+  wouldFaultUnchecked claim1Cm >>= assertBool
+    "CLAIM 1 would double-free if admitted (rejection is load-bearing)"
+  wouldFaultUnchecked claim2Cm >>= assertBool
+    "CLAIM 2 would double-free if admitted (rejection is load-bearing)"
+  wouldFaultUnchecked claim3Cm >>= assertBool
+    "CLAIM 3 would double-free if admitted (rejection is load-bearing)"
+  wouldFaultUnchecked claim4Cm >>= assertBool
+    "CLAIM 4 would double-free/UAF if admitted (rejection is load-bearing)"
 
   -- ADMIT 1 (newly admitted + SOUND): a group nested inside a LAMBDA that sits in a
   -- member body. The lambda body is a fresh frame (resets the member-outer set), so
@@ -12100,7 +12377,8 @@ rcM2a2NestedCaptureRejected = do
       admitLamCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] admitLam])
   assertBool "ADMIT 1: a group nested inside a lambda in a member body must be ADMITTED"
     (null (firstOrderNoHandlerViolations admitLamCm))
-  case (Interp.runModule admitLamCm, RCM.runModuleRCUnchecked (Perceus.insertRC admitLamCm)) of
+  admitLamRc <- RCM.runModuleRCUnchecked (Perceus.insertRC admitLamCm)
+  case (Interp.runModule admitLamCm, admitLamRc) of
     (Right v, Right run) -> do
       Interp.renderValue v @?= RCM.rcOutput run
       assertEqual "group-in-lambda: live cells return to baseline"
@@ -12140,7 +12418,8 @@ rcM2a2NestedCaptureRejected = do
       admitPerEntryCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] admitPerEntry])
   assertBool "ADMIT 2: a nested group capturing a per-entry let-local must be ADMITTED"
     (null (firstOrderNoHandlerViolations admitPerEntryCm))
-  case (Interp.runModule admitPerEntryCm, RCM.runModuleRCUnchecked (Perceus.insertRC admitPerEntryCm)) of
+  admitPerEntryRc <- RCM.runModuleRCUnchecked (Perceus.insertRC admitPerEntryCm)
+  case (Interp.runModule admitPerEntryCm, admitPerEntryRc) of
     (Right v, Right run) -> do
       Interp.renderValue v @?= RCM.rcOutput run
       assertEqual "per-entry-let-local: live cells return to baseline"
@@ -12172,7 +12451,8 @@ rcM2a2NestedCaptureRejected = do
       flatCm = pruneToReachable (CoreModule [TopBind (nm "main" 1000000) [] flatBody])
   assertBool "PRECISION: a FLAT group capturing an enclosing local must stay ADMITTED"
     (null (firstOrderNoHandlerViolations flatCm))
-  case (Interp.runModule flatCm, RCM.runModuleRCUnchecked (Perceus.insertRC flatCm)) of
+  flatRc <- RCM.runModuleRCUnchecked (Perceus.insertRC flatCm)
+  case (Interp.runModule flatCm, flatRc) of
     (Right v, Right run) -> do
       Interp.renderValue v @?= RCM.rcOutput run
       let st = RCM.rcStats run
@@ -12352,20 +12632,20 @@ rcM2a2FencePartitionPinned = do
       consumeMsg = T.pack "consumes an enclosing capture"
       rejectedBy needle cm = any (T.isInfixOf needle) (firstOrderNoHandlerViolations cm)
       wouldFaultUnchecked cm =
-        case RCM.runModuleRCUnchecked (Perceus.insertRC cm) of
-          Left _    -> True
-          Right run -> St.stLive (RCM.rcStats run) /= RCM.rcBaseline run
+        RCM.runModuleRCUnchecked (Perceus.insertRC cm) >>= \case
+          Left _    -> pure True
+          Right run -> pure (St.stLive (RCM.rcStats run) /= RCM.rcBaseline run)
       runsSoundUnchecked cm =
-        case RCM.runModuleRCUnchecked (Perceus.insertRC cm) of
-          Left _    -> False
-          Right run -> St.stLive (RCM.rcStats run) == RCM.rcBaseline run
+        RCM.runModuleRCUnchecked (Perceus.insertRC cm) >>= \case
+          Left _    -> pure False
+          Right run -> pure (St.stLive (RCM.rcStats run) == RCM.rcBaseline run)
 
   -- SAME-CELL 'RAtom' alias: caught by the NESTED-CAPTURE fence (mob propagates the
   -- rename), and the rejection is LOAD-BEARING --- it genuinely double-frees.
   assertBool "RAtom-rename alias must be REJECTED by the nested-capture fence (mob)"
     (rejectedBy nestedMsg ratomCm)
-  assertBool "RAtom-rename alias would DOUBLE-FREE if admitted (nested-capture fence is load-bearing)"
-    (wouldFaultUnchecked ratomCm)
+  wouldFaultUnchecked ratomCm >>= assertBool
+    "RAtom-rename alias would DOUBLE-FREE if admitted (nested-capture fence is load-bearing)"
 
   -- INDIRECT aliases: caught by the CONSUMING-CAPTURE fence, NOT the nested-capture
   -- fence (mob does not propagate through RApp/RCon-destructure/RProj). The partition.
@@ -12388,24 +12668,24 @@ rcM2a2FencePartitionPinned = do
   -- KNOWN, INTENTIONAL fact: if a future slice relaxes consumeViol to ADMIT these, the
   -- run is already sound (so the admission is safe) --- but the RAtom case above stays
   -- held by the nested-capture fence and must not be dropped.
-  assertBool "call-result alias actually RUNS SOUND if admitted (over-rejection, not a double-free)"
-    (runsSoundUnchecked callResultCm)
-  assertBool "con-destructure alias actually RUNS SOUND if admitted (over-rejection)"
-    (runsSoundUnchecked conCm)
-  assertBool "record-proj alias actually RUNS SOUND if admitted (over-rejection)"
-    (runsSoundUnchecked recProjCm)
+  runsSoundUnchecked callResultCm >>= assertBool
+    "call-result alias actually RUNS SOUND if admitted (over-rejection, not a double-free)"
+  runsSoundUnchecked conCm >>= assertBool
+    "con-destructure alias actually RUNS SOUND if admitted (over-rejection)"
+  runsSoundUnchecked recProjCm >>= assertBool
+    "record-proj alias actually RUNS SOUND if admitted (over-rejection)"
 
 -- | The soundness proof. Generate an M2a-1 program; if the boundary guard accepts
 -- it, the unchecked RC run MUST succeed, be heap-balanced, AND match the
 -- reference value. If the guard rejects, the run assertion is skipped.
 prop_m2a1Escape :: Property
 prop_m2a1Escape =
-  forAllShrink genM2a1Program shrinkProgram $ \cm0 ->
+  forAllShrink genM2a1Program shrinkProgram $ \cm0 -> QC.ioProperty $ do
     let cm      = pruneToReachable cm0
         accepted = null (firstOrderNoHandlerViolations cm)
         refRes  = Interp.runModule cm
-        rcRes   = RCM.runModuleRCUnchecked (Perceus.insertRC cm)
-        report  =
+    rcRes <- RCM.runModuleRCUnchecked (Perceus.insertRC cm)
+    let report  =
           "boundary accepted: " <> show accepted
             <> "\ninstrumented ANF:\n" <> T.unpack (Perceus.prettyPerceus cm)
             <> "\nreference: " <> showRes (fmap Interp.renderValue refRes)
@@ -12432,7 +12712,7 @@ prop_m2a1Escape =
         -- floor from an inert warning into a HARD FAILURE: if a generator regression
         -- stops producing any class above its floor, the property goes red.
         ranSound = accepted && either (const False) (const True) rcRes
-    in checkCoverage $
+    pure $ checkCoverage $
        cover 4.0 (memberEsc && ranSound) "member-body sibling escape: accepted+run" $
        cover 3.0 (partialMember && ranSound) "partial multi-arity member apply: accepted+run" $
        cover 3.0 (rlamMemberPartial && ranSound) "RLam-mediated member partial (CROSS 5/6): accepted+run" $
@@ -12899,28 +13179,32 @@ prop_m2a1LintClean =
 -- so it is not a false counterexample.
 prop_m2a1Teeth :: Property
 prop_m2a1Teeth =
-  forAllShrink genM2a1Program shrinkProgram $ \cm0 ->
+  forAllShrink genM2a1Program shrinkProgram $ \cm0 -> QC.ioProperty $ do
     let cm = pruneToReachable cm0
-    in conjoin
-         [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
-                             <> T.unpack (Perceus.prettyPerceus cm))
-             (mutationCaught mut cm)
-         | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+    props <- mapM
+      (\mut -> do
+         caught <- mutationCaught mut cm
+         pure (counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
+                                 <> T.unpack (Perceus.prettyPerceus cm))
+                 caught))
+      [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop]
+    pure (conjoin props)
 
 -- | Is the given single-site mutation caught on this module, or a structural
 -- no-op? Caught = a non-empty 'lintInstrumented' OR a 'Left' from the unchecked
 -- RC run. No-op = the mutated instrumentation is byte-identical to the correct
 -- one (the mutation site did not exist), which counts as "fine" (nothing to
 -- catch).
-mutationCaught :: Perceus.Mutation -> CoreModule -> Bool
-mutationCaught mut cm =
+mutationCaught :: Perceus.Mutation -> CoreModule -> IO Bool
+mutationCaught mut cm = do
   let correct = Perceus.insertRC cm
       mutated = Perceus.insertRCMutated mut cm
-  in mutated == correct                                  -- mutation was a no-op
+  if mutated == correct                                  -- mutation was a no-op
        || not (null (Perceus.lintInstrumented mutated))  -- caught statically
-       || (case RCM.runModuleRCUnchecked mutated of      -- caught at runtime
-             Left _  -> True
-             Right _ -> False)
+    then pure True
+    else RCM.runModuleRCUnchecked mutated >>= \case      -- caught at runtime
+           Left _  -> pure True
+           Right _ -> pure False
 
 -- | Shrinking: drop the program toward a constant. We shrink the single 'main'
 -- bind's body to its trivial sub-results (a 'Ret' of a contained atom, an alt
@@ -13571,12 +13855,12 @@ m2bWithOps nOps underCase scrut _scrutEnv inner = do
 -- its floor, the property goes red.
 prop_m2bEscape :: Property
 prop_m2bEscape =
-  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 ->
+  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 -> QC.ioProperty $ do
     let cm       = pruneToReachable cm0
         accepted = null (firstOrderNoHandlerViolations cm)
         refRes   = Interp.runModule cm
-        rcRes    = RCM.runModuleRCUnchecked (Perceus.insertRC cm)
-        report   =
+    rcRes <- RCM.runModuleRCUnchecked (Perceus.insertRC cm)
+    let report   =
           "boundary accepted: " <> show accepted
             <> "\ninstrumented ANF:\n" <> T.unpack (Perceus.prettyPerceus cm)
             <> "\nreference: " <> showR (fmap Interp.renderValue refRes)
@@ -13599,7 +13883,7 @@ prop_m2bEscape =
         tailResume      = isResume && not valuePos
         tailAbort       = isAbort && not valuePosAbrt
         valuePosResume  = isResume && valuePos
-    in checkCoverage $
+    pure $ checkCoverage $
        cover 25.0 (isAbort && ranSound)  "abort path (any kind): accepted+run" $
        cover 25.0 (isResume && ranSound) "resume path (any kind): accepted+run" $
        -- Split floors: tail-position (M2b-1) independently pinned from value-position (M2b-2).
@@ -13669,13 +13953,16 @@ prop_m2bLintClean =
 -- A mutation that is a structural no-op (the site did not exist) counts as fine.
 prop_m2bTeeth :: Property
 prop_m2bTeeth =
-  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 ->
+  forAllShrink genM2bProgram shrinkProgramM2b $ \cm0 -> QC.ioProperty $ do
     let cm = pruneToReachable cm0
-    in conjoin
-         [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
-                             <> T.unpack (Perceus.prettyPerceus cm))
-             (mutationCaughtM2b mut cm)
-         | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+    props <- mapM
+      (\mut -> do
+         caught <- mutationCaughtM2b mut cm
+         pure (counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
+                                 <> T.unpack (Perceus.prettyPerceus cm))
+                 caught))
+      [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop]
+    pure (conjoin props)
 
 -- | Extended mutation-caught check for the M2b generator: extends the shared
 -- 'mutationCaught' with a heap-imbalance detector. Value-position handler arms
@@ -13683,19 +13970,20 @@ prop_m2bTeeth =
 -- 'lintInstrumented' does not audit them inline (it treats the outer join as
 -- unknown). A omitted drop in such an arm causes a leak ('stLive > baseline'),
 -- which is detected here by running the mutated program and checking the stats.
-mutationCaughtM2b :: Perceus.Mutation -> CoreModule -> Bool
-mutationCaughtM2b mut cm =
+mutationCaughtM2b :: Perceus.Mutation -> CoreModule -> IO Bool
+mutationCaughtM2b mut cm = do
   let correct = Perceus.insertRC cm
       mutated = Perceus.insertRCMutated mut cm
-  in mutated == correct                                    -- mutation was a no-op
+  if mutated == correct                                    -- mutation was a no-op
        || not (null (Perceus.lintInstrumented mutated))    -- caught statically
-       || case RCM.runModuleRCUnchecked mutated of
-            Left _    -> True                             -- caught as runtime crash
-            Right run ->
-              let st       = RCM.rcStats run
-                  baseline = RCM.rcBaseline run
-              in St.stLive st /= baseline                 -- detected as a heap leak
-                   || St.stAllocs st - St.stFrees st /= baseline
+    then pure True
+    else RCM.runModuleRCUnchecked mutated >>= \case
+           Left _    -> pure True                          -- caught as runtime crash
+           Right run ->
+             let st       = RCM.rcStats run
+                 baseline = RCM.rcBaseline run
+             in pure (St.stLive st /= baseline             -- detected as a heap leak
+                        || St.stAllocs st - St.stFrees st /= baseline)
 
 -- | Shrinker for a generated M2b program. The program is a handler bind (plus an
 -- optional CAF bind), so the generic single-main 'shrinkProgram' does not apply; we
@@ -14182,12 +14470,12 @@ m2bHasGlobalAcrossOp (CoreModule binds) =
 -- property goes red.
 prop_m3Escape :: Property
 prop_m3Escape =
-  forAllShrink genM3Program shrinkProgramM3 $ \cm0 ->
+  forAllShrink genM3Program shrinkProgramM3 $ \cm0 -> QC.ioProperty $ do
     let cm       = pruneToReachable cm0
         accepted = null (firstOrderNoHandlerViolations cm)
         refRes   = Interp.runModule cm
-        rcRes    = RCM.runModuleRCUnchecked (Perceus.insertRC cm)
-        report   =
+    rcRes <- RCM.runModuleRCUnchecked (Perceus.insertRC cm)
+    let report   =
           "boundary accepted: " <> show accepted
             <> "\ninstrumented ANF:\n" <> T.unpack (Perceus.prettyPerceus cm)
             <> "\nreference: " <> showR (fmap Interp.renderValue refRes)
@@ -14200,7 +14488,7 @@ prop_m3Escape =
         boxedAcr    = m2bHasBoxedAcrossOp cm
         opAbove     = m2bHasOpUnderCase cm
         globalAcr   = m2bHasGlobalAcrossOp cm
-    in checkCoverage $
+    pure $ checkCoverage $
        cover 30.0 (storeResume && ranSound) "store-resume run (store->take->resume)" $
        cover 30.0 (storeDrop && ranSound)   "store-drop run (store->drop, cascade free)" $
        cover 10.0 (movedB && ranSound)      "moved-into-con present (store path)" $
@@ -14263,13 +14551,16 @@ prop_m3LintClean =
 -- (the M2b teeth oracle with the heap-imbalance detector).
 prop_m3Teeth :: Property
 prop_m3Teeth =
-  forAllShrink genM3Program shrinkProgramM3 $ \cm0 ->
+  forAllShrink genM3Program shrinkProgramM3 $ \cm0 -> QC.ioProperty $ do
     let cm = pruneToReachable cm0
-    in conjoin
-         [ counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
-                             <> T.unpack (Perceus.prettyPerceus cm))
-             (mutationCaughtM2b mut cm)
-         | mut <- [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop] ]
+    props <- mapM
+      (\mut -> do
+         caught <- mutationCaughtM2b mut cm
+         pure (counterexample ("mutation " <> show mut <> " was NOT caught\nANF:\n"
+                                 <> T.unpack (Perceus.prettyPerceus cm))
+                 caught))
+      [Perceus.OmitOneDrop, Perceus.OmitOneDup, Perceus.DuplicateOneDrop]
+    pure (conjoin props)
 
 -- | Suite G (extended, M3): the generative oracle for the stored-continuation
 -- store route. The accepted=>sound property, the lint-clean property, and the
@@ -14297,34 +14588,34 @@ rcM3PropertyTests =
 rvRecMemberChildren :: Assertion
 rvRecMemberChildren = do
   assertEqual "lit has no children"    []  (St.valueChildren (St.RVLit LUnit))
-  assertEqual "box child"              [7] (St.valueChildren (St.RVBox 7))
-  assertEqual "recmember counts env"   [9] (St.valueChildren (St.RVRecMember (-5) 0 9))
+  assertEqual "box child"              [St.HAddr 7] (St.valueChildren (St.RVBox (St.HAddr 7)))
+  assertEqual "recmember counts env"   [St.HAddr 9] (St.valueChildren (St.RVRecMember (St.HAddr (-5)) 0 (St.HAddr 9)))
 
 -- | Dropping the env address referenced by an 'St.RVRecMember' must free the
 -- 'NEnv' cell.  An 'NEnv Map.empty' has no children, so after the single drop
 -- the live count must be zero.
 rvRecMemberDropCountsEnv :: Assertion
 rvRecMemberDropCountsEnv = do
-  let (envA, s0) = St.alloc (St.NEnv Map.empty) St.emptyStore
-  case St.dropAddr envA s0 of
+  let (envA, s0) = St.allocPure (St.NEnv Map.empty) St.emptyStore
+  case St.dropAddrPure envA s0 of
     Right s1 -> assertEqual "env freed" 0 (St.stLive (St.stStats s1))
     Left err -> assertFailure (show err)
 
 -- | The static sentinel installed by 'St.initSentinel' must live at
 -- 'St.emptyEnvSentinelAddr' and be a static (negative) address, so
--- 'St.incref' and 'St.dropAddr' are no-ops on it.
+-- 'St.increfPure' and 'St.dropAddrPure' are no-ops on it.
 rvRecMemberSentinelNoOp :: Assertion
 rvRecMemberSentinelNoOp = do
   let s0 = St.initSentinel St.emptyStore
   -- The sentinel must be at the fixed static address.
   assertEqual "sentinel addr is static" True (St.isStaticAddr St.emptyEnvSentinelAddr)
   -- incref on the sentinel is a no-op: store is unchanged.
-  case St.incref St.emptyEnvSentinelAddr s0 of
+  case St.increfPure St.emptyEnvSentinelAddr s0 of
     Left err -> assertFailure ("incref sentinel failed: " <> show err)
     Right s1 -> assertEqual "incref on sentinel is no-op (live unchanged)" 0
                   (St.stLive (St.stStats s1))
   -- dropAddr on the sentinel is a no-op: store is unchanged.
-  case St.dropAddr St.emptyEnvSentinelAddr s0 of
+  case St.dropAddrPure St.emptyEnvSentinelAddr s0 of
     Left err -> assertFailure ("drop sentinel failed: " <> show err)
     Right s1 -> assertEqual "drop on sentinel is no-op (live unchanged)" 0
                   (St.stLive (St.stStats s1))
@@ -14335,7 +14626,7 @@ rvRecMemberSentinelNoOp = do
 rvRecMemberRender :: Assertion
 rvRecMemberRender = do
   let s  = St.emptyStore
-      v  = St.RVRecMember (-5) 0 9
+      v  = St.RVRecMember (St.HAddr (-5)) 0 (St.HAddr 9)
   case St.renderRCValue s v of
     Left err  -> assertFailure ("renderRCValue failed: " <> show err)
     Right txt -> assertEqual "renders as <closure>" (T.pack "<closure>") txt
@@ -14635,7 +14926,7 @@ m2b2NoParamHandler =
 -- frame must include the parameter's dynamic address in the owned set.
 continuationOwnedNestedParam :: Assertion
 continuationOwnedNestedParam = do
-  let dynAddr = 7        -- non-static (positive) address
+  let dynAddr = St.HAddr 7  -- non-static (positive) address
       pb      = Binder (Name (T.pack "s") (Unique 8001)) Unrestricted m2bBoxTy
       h       = m2b2ParamHandler pb
       -- The frame's hsc binds pb's Unique to RVBox dynAddr.
@@ -14659,7 +14950,7 @@ continuationOwnedNoParam = do
 -- owned slots, matching the refcount bump the interpreter performs on entry).
 continuationOwnedDedup :: Assertion
 continuationOwnedDedup = do
-  let dynAddr = 7
+  let dynAddr = St.HAddr 7
       pb1     = Binder (Name (T.pack "s1") (Unique 8010)) Unrestricted m2bBoxTy
       pb2     = Binder (Name (T.pack "s2") (Unique 8011)) Unrestricted m2bBoxTy
       h1      = m2b2ParamHandler pb1
@@ -14677,7 +14968,7 @@ continuationOwnedDedup = do
 -- (aliased live-across-frames) should be counted once, matching refcount.
 continuationOwnedSameUniqueDedup :: Assertion
 continuationOwnedSameUniqueDedup = do
-  let dynAddr = 7
+  let dynAddr = St.HAddr 7
       pb      = Binder (Name (T.pack "s") (Unique 8020)) Unrestricted m2bBoxTy
       h       = m2b2ParamHandler pb
       hsc     = St.RCScope (Map.fromList [(Unique 8020, St.RVBox dynAddr)]) Map.empty
@@ -14694,8 +14985,8 @@ continuationOwnedSameUniqueDedup = do
 -- This test pins the (Unique, Addr) keying that 'continuationOwned' uses.
 continuationOwnedSameUniqueDiffAddr :: Assertion
 continuationOwnedSameUniqueDiffAddr = do
-  let addrA = 7    -- new param value (in KHandleRC)
-      addrB = 8    -- old param value (in KLetRC env2)
+  let addrA = St.HAddr 7    -- new param value (in KHandleRC)
+      addrB = St.HAddr 8    -- old param value (in KLetRC env2)
       pb    = Binder (Name (T.pack "s") (Unique 8030)) Unrestricted m2bBoxTy
       h     = m2b2ParamHandler pb
       hsc   = St.RCScope (Map.fromList [(Unique 8030, St.RVBox addrA)]) Map.empty
