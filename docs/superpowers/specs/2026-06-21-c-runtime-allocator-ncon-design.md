@@ -423,12 +423,15 @@ memory safety.
     objects (ties into the existing one-shot / multiplicity analysis). These change what a
     field can *hold*, so some interact with the ABI's value model — a separate design pass
     after the struct-level compaction above.
-- **Language-specific allocator (the "allocator slice").** Replace slice-1 `malloc`/`free`
+- **[IMPLEMENTED — see `2026-06-21-c-runtime-arena-allocator-design.md`] Language-specific
+  allocator (the "allocator slice").** Replace slice-1 `malloc`/`free`
   with a wok-tailored pool: exact arity-keyed size classes (`16 + 16*arity` -> 16/32/48/64…,
   zero rounding waste, few hot classes), a per-run slab arena with O(1) bulk teardown, and LIFO
   same-class reuse (the FBIP substrate). Decide hand-rolled-pool vs mimalloc first-class heaps
   (v3, or v2 + bound-thread per heap) with benchmarks; validate against the slice-1
-  malloc-backed oracle.
+  malloc-backed oracle. **Shipped** as a hand-rolled slab arena (bump + arity-exact LIFO free
+  lists + O(slabs) bulk teardown); mimalloc-v3 remains a possible future swap behind the
+  unchanged ABI.
 - **Emitting code.** The lowering half, against this now-real runtime.
 - **Packed/serialized representation (LoCal/Gibbon) — far-future, *separate model*.** An opt-in
   `packed` representation for immutable AST-shaped types, sitting *beside* the RC heap (it is an

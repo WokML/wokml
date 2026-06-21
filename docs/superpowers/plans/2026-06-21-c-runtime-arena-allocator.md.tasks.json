@@ -1,0 +1,26 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-21-c-runtime-arena-allocator.md",
+  "tasks": [
+    {
+      "id": 7,
+      "subject": "Task 1: The slab arena in wok_rc.{c,h}",
+      "status": "completed",
+      "description": "**Goal:** Replace the allocator internals with the slab arena (malloc retained behind WOK_RC_MALLOC, poison behind WOK_RC_POISON, additive stat readers), proven by an extended standalone C test and the full Haskell differential oracle.\n\n**Files:** Modify runtime/wok_rc.h (3 additive stat decls), runtime/wok_rc.c (replace allocator internals), runtime/test/wok_rc_test.c (arena assertions).\n\n**Acceptance Criteria:** -Werror-clean under cabal cc-options; standalone test asserts reuse/slab-boundary/large/teardown; full Haskell suite green with live==baseline; dup/dec/slot/tag/arity + 4 original stats unchanged.\n\n**Verify:** bash scripts/asan-runtime.sh && cabal test 2>&1 | tail -8\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\", \"runtime/test/wok_rc_test.c\"], \"verifyCommand\": \"bash scripts/asan-runtime.sh && cabal test 2>&1 | tail -8\", \"acceptanceCriteria\": [\"wok_rc.c -Werror-clean\", \"standalone test asserts reuse/slab-boundary/large/teardown\", \"full Haskell suite green, live==baseline\", \"dup/dec/slot/tag/arity + 4 stats unchanged\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 2: Sanitizer matrix + UAF oracle + microbench",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "**Goal:** Run the standalone test under ASan/UBSan(+LSan) across arena, WOK_RC_MALLOC, and WOK_RC_POISON variants; add an alloc/free microbench comparing arena vs malloc.\n\n**Files:** Create runtime/test/wok_rc_bench.c; modify scripts/asan-runtime.sh.\n\n**Acceptance Criteria:** asan-runtime.sh builds+runs 3 variants, each OK + sanitizer-clean, exit 0; LSan only where supported (Darwin guard); microbench prints ns/op for arena and malloc.\n\n**Verify:** bash scripts/asan-runtime.sh && bash scripts/asan-runtime.sh bench\n\n```json:metadata\n{\"files\": [\"runtime/test/wok_rc_bench.c\", \"scripts/asan-runtime.sh\"], \"verifyCommand\": \"bash scripts/asan-runtime.sh && bash scripts/asan-runtime.sh bench\", \"acceptanceCriteria\": [\"3 variants OK + sanitizer-clean, exit 0\", \"LSan only where supported\", \"microbench prints ns/op arena vs malloc\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 3: Docs + memory",
+      "status": "completed",
+      "blockedBy": [8],
+      "description": "**Goal:** Record the arena as the live allocator (ABI unchanged), mark the deferred slice done, update the memory note.\n\n**Files:** Modify runtime/README.md, both specs (arena -> IMPLEMENTED, slice-1 §9 marked done), memory note + MEMORY.md.\n\n**Acceptance Criteria:** README allocator bullet describes the slab arena (ABI unchanged, malloc behind WOK_RC_MALLOC); arena spec status IMPLEMENTED; slice-1 §9 bullet marked implemented; memory note + MEMORY.md updated with absolute dates.\n\n**Verify:** grep -n 'slab arena' runtime/README.md && grep -n IMPLEMENTED docs/superpowers/specs/2026-06-21-c-runtime-arena-allocator-design.md\n\n```json:metadata\n{\"files\": [\"runtime/README.md\", \"docs/superpowers/specs/2026-06-21-c-runtime-arena-allocator-design.md\", \"docs/superpowers/specs/2026-06-21-c-runtime-allocator-ncon-design.md\"], \"verifyCommand\": \"grep -n 'slab arena' runtime/README.md && grep -n IMPLEMENTED docs/superpowers/specs/2026-06-21-c-runtime-arena-allocator-design.md\", \"acceptanceCriteria\": [\"README allocator bullet = slab arena, ABI unchanged\", \"arena spec IMPLEMENTED\", \"slice-1 §9 marked implemented\", \"memory note + MEMORY.md updated\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-21"
+}

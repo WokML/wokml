@@ -42,4 +42,9 @@ WOK_PURE uint64_t wok_stat_frees(const WokHeap* h);
 WOK_PURE int64_t  wok_stat_live(const WokHeap* h);
 WOK_PURE int64_t  wok_stat_peak(const WokHeap* h);
 
+/* additive observability (arena-only; the WOK_RC_MALLOC backend reports 0).
+   Consumed C-side by the standalone test / microbench; no Haskell binding. */
+WOK_PURE uint64_t wok_stat_reused(const WokHeap* h);
+WOK_PURE uint64_t wok_stat_slabs(const WokHeap* h);
+
 #endif /* WOK_RC_H */

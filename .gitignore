@@ -26,3 +26,6 @@ src-generated/GeneratedParser/Wok/Par.hs
 # Local dev scratch swept into the branch by mistake (not slice artifacts)
 .ghci
 REVIEW.md
+
+# superpowers brainstorming companion (local-only)
+.superpowers/

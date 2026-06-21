@@ -138,12 +138,18 @@ The C runtime is deliberately ignorant of wok's value model:
   whichever heap it lives in (`CAddr` → FFI `wok_dec`/`wok_free`; `HAddr` → the IntMap
   path), and only then calls `wok_free`. None of the twice-reviewed continuation
   owned-set logic is rewritten; cross-heap edges (`NCon "Box" [closure]`) just work.
-- **The allocator is plain `malloc` / `free` for now**, by design, to isolate the RC
-  cascade as the variable under test (a missing drop surfaces immediately as a non-zero
-  live count rather than being masked by an arena's bulk teardown). The allocator is
-  swappable behind this ABI: a wok-tailored arity-keyed pool / slab arena is a later
-  "allocator slice," validated against this `malloc`-backed run as oracle. **Swapping the
-  allocator does not change the ABI above.**
+- **The allocator is a per-run slab arena.** `wok_alloc` reuses a same-arity freed cell
+  from a LIFO free list (the FBIP fast path) or bump-allocates within a 64 KiB slab;
+  constructors of `arity >= 64` fall back to a direct `malloc`. `wok_free` recycles the
+  cell to `freelist[arity]` (or `free`s the large path). `wok_heap_free` walks the slab
+  list (O(slabs) bulk teardown). The cell representation and the entire function ABI above
+  are unchanged — only the bytes' provenance changed. Because bulk teardown means a
+  *logical* leak of a slab cell is no longer a real `malloc` leak, the stat-based
+  `live == baseline` differential check is the load-bearing leak detector (LeakSanitizer
+  still sees large-cell leaks). The slice-1 one-`malloc`-per-cell allocator is retained
+  behind `-DWOK_RC_MALLOC` purely as a use-after-free oracle and microbench baseline (not
+  in the Haskell path); poison-on-free is `-DWOK_RC_POISON`. **Swapping the allocator does
+  not change the ABI above.**
 
 ## Soundness signal
 
