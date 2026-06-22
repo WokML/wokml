@@ -40,6 +40,8 @@ module Wok.Interp.RC.Value
   , writeNode
   , writeNodePure
   , isStaticAddr
+  , isInline
+  , isUncounted
   , deref
   , derefPure
   , mkClosure
@@ -121,7 +123,7 @@ liftRC = except
 -- cell may hold an 'HAddr' child via the @HBOX@ slot tag, and an abstract cell
 -- may hold a 'CAddr' child via 'RVBox'); the drop cascade routes each child by
 -- its 'Addr' kind, so the two heaps interoperate.
-data Addr = HAddr Int | CAddr (Ptr WokObj)
+data Addr = HAddr Int | CAddr (Ptr WokObj) | Inline Word32
   deriving (Eq, Ord, Show)
 
 -- | Runtime values in the RC interpreter. Either an unboxed literal, a
@@ -168,7 +170,7 @@ valueChildren (RVInst _ _)        = []
 -- value shape ('RVBox', 'RVRecMember', and any future variant) is retained
 -- EXACTLY as it is released. There is no parallel borrowed-set to drift.
 countedRefs :: [RCValue] -> [Addr]
-countedRefs = concatMap (filter (not . isStaticAddr) . valueChildren)
+countedRefs = concatMap (filter (not . isUncounted) . valueChildren)
 
 -- | Variable environment: identity (Unique) -> RC runtime value.
 type REnv = Map Unique RCValue
@@ -278,7 +280,7 @@ continuationOwned = dedup . go
     go KDoneRC                = []
     go (KLetRC r body sc k)   = frameOwned r body sc ++ go k
     go (KAppRC vs k)          = [ (Nothing, a) | a <- countedRefs vs ] ++ go k
-    go (KDropCellRC a k)      = [ (Nothing, a) | not (isStaticAddr a) ] ++ go k
+    go (KDropCellRC a k)      = [ (Nothing, a) | not (isUncounted a) ] ++ go k
     -- A nested handler frame in the captured prefix owns its PARAMETER value (if
     -- any).  Only the parameter slot is owned by the frame itself; the rest of
     -- hsc is the captured enclosing scope, whose binders are owned by their own
@@ -398,7 +400,8 @@ moveOutCont a s = liftRC (moveOutContPure a s)
 -- not an 'NCon'), so it always lives on the abstract heap; a 'CAddr' here is an
 -- internal routing error.
 moveOutContPure :: Addr -> Store -> Either RuntimeError (RCKont, (Handler, Int, RCScope), Store)
-moveOutContPure (CAddr _) _ = Left (PrimError (Tx.pack "resume: continuation cannot live on the C heap"))
+moveOutContPure (CAddr _)   _ = Left (PrimError (Tx.pack "resume: continuation cannot live on the C heap"))
+moveOutContPure (Inline _)  _ = Left (PrimError (Tx.pack "resume: inline immediate is not a continuation"))
 moveOutContPure a@(HAddr i) s = do
   c <- derefPure a s
   case cNode c of
@@ -681,30 +684,48 @@ data SlotKind = KLitInt | KLitChar | KLitUnit | KPointer
 -- 'NCon' to fall back to the abstract heap.  This preserves the encoding
 -- semantics exactly: NO value is promoted or widened.
 --
--- 'CAddr' pointers are aligned to at least 8 bytes, so their low bit is always
--- 0.  'HAddr' indices are tagged with low bit 1 (shifted left by 1, OR'd with 1)
--- to distinguish them; negative static indices round-trip correctly because the
--- arithmetic right-shift in 'decodeSlotC' sign-extends the high bit.
+-- The @KPointer@ class uses the low 2 bits to discriminate three pointer-classes:
+--
+--   * @..0@ (bit0 = 0): 'CAddr' bare 8-aligned pointer.  'CAddr' pointers are
+--     aligned to at least 8 bytes so their low three bits are always 0; no shift
+--     needed.
+--   * @01@ (bits 1:0 = 01): 'HAddr' abstract index, stored as
+--     @(i << 2) .|. 1@.  Negative static indices round-trip correctly because
+--     the arithmetic right-shift in 'decodeSlotC' sign-extends the high bit.
+--   * @11@ (bits 1:0 = 11): 'Inline' nullary constructor tag, stored as
+--     @(tag << 2) .|. 3@.  The slot round-trips the full 'Word32' tag (62 bits of
+--     headroom after the 2-bit shift). (The @tid >= 65536@ fallback in 'allocNCon'
+--     is a SEPARATE constraint on the C PARENT cell's @uint16@ header tag, not on an
+--     'Inline' slot child.)
 encodeSlotC :: RCValue -> Maybe (SlotKind, Word64)
-encodeSlotC (RVLit (LInt n))  = (\w -> (KLitInt, fromIntegral (w :: Int64))) <$> toIntegralSized n
-encodeSlotC (RVLit (LChar c)) = Just (KLitChar, fromIntegral (fromEnum c))
-encodeSlotC (RVLit LUnit)     = Just (KLitUnit, 0)
-encodeSlotC (RVBox (CAddr p)) = Just (KPointer, fromIntegral (ptrToWordPtr p))
--- HAddr round-trip: low bit 1 distinguishes from CAddr (which is always 8-aligned
--- so its low three bits are 0).  Negative static indices are sign-preserved
+encodeSlotC (RVLit (LInt n))    = (\w -> (KLitInt, fromIntegral (w :: Int64))) <$> toIntegralSized n
+encodeSlotC (RVLit (LChar c))   = Just (KLitChar, fromIntegral (fromEnum c))
+encodeSlotC (RVLit LUnit)       = Just (KLitUnit, 0)
+encodeSlotC (RVBox (CAddr p))   = Just (KPointer, fromIntegral (ptrToWordPtr p))
+-- HAddr round-trip: low 2 bits = 01.  Negative static indices are sign-preserved
 -- because we use Int64 arithmetic shift right on decode.
-encodeSlotC (RVBox (HAddr i)) = Just (KPointer, fromIntegral ((i `shiftL` 1) .|. 1))
-encodeSlotC _                 = Nothing
+encodeSlotC (RVBox (HAddr i))   = Just (KPointer, fromIntegral ((i `shiftL` 2) .|. 1))
+-- Inline round-trip: low 2 bits = 11.  The full Word32 tag fits after << 2 (62 bits
+-- of headroom); even Word32 maxBound (0xFFFFFFFF << 2) stays well within 64 bits.
+encodeSlotC (RVBox (Inline t))  = Just (KPointer, (fromIntegral t `shiftL` 2) .|. 3)
+encodeSlotC _                   = Nothing
 
 -- | The exact inverse of 'encodeSlotC' on the encodable shapes, driven by the
 -- 'SlotKind' from the stored per-constructor descriptor.
+--
+-- The @KPointer@ low-2-bit discriminant:
+--
+--   * @..0@ (bit0 = 0): 'CAddr' bare pointer (read as-is).
+--   * @01@ (bits 1:0 = 01): 'HAddr' index (arithmetic @>> 2@, sign-extends).
+--   * @11@ (bits 1:0 = 11): 'Inline' tag (@>> 2@, unsigned).
 decodeSlotC :: SlotKind -> Word64 -> RCValue
 decodeSlotC KLitInt  w = RVLit (LInt (fromIntegral (fromIntegral w :: Int64)))
 decodeSlotC KLitChar w = RVLit (LChar (decodeChar w))
 decodeSlotC KLitUnit _ = RVLit LUnit
 decodeSlotC KPointer w
-  | w .&. 1 == 0 = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral w))))
-  | otherwise    = RVBox (HAddr (fromIntegral ((fromIntegral w :: Int64) `shiftR` 1)))
+  | w .&. 1 == 0 = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral w))))                   -- 00
+  | w .&. 2 == 0 = RVBox (HAddr (fromIntegral ((fromIntegral w :: Int64) `shiftR` 2)))        -- 01
+  | otherwise    = RVBox (Inline (fromIntegral (w `shiftR` 2)))                               -- 11
 
 -- | Guard the codepoint so an out-of-range payload yields a clear invariant error.
 -- The encoder never emits an out-of-range char, so this can't happen on real data.
@@ -720,6 +741,18 @@ decodeChar w
 isStaticAddr :: Addr -> Bool
 isStaticAddr (HAddr i) = i < 0
 isStaticAddr (CAddr _) = False
+isStaticAddr (Inline _) = False
+
+-- | True for an inline immediate (a nullary constructor with no cell).
+isInline :: Addr -> Bool
+isInline (Inline _) = True
+isInline _          = False
+
+-- | True for an address that owns no counted cell: a static (immortal) address
+-- OR an inline immediate. The single filter the counted-ref / owned-set / CAF
+-- paths use, so dup/drop and the free cascade skip both uniformly.
+isUncounted :: Addr -> Bool
+isUncounted a = isStaticAddr a || isInline a
 
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
@@ -731,8 +764,16 @@ isStaticAddr (CAddr _) = False
 -- the Task-0 pure core, so store-algebra unit tests that call 'allocPure'
 -- directly keep working.
 alloc :: Node -> Store -> RC (Addr, Store)
+alloc (NCon con []) s = pure (allocInline con s)
 alloc (NCon con vs) s = allocNCon con vs s
 alloc n             s = pure (allocPure n s)
+
+-- | A nullary constructor becomes an inline immediate carrying the interned
+-- tag. No 'recordAlloc': an immediate lives on no heap. Interns on BOTH backends
+-- so 'deref' can reverse the tag via 'tagName' (stat-invisible: touches only
+-- stTagFwd/stTagRev).
+allocInline :: Text -> Store -> (Addr, Store)
+allocInline con s = let (tid, s') = internTag con s in (Inline tid, s')
 
 -- | Allocate an 'NCon', routing to the C heap when the backend is 'CHeap' and
 -- every field is encodable; otherwise the abstract heap. The C path's
@@ -812,6 +853,7 @@ allocStatic n s =
 writeStatic :: Addr -> Node -> Store -> Store
 writeStatic (HAddr i) n s = s { stCells = IM.insert i (Cell 1 n) (stCells s) }
 writeStatic (CAddr _) _ _ = error "writeStatic: a C-heap address is never static"
+writeStatic (Inline _) _ _ = error "writeStatic: an inline immediate has no cell to overwrite"
 
 -- | Overwrite the NODE payload of an existing cell while PRESERVING its reference
 -- count (and statistics). Used by the M3 continuation-cell move primitives
@@ -827,7 +869,8 @@ writeNode a n s = liftRC (writeNodePure a n s)
 -- continuation-cell ('NContCell') moves it serves are never C-eligible (an
 -- 'NContCell' is not an 'NCon'), so a 'CAddr' here is an internal error.
 writeNodePure :: Addr -> Node -> Store -> Either RuntimeError Store
-writeNodePure (CAddr _) _ _ = Left (PrimError (Tx.pack "writeNode: unexpected C-heap address"))
+writeNodePure (CAddr _)   _ _ = Left (PrimError (Tx.pack "writeNode: unexpected C-heap address"))
+writeNodePure (Inline _)  _ _ = Left (PrimError (Tx.pack "writeNode: inline immediate has no cell"))
 writeNodePure a@(HAddr i) n s = do
   c <- derefPure a s
   Right s { stCells = IM.insert i c { cNode = n } (stCells s) }
@@ -864,7 +907,7 @@ mkClosure env ps body = NClosure env ps body OwnCaptures
 -- 'RVBox' captures.
 closureOwnedBoxed :: Node -> [Addr]
 closureOwnedBoxed (NClosure env _ _ OwnCaptures) =
-  [ a | RVBox a <- Map.elems env, not (isStaticAddr a) ]
+  [ a | RVBox a <- Map.elems env, not (isUncounted a) ]
 closureOwnedBoxed (NClosure _ _ _ BorrowCaptures) = []
 closureOwnedBoxed _ = []
 
@@ -876,8 +919,9 @@ closureOwnedBoxed _ = []
 -- 'derefPure' is the abstract-heap pure core used by the store-aware renderers
 -- and the store-algebra unit tests.
 deref :: Addr -> Store -> RC Cell
-deref (CAddr p)   s = liftIO (readCCell p s)
-deref a@(HAddr _) s = liftRC (derefPure a s)
+deref (CAddr p)    s = liftIO (readCCell p s)
+deref a@(HAddr _)  s = liftRC (derefPure a s)
+deref (Inline tid) s = pure (Cell 0 (NCon (tagName tid s) []))
 
 -- | Reconstruct the 'Cell' of a C-heap 'NCon' from its tag/arity/slots. Shared
 -- by 'deref' and the C-cell free cascade in 'dropAddr'.
@@ -923,10 +967,15 @@ readCWords p = do
 
 -- | The pure core of 'deref' over the ABSTRACT heap. A 'CAddr' is reconstructed
 -- by the IO 'deref' wrapper (the C runtime is read in 'IO'); reaching this pure
--- core with a 'CAddr' is an internal routing error.
+-- core with a 'CAddr' is an internal routing error. An 'Inline' immediate is
+-- synthesized to its nullary 'NCon' here directly --- 'tagName' is pure, so
+-- reading an immediate's value is a meaningful pure operation (like the no-op
+-- 'increfPure'/'dropAddrStepPure' on an 'Inline'), and the IO 'deref' produces
+-- the identical cell. This is why the renderers need no inline special-case.
 derefPure :: Addr -> Store -> Either RuntimeError Cell
-derefPure (CAddr _) _ = Left (PrimError (Tx.pack "deref: C-heap address has no pure reconstruction"))
-derefPure (HAddr i) s
+derefPure (CAddr _)   _ = Left (PrimError (Tx.pack "deref: C-heap address has no pure reconstruction"))
+derefPure (Inline tid) s = Right (Cell 0 (NCon (tagName tid s) []))
+derefPure (HAddr i)  s
   | IS.member i (stDead s) =
       Left (PrimError (Tx.pack ("use-after-free: addr " <> show i)))
   | otherwise =
@@ -946,12 +995,14 @@ derefPure (HAddr i) s
 incref :: Addr -> Store -> RC Store
 incref (CAddr p)   s = liftIO (H.wokDup p) >> pure s
 incref a@(HAddr _) s = liftRC (increfPure a s)
+incref (Inline _)  s = pure s
 
 -- | The pure core of 'incref' over the ABSTRACT heap. A 'CAddr' is increfed by
 -- the IO 'incref' wrapper (a direct @wok_dup@); reaching this pure core with one
 -- is an internal routing error.
 increfPure :: Addr -> Store -> Either RuntimeError Store
-increfPure (CAddr _) _ = Left (PrimError (Tx.pack "incref: C-heap address has no pure incref"))
+increfPure (CAddr _)  _ = Left (PrimError (Tx.pack "incref: C-heap address has no pure incref"))
+increfPure (Inline _) s = Right s
 increfPure a@(HAddr i) s
   | isStaticAddr a = Right s
   | otherwise = do
@@ -975,6 +1026,7 @@ dropAddr :: Addr -> Store -> RC Store
 dropAddr a0 s0 = go [a0] s0
   where
     go [] s = pure s
+    go (Inline _ : rest) s = go rest s
     go (CAddr p : rest) s = do
       newrc <- liftIO (H.wokDec p)
       if newrc /= 0
@@ -1027,7 +1079,8 @@ heapPtr s = case stBackend s of
 -- 'dropAddrPure'; the unified 'dropAddr' loop and the pure 'dropAddrPure' loop
 -- both drive it.
 dropAddrStepPure :: Addr -> Store -> Either RuntimeError (Maybe [Addr], Store)
-dropAddrStepPure (CAddr _) _ = Left (PrimError (Tx.pack "dropAddrStepPure: C-heap address is not an abstract step"))
+dropAddrStepPure (CAddr _)   _ = Left (PrimError (Tx.pack "dropAddrStepPure: C-heap address is not an abstract step"))
+dropAddrStepPure (Inline _)  s = Right (Nothing, s)
 dropAddrStepPure a@(HAddr i) s
   -- Static (immortal) cells are uncounted: a drop of a global handle, or of a
   -- dynamic field that points at a global, is inert. Skip it (no cascade).
@@ -1159,12 +1212,14 @@ bindRCBinders bs vs env = foldl' (\e (b, v) -> bindRCBinder b v e) env (zip bs v
 renderValueWith :: Monad m => (Addr -> Store -> m Cell) -> Store -> RCValue -> m Text
 renderValueWith drf = goVal
   where
-    goVal _ (RVLit l)       = pure (renderLit l)
-    goVal s (RVBox a)       = do
+    goVal _ (RVLit l)              = pure (renderLit l)
+    -- 'RVBox a' covers an 'Inline' immediate too: both 'deref' and 'derefPure'
+    -- synthesize its nullary 'NCon', so no inline special-case is needed.
+    goVal s (RVBox a)              = do
       c <- drf a s
       goNode s (cNode c)
-    goVal _ RVRecMember{}   = pure (Tx.pack "<closure>")
-    goVal _ (RVInst _ _)    = pure (Tx.pack "<instance>")
+    goVal _ RVRecMember{}          = pure (Tx.pack "<closure>")
+    goVal _ (RVInst _ _)           = pure (Tx.pack "<instance>")
 
     goNode _ (NCon t []) | t == Tx.pack "Nil" = pure (Tx.pack "[]")
     goNode s (NCon t [h, tl]) | t == Tx.pack "Cons" = goList s h tl
@@ -1193,6 +1248,8 @@ renderValueWith drf = goVal
       spine [hd] tl0
       where
         spine acc v = case v of
+          -- 'RVBox a' covers the 'Inline' Nil terminator: 'drf' synthesizes its
+          -- 'NCon "Nil" []', which the @t == "Nil"@ guard below closes the list on.
           RVBox a -> do
             c <- drf a s
             case cNode c of

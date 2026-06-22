@@ -45,9 +45,12 @@ WOK_PURE uint64_t wok_stat_frees(const WokHeap* h);
 WOK_PURE int64_t  wok_stat_live(const WokHeap* h);
 WOK_PURE int64_t  wok_stat_peak(const WokHeap* h);
 
-/* additive observability (arena-only; the WOK_RC_MALLOC backend reports 0).
-   Consumed C-side by the standalone test / microbench; no Haskell binding. */
+/* additive observability. reused/slabs are arena-only (the WOK_RC_MALLOC backend
+   reports 0) and consumed C-side by the standalone test / microbench (no Haskell binding). */
 WOK_PURE uint64_t wok_stat_reused(const WokHeap* h);
 WOK_PURE uint64_t wok_stat_slabs(const WokHeap* h);
+/* peak_bytes (high-water Sigma(8 + 8*arity)) is tracked in BOTH backends and returns the
+   real figure under WOK_RC_MALLOC; bound in Haskell as wokStatPeakBytes for benchmarking. */
+WOK_PURE uint64_t wok_stat_peak_bytes(const WokHeap* h);
 
 #endif /* WOK_RC_H */

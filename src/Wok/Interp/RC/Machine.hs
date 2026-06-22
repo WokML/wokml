@@ -349,7 +349,7 @@ enterRC borrowHead _ fv args k s = case fv of
             -- BORROW-ONLY cells are a static (global) closure: their captures are
             -- owned by the static lifetime, so a call neither increfs them (as
             -- before) nor cascades them, and they are never consumed by the call.
-            borrowOnly      = isStaticAddr addr
+            borrowOnly      = isUncounted addr
             increfOwned st  = if borrowOnly then pure st
                               else foldM (flip incref) st ownedCaptured
             -- This call CONSUMES the cell iff it is an unnamed intermediate (not a
@@ -958,7 +958,7 @@ installBinds prims knotEnv = go
           -- fix, a captor cascading into the CAF's dynamic cell). A deref failure
           -- of a just-forced CAF result is a REAL error and should abort the run.
           (s'', envV) <- case v of
-            RVBox dynAddr | not (isStaticAddr dynAddr) ->
+            RVBox dynAddr | not (isUncounted dynAddr) ->
               (\c -> (writeStatic a (cNode c) s', RVBox a)) <$> deref dynAddr s'
             _ -> pure (s', v)
           go bs s'' (Map.insert (nameUniq n) envV env) as

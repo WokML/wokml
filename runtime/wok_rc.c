@@ -27,7 +27,7 @@ static size_t wok_cell_bytes(uint32_t arity) {
    WOK_RC_MALLOC build via the standalone test). */
 #ifdef WOK_RC_MALLOC
 /* ---- retained slice-1 allocator: one malloc per cell (UAF oracle + bench baseline) ---- */
-struct WokHeap { uint64_t allocs; uint64_t frees; int64_t live; int64_t peak; };
+struct WokHeap { uint64_t allocs; uint64_t frees; int64_t live; int64_t peak; uint64_t cur_bytes; uint64_t peak_bytes; };
 
 WokHeap* wok_heap_new(void) {
     WokHeap* h = (WokHeap*)calloc(1, sizeof(WokHeap));
@@ -47,11 +47,15 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
     p->rc = 1u; p->tag = (uint16_t)tag; p->arity = (uint8_t)arity; p->scan = 0u;
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)wok_cell_bytes(arity);
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
     return p;
 }
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
+    uint32_t arity = (uint32_t)p->arity;
     h->frees += 1u; h->live -= 1;
+    h->cur_bytes -= (uint64_t)wok_cell_bytes(arity);
     free(p);
 }
 uint64_t wok_stat_reused(const WokHeap* h)         { (void)h; return 0u; }
@@ -69,6 +73,8 @@ struct WokHeap {
     uint64_t frees;
     int64_t  live;
     int64_t  peak;
+    uint64_t cur_bytes;              /* current live bytes: Σ(8 + 8*arity) */
+    uint64_t peak_bytes;             /* high-water mark of cur_bytes */
     uint64_t reused;                 /* free-list pops */
     uint64_t nslabs;                 /* slabs malloc'd */
     WokSlab* slabs;                  /* linked list, for O(slabs) bulk teardown */
@@ -140,6 +146,8 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
     p->rc = 1u; p->tag = (uint16_t)tag; p->arity = (uint8_t)arity; p->scan = 0u;
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)wok_cell_bytes(arity);
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
     return p;
 }
 
@@ -147,6 +155,7 @@ void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
     uint32_t arity = (uint32_t)p->arity;
     h->frees += 1u; h->live -= 1;
+    h->cur_bytes -= (uint64_t)wok_cell_bytes(arity);
 #ifdef WOK_RC_POISON
     /* Poison is arena-only by design: it forces a reuse-after-free read to see garbage,
        since ASan cannot flag the arena recycling its own live memory. The WOK_RC_MALLOC
@@ -165,6 +174,9 @@ uint64_t wok_stat_reused(const WokHeap* h)         { return h->reused; }
 uint64_t wok_stat_slabs(const WokHeap* h)          { return h->nslabs; }
 
 #endif /* WOK_RC_MALLOC */
+
+/* ---- shared across both backends ---------------------------------------------------- */
+uint64_t wok_stat_peak_bytes(const WokHeap* h)     { return h->peak_bytes; }
 
 /* ---- shared across both backends (unchanged from slice 1) --------------------------- */
 void wok_dup(WokObj* p) { p->rc += 1u; }

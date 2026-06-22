@@ -1,0 +1,24 @@
+=== tree    (binary tree, depth 8) ===
+allocs   = 511
+frees    = 511
+peakLive = 511
+baseline = 0
+
+=== list    (spine of 100 nodes) ===
+allocs   = 101
+frees    = 101
+peakLive = 101
+baseline = 0
+
+=== bools   (1000 bool-alloc steps) ===
+allocs   = 3000
+frees    = 3000
+peakLive = 2
+baseline = 0
+
+=== maybes  (64 Option values) ===
+allocs   = 193
+frees    = 193
+peakLive = 129
+baseline = 0
+

@@ -1,0 +1,22 @@
+-- Binary tree benchmark: build a balanced tree of depth 8 and fold
+-- it to a number by summing all node labels. Exercises many Leaf
+-- (nullary) constructors and many Node (3-field) constructors.
+module Main
+import Std.Base
+
+data Tree = Leaf | Node U64 Tree Tree
+
+-- Build a balanced tree of given depth; each internal node is labelled 1.
+build : U64 -> Tree
+build d = case d of
+  0 -> Leaf
+  _ -> Node 1 (build (d - 1)) (build (d - 1))
+
+-- Sum all node labels.
+sumTree : Tree -> U64
+sumTree t = case t of
+  Leaf        -> 0
+  Node v l r  -> v + sumTree l + sumTree r
+
+main : U64
+main = sumTree (build 8)

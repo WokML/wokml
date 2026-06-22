@@ -49,6 +49,13 @@ typedef struct WokObj {
   layout ABI break. The slot accessors themselves became **one word**
   (`wok_slot_set(p,i,word)` / `wok_slot_get(p,i)->uint64`) — the one deliberate
   accessor-signature change.
+- A **nullary constructor** (zero fields: `Nil`/`None`/`True`/`False`/any `data T = A`) is
+  **never a cell**. It is an **inline immediate** (`RVBox (Inline tag)`): the interned tag
+  rides directly in the slot/binding word (low 2 bits `11`; see the slot table), so the C
+  heap never holds an arity-0 cell. `wok_alloc` is therefore only ever called with
+  `arity >= 1`. Constructing a nullary value allocates nothing and dup/drop on it are no-ops
+  (it is uncounted). The additive `wok_stat_peak_bytes` accessor reports the high-water live
+  bytes (`Σ 8 + 8*arity`) for benchmarking; it does not affect the ABI.
 
 ## Slot encoding (descriptor-driven)
 
@@ -62,12 +69,19 @@ unchanged from the 16B era** — no range-widening, no promotion:
 | `KLitInt`  | `int64` bit pattern | `RVLit (LInt n)`, `n` fits in `Int64` |
 | `KLitChar` | code point          | `RVLit (LChar c)` |
 | `KLitUnit` | `0`                 | `RVLit LUnit` |
-| `KPointer` (low bit 0) | `WokObj*` bits      | `RVBox (CAddr p)` — another C cell |
-| `KPointer` (low bit 1) | `(i << 1) \| 1`     | `RVBox (HAddr i)` — IntMap-resident node |
+| `KPointer` (low 2 bits `00`) | `WokObj*` bits     | `RVBox (CAddr p)` — another C cell |
+| `KPointer` (low 2 bits `01`) | `(i << 2) \| 1`    | `RVBox (HAddr i)` — IntMap-resident node |
+| `KPointer` (low 2 bits `11`) | `(tag << 2) \| 3`  | `RVBox (Inline tag)` — a **nullary constructor as an inline immediate**, NO cell |
 
 The kind distinguishes scalar-vs-pointer (a per-constructor constant); for a pointer slot the
-**low bit** distinguishes a C cell (`CAddr`, ≥16-aligned → bit 0) from an abstract-heap child
-(`HAddr`, stored shifted → bit 1) — that split is runtime-dependent, so it stays in the word.
+**low 2 bits** discriminate three runtime pointer-classes (Koka-style, bit 0 = pointer-vs-value):
+a C cell (`CAddr`, ≥8-aligned → `00`, read as-is), an abstract-heap child (`HAddr`, stored
+`(i << 2) | 1` → `01`, decoded by arithmetic `>> 2` so negatives sign-extend), or an **inline
+immediate** (`Inline tag`, stored `(tag << 2) | 3` → `11`, decoded `>> 2`). The `10`
+combination is never produced. This split is runtime-dependent (the same `Maybe a` field holds
+a `Some` pointer in one cell and a `None` immediate in another), so it stays in the word; the
+descriptor still records the slot as a single `KPointer` kind — `KPointer` subsumes
+"pointer-or-immediate".
 
 ### Encodable-or-fallback rule
 

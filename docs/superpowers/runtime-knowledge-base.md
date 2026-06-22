@@ -135,8 +135,16 @@ common knowledge.
   per-slot "kind" out of every cell. The **crux**: self-description (tagged word, loses bits,
   *promotes*) vs descriptor (raw, no promotion); static typing makes the descriptor free.
   [W: compaction spec]
-- **Pointer slots carry one low bit = C-cell vs H-addr** (the cross-heap fallback split); this
-  mirrors Koka's low-bit field tag but discriminates *heap*, not pointer-vs-value.  [W]
+- **Immediates (Slice 2, IMPLEMENTED `feat/layout-compaction-slice2`, 1282 green):** a nullary
+  constructor (`Nil`/`None`/`True`/`False`/any `data T = A`) is an **inline immediate** —
+  `Addr` gains `Inline Word32` (the interned con tag), intercepted at the shared `alloc`
+  chokepoint (no cell, no stat bump, both backends) and synthesized back by `deref`. Uncounted
+  (dup/drop no-ops, reusing the static-cell precedent). The C heap never holds an arity-0 cell.
+  Measured: tree −50% allocs / −20% bytes, boolean churn −100%.  [W: slice2 spec]
+- **Pointer slots carry a 2-bit low tag** (was 1 bit in Slice 1): `00` = C-cell (`CAddr`,
+  8-aligned, read as-is), `01` = H-addr (`(i<<2)|1`), `11` = inline immediate (`(tag<<2)|3`);
+  `10` unused. Koka-style bit 0 = pointer-vs-value; `KPointer` subsumes pointer-or-immediate
+  (no new `SlotKind`). The cross-heap C-vs-H split rides in bit 1.  [W]
 - **Extreme-perf roadmap (follow-on slices):** FBIP in-place reuse → escape→stack/region
   allocation → reuse specialization + rc elision → monomorphize/unbox. All enabled by the
   descriptor + arena + the analyses; none folded into the layout slice.  [W, P1]

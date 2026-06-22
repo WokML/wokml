@@ -5,6 +5,7 @@ module Wok.Interp.RC.Heap
   , wokAlloc, wokDup, wokDec, wokFree
   , wokSlotSet, wokSlotGet, wokTag, wokArity
   , wokStatAllocs, wokStatFrees, wokStatLive, wokStatPeak
+  , wokStatPeakBytes
   ) where
 
 import Foreign.Ptr (Ptr)
@@ -24,7 +25,8 @@ foreign import ccall unsafe "wok_slot_set"  wokSlotSet  :: Ptr WokObj -> Word32 
 foreign import ccall unsafe "wok_slot_get"  wokSlotGet  :: Ptr WokObj -> Word32 -> IO Word64
 foreign import ccall unsafe "wok_tag"       wokTag      :: Ptr WokObj -> IO Word32
 foreign import ccall unsafe "wok_arity"     wokArity    :: Ptr WokObj -> IO Word32
-foreign import ccall unsafe "wok_stat_allocs" wokStatAllocs :: Ptr WokHeap -> IO Word64
-foreign import ccall unsafe "wok_stat_frees"  wokStatFrees  :: Ptr WokHeap -> IO Word64
-foreign import ccall unsafe "wok_stat_live"   wokStatLive   :: Ptr WokHeap -> IO Int64
-foreign import ccall unsafe "wok_stat_peak"   wokStatPeak   :: Ptr WokHeap -> IO Int64
+foreign import ccall unsafe "wok_stat_allocs"      wokStatAllocs      :: Ptr WokHeap -> IO Word64
+foreign import ccall unsafe "wok_stat_frees"       wokStatFrees       :: Ptr WokHeap -> IO Word64
+foreign import ccall unsafe "wok_stat_live"        wokStatLive        :: Ptr WokHeap -> IO Int64
+foreign import ccall unsafe "wok_stat_peak"        wokStatPeak        :: Ptr WokHeap -> IO Int64
+foreign import ccall unsafe "wok_stat_peak_bytes"  wokStatPeakBytes   :: Ptr WokHeap -> IO Word64

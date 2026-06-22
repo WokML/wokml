@@ -1,0 +1,29 @@
+-- Option allocation benchmark: build a list of 64 Option U64 values
+-- where most are None (nullary) and a few are Some (one-field).
+-- Folds to the count of Some values. Uses eqU64 directly (no
+-- typeclass dict) for RC compatibility.
+module Main
+import Std.Base
+
+data MyList = Nil | Cons (Option U64) MyList
+
+-- Build a list of n Options: Some n when mod n 8 == 0, else None.
+build : U64 -> MyList
+build n = case n of
+  0 -> Nil
+  _ ->
+    let opt = case eqU64 (mod n 8) 0 of
+                True  -> Some n
+                False -> None
+    in Cons opt (build (n - 1))
+
+-- Count the Some elements.
+countSomes : MyList -> U64
+countSomes xs = case xs of
+  Nil       -> 0
+  Cons h t  -> case h of
+    None    -> countSomes t
+    Some _  -> 1 + countSomes t
+
+main : U64
+main = countSomes (build 64)

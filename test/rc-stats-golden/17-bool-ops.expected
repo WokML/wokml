@@ -1,4 +1,4 @@
-allocs   = 5
-frees    = 5
-peakLive = 2
+allocs   = 0
+frees    = 0
+peakLive = 0
 baseline = 0

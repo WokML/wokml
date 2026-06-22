@@ -1,0 +1,20 @@
+-- Boolean allocation benchmark: a counter loop that repeatedly tests
+-- equality and ANDs/ORs the results together, exercising Bool heap
+-- allocations. Counts down from 1000 to 0, performing two Bool ops
+-- per iteration. Uses eqU64 directly (no typeclass dict) for RC
+-- compatibility.
+module Main
+import Std.Base
+
+-- Count down from n to 0; return the number of iterations where both
+-- mod-2 and mod-3 remainders are zero (i.e. multiples of 6).
+loop : U64 -> U64
+loop n = case n of
+  0 -> 0
+  _ -> let b = eqU64 (mod n 2) 0 && eqU64 (mod n 3) 0 in
+       case b of
+         True  -> 1 + loop (n - 1)
+         False -> loop (n - 1)
+
+main : U64
+main = loop 1000

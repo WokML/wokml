@@ -1,0 +1,20 @@
+-- List allocation control benchmark: build a spine of 100 explicit
+-- list nodes and fold to its length. This is the simplest allocator
+-- workload -- no branching on content, pure Cons/Nil spine.
+module Main
+import Std.Base
+
+data List = Nil | Cons U64 List
+
+build : U64 -> List
+build n = case n of
+  0 -> Nil
+  _ -> Cons n (build (n - 1))
+
+lengthList : List -> U64
+lengthList xs = case xs of
+  Nil      -> 0
+  Cons _ t -> 1 + lengthList t
+
+main : U64
+main = lengthList (build 100)

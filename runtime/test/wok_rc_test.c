@@ -23,6 +23,22 @@ int main(void) {
         assert(wok_stat_frees(h) == 1u);
         assert(wok_stat_live(h) == 0);
         assert(wok_stat_peak(h) == 1);
+        /* peak_bytes: arity 2 -> 8 + 2*8 = 24 bytes; cell freed so cur=0, peak stays */
+        assert(wok_stat_peak_bytes(h) == 24u);
+        wok_heap_free(h);
+    }
+
+    /* --- peak_bytes high-water: allocate two cells, peak captured at two-cell mark --- */
+    {
+        WokHeap* h = wok_heap_new();
+        /* arity 0: 8 bytes; arity 1: 16 bytes */
+        WokObj* a = wok_alloc(h, 1u, 0u);   /* +8  -> cur=8,  peak=8  */
+        WokObj* b = wok_alloc(h, 2u, 1u);   /* +16 -> cur=24, peak=24 */
+        assert(wok_stat_peak_bytes(h) == 24u);
+        assert(wok_dec(a) == 0u); wok_free(h, a);  /* cur=16, peak stays 24 */
+        assert(wok_stat_peak_bytes(h) == 24u);
+        assert(wok_dec(b) == 0u); wok_free(h, b);  /* cur=0,  peak stays 24 */
+        assert(wok_stat_peak_bytes(h) == 24u);
         wok_heap_free(h);
     }
 

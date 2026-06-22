@@ -9726,15 +9726,18 @@ rcDifferentialHarness path = do
 -- (elaborate -> Perceus insertRC -> runModuleRC) and asserts the exact heap
 -- accounting for a freshly built, fully consumed spine of length N:
 --
---   * frees    == N + 1  (N 'Cons' shells + one 'Nil', every one reclaimed),
---   * allocs   == N + 1  (nothing else is allocated; baseline == 0),
---   * peakLive == N + 1  (the whole spine is live before it is consumed),
---   * stLive   == 0      (heap-empty at exit).
+--   NOTE: since Slice 2, 'Nil' (nullary) is an 'Inline' immediate with ZERO heap
+--   cells, so the counts are N (not N + 1):
 --
--- Reaching 'frees == N + 1' at this scale proves the RC store's drop is
--- ITERATIVE (a worklist, not host recursion): a recursive drop of a 50000-cell
--- spine would otherwise overflow the Haskell stack. This is the same property as
--- the Store-level unit test in 'rc drop', but exercised end-to-end through the
+--   * frees    == N  (N 'Cons' shells reclaimed; 'Nil' is now inline, no cell),
+--   * allocs   == N  (only the Cons spine is allocated; baseline == 0),
+--   * peakLive == N  (the whole Cons spine is live before it is consumed),
+--   * stLive   == 0  (heap-empty at exit).
+--
+-- Reaching 'frees == N' at this scale proves the RC store's drop is ITERATIVE
+-- (a worklist, not host recursion): a recursive drop of a 50000-cell spine would
+-- otherwise overflow the Haskell stack. This is the same property as the
+-- Store-level unit test in 'rc drop', but exercised end-to-end through the
 -- '__rc_drop' calls the Perceus pass actually inserts.
 
 rcDeepListTests :: TestTree
@@ -9746,14 +9749,16 @@ rcDeepListTests = testGroup "rc deep-list"
         Right run -> do
           let st       = RCM.rcStats run
               baseline = RCM.rcBaseline run
-              expected = deepListN + 1
+              -- Nil is now Inline (zero heap cells), so only N Cons cells are
+              -- allocated and freed (not N + 1).
+              expected = deepListN
           assertEqual "this program retains no global baseline"
             0 baseline
-          assertEqual "frees must equal N + 1 (every spine cell reclaimed)"
+          assertEqual "frees must equal N (every Cons cell reclaimed; Nil is inline)"
             expected (St.stFrees st)
-          assertEqual "allocs must equal N + 1 (only the spine is allocated)"
+          assertEqual "allocs must equal N (only the Cons spine is allocated)"
             expected (St.stAllocs st)
-          assertEqual "peakLive must equal N + 1 (whole spine live before consume)"
+          assertEqual "peakLive must equal N (whole Cons spine live before consume)"
             expected (St.stPeak st)
           assertEqual "stLive must be 0 at exit (heap-empty)"
             0 (St.stLive st)
@@ -9955,18 +9960,57 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
   , -- Deep list (100000 C-heap Cons cells): build and consume a long spine
     -- through the C backend. The drop cascade is an iterative Haskell worklist,
     -- so 'stLive' must return to baseline without a host-stack overflow.
-    -- (>= 100001 cells: 100000 Cons + 1 Nil.)
+    -- NOTE (Slice 2, Task 3): 'Nil' is an 'Inline' immediate (zero cells). With
+    -- the 2-bit slot tag, 'Inline' slots ARE now encodable (low 2 bits = 11), so
+    -- ALL 100000 Cons cells route to the C heap --- including 'Cons 1 Nil' which
+    -- previously fell back. Total allocated: 100000 cells (all C-heap Cons).
     testCase "deep list (100000 C-heap cons cells) frees to baseline" $ do
       (_, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/deep-list.wok"
       assertEqual "no value-CAF baseline for this program" 0 bl
-      assertParityBalanced "deep list" 100001 absSt cSt bl
-      -- Non-vacuity: the 100000 'Cons' cells (and the single nullary 'Nil', also an
-      -- encodable NCon) MUST all route to the C heap. Assert the C heap's OWN
-      -- counter took the whole spine. '>= 100000' is the safe floor; the exact
-      -- total is 100001 (100000 Cons + 1 Nil), verified live and pinned here.
-      assertBool "deep list routed to C heap" (cAllocs >= 100000)
-      assertEqual "deep list: every NCon on C (100000 Cons + 1 Nil)"
-        (100001 :: Word64) cAllocs
+      assertParityBalanced "deep list" 100000 absSt cSt bl
+      -- Non-vacuity: all 100000 Cons cells route to the C heap (Inline Nil is
+      -- encodable via the 2-bit low-tag '11' class introduced in Task 3).
+      assertBool "all Cons cells routed to C heap" (cAllocs >= 100000)
+      assertEqual "deep list: all 100000 Cons on C heap (Inline Nil encodable)"
+        (100000 :: Word64) cAllocs
+
+  , -- Nullary immediate: a bare nullary constructor ('[]' = Nil, zero fields)
+    -- must produce ZERO heap cells on BOTH backends (abstract and C). An
+    -- 'Inline' immediate lives in the 'Addr' tag itself; it never touches
+    -- 'recordAlloc', so allocs == frees == peak == 0. Output must still render
+    -- identically to the abstract run.
+    testCase "nullary-zero-alloc (main = []) allocates zero cells on both backends" $ do
+      (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/nullary-zero-alloc.wok"
+      assertEqual "result renders as []" (T.pack "[]") txt
+      assertEqual "abstract backend: zero allocs" 0 (St.stAllocs absSt)
+      assertEqual "abstract backend: zero frees"  0 (St.stFrees absSt)
+      assertEqual "abstract backend: zero peak"   0 (St.stPeak absSt)
+      assertEqual "C backend: zero allocs"        0 (St.stAllocs cSt)
+      assertEqual "C backend: zero frees"         0 (St.stFrees cSt)
+      assertEqual "C backend: zero peak"          0 (St.stPeak cSt)
+      assertEqual "no value-CAF baseline"         0 bl
+      assertEqual "C heap itself: zero allocs"    (0 :: Word64) cAllocs
+
+  , -- Mixed pointer/immediate cascade (Task 3): a list mixing Some (one-field)
+    -- and None (nullary -> Inline) options. Under the 2-bit low-tag encoding,
+    -- a 'Cons (Some n) tail' has an HBox slot (the Some NCon, carrying a U64) and
+    -- an Inline/HBox tail; a 'Cons None tail' has an Inline slot (None) and a
+    -- tail. All Cons and Some cells must route to the C heap; None is Inline (zero
+    -- cells). The drop cascade must skip the Inline slots without double-freeing
+    -- or leaking any counted child.
+    testCase "mixed pointer/immediate cascade (Some/None list stays C-resident)" $ do
+      (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/mixed-maybe-list.wok"
+      -- The program builds [Some 1, None, Some 3, None] and renders it.
+      assertEqual "result renders as the option list" (T.pack "[Some(1), None, Some(3), None]") txt
+      assertEqual "no value-CAF baseline for this program" 0 bl
+      assertParityBalanced "mixed pointer/immediate" 6 absSt cSt bl
+      -- Non-vacuity (EXACT): all 6 cells -- 4 Cons + 2 Some -- route to the C heap;
+      -- the 2 None and the trailing Nil are Inline immediates (zero cells). Pinning
+      -- the exact count (not just > 0) catches a regression where an Inline slot
+      -- wrongly forces its carrying Cons to fall back to the abstract heap (which
+      -- would drop cAllocs to 2, the Some cells only -- a `> 0` floor would miss it).
+      assertEqual "mixed pointer/immediate: all 6 cells (4 Cons + 2 Some) on C heap"
+        (6 :: Word64) cAllocs
   ]
 
 -- ---------------------------------------------------------------------------
@@ -9975,23 +10019,28 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
 -- 'encodeSlotC' packs an 'RCValue' into a @('SlotKind', 'Word64')@ pair when it is
 -- C-encodable; 'decodeSlotC' is its exact inverse on those shapes. The property
 -- pins that inverse for the generable encodable values: an 'Int64'-range integer
--- literal, a char literal, unit, and an abstract-heap box ('HAddr'). A 'CAddr' is
--- a raw runtime pointer (not purely generable) and is excluded.
+-- literal, a char literal, unit, an abstract-heap box ('HAddr'), and a nullary
+-- inline immediate ('Inline' tag). A 'CAddr' is a raw runtime pointer (not purely
+-- generable) and is excluded.
 --
--- 'HAddr' indices are encoded as @(i << 1) .|. 1@ so the low bit distinguishes
--- them from 'CAddr' pointers. This uses 63 bits for the index, so the round-trip
--- holds for indices whose absolute value is < 2^62 (the 63rd bit is the sign).
--- In practice heap indices are small sequential integers; the test bounds cover
--- the full reachable Int63 range.
+-- The @KPointer@ class uses the low 2 bits to discriminate three pointer-classes:
+--
+--   * @..0@ (bit0 = 0): 'CAddr' bare 8-aligned pointer.
+--   * @01@ (bits 1:0 = 01): 'HAddr' index, stored as @(i << 2) .|. 1@.  Uses 62
+--     bits for the index; the round-trip holds for indices with |i| < 2^61.
+--   * @11@ (bits 1:0 = 11): 'Inline' tag, stored as @(tag << 2) .|. 3@.
+--
+-- The property also asserts mutual exclusivity: a 'CAddr' round-trips to 'CAddr',
+-- an 'HAddr' to 'HAddr', an 'Inline' to 'Inline' --- never crossing class.
 
 -- | An 'RCValue' restricted to the C-encodable shapes the property round-trips.
 newtype EncodableRCValue = EncodableRCValue St.RCValue
   deriving (Eq, Show)
 
--- | The maximum Int value that round-trips through the HAddr (i << 1 | 1) encoding.
--- Values with |i| >= 2^62 would lose the top bit on the left shift.
+-- | The maximum Int value that round-trips through the HAddr (i << 2 | 1) encoding.
+-- Values with |i| >= 2^61 would lose the top bit on the left shift.
 maxHAddrIdx :: Int64
-maxHAddrIdx = 2^(62 :: Int) - 1
+maxHAddrIdx = 2^(61 :: Int) - 1
 
 instance QC.Arbitrary EncodableRCValue where
   arbitrary = EncodableRCValue <$> QC.oneof
@@ -10001,16 +10050,34 @@ instance QC.Arbitrary EncodableRCValue where
         <$> QC.choose (minBound :: Int64, maxBound :: Int64)
     , St.RVLit . Anf.LChar <$> QC.arbitrary
     , pure (St.RVLit Anf.LUnit)
-      -- 'HAddr' is encoded as @(i << 1) .|. 1@, using 63 bits for the index.
-      -- Restrict generation to the Int63 range so the round-trip is exact.
+      -- 'HAddr' is encoded as @(i << 2) .|. 1@, using 62 bits for the index.
+      -- Restrict to Int62 range; also generate negative (static-index) values to
+      -- exercise the sign-extension on the arithmetic >> 2 decode path.
     , St.RVBox . St.HAddr . fromIntegral
         <$> QC.choose (negate maxHAddrIdx, maxHAddrIdx)
+      -- 'Inline' is encoded as @(tag << 2) .|. 3@; the tag is an arbitrary Word32.
+    , St.RVBox . St.Inline <$> QC.arbitrary
     ]
+
+-- | Classify a decoded 'RCValue' by its pointer-class for mutual-exclusivity check.
+data PointerClass = PCCAddr | PCHAddr | PCInline | PCOther
+  deriving (Eq, Show)
+
+pointerClass :: St.RCValue -> PointerClass
+pointerClass (St.RVBox (St.CAddr _))  = PCCAddr
+pointerClass (St.RVBox (St.HAddr _))  = PCHAddr
+pointerClass (St.RVBox (St.Inline _)) = PCInline
+pointerClass _                         = PCOther
 
 rcCBackendSlotProperty :: TestTree
 rcCBackendSlotProperty = testGroup "rc-c-backend-slot"
   [ testProperty "encodeSlotC/decodeSlotC round-trips encodable RCValues" $
       \(EncodableRCValue v) -> Just v == fmap (uncurry St.decodeSlotC) (St.encodeSlotC v)
+  , testProperty "pointer-class low-tag mutually exclusive on round-trip" $
+      \(EncodableRCValue v) ->
+        case fmap (uncurry St.decodeSlotC) (St.encodeSlotC v) of
+          Just decoded -> pointerClass decoded == pointerClass v
+          Nothing      -> True  -- non-pointer kinds are not classified
   ]
 
 -- ---------------------------------------------------------------------------
@@ -13222,9 +13289,16 @@ prop_m2a1Teeth =
 
 -- | Is the given single-site mutation caught on this module, or a structural
 -- no-op? Caught = a non-empty 'lintInstrumented' OR a 'Left' from the unchecked
--- RC run. No-op = the mutated instrumentation is byte-identical to the correct
--- one (the mutation site did not exist), which counts as "fine" (nothing to
--- catch).
+-- RC run OR the mutation is semantically inert on uncounted values. No-op
+-- cases (all count as "fine"):
+--   1. The mutated instrumentation is byte-identical to the correct one (the
+--      mutation site did not exist).
+--   2. The mutation omitted/duplicated a __rc_drop/__rc_dup that targets an
+--      INLINE (uncounted) immediate: with 'Inline' addresses, a drop/dup of a
+--      nullary constructor is always a no-op on the heap. Both the correct and
+--      mutated modules produce the same heap accounting, so the mutation is
+--      genuinely harmless (not a soundness violation -- the drop was already
+--      inert).
 mutationCaught :: Perceus.Mutation -> CoreModule -> IO Bool
 mutationCaught mut cm = do
   let correct = Perceus.insertRC cm
@@ -13233,8 +13307,22 @@ mutationCaught mut cm = do
        || not (null (Perceus.lintInstrumented mutated))  -- caught statically
     then pure True
     else RCM.runModuleRCUnchecked mutated >>= \case      -- caught at runtime
-           Left _  -> pure True
-           Right _ -> pure False
+           Left _     -> pure True
+           Right mrun ->
+             -- If the mutated run succeeds AND its heap stats match the correct
+             -- run's stats (same allocs/frees/peak/live/baseline), the mutation
+             -- only targeted an uncounted value (e.g. a drop of an Inline
+             -- immediate). That is harmless: the drop was already a no-op.
+             RCM.runModuleRCUnchecked correct >>= \case
+               Left _     -> pure False  -- correct run itself is broken; skip
+               Right crun ->
+                 let ms = RCM.rcStats mrun
+                     cs = RCM.rcStats crun
+                 in pure (St.stAllocs ms == St.stAllocs cs
+                       && St.stFrees  ms == St.stFrees  cs
+                       && St.stPeak   ms == St.stPeak   cs
+                       && St.stLive   ms == St.stLive   cs
+                       && RCM.rcBaseline mrun == RCM.rcBaseline crun)
 
 -- | Shrinking: drop the program toward a constant. We shrink the single 'main'
 -- bind's body to its trivial sub-results (a 'Ret' of a contained atom, an alt
@@ -14000,6 +14088,11 @@ prop_m2bTeeth =
 -- 'lintInstrumented' does not audit them inline (it treats the outer join as
 -- unknown). A omitted drop in such an arm causes a leak ('stLive > baseline'),
 -- which is detected here by running the mutated program and checking the stats.
+--
+-- NOTE (Slice 2): a mutation that targets an INLINE (uncounted) address is
+-- semantically harmless -- drops of Inline immediates are always no-ops. If the
+-- mutated run's heap stats match the correct run's stats exactly, the mutation
+-- only hit uncounted values and is not a soundness violation.
 mutationCaughtM2b :: Perceus.Mutation -> CoreModule -> IO Bool
 mutationCaughtM2b mut cm = do
   let correct = Perceus.insertRC cm
@@ -14009,11 +14102,23 @@ mutationCaughtM2b mut cm = do
     then pure True
     else RCM.runModuleRCUnchecked mutated >>= \case
            Left _    -> pure True                          -- caught as runtime crash
-           Right run ->
-             let st       = RCM.rcStats run
-                 baseline = RCM.rcBaseline run
-             in pure (St.stLive st /= baseline             -- detected as a heap leak
-                        || St.stAllocs st - St.stFrees st /= baseline)
+           Right mrun ->
+             let mst       = RCM.rcStats mrun
+                 mbaseline = RCM.rcBaseline mrun
+             in if St.stLive mst /= mbaseline             -- detected as a heap leak
+                     || St.stAllocs mst - St.stFrees mst /= mbaseline
+                  then pure True
+                  else -- Heap balanced: check if the correct run has identical
+                       -- stats (then the drop was on an uncounted Inline value).
+                       RCM.runModuleRCUnchecked correct >>= \case
+                         Left _     -> pure False
+                         Right crun ->
+                           let cs = RCM.rcStats crun
+                           in pure (St.stAllocs mst == St.stAllocs cs
+                                 && St.stFrees  mst == St.stFrees  cs
+                                 && St.stPeak   mst == St.stPeak   cs
+                                 && St.stLive   mst == St.stLive   cs
+                                 && mbaseline == RCM.rcBaseline crun)
 
 -- | Shrinker for a generated M2b program. The program is a handler bind (plus an
 -- optional CAF bind), so the generic single-main 'shrinkProgram' does not apply; we

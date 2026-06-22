@@ -1,0 +1,40 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-22-layout-compaction-slice2.md",
+  "tasks": [
+    {
+      "id": 6,
+      "subject": "Task 1: Benchmark corpus + pre-Slice-2 baseline capture",
+      "status": "completed",
+      "description": "**Goal:** Add the four benchmark .wok programs and record the genuine pre-change --dump-rc-stats numbers.\n\n**Files:** Create bench/{tree,bools,maybes,list}.wok, bench/baseline.txt, scripts/rc-bench.sh.\n\n**Verify:** `bash scripts/rc-bench.sh` prints four rows; `cat bench/baseline.txt` matches.\n\n```json:metadata\n{\"files\": [\"bench/tree.wok\", \"bench/bools.wok\", \"bench/maybes.wok\", \"bench/list.wok\", \"bench/baseline.txt\", \"scripts/rc-bench.sh\"], \"verifyCommand\": \"bash scripts/rc-bench.sh\", \"acceptanceCriteria\": [\"four programs run under --dump-rc-stats\", \"baseline.txt records pre-change stats\", \"rc-bench.sh prints a table\", \"no src/runtime change\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 2: Value model + chokepoints (Inline, alloc/deref/incref/drop, uncounted)",
+      "status": "completed",
+      "blockedBy": [6],
+      "description": "**Goal:** A nullary constructor becomes RVBox (Inline tag) with zero allocations on both backends, synthesized by deref, inert under dup/drop; machine sites untouched.\n\n**Files:** Modify src/Wok/Interp/RC/Value.hs (Addr+Inline Word32, alloc/allocInline, deref, incref, dropAddr, isInline/isUncounted, countedRefs, closureOwnedBoxed, exports); Machine.hs CAF guard; test/Spec.hs + test/rc-cbackend/nullary-zero-alloc.wok; regenerate test/rc-stats-golden/*.expected.\n\n**Verify:** `cabal test wok-tests --test-options='-p \"rc\"'` all RC groups pass.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"src/Wok/Interp/RC/Machine.hs\", \"test/Spec.hs\", \"test/rc-cbackend/nullary-zero-alloc.wok\", \"test/rc-stats-golden/\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"rc\\\"'\", \"acceptanceCriteria\": [\"Addr gains Inline Word32; isInline/isUncounted exported\", \"bare nullary => allocs==frees==peak==0 both backends, identical render\", \"mixed program live==baseline both backends\", \"shifted stats goldens regenerated, only reductions\", \"full suite green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 3: Slot encoding — the 2-bit low tag",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "**Goal:** An immediate can live inside a C cell's slot via a 2-bit low tag (00 CAddr / 01 HAddr / 11 Inline), so immediate-bearing constructors stay C-resident.\n\n**Files:** Modify src/Wok/Interp/RC/Value.hs (encodeSlotC, decodeSlotC); test/Spec.hs (rcCBackendSlotProperty refresh + mixed targeted case); Create test/rc-cbackend/mixed-maybe-list.wok.\n\n**Verify:** `cabal test wok-tests --test-options='-p \"c-backend\"'` slot property + parity + targeted pass.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\", \"test/rc-cbackend/mixed-maybe-list.wok\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"c-backend\\\"'\", \"acceptanceCriteria\": [\"round-trip identity incl Inline + negative HAddr via <<2\", \"three low-tag classes mutually exclusive\", \"mixed pointer/immediate program C-resident, identical render, live==baseline\", \"full suite green, no stats golden shift\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 4: peak-bytes counter + benchmark report + whole-corpus parity",
+      "status": "completed",
+      "blockedBy": [8],
+      "description": "**Goal:** Track high-water live bytes in the C runtime, surface in --dump-rc-stats, produce the before/after report, confirm whole-corpus oracle green.\n\n**Files:** Modify runtime/wok_rc.h (+wok_stat_peak_bytes), runtime/wok_rc.c (cur_bytes/peak_bytes both builds), src/Wok/Interp/RC/Heap.hs (FFI), app/Main.hs + Machine.hs (--dump-rc-stats peakBytes on C path), runtime/test/wok_rc_bench.c (optional); Create bench/RESULTS.md.\n\n**Verify:** `bash scripts/rc-bench.sh && bash scripts/asan-runtime.sh` table prints; sanitizers clean.\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\", \"src/Wok/Interp/RC/Heap.hs\", \"app/Main.hs\", \"src/Wok/Interp/RC/Machine.hs\", \"runtime/test/wok_rc_bench.c\", \"bench/RESULTS.md\"], \"verifyCommand\": \"bash scripts/rc-bench.sh && bash scripts/asan-runtime.sh\", \"acceptanceCriteria\": [\"wok_stat_peak_bytes in both builds, accessors/static_asserts unchanged\", \"RESULTS.md before/after with per-program delta\", \"whole-corpus parity green\", \"sanitizers clean, no ABI change\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 5: Docs + memory + spec status",
+      "status": "completed",
+      "blockedBy": [9],
+      "description": "**Goal:** Update the runtime contract + design spec to the implemented immediate scheme; record the memory note.\n\n**Files:** Modify runtime/README.md (slot table 2-bit + immediate), docs/superpowers/specs/2026-06-22-layout-compaction-slice2-design.md (Status IMPLEMENTED), docs/superpowers/runtime-knowledge-base.md (§6 line); Create/Modify memory note layout-compaction-slice2 + MEMORY.md pointer.\n\n**Verify:** `grep -n Inline runtime/README.md` shows the slot-table update; `git diff --stat`.\n\n```json:metadata\n{\"files\": [\"runtime/README.md\", \"docs/superpowers/specs/2026-06-22-layout-compaction-slice2-design.md\", \"docs/superpowers/runtime-knowledge-base.md\"], \"verifyCommand\": \"grep -n Inline runtime/README.md\", \"acceptanceCriteria\": [\"README slot table updated to 2-bit + immediate\", \"spec Status IMPLEMENTED\", \"memory note + MEMORY.md pointer written\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-23"
+}

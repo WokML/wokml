@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+
+-- Mixed pointer/immediate cascade (Task 3): a list mixing Some (one-field) and
+-- None (nullary -> Inline) options. Under the 2-bit low-tag slot encoding,
+-- 'Cons (Some n) tail' carries a KPointer slot for Some (a C-heap NCon with a
+-- U64 field) and a KPointer slot for the tail; 'Cons None tail' carries an
+-- Inline slot (None is a nullary constructor, encoded as (tag << 2) | 3) and a
+-- tail pointer. All Cons and Some cells must route to the C heap; None is
+-- Inline (zero cells). The drop cascade must skip the Inline slots without
+-- double-freeing or leaking any counted child.
+
+data List = Nil | Cons (Option U64) List
+
+main : List
+main = Cons (Some 1) (Cons None (Cons (Some 3) (Cons None Nil)))
