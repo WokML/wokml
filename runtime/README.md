@@ -20,64 +20,69 @@ Design rationale lives in
 
 ## Object and slot layout
 
-Two structs, both exactly 16 bytes, locked with `_Static_assert` so a layout drift fails
-the compile rather than corrupting silently.
+An **8-byte header** plus one **8-byte raw word per slot** (no per-slot tag), locked with
+`_Static_assert(sizeof(WokObj) == 8)` so a layout drift fails the compile.
 
 ```c
-typedef struct WokSlot {           // 16 bytes
-    uint64_t tag;                  // WokSlotTag (see below)
-    uint64_t payload;              // value | C pointer bits | Haskell Addr int
-} WokSlot;
-
 typedef struct WokObj {
-    uint64_t rc;                   // reference count (>= 1 while live)
-    uint32_t tag;                  // interned constructor id (opaque to C)
-    uint32_t arity;                // number of slots
-    WokSlot  slots[];              // flexible array member, `arity` entries
+    uint32_t rc;       // reference count (>= 1 while live)
+    uint16_t tag;      // interned constructor id (opaque to C) -> indexes the Haskell descriptor
+    uint8_t  arity;    // number of slots (0..255)
+    uint8_t  scan;     // RESERVED for a future C cascade (always 0 today; no write path)
+    uint64_t slots[];  // `arity` raw 8-byte words
 } WokObj;
 ```
 
-- The 16-byte header (`rc:64 + tag:32 + arity:32`) plus `arity` 16-byte slots is the
-  total cell size: `16 + 16 * arity` bytes.
-- `tag` is an interned `uint32` id. **C never interprets it.** The constructor's identity
-  (the APrim `(Module, Name)`) stays on the Haskell side; Haskell interns it to an id
-  before `wok_alloc` and maps it back after `wok_tag` (`internTag` / `tagName` in
-  `Wok.Interp.RC.Value`).
-- `rc` is unsigned. `wok_dec` on an already-zero cell, and `wok_free` on a cell whose
-  `rc != 0`, are trapped invariant violations (`abort()`) — the C analogues of the
-  interpreter's `Left RuntimeError` double-free / premature-free guards.
-- These are the deliberately *uncompacted* forms (correctness-first). The compaction to
-  an 8-byte header and an 8-byte tagged-word slot is a separately designed later slice
-  and, because the fields are private behind the accessor functions, is not an ABI break.
+- Total cell size is `8 + 8 * arity` bytes — ~50% smaller than the original 16B header +
+  16B slots, ~2x cache density.
+- A slot is **one raw `uint64`**; there is no self-describing tag word. The per-slot *kind*
+  (int / char / unit / pointer) is hoisted into a shared **per-constructor descriptor** on
+  the Haskell side (`stConDesc :: IntMap [SlotKind]`, keyed by `tag`) — recorded once per
+  constructor instead of re-stamped in every cell. `tag` is the index into it (wok's
+  analogue of an info-table pointer, but a 16-bit index).
+- `tag` is a `uint16` interned id — **C never interprets it**; the constructor's identity
+  (the APrim `(Module, Name)`) stays Haskell-side (`internTag`/`tagName`). `wok_alloc`
+  asserts `tag < 65536 && arity < 256` before packing.
+- `rc` is unsigned (32-bit). `wok_dec` on a zero cell / `wok_free` on a non-zero cell abort
+  (the C analogues of the double-free / premature-free guards).
+- The header fields are **private behind the accessor ABI**, so the compaction is not a
+  layout ABI break. The slot accessors themselves became **one word**
+  (`wok_slot_set(p,i,word)` / `wok_slot_get(p,i)->uint64`) — the one deliberate
+  accessor-signature change.
 
-## Slot-tag encoding
+## Slot encoding (descriptor-driven)
 
-A slot holds one machine word of payload, so not every `RCValue` fits. The encoding is
-the bijection `encodeSlot` / `decodeSlot` (in `Wok.Interp.RC.Value`), with tag constants
-defined in `Wok.Interp.RC.Heap`:
+A slot is one raw `uint64`; its meaning comes from the constructor's **descriptor**, not
+from the slot. `decodeSlotC :: SlotKind -> Word64 -> RCValue` is driven by the recorded kind;
+`encodeSlotC :: RCValue -> Maybe (SlotKind, Word64)` is its inverse. **Encoding semantics are
+unchanged from the 16B era** — no range-widening, no promotion:
 
-| `WokSlotTag` | value | `payload` holds | `RCValue` shape |
-| ------------ | ----- | --------------- | --------------- |
-| `wsLitInt`   | `0`   | `int64` bit pattern | `RVLit (LInt n)`, `n` fits in `Int64` |
-| `wsLitChar`  | `1`   | code point          | `RVLit (LChar c)` |
-| `wsLitUnit`  | `2`   | `0`                 | `RVLit LUnit` |
-| `wsCBox`     | `3`   | `WokObj*` bits      | `RVBox (CAddr p)` — another C cell |
-| `wsHBox`     | `4`   | Haskell `Addr` int  | `RVBox (HAddr i)` — IntMap-resident node |
+| `SlotKind` | the raw word holds | `RCValue` shape |
+| ---------- | ------------------ | --------------- |
+| `KLitInt`  | `int64` bit pattern | `RVLit (LInt n)`, `n` fits in `Int64` |
+| `KLitChar` | code point          | `RVLit (LChar c)` |
+| `KLitUnit` | `0`                 | `RVLit LUnit` |
+| `KPointer` (low bit 0) | `WokObj*` bits      | `RVBox (CAddr p)` — another C cell |
+| `KPointer` (low bit 1) | `(i << 1) \| 1`     | `RVBox (HAddr i)` — IntMap-resident node |
+
+The kind distinguishes scalar-vs-pointer (a per-constructor constant); for a pointer slot the
+**low bit** distinguishes a C cell (`CAddr`, ≥16-aligned → bit 0) from an abstract-heap child
+(`HAddr`, stored shifted → bit 1) — that split is runtime-dependent, so it stays in the word.
 
 ### Encodable-or-fallback rule
 
-These `RCValue` shapes are **not encodable** and have no slot tag:
+The whole `NCon` falls back to the Haskell `IntMap` heap (as an `HAddr`) when ANY of:
 
-- `RVLit (LStr _)` — strings
-- `RVLit (LInt n)` where `n` does **not** fit in `Int64` (bignum)
-- `RVRecMember _ _ _`
-- `RVInst _ _`
+- a field is `RVLit (LStr _)`, a bignum / high-bit-`U64` `RVLit (LInt n)` (doesn't fit
+  `Int64`), `RVRecMember`, or `RVInst` (not encodable — unchanged);
+- the constructor's slot kinds **differ from a previously-recorded descriptor** for the same
+  tag. wok constructors are nominal/polymorphic, so the same name can appear at different
+  instantiations (`Tuple2(ptr,int)` vs `Tuple2(int,int)`); first-kind-seen wins the C heap,
+  the rest fall back — keeping the descriptor consistent for every C cell of a tag;
+- `arity > 255` (exceeds the `uint8` arity field).
 
-At `alloc` time, if **any** field of an `NCon` fails to encode, the whole constructor is
-allocated on the Haskell `IntMap` heap (as before this slice) and handed back as an
-`HAddr`. Everything downstream already dispatches on `Addr`, so the fallback costs no
-extra code path and guarantees correctness for the rare cases. C-side `LStr`/bignum
-support is a later slice if the corpus ever needs it.
+The fallback is alloc-site heap selection (everything downstream dispatches on `Addr`), and
+is **never runtime promotion** — a value is built once on whichever heap fits it.
 
 ## Function ABI
 

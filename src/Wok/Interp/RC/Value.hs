@@ -64,13 +64,14 @@ module Wok.Interp.RC.Value
   , renderRCValue
   , renderRCValueRC
     -- * Slot encoding (C-heap NCon field packing)
-  , encodeSlot
-  , decodeSlot
+  , SlotKind (..)
+  , encodeSlotC
+  , decodeSlotC
   ) where
 
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, except)
-import Data.Bits (toIntegralSized)
+import Data.Bits (shiftL, shiftR, toIntegralSized, (.&.), (.|.))
 import Data.Int (Int64)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
@@ -571,6 +572,10 @@ data Store = Store
     -- tag word (which the C runtime stores verbatim and 'deref' reverses).
   , stTagRev     :: IntMap Text
     -- ^ tag-id -> constructor-name, the reverse half (keyed by the id as 'Int').
+  , stConDesc    :: IntMap [SlotKind]
+    -- ^ tag-id -> per-slot kind descriptor, recorded by 'allocNCon' on first
+    -- intern. 'readCCell' and the 'CAddr' arm of 'dropAddr' consult this to
+    -- decode raw slot words back into 'RCValue's without a per-slot tag word.
   }
 
 -- | Which heap an 'NCon' is allocated into. 'AbstractHeap' is the default and is
@@ -622,6 +627,7 @@ emptyStore = Store
   , stBackend    = AbstractHeap
   , stTagFwd     = Map.empty
   , stTagRev     = IM.empty
+  , stConDesc    = IM.empty
   }
 
 -- | Intern a constructor name to its stable tag-id, allocating a fresh id on
@@ -646,52 +652,66 @@ tagName :: Word32 -> Store -> Text
 tagName w s = IM.findWithDefault (error "tagName: unknown tag id") (fromIntegral w) (stTagRev s)
 
 -- ---------------------------------------------------------------------------
+-- C-heap slot kind descriptor
+--
+-- Each C-eligible 'NCon' field has a 'SlotKind' that records its type without
+-- consuming a per-slot tag word in the cell.  The descriptor is hoisted into
+-- 'stConDesc' (keyed by the constructor's interned tag-id) when the constructor
+-- is first allocated, and consulted on every decode ('readCCell', 'dropAddr').
+
+-- | The kind of a single raw slot word in a compact C cell.
+data SlotKind = KLitInt | KLitChar | KLitUnit | KPointer
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
 -- C-heap slot encode/decode (the §5 encoding; the single source of truth that
 -- decides whether an 'NCon' field is C-eligible).
 --
--- 'encodeSlot' returns 'Nothing' for any value that cannot be packed into a
--- 64-bit @(tag, payload)@ slot, which makes the whole 'NCon' fall back to the
--- abstract heap (see 'allocNCon'). 'decodeSlot' is its exact inverse on the
--- encodable shapes.
+-- 'encodeSlotC' returns 'Nothing' for any value that cannot be packed into a
+-- single raw 'Word64' slot, which makes the whole 'NCon' fall back to the
+-- abstract heap (see 'allocNCon'). 'decodeSlotC' is its exact inverse on the
+-- encodable shapes, driven by the 'SlotKind' from the stored descriptor.
 
--- | Pack an 'RCValue' into a C slot @(slotTag, payload)@, or 'Nothing' if the
--- value is not C-encodable (a string literal, a bignum 'LInt' too wide for
+-- | Pack an 'RCValue' into a raw slot @('SlotKind', 'Word64')@, or 'Nothing' if
+-- the value is not C-encodable (a string literal, a bignum 'LInt' too wide for
 -- 'Int64', a closure-member handle, or an instance handle).
 --
--- A negative (static) 'HAddr' round-trips through @HBOX@ via two's-complement:
--- @fromIntegral (i :: Int) :: Word64@ then @fromIntegral :: Word64 -> Int@ is the
--- identity for all 'Int' (the payload is the full 64-bit pattern; 'decodeSlot'
--- reverses it), so a constructor field pointing at a global is preserved exactly.
-encodeSlot :: RCValue -> Maybe (Word64, Word64)
-encodeSlot (RVLit (LInt n))  = (\w -> (H.wsLitInt, fromIntegral (w :: Int64))) <$> toIntegralSized n
-encodeSlot (RVLit (LChar c)) = Just (H.wsLitChar, fromIntegral (fromEnum c))
-encodeSlot (RVLit LUnit)     = Just (H.wsLitUnit, 0)
-encodeSlot (RVBox (CAddr p)) = Just (H.wsCBox, fromIntegral (ptrToWordPtr p))
--- HBOX round-trip ('HAddr' 'Int' <-> 'Word64') assumes a 64-bit 'Int' (the
--- supported platform); a 32-bit-'Int' target would need a width guard here and in
--- 'decodeSlot's @wsHBox@ branch.
-encodeSlot (RVBox (HAddr i)) = Just (H.wsHBox, fromIntegral i)
-encodeSlot _                 = Nothing
+-- The 'Int64'-fit check on 'LInt' is load-bearing: a high-bit 'U64' (a natural
+-- number >= 2^63) returns 'Nothing' via 'toIntegralSized', causing the whole
+-- 'NCon' to fall back to the abstract heap.  This preserves the encoding
+-- semantics exactly: NO value is promoted or widened.
+--
+-- 'CAddr' pointers are aligned to at least 8 bytes, so their low bit is always
+-- 0.  'HAddr' indices are tagged with low bit 1 (shifted left by 1, OR'd with 1)
+-- to distinguish them; negative static indices round-trip correctly because the
+-- arithmetic right-shift in 'decodeSlotC' sign-extends the high bit.
+encodeSlotC :: RCValue -> Maybe (SlotKind, Word64)
+encodeSlotC (RVLit (LInt n))  = (\w -> (KLitInt, fromIntegral (w :: Int64))) <$> toIntegralSized n
+encodeSlotC (RVLit (LChar c)) = Just (KLitChar, fromIntegral (fromEnum c))
+encodeSlotC (RVLit LUnit)     = Just (KLitUnit, 0)
+encodeSlotC (RVBox (CAddr p)) = Just (KPointer, fromIntegral (ptrToWordPtr p))
+-- HAddr round-trip: low bit 1 distinguishes from CAddr (which is always 8-aligned
+-- so its low three bits are 0).  Negative static indices are sign-preserved
+-- because we use Int64 arithmetic shift right on decode.
+encodeSlotC (RVBox (HAddr i)) = Just (KPointer, fromIntegral ((i `shiftL` 1) .|. 1))
+encodeSlotC _                 = Nothing
 
--- | The exact inverse of 'encodeSlot' on the encodable shapes. A slot tag the
--- encoder never emits is an internal corruption and fails loudly.
-decodeSlot :: (Word64, Word64) -> RCValue
-decodeSlot (t, p)
-  | t == H.wsLitInt  = RVLit (LInt (fromIntegral (fromIntegral p :: Int64)))
-  | t == H.wsLitChar = RVLit (LChar (decodeChar p))
-  | t == H.wsLitUnit = RVLit LUnit
-  | t == H.wsCBox    = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral p))))
-  | t == H.wsHBox    = RVBox (HAddr (fromIntegral (fromIntegral p :: Int64)))
-  | otherwise        = error "decodeSlot: unknown slot tag"
-  where
-    -- Guard the codepoint so an out-of-range payload yields a CLEAR invariant
-    -- error (matching the "unknown slot tag" style above) rather than the opaque
-    -- 'Prelude.toEnum: bad argument'. 'decodeSlot' stays total and pure: the
-    -- encoder never emits an out-of-range char, so this can't happen on real data
-    -- (no Either ripple, per the repo no-error-handling-for-can't-happen rule).
-    decodeChar w
-      | w <= 0x10FFFF && not (w >= 0xD800 && w <= 0xDFFF) = toEnum (fromIntegral w)
-      | otherwise = error "decodeSlot: WS_LIT_CHAR payload out of Char range"
+-- | The exact inverse of 'encodeSlotC' on the encodable shapes, driven by the
+-- 'SlotKind' from the stored per-constructor descriptor.
+decodeSlotC :: SlotKind -> Word64 -> RCValue
+decodeSlotC KLitInt  w = RVLit (LInt (fromIntegral (fromIntegral w :: Int64)))
+decodeSlotC KLitChar w = RVLit (LChar (decodeChar w))
+decodeSlotC KLitUnit _ = RVLit LUnit
+decodeSlotC KPointer w
+  | w .&. 1 == 0 = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral w))))
+  | otherwise    = RVBox (HAddr (fromIntegral ((fromIntegral w :: Int64) `shiftR` 1)))
+
+-- | Guard the codepoint so an out-of-range payload yields a clear invariant error.
+-- The encoder never emits an out-of-range char, so this can't happen on real data.
+decodeChar :: Word64 -> Char
+decodeChar w
+  | w <= 0x10FFFF && not (w >= 0xD800 && w <= 0xDFFF) = toEnum (fromIntegral w)
+  | otherwise = error "decodeSlotC: KLitChar payload out of Char range"
 
 -- | True for a static (immortal, uncounted) address. Static cells are
 -- allocated by 'allocStatic' at negative abstract-heap addresses; the dynamic
@@ -721,14 +741,36 @@ alloc n             s = pure (allocPure n s)
 allocNCon :: Text -> [RCValue] -> Store -> RC (Addr, Store)
 allocNCon con vs s = case stBackend s of
   AbstractHeap -> pure (allocPure (NCon con vs) s)
-  CHeap hp -> case traverse encodeSlot vs of
-    Nothing      -> pure (allocPure (NCon con vs) s)
-    Just encoded -> do
-      let (tid, s1) = internTag con s
-      p <- liftIO (H.wokAlloc hp tid (fromIntegral (length vs)))
-      liftIO $ mapM_ (\(i, (t, pl)) -> H.wokSlotSet p (fromIntegral i) t pl)
-                     (zip [0 :: Int ..] encoded)
-      pure (CAddr p, s1 { stStats = recordAlloc (stStats s1) })
+  CHeap hp
+    -- The C @arity@ field is a 'uint8' (0..255); a wider constructor cannot be
+    -- represented, so route it to the unbounded abstract heap. Checked BEFORE the
+    -- encode (which would otherwise be wasted on a cell that must fall back).
+    | length vs > 255 -> pure (allocPure (NCon con vs) s)
+    | otherwise -> case traverse encodeSlotC vs of
+        Nothing -> pure (allocPure (NCon con vs) s)
+        Just encoded ->
+          let (tid, s1)  = internTag con s
+              newKinds   = map fst encoded
+              doAlloc st = do
+                p <- liftIO (H.wokAlloc hp tid (fromIntegral (length vs)))
+                liftIO $ mapM_ (\(i, (_, w)) -> H.wokSlotSet p (fromIntegral i) w)
+                               (zip [0 :: Int ..] encoded)
+                pure (CAddr p, st { stStats = recordAlloc (stStats st) })
+          -- The C @tag@ field is a 'uint16'; beyond 65535 distinct interned
+          -- constructors a 'CAddr' would truncate the tag and collide. Fall back.
+          in if tid >= 65536
+               then pure (allocPure (NCon con vs) s1)
+               else case IM.lookup (fromIntegral tid) (stConDesc s1) of
+                 -- A nominal/polymorphic constructor (e.g. Tuple2) can appear at
+                 -- different instantiations with different slot kinds. The FIRST kind
+                 -- seen for a tag wins the C heap; a later mismatch falls back, so the
+                 -- recorded descriptor stays correct for every C cell of that tag.
+                 -- (Here @s1 == s@: a recorded descriptor implies the tag was already
+                 -- interned, so 'internTag' left the store unchanged.)
+                 Just existing
+                   | existing == newKinds -> doAlloc s1                        -- known: no re-insert
+                   | otherwise            -> pure (allocPure (NCon con vs) s1)  -- kind mismatch
+                 Nothing -> doAlloc (s1 { stConDesc = IM.insert (fromIntegral tid) newKinds (stConDesc s1) })
 
 -- | The pure core of 'alloc': always allocates on the abstract 'IntMap' heap,
 -- returning an 'HAddr'. The backend-aware 'alloc' wrapper decides whether an
@@ -849,15 +891,33 @@ deref a@(HAddr _) s = liftRC (derefPure a s)
 readCCell :: Ptr WokObj -> Store -> IO Cell
 readCCell p s = do
   tid <- H.wokTag p
-  raw <- readCSlots p
-  pure (Cell 0 (NCon (tagName tid s) (map decodeSlot raw)))
+  vs  <- readCConValues p s
+  pure (Cell 0 (NCon (tagName tid s) vs))
 
--- | Read every slot of a C cell as @[(tag, payload)]@. Uses an explicit @take@
--- over the arity rather than @[0 .. ar - 1]@: 'wokArity' is a 'Word32', so a
--- nullary constructor (@ar == 0@) would make @ar - 1@ underflow to 'maxBound'
--- and enumerate four billion slots --- a hang. @take 0@ is correctly empty.
-readCSlots :: Ptr WokObj -> IO [(Word64, Word64)]
-readCSlots p = do
+-- | Decode a C cell's slots back to @[RCValue]@ via its per-constructor
+-- descriptor --- the single @tag -> kinds -> decode@ path shared by 'readCCell'
+-- and the 'dropAddr' free cascade. The descriptor length equals the cell's arity
+-- by construction ('allocNCon' records exactly the cell's kinds and routes any
+-- kind/arity mismatch to the abstract heap), so a length disagreement is an
+-- invariant violation and fails loudly rather than silently truncating the list
+-- --- in the cascade a silent truncation would drop counted children (an RC leak).
+readCConValues :: Ptr WokObj -> Store -> IO [RCValue]
+readCConValues p s = do
+  tid <- H.wokTag p
+  ws  <- readCWords p
+  let kinds = IM.findWithDefault (error "readCConValues: no descriptor for tag")
+                                 (fromIntegral tid) (stConDesc s)
+  if length kinds == length ws
+    then pure (zipWith decodeSlotC kinds ws)
+    else error ("readCConValues: descriptor arity " <> show (length kinds)
+                  <> " /= cell arity " <> show (length ws) <> " for tag " <> show tid)
+
+-- | Read every raw slot word of a C cell. Uses an explicit @take@ over the arity
+-- rather than @[0 .. ar - 1]@: 'wokArity' is a 'Word32', so a nullary constructor
+-- (@ar == 0@) would make @ar - 1@ underflow to 'maxBound' and enumerate four
+-- billion slots --- a hang. @take 0@ is correctly empty.
+readCWords :: Ptr WokObj -> IO [Word64]
+readCWords p = do
   ar <- H.wokArity p
   mapM (H.wokSlotGet p) (take (fromIntegral ar) [0 ..])
 
@@ -934,8 +994,7 @@ dropAddr a0 s0 = go [a0] s0
           -- owned-set path) never applies to a 'CAddr'. If some OTHER node kind ever
           -- becomes C-eligible AND needs that special routing, this branch must be
           -- revisited to call 'cascadeChildren' on a reconstructed node instead.
-          raw <- liftIO (readCSlots p)
-          let kids = countedRefs (map decodeSlot raw)
+          kids <- countedRefs <$> liftIO (readCConValues p s)
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats s)

@@ -15,13 +15,16 @@
 #  define WOK_PURE
 #endif
 
-typedef struct WokSlot { uint64_t tag; uint64_t payload; } WokSlot;
-
 typedef struct WokObj {
-    uint64_t rc;
-    uint32_t tag;
-    uint32_t arity;
-    WokSlot  slots[];   /* flexible array member, `arity` entries */
+    uint32_t rc;       /* plain counter */
+    uint16_t tag;      /* interned constructor id -> indexes the Haskell descriptor */
+    uint8_t  arity;    /* 0..255 */
+    uint8_t  scan;     /* RESERVED for the future C cascade (pointer-slot count). Currently
+                          ALWAYS 0 -- there is NO write path yet. The deferred C-cascade slice
+                          MUST populate it (a wok_alloc param or a wok_scan_set) BEFORE reading
+                          it, else a descriptor-bounded C free would skip every child (RC leak).
+                          Slice 1's cascade is Haskell-driven via the descriptor and ignores scan. */
+    uint64_t slots[];  /* `arity` raw 8-byte words */
 } WokObj;
 
 typedef struct WokHeap WokHeap;   /* opaque per-run context */
@@ -32,8 +35,8 @@ WokObj*  wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity);
 void     wok_dup(WokObj* p);
 uint64_t wok_dec(WokObj* p);                        /* rc--, returns NEW rc; no free */
 void     wok_free(WokHeap* h, WokObj* p);
-void     wok_slot_set(WokObj* p, uint32_t i, uint64_t tag, uint64_t payload);
-void     wok_slot_get(const WokObj* p, uint32_t i, uint64_t* restrict tag, uint64_t* restrict payload);
+void     wok_slot_set(WokObj* p, uint32_t i, uint64_t word);
+WOK_PURE uint64_t wok_slot_get(const WokObj* p, uint32_t i);
 WOK_PURE uint32_t wok_tag(const WokObj* p);
 WOK_PURE uint32_t wok_arity(const WokObj* p);
 

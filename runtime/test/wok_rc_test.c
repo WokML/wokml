@@ -9,13 +9,12 @@ int main(void) {
     {
         WokHeap* h = wok_heap_new();
         WokObj* p = wok_alloc(h, 7u, 2u);
-        wok_slot_set(p, 0u, 0u /*WS_LIT_INT*/, 42u);
-        wok_slot_set(p, 1u, 2u /*WS_LIT_UNIT*/, 0u);
+        wok_slot_set(p, 0u, 42u);
+        wok_slot_set(p, 1u, 0u);
         assert(wok_tag(p) == 7u);
         assert(wok_arity(p) == 2u);
-        uint64_t t, v;
-        wok_slot_get(p, 0u, &t, &v);
-        assert(t == 0u && v == 42u);
+        uint64_t w = wok_slot_get(p, 0u);
+        assert(w == 42u);
         wok_dup(p);
         assert(wok_dec(p) == 1u);
         assert(wok_dec(p) == 0u);
@@ -52,9 +51,9 @@ int main(void) {
         WokHeap* h = wok_heap_new();
         WokObj* big = wok_alloc(h, 5u, 100u);
         assert(wok_arity(big) == 100u);
-        wok_slot_set(big, 99u, 0u, 7u);
-        uint64_t t, v; wok_slot_get(big, 99u, &t, &v);
-        assert(v == 7u);
+        wok_slot_set(big, 99u, 7u);
+        uint64_t w = wok_slot_get(big, 99u);
+        assert(w == 7u);
         assert(wok_dec(big) == 0u);
         wok_free(h, big);
         assert(wok_stat_live(h) == 0);
@@ -64,12 +63,12 @@ int main(void) {
     /* --- multi-slab bump: headers intact across a slab boundary; bulk teardown --- */
     {
         WokHeap* h = wok_heap_new();
-        enum { N = 5000 };              /* 5000 * 16 B > 64 KiB -> spills a 2nd slab */
+        enum { N = 9000 };              /* 9000 * 8 B > 64 KiB -> spills a 2nd slab */
         WokObj** ptrs = (WokObj**)malloc((size_t)N * sizeof(WokObj*));
         assert(ptrs != NULL);
         for (int i = 0; i < N; i++) {
-            ptrs[i] = wok_alloc(h, (uint32_t)i, 0u);
-            assert(wok_tag(ptrs[i]) == (uint32_t)i);
+            ptrs[i] = wok_alloc(h, (uint32_t)i % 65536u, 0u);
+            assert(wok_tag(ptrs[i]) == (uint32_t)i % 65536u);
         }
 #ifndef WOK_RC_MALLOC
         assert(wok_stat_slabs(h) >= 2u);

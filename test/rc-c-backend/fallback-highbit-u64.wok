@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+
+-- Fallback (high-bit U64): a constructor with a U64 field whose value exceeds
+-- Int64.maxBound (2^63 - 1). 'encodeSlotC' calls 'toIntegralSized n :: Maybe
+-- Int64', which returns 'Nothing' for n >= 2^63, so the whole NCon falls back
+-- to the ABSTRACT heap even under the C backend. The program must still render
+-- the correct result and return to its baseline with balanced stats.
+--
+-- Literal: 9223372036854775815 = 2^63 + 7.
+
+data Tagged = Tagged U64 U64
+
+tagOf : Tagged -> U64
+tagOf t = case t of Tagged _ k -> k
+
+main = tagOf (Tagged 9223372036854775815 42)

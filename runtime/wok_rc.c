@@ -4,21 +4,20 @@
 #include <stdio.h>
 #include <string.h>   /* memcpy, memset */
 
-_Static_assert(sizeof(WokSlot) == 16, "WokSlot must be 16 bytes");
-_Static_assert(sizeof(WokObj)  == 16, "WokObj header must be 16 bytes");
+_Static_assert(sizeof(WokObj)  == 8, "WokObj header must be 8 bytes");
 
 /* --- tunables (spec section 11) --------------------------------------------- */
-#define WOK_GRANULE     16u
+#define WOK_GRANULE     8u
 #define WOK_ARENA_SIZE  (64u * 1024u)   /* slab bytes */
 #define WOK_NUM_CLASSES 64u             /* arity 0..63 -> slabs; >=64 -> malloc */
 
 _Static_assert(WOK_ARENA_SIZE % WOK_GRANULE == 0u,
                "arena size must be a granule multiple");
-_Static_assert((sizeof(WokObj) + (WOK_NUM_CLASSES - 1u) * sizeof(WokSlot)) < WOK_ARENA_SIZE,
+_Static_assert((sizeof(WokObj) + (WOK_NUM_CLASSES - 1u) * sizeof(uint64_t)) < WOK_ARENA_SIZE,
                "largest slab-class cell must fit a slab");
 
 static size_t wok_cell_bytes(uint32_t arity) {
-    return sizeof(WokObj) + (size_t)arity * sizeof(WokSlot);
+    return sizeof(WokObj) + (size_t)arity * sizeof(uint64_t);
 }
 
 /* INVARIANT: both `struct WokHeap` definitions below begin with the same four fields
@@ -42,9 +41,10 @@ void wok_heap_free(WokHeap* h) {
     free(h);
 }
 WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
+    assert(tag < 65536u && arity < 256u);
     WokObj* p = (WokObj*)malloc(wok_cell_bytes(arity));
     if (WOK_UNLIKELY(p == NULL)) { abort(); }
-    p->rc = 1u; p->tag = tag; p->arity = arity;
+    p->rc = 1u; p->tag = (uint16_t)tag; p->arity = (uint8_t)arity; p->scan = 0u;
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     return p;
@@ -79,7 +79,8 @@ struct WokHeap {
 
 /* strict-aliasing-safe free-list link: store/load the next ptr in the dead cell's bytes.
    Casts to void* suppress -Wsizeof-pointer-memaccess: we intentionally copy pointer-sized
-   bytes, not the full WokObj struct. */
+   bytes, not the full WokObj struct. The minimum cell is 8 bytes (the header alone, for
+   arity 0), which is exactly sizeof(WokObj*) on a 64-bit platform -- just enough. */
 static WokObj* fl_next(WokObj* p) {
     WokObj* n;
     memcpy(&n, (void*)p, sizeof(WokObj*));
@@ -95,7 +96,7 @@ static void wok_new_slab(WokHeap* h) {
     s->next = h->slabs;
     h->slabs = s;
     h->nslabs += 1u;
-    /* cells start one granule in (sizeof(WokSlab) <= 16), preserving 16-alignment. */
+    /* cells start one granule in (sizeof(WokSlab) <= 8), preserving 8-alignment. */
     h->bump_ptr = (char*)s + WOK_GRANULE;
     h->bump_end = (char*)s + WOK_ARENA_SIZE;
 }
@@ -116,6 +117,7 @@ void wok_heap_free(WokHeap* h) {
 }
 
 WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
+    assert(tag < 65536u && arity < 256u);
     size_t  sz = wok_cell_bytes(arity);
     WokObj* p;
     if (arity < WOK_NUM_CLASSES) {
@@ -135,7 +137,7 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
         p = (WokObj*)malloc(sz);
         if (WOK_UNLIKELY(p == NULL)) { abort(); }
     }
-    p->rc = 1u; p->tag = tag; p->arity = arity;
+    p->rc = 1u; p->tag = (uint16_t)tag; p->arity = (uint8_t)arity; p->scan = 0u;
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     return p;
@@ -143,7 +145,7 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
 
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
-    uint32_t arity = p->arity;
+    uint32_t arity = (uint32_t)p->arity;
     h->frees += 1u; h->live -= 1;
 #ifdef WOK_RC_POISON
     /* Poison is arena-only by design: it forces a reuse-after-free read to see garbage,
@@ -173,23 +175,21 @@ uint64_t wok_dec(WokObj* p) {
         abort();
     }
     p->rc -= 1u;
-    return p->rc;
+    return (uint64_t)p->rc;
 }
 
-void wok_slot_set(WokObj* p, uint32_t i, uint64_t tag, uint64_t payload) {
-    assert(i < p->arity);
-    p->slots[i].tag = tag;
-    p->slots[i].payload = payload;
+void wok_slot_set(WokObj* p, uint32_t i, uint64_t word) {
+    assert(i < (uint32_t)p->arity);
+    p->slots[i] = word;
 }
 
-void wok_slot_get(const WokObj* p, uint32_t i, uint64_t* restrict tag, uint64_t* restrict payload) {
-    assert(i < p->arity);
-    *tag = p->slots[i].tag;
-    *payload = p->slots[i].payload;
+uint64_t wok_slot_get(const WokObj* p, uint32_t i) {
+    assert(i < (uint32_t)p->arity);
+    return p->slots[i];
 }
 
-uint32_t wok_tag(const WokObj* p)   { return p->tag; }
-uint32_t wok_arity(const WokObj* p) { return p->arity; }
+uint32_t wok_tag(const WokObj* p)   { return (uint32_t)p->tag; }
+uint32_t wok_arity(const WokObj* p) { return (uint32_t)p->arity; }
 
 uint64_t wok_stat_allocs(const WokHeap* h) { return h->allocs; }
 uint64_t wok_stat_frees(const WokHeap* h)  { return h->frees; }

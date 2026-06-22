@@ -7515,16 +7515,17 @@ wokRcHeapTests = testGroup "wok-rc-heap (raw C runtime FFI)"
   [ testCase "alloc/set/get/dup/dec/free round-trip + stats" $ do
       h <- Heap.wokHeapNew
       p <- Heap.wokAlloc h 7 2
-      Heap.wokSlotSet p 0 Heap.wsLitInt 42
-      Heap.wokSlotSet p 1 Heap.wsLitUnit 0
+      -- Compact slots: one Word64 each (no per-slot tag; kind lives in the Haskell descriptor)
+      Heap.wokSlotSet p 0 42
+      Heap.wokSlotSet p 1 0
       t  <- Heap.wokTag p
       ar <- Heap.wokArity p
-      s0 <- Heap.wokSlotGet p 0
-      s1 <- Heap.wokSlotGet p 1
+      w0 <- Heap.wokSlotGet p 0
+      w1 <- Heap.wokSlotGet p 1
       assertEqual "tag" (7 :: Word32) t
       assertEqual "arity" (2 :: Word32) ar
-      assertEqual "slot0" (Heap.wsLitInt, 42 :: Word64) s0
-      assertEqual "slot1" (Heap.wsLitUnit, 0 :: Word64) s1
+      assertEqual "slot0" (42 :: Word64) w0
+      assertEqual "slot1" (0  :: Word64) w1
       Heap.wokDup p
       rc1 <- Heap.wokDec p
       assertEqual "rc after dup+dec" (1 :: Word64) rc1
@@ -9917,7 +9918,7 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
       -- silently all-falls-back to the abstract store.
       assertBool "C heap genuinely exercised (NCon routed to CAddr)" (cAllocs > 0)
 
-  , -- Fallback: a 'Tagged' NCon with an 'LStr' field. 'encodeSlot' rejects the
+  , -- Fallback: a 'Tagged' NCon with an 'LStr' field. 'encodeSlotC' rejects the
     -- 'LStr', so this NCon falls back to the ABSTRACT heap under the C backend;
     -- the result and the heap accounting must still match the abstract reference.
     testCase "LStr fallback (constructor with a string field stays abstract)" $ do
@@ -9931,6 +9932,24 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
       -- OWN allocation counter must be exactly zero -- direct proof the fallback
       -- fired (the cell lives on the abstract store, not the C runtime).
       assertEqual "LStr-bearing NCon fell back to abstract heap; nothing on C"
+        (0 :: Word64) cAllocs
+
+  , -- Fallback: a 'Tagged' NCon whose first field is a U64 literal >= 2^63.
+    -- 'encodeSlotC' calls 'toIntegralSized n :: Maybe Int64', which returns
+    -- 'Nothing' for n >= 2^63, so the whole NCon falls back to the ABSTRACT
+    -- heap under the C backend even though the second field (42) is encodable.
+    -- The result and heap accounting must still match the abstract reference.
+    testCase "high-bit U64 fallback (U64 >= 2^63 stays abstract)" $ do
+      (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/fallback-highbit-u64.wok"
+      assertEqual "result is the second U64 field (42)" (T.pack "42") txt
+      assertEqual "no value-CAF baseline for this program" 0 bl
+      assertParityBalanced "high-bit U64 fallback" 1 absSt cSt bl
+      -- Non-vacuity (fallback proof): the ONLY constructor this program builds is
+      -- 'Tagged 9223372036854775815 42'. The first field (2^63 + 7) exceeds
+      -- Int64.maxBound, so 'encodeSlotC' returns 'Nothing' for the whole NCon,
+      -- routing it to the abstract heap. The C heap's OWN counter must be zero
+      -- -- direct proof the high-bit check fired at alloc-site selection time.
+      assertEqual "high-bit-U64-bearing NCon fell back to abstract heap; nothing on C"
         (0 :: Word64) cAllocs
 
   , -- Deep list (100000 C-heap Cons cells): build and consume a long spine
@@ -9953,15 +9972,26 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
 -- ---------------------------------------------------------------------------
 -- C-backend slot encode/decode round-trip property (Task 3 step 5).
 --
--- 'encodeSlot' packs an 'RCValue' into a 64-bit @(tag, payload)@ slot when it is
--- C-encodable; 'decodeSlot' is its exact inverse on those shapes. The property
+-- 'encodeSlotC' packs an 'RCValue' into a @('SlotKind', 'Word64')@ pair when it is
+-- C-encodable; 'decodeSlotC' is its exact inverse on those shapes. The property
 -- pins that inverse for the generable encodable values: an 'Int64'-range integer
 -- literal, a char literal, unit, and an abstract-heap box ('HAddr'). A 'CAddr' is
 -- a raw runtime pointer (not purely generable) and is excluded.
+--
+-- 'HAddr' indices are encoded as @(i << 1) .|. 1@ so the low bit distinguishes
+-- them from 'CAddr' pointers. This uses 63 bits for the index, so the round-trip
+-- holds for indices whose absolute value is < 2^62 (the 63rd bit is the sign).
+-- In practice heap indices are small sequential integers; the test bounds cover
+-- the full reachable Int63 range.
 
 -- | An 'RCValue' restricted to the C-encodable shapes the property round-trips.
 newtype EncodableRCValue = EncodableRCValue St.RCValue
   deriving (Eq, Show)
+
+-- | The maximum Int value that round-trips through the HAddr (i << 1 | 1) encoding.
+-- Values with |i| >= 2^62 would lose the top bit on the left shift.
+maxHAddrIdx :: Int64
+maxHAddrIdx = 2^(62 :: Int) - 1
 
 instance QC.Arbitrary EncodableRCValue where
   arbitrary = EncodableRCValue <$> QC.oneof
@@ -9971,16 +10001,16 @@ instance QC.Arbitrary EncodableRCValue where
         <$> QC.choose (minBound :: Int64, maxBound :: Int64)
     , St.RVLit . Anf.LChar <$> QC.arbitrary
     , pure (St.RVLit Anf.LUnit)
-      -- 'HAddr' is an abstract-heap index; the payload round-trips through
-      -- Word64/Int64 for any Int, so draw the full Int range.
+      -- 'HAddr' is encoded as @(i << 1) .|. 1@, using 63 bits for the index.
+      -- Restrict generation to the Int63 range so the round-trip is exact.
     , St.RVBox . St.HAddr . fromIntegral
-        <$> QC.choose (minBound :: Int64, maxBound :: Int64)
+        <$> QC.choose (negate maxHAddrIdx, maxHAddrIdx)
     ]
 
 rcCBackendSlotProperty :: TestTree
 rcCBackendSlotProperty = testGroup "rc-c-backend-slot"
-  [ testProperty "encodeSlot/decodeSlot round-trips encodable RCValues" $
-      \(EncodableRCValue v) -> Just v == fmap St.decodeSlot (St.encodeSlot v)
+  [ testProperty "encodeSlotC/decodeSlotC round-trips encodable RCValues" $
+      \(EncodableRCValue v) -> Just v == fmap (uncurry St.decodeSlotC) (St.encodeSlotC v)
   ]
 
 -- ---------------------------------------------------------------------------
