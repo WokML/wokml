@@ -58,7 +58,30 @@ void wok_free(WokHeap* h, WokObj* p) {
     h->cur_bytes -= (uint64_t)wok_cell_bytes(arity);
     free(p);
 }
+/* FBIP in-place reuse: re-stamp a just-decremented cell's header without touching
+   the allocator or any byte-accounting stat. The new tag re-uses the EXACT same
+   shell (same arity, same byte size), so live/peak/cur_bytes are unchanged. No
+   reuse counter on the malloc backend (mirrors wok_stat_reused). */
+WokObj* wok_alloc_at(WokHeap* h, uint32_t tag, uint32_t arity, WokObj* p) {
+    (void)h;
+    assert(tag < 65536u && arity < 256u);
+    /* The arity-match and rc==0 invariants are ALWAYS-ON (mirroring wok_free's
+       premature-free guard): a mispaired reuse token (wrong-arity re-stamp, or a
+       still-live shell) must abort LOUDLY in release builds too, not be stripped
+       under NDEBUG. */
+    if (WOK_UNLIKELY((uint32_t)p->arity != arity)) {
+        fprintf(stderr, "wok_rc: wok_alloc_at arity mismatch (token arity != new node arity)\n");
+        abort();
+    }
+    if (WOK_UNLIKELY(p->rc != 0u)) {
+        fprintf(stderr, "wok_rc: wok_alloc_at on rc!=0 (drop_reuse must decrement the shell to 0 before re-stamp)\n");
+        abort();
+    }
+    p->rc = 1u; p->tag = (uint16_t)tag; p->arity = (uint8_t)arity; p->scan = 0u;
+    return p;
+}
 uint64_t wok_stat_reused(const WokHeap* h)         { (void)h; return 0u; }
+uint64_t wok_stat_reused_inplace(const WokHeap* h) { (void)h; return 0u; }
 uint64_t wok_stat_slabs(const WokHeap* h)          { (void)h; return 0u; }
 
 #else
@@ -76,6 +99,7 @@ struct WokHeap {
     uint64_t cur_bytes;              /* current live bytes: Σ(8 + 8*arity) */
     uint64_t peak_bytes;             /* high-water mark of cur_bytes */
     uint64_t reused;                 /* free-list pops */
+    uint64_t reused_inplace;         /* FBIP wok_alloc_at hits */
     uint64_t nslabs;                 /* slabs malloc'd */
     WokSlab* slabs;                  /* linked list, for O(slabs) bulk teardown */
     char*    bump_ptr;
@@ -151,6 +175,30 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
     return p;
 }
 
+/* FBIP in-place reuse (spec section 4.3): re-stamp a just-decremented (rc-0) cell's
+   header into the SAME shell, bypassing the free list and the bump pointer. The new
+   tag re-uses the exact same arity-sized cell, so allocs/live/peak/cur_bytes/peak_bytes
+   and the free list are ALL untouched -- a fired reuse pair nets 0 alloc / 0 free. Only
+   the additive reused_inplace counter moves (arena observability for the microbench). */
+WokObj* wok_alloc_at(WokHeap* h, uint32_t tag, uint32_t arity, WokObj* p) {
+    assert(tag < 65536u && arity < 256u);
+    /* The arity-match and rc==0 invariants are ALWAYS-ON (mirroring wok_free's
+       premature-free guard): a mispaired reuse token (wrong-arity re-stamp, or a
+       still-live shell) must abort LOUDLY in release builds too, not be stripped
+       under NDEBUG. */
+    if (WOK_UNLIKELY((uint32_t)p->arity != arity)) {
+        fprintf(stderr, "wok_rc: wok_alloc_at arity mismatch (token arity != new node arity)\n");
+        abort();
+    }
+    if (WOK_UNLIKELY(p->rc != 0u)) {
+        fprintf(stderr, "wok_rc: wok_alloc_at on rc!=0 (drop_reuse must decrement the shell to 0 before re-stamp)\n");
+        abort();
+    }
+    p->rc = 1u; p->tag = (uint16_t)tag; p->arity = (uint8_t)arity; p->scan = 0u;
+    h->reused_inplace += 1u;
+    return p;
+}
+
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
     uint32_t arity = (uint32_t)p->arity;
@@ -171,6 +219,7 @@ void wok_free(WokHeap* h, WokObj* p) {
 }
 
 uint64_t wok_stat_reused(const WokHeap* h)         { return h->reused; }
+uint64_t wok_stat_reused_inplace(const WokHeap* h) { return h->reused_inplace; }
 uint64_t wok_stat_slabs(const WokHeap* h)          { return h->nslabs; }
 
 #endif /* WOK_RC_MALLOC */

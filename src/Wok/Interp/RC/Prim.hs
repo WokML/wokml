@@ -10,7 +10,7 @@ import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.RC.Value
   ( RC, liftRC, RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
-  , Node (..), Cell (..), Store, alloc, deref, incref, dropAddr, writeNode
+  , Node (..), Cell (..), Store, alloc, deref, incref, dropAddr, dropReuse, writeNode
   , continuationOwned )
 import Wok.Interp.Value (RuntimeError (..))
 
@@ -44,6 +44,7 @@ prims =
   , dollarP
   , rcDup
   , rcDrop
+  , rcDropReuse
   , contCellNew
   , contStore
   , contTake
@@ -86,6 +87,23 @@ rcDrop = RCPrim PN.rcDropName 1 [] $ \args s -> case args of
   -- before the captured frame ran.
   [RVInst _ _] -> pure (PRDone (RVLit LUnit), s)
   _           -> throwE (ArityError (Tx.pack "__rc_drop"))
+
+-- | @__rc_drop_reuse x@ is the FBIP @drop_reuse@ intrinsic (spec §5.2): the
+-- counted analogue of @__rc_drop@ that, instead of unit, returns a reuse TOKEN
+-- ('RVReuse'). 'dropReuse' releases the cell's children and, when the decrement
+-- hits zero (unique), RETAINS the freed shell as the token (else a NULL token).
+-- The token is the @rpFn@ result, consumed downstream by an 'RReuseCon'. A
+-- literal / uncounted handle is never a donor, so it yields @RVReuse Nothing@.
+rcDropReuse :: RCPrim
+rcDropReuse = RCPrim PN.rcDropReuseName 1 [] $ \args s -> case args of
+  [RVBox a]   -> do (tok, s') <- dropReuse a s; pure (PRDone tok, s')
+  [RVLit _]   -> pure (PRDone (RVReuse Nothing), s)
+  -- A shared-env recursive member behaves like a boxed handle: drop-reuse its env
+  -- (a no-op on the static empty-env sentinel) and surface whatever token results.
+  [RVRecMember _ _ e] -> do (tok, s') <- dropReuse e s; pure (PRDone tok, s')
+  -- A named effect-instance handle owns no counted cell, so it is never a donor.
+  [RVInst _ _] -> pure (PRDone (RVReuse Nothing), s)
+  _           -> throwE (ArityError (Tx.pack "__rc_drop_reuse"))
 
 -- ---------------------------------------------------------------------------
 -- The M3 stored-continuation cell primitives (spec §4.1)
@@ -268,6 +286,7 @@ renderArg (RVLit _)        = Tx.pack "literal"
 renderArg (RVBox _)        = Tx.pack "box"
 renderArg RVRecMember{}    = Tx.pack "closure handle"
 renderArg (RVInst _ _)     = Tx.pack "instance handle"
+renderArg (RVReuse _)      = Tx.pack "reuse token"
 
 -- ---------------------------------------------------------------------------
 -- Pure value prims (store-passthrough)
@@ -331,6 +350,7 @@ asBool (RVBox a) s = do
 asBool (RVLit _)           _ = throwE (PrimError (Tx.pack "expected Bool, got a literal"))
 asBool RVRecMember{} _ = throwE (PrimError (Tx.pack "expected Bool, got a closure handle"))
 asBool (RVInst _ _)  _ = throwE (PrimError (Tx.pack "expected Bool, got an instance handle"))
+asBool (RVReuse _)   _ = throwE (PrimError (Tx.pack "expected Bool, got a reuse token"))
 
 -- | Allocate a boxed boolean constructor and return its handle.
 allocBool :: Bool -> Store -> RC (RCValue, Store)
@@ -372,3 +392,6 @@ dropBoxed (RVBox a)          s = dropAddr a s
 dropBoxed (RVLit _)          s = pure s
 dropBoxed (RVRecMember _ _ e) s = dropAddr e s
 dropBoxed (RVInst _ _)       s = pure s
+-- A reuse token owns no counted child ('valueChildren (RVReuse _) = []'), so a
+-- drop of one is inert --- consistent with its affine handling everywhere else.
+dropBoxed (RVReuse _)        s = pure s

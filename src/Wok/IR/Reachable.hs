@@ -88,6 +88,12 @@ exprUniques = goE
       Anf.ROp minst _ _ xs -> Set.union (maybe Set.empty av minst) (avs xs)
       Anf.RRecord _ flds   -> avs (map snd flds)
       Anf.RProj _ a        -> av a
+      -- The FBIP reuse form is introduced by a post-pass that runs AFTER insertRC.
+      -- The boundary guard ('firstOrderNoHandlerViolations') re-runs on the
+      -- already-fused module inside 'runModuleRC', so this walk MUST tolerate it:
+      -- 'RReuseCon tok c fields' references the token + field atoms, exactly like an
+      -- 'RCon' plus the token operand.
+      Anf.RReuseCon tok _ xs -> Set.union (av tok) (avs xs)
     goA a = case a of
       Anf.AltCon _ _ e -> goE e
       Anf.AltLit _ e   -> goE e
@@ -209,6 +215,10 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
       Anf.RCon _ _         -> []
       Anf.RRecord _ _      -> []
       Anf.RProj _ _        -> []
+      -- An 'RReuseCon' (post-pass, after insertRC) carries no LetRec-relevant
+      -- content; like 'RCon'/'RApp' it contributes no violation. The guard re-runs
+      -- on the fused module inside 'runModuleRC', so this must not error.
+      Anf.RReuseCon{}      -> []
     alt mob lr bsc a = case a of
       Anf.AltCon _ bs b -> go mob lr (Set.union bsc (Set.fromList (boxedBs bs))) b
       Anf.AltLit _ b    -> go mob lr bsc b

@@ -99,6 +99,7 @@ library
         Wok.IR.Match
         Wok.IR.Multiplicity
         Wok.IR.Perceus
+        Wok.IR.ReusePairing
         Wok.IR.Reachable
         Wok.Interp
         Wok.Interp.Value

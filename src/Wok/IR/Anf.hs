@@ -65,6 +65,12 @@ data Rhs
     -- operation is performed; 'Nothing' = ambient (route to nearest handler).
   | RRecord Text [(Text, Atom)]  -- T { l = a }
   | RProj Text Atom              -- a.l
+  | RReuseCon Atom Text [Atom]   -- alloc_at(tok) Con field...  (FBIP reuse)
+    -- ^ An 'RCon' that consumes a reuse token (the leading 'Atom', an 'AVar'
+    -- naming a token binder produced by @__rc_drop_reuse@). Produced ONLY by the
+    -- FBIP reuse-pairing post-pass that runs AFTER 'Wok.IR.Perceus.insertRC';
+    -- the elaborator and every analysis that runs before that post-pass never
+    -- emit or observe it (spec 2026-06-23-fbip-reuse-design §5.1).
   deriving (Eq, Show)
 
 -- | Block / control structure. Strict: Let = evaluate-now sequencing.
@@ -144,6 +150,7 @@ collectRhs (RLam ps e)     t = collectExpr e (insertBinders ps t)
 collectRhs (ROp minst _ _ xs) t = foldr collectAtom t (maybe xs (: xs) minst)
 collectRhs (RRecord _ flds) t = foldr (\(_, a) acc -> collectAtom a acc) t flds
 collectRhs (RProj _ a)     t = collectAtom a t
+collectRhs (RReuseCon tok _ xs) t = foldr collectAtom t (tok : xs)
 
 collectExpr :: Expr -> HintTable -> HintTable
 collectExpr (Ret a)              t = collectAtom a t
@@ -265,6 +272,13 @@ renderRhs _   tbl (RRecord tyName flds) =
     <> Tx.pack " }"
 renderRhs _   tbl (RProj lbl a) =
   renderAtom tbl a <> Tx.pack "." <> lbl
+renderRhs _   tbl (RReuseCon tok c xs) =
+  c
+    <> Tx.pack "@"
+    <> renderAtom tbl tok
+    <> Tx.pack "("
+    <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
+    <> Tx.pack ")"
 
 -- ---------------------------------------------------------------------------
 -- Rendering Expr (flat layout, no extra depth per let)
@@ -506,6 +520,7 @@ freeVarsRhs (RLam ps e)      = freeVarsExpr e `Set.difference` Set.fromList (map
 freeVarsRhs (ROp m _ _ as)   = Set.unions (map atomVars (maybe as (: as) m))
 freeVarsRhs (RRecord _ flds) = Set.unions (map (atomVars . snd) flds)
 freeVarsRhs (RProj _ a)      = atomVars a
+freeVarsRhs (RReuseCon tok _ as) = Set.unions (atomVars tok : map atomVars as)
 
 atomVars :: Atom -> Set Unique
 atomVars (AVar n) = Set.singleton (nameUniq n)

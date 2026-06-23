@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+
+-- FBIP integer-width flip (Task 5, §4.3 / §11-finding): a 'map' whose result
+-- crosses >= 2^63. The INPUT cells carry small encodable U64 heads (C-eligible),
+-- but 'bigBump' adds 9223372036854775800 so each OUTPUT head exceeds
+-- Int64.maxBound and is NOT C-encodable. The §6.3 slot-kind guard still PAIRS
+-- (both fields are statically 'U64' -> KLitInt), so a reuse token is produced;
+-- but at runtime 'alloc_at' sees 'nodeCEligible newNode == False' while the
+-- reserved shell was C-eligible, so it takes the §4.3 "not eligible" branch:
+-- free the reserved shell for real, allocate fresh on the abstract heap. Net 1
+-- free + 1 alloc on BOTH backends, accounted identically. Output and counts must
+-- still match abstract == C.
+--
+-- 9223372036854775800 = 2^63 - 8; + 8 = 2^63 (= 9223372036854775808), + 9 / + 10
+-- cross further. The mapped heads all land in [2^63, 2^63 + 2], all non-encodable.
+
+data List = Nil | Cons U64 List
+
+bigBump : U64 -> U64
+bigBump x = x + 9223372036854775800
+
+mapBig : List -> List
+mapBig xs = case xs of
+  Nil       -> Nil
+  Cons x xx -> Cons (bigBump x) (mapBig xx)
+
+sumList : List -> U64
+sumList xs = case xs of
+  Nil       -> 0
+  Cons y ys -> y + sumList ys
+
+main = sumList (mapBig (Cons 8 (Cons 9 (Cons 10 Nil))))

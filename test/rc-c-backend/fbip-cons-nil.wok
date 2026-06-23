@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+
+-- FBIP Cons-with-immediate-tail (Task 5, §7): a single-element 'Cons x Nil'
+-- whose tail is the inline 'Nil' immediate (zero cells since the layout-
+-- compaction immediates slice). Mapping it reuses the one 'Cons' shell in place;
+-- the inline 'Nil' slot is left untouched and the new tail (again inline 'Nil')
+-- overwrites it. Cell-to-cell reuse only: the immediate is never a donor and is
+-- not double-freed. The FUSED run reuses the single Cons (allocs drop by 1 vs
+-- the non-FBIP run); output and stats agree on both backends.
+
+data List = Nil | Cons U64 List
+
+mapInc : List -> List
+mapInc xs = case xs of
+  Nil       -> Nil
+  Cons x xx -> Cons (x + 1) (mapInc xx)
+
+main = mapInc (Cons 41 Nil)

@@ -174,6 +174,9 @@ cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
                             then Many else Zero
       RRecord _ flds   -> if any (mentionsAtom r . snd) flds then Many else Zero
       RProj _ a        -> if mentionsAtom r a then Many else Zero
+      -- The FBIP reuse form is introduced by a post-pass that runs AFTER
+      -- multiplicity analysis; it never reaches this pass.
+      RReuseCon{}      -> error "RReuseCon: produced only by reusePairing post-pass (after multiplicity analysis)"
 
 -- | Conservative "does `r` occur free anywhere in `e`" (shadowing ignored: resume
 -- binders are fresh, and a false positive only over-approximates to Many).
@@ -196,6 +199,7 @@ occursRhs r rhs = case rhs of
   ROp minst _ _ as -> maybe False (mentionsAtom r) minst || mentionsAny r as
   RRecord _ flds   -> any (mentionsAtom r . snd) flds
   RProj _ a        -> mentionsAtom r a
+  RReuseCon{}      -> error "RReuseCon: produced only by reusePairing post-pass (after multiplicity analysis)"
 
 occursAlt :: Name -> Alt -> Bool
 occursAlt r (AltCon _ _ b) = occursExpr r b

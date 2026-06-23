@@ -32,6 +32,7 @@ typedef struct WokHeap WokHeap;   /* opaque per-run context */
 WokHeap* wok_heap_new(void);
 void     wok_heap_free(WokHeap* h);
 WokObj*  wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity);
+WokObj*  wok_alloc_at(WokHeap* h, uint32_t tag, uint32_t arity, WokObj* p);  /* FBIP: re-stamp in place */
 void     wok_dup(WokObj* p);
 uint64_t wok_dec(WokObj* p);                        /* rc--, returns NEW rc; no free */
 void     wok_free(WokHeap* h, WokObj* p);
@@ -48,6 +49,7 @@ WOK_PURE int64_t  wok_stat_peak(const WokHeap* h);
 /* additive observability. reused/slabs are arena-only (the WOK_RC_MALLOC backend
    reports 0) and consumed C-side by the standalone test / microbench (no Haskell binding). */
 WOK_PURE uint64_t wok_stat_reused(const WokHeap* h);
+WOK_PURE uint64_t wok_stat_reused_inplace(const WokHeap* h);  /* FBIP wok_alloc_at hits (arena only) */
 WOK_PURE uint64_t wok_stat_slabs(const WokHeap* h);
 /* peak_bytes (high-water Sigma(8 + 8*arity)) is tracked in BOTH backends and returns the
    real figure under WOK_RC_MALLOC; bound in Haskell as wokStatPeakBytes for benchmarking. */

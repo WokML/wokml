@@ -55,6 +55,8 @@ import Data.Int (Int64)
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
 import qualified Wok.IR.Perceus as Perceus
+import Wok.IR.ReusePairing (reusePairing)
+import qualified Wok.IR.ReusePairing as RP
 import qualified Wok.IR.Escape as Esc
 import Wok.IR.Reachable
   ( pruneToReachable, exprUniques
@@ -109,6 +111,11 @@ main = do
   -- bypass the M2a-1 guard-rejected programs use ('assertRcAgrees'). When Task 4
   -- admits the route, these move into the auto-discovered corpus.
   rcM3Files <- findByExtension [".wok"] "test/rc-m3"
+  -- FBIP S2 (Task 5): the in-place-reuse corpus. Kept out of the auto-discovered
+  -- corpus (lives under 'test/rc-c-backend', its own directory) and listed
+  -- explicitly so the FBIP parity + targeted assertions reference each file by
+  -- name. Fed to 'rcCBackendParity' for the output + abstract==C + balance-lint
+  -- parity check.
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -199,6 +206,9 @@ main = do
     , rcIncrefTests
     , rcM3NodeTests
     , wokRcHeapTests
+    , wokRcReuseTests
+    , wokRcReuseIrTests
+    , rcReusePairingTests
     , rcMachineTests
     , rcModuleTests
     , rcLetRecTests
@@ -270,8 +280,10 @@ main = do
     -- through both the abstract heap and the C heap, asserting output + alloc-stat
     -- parity; plus targeted cross-heap/fallback/deep tests and the slot
     -- encode/decode round-trip property.
-    , rcCBackendParity (perceusFiles ++ rcM2bFiles)
+    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles)
     , rcCBackendTargeted
+    , rcFbipTargeted
+    , rcFbipFaultInjection
     , rcCBackendSlotProperty
     , rcPropertyTests
     , rcM2a1PropertyTests
@@ -5074,6 +5086,7 @@ aprimKeysInModule (Anf.CoreModule binds) =
       ROp m _ _ as  -> Set.unions (map goA (maybe as (: as) m))
       RRecord _ fls -> Set.unions (map (goA . snd) fls)
       RProj _ a     -> goA a
+      RReuseCon{}   -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
     goE e = case e of
       Ret a               -> goA a
       Jump _ as           -> Set.unions (map goA as)
@@ -7359,6 +7372,31 @@ buildRawAndNamedOwned =
 freeEach :: [St.Addr] -> St.Store -> Either IV.RuntimeError St.Store
 freeEach addrs s0 = foldl (\acc a -> acc >>= St.dropAddrPure a) (Right s0) addrs
 
+-- | A captured continuation prefix (FIX 1b) whose single 'KLetRC' frame body
+-- contains an 'RReuseCon' --- the shape that would arise if a reuse token were in
+-- flight when an op captured the continuation. The frame body is
+-- @let r = RReuseCon tok Cons [y] in Ret r@; @y@ (the field) resolves through the
+-- frame scope to a live 'Owned' cell, so the frame's owned set is exactly that
+-- cell. 'continuationOwned' over this prefix must NOT crash and must return @[y]@'s
+-- address (the field is the owned move; the affine token is uncounted, ignored).
+-- Returns the prefix and the field's owned address.
+buildReuseConFrame :: (St.RCKont, St.Addr)
+buildReuseConFrame =
+  let s0          = St.emptyStore
+      (yAddr, _)  = St.allocPure (St.NCon (T.pack "Owned") []) s0   -- the field cell
+      yName       = Name (T.pack "y")   (Unique 9101)
+      rBndr       = Binder (Name (T.pack "r") (Unique 9102)) Unrestricted m2bBoxTy
+      tokName     = Name (T.pack "tok") (Unique 9103)
+      -- body = let r = RReuseCon tok Cons [y] in Ret r
+      body        = Let rBndr
+                      (RReuseCon (AVar tokName) (T.pack "Cons") [AVar yName])
+                      (Ret (AVar (Name (T.pack "r") (Unique 9102))))
+      -- y is the only frame-scoped binder bound to a counted cell; tok is NOT in
+      -- the env (an uncounted affine token, never resolved to an address).
+      sc          = St.RCScope (Map.fromList [(Unique 9101, St.RVBox yAddr)]) Map.empty
+      prefix      = St.KLetRC rBndr body sc St.KDoneRC
+  in (prefix, yAddr)
+
 -- ---------------------------------------------------------------------------
 -- M3 Task 5: the DOUBLE-RESUME red-check (the 'moveOutCont' rc==1 floor is
 -- load-bearing, spec §4.2 / §10 item 1). A stored continuation resumed TWICE is
@@ -7509,6 +7547,7 @@ runAndAccount e =
                 Left err -> assertFailure ("result drop failed: " <> show err)
                 Right s' -> pure (txt, St.stLive (St.stStats s'))
             St.RVInst _ _        -> pure (txt, St.stLive (St.stStats s))
+            St.RVReuse _         -> assertFailure "a reuse token is never a program result value"
 
 wokRcHeapTests :: TestTree
 wokRcHeapTests = testGroup "wok-rc-heap (raw C runtime FFI)"
@@ -7542,6 +7581,574 @@ wokRcHeapTests = testGroup "wok-rc-heap (raw C runtime FFI)"
       assertEqual "peak"   (1 :: Int64) peak
       Heap.wokHeapFree h
   ]
+
+-- ---------------------------------------------------------------------------
+-- RC reuse tests (FBIP Task 1: the reuse token + abstract-heap
+-- 'drop_reuse'/'alloc_at' store algebra).
+--
+-- A reuse pair is 'dropReuse' (release the children, retain the shell as a
+-- token) followed by 'allocAt' (consume the token, write the new node into the
+-- reserved shell if its placement matches, else free + fresh). The headline win
+-- is that a unique cons reusing a same-arity/same-eligibility shell nets to 0
+-- allocs / 0 frees and revives the SAME index; a shared cell yields a NULL token
+-- and falls back to a fresh alloc; a placement mismatch frees the shell for real
+-- and allocates fresh. These run on the abstract heap exclusively, the same way
+-- 'rcDropTests' does.
+wokRcReuseTests :: TestTree
+wokRcReuseTests = testGroup "rc-reuse"
+  [ testCase "unique cons reuse nets 0 alloc / 0 free and revives the same index" $ do
+      -- Build a unique 'Cons 1 Nil': the Nil tail is an inline immediate (no cell,
+      -- routed by 'alloc' on a nullary 'NCon'), so the only counted cell is the
+      -- Cons. Drop-reuse it (unique, rc 1), then alloc_at a new same-arity
+      -- 'Cons 2 Nil'.
+      r <- runExceptT $ do
+             (nil, s1)  <- St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+             (cons, s2) <- St.alloc
+                             (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 1), St.RVBox nil]) s1
+             let newNode = St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 2), St.RVBox nil]
+                 allocsBefore = St.stAllocs (St.stStats s2)
+                 freesBefore  = St.stFrees (St.stStats s2)
+             (tok, s3) <- St.dropReuse cons s2
+             (a, s4)   <- St.allocAt tok newNode s3
+             pure (cons, newNode, allocsBefore, freesBefore, tok, a, s4)
+      case r of
+        Left e -> assertFailure ("reuse pair failed: " <> show e)
+        Right (cons, newNode, allocsBefore, freesBefore, tok, a, s4) -> do
+          St.valueChildren tok @?= []
+          a @?= cons                         -- same index revived
+          St.stAllocs (St.stStats s4) - allocsBefore @?= 0
+          St.stFrees  (St.stStats s4) - freesBefore  @?= 0
+          case St.derefPure a s4 of
+            Right c -> St.cNode c @?= newNode
+            Left e  -> assertFailure ("deref of revived shell: " <> show e)
+  , testCase "shared cell yields RVReuse Nothing and falls back to a fresh alloc (+1/0)" $ do
+      -- A cons shared at rc 2: drop_reuse decrements (no free, NULL token), then
+      -- alloc_at NULL fresh-allocates.
+      r <- runExceptT $ do
+             (nil, s1)  <- St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+             (cons, s2) <- St.alloc
+                             (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 1), St.RVBox nil]) s1
+             s3 <- St.incref cons s2          -- share it: rc 2
+             let newNode = St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 2), St.RVBox nil]
+                 allocsBefore = St.stAllocs (St.stStats s3)
+                 freesBefore  = St.stFrees (St.stStats s3)
+             (tok, s4) <- St.dropReuse cons s3
+             (a, s5)   <- St.allocAt tok newNode s4
+             pure (cons, allocsBefore, freesBefore, tok, a, s5)
+      case r of
+        Left e -> assertFailure ("shared fallback failed: " <> show e)
+        Right (cons, allocsBefore, freesBefore, tok, a, s5) -> do
+          tok @?= St.RVReuse Nothing
+          a /= cons @? "fresh alloc must NOT revive the shared cons"
+          St.stAllocs (St.stStats s5) - allocsBefore @?= 1
+          St.stFrees  (St.stStats s5) - freesBefore  @?= 0
+          -- the shared cons survives at rc 1
+          case St.derefPure cons s5 of
+            Right c -> St.cRc c @?= 1
+            Left e  -> assertFailure ("shared cons must survive: " <> show e)
+  , testCase "not-eligible token (arity mismatch) frees the shell for real then fresh-allocs (+1/+1)" $ do
+      -- A unique arity-2 Cons donor, but alloc_at an arity-1 node: the placement
+      -- (arity) does not match, so the shell is freed for real and a fresh cell
+      -- allocated. Net +1 alloc / +1 free.
+      let (cons, s1) = St.allocPure
+                         (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 1), St.RVLit (Anf.LInt 2)])
+                         St.emptyStore
+          allocsBefore = St.stAllocs (St.stStats s1)
+          freesBefore  = St.stFrees (St.stStats s1)
+          newNode = St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 9)]   -- arity 1, != donor arity 2
+      r <- runExceptT $ do
+             (tok, s2) <- St.dropReuse cons s1
+             (a, s3)   <- St.allocAt tok newNode s2
+             pure (tok, a, s3)
+      case r of
+        Left e -> assertFailure ("not-eligible fallback failed: " <> show e)
+        Right (_, a, s3) -> do
+          St.stAllocs (St.stStats s3) - allocsBefore @?= 1
+          St.stFrees  (St.stStats s3) - freesBefore  @?= 1
+          -- the donor index is freed for real (UAF on re-deref); the fresh node is at a new index
+          (a /= cons) @? "fresh alloc must not revive the freed donor"
+          case St.derefPure cons s3 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "donor shell must be freed for real"
+          case St.derefPure a s3 of
+            Right c -> St.cNode c @?= newNode
+            Left e  -> assertFailure ("fresh node deref: " <> show e)
+  , testCase "valueChildren of a reuse token is empty (inert to dup/drop)" $ do
+      St.valueChildren (St.RVReuse Nothing) @?= []
+      St.valueChildren (St.RVReuse (Just (St.ReuseSlot (St.HAddr 7) 2 True))) @?= []
+  ]
+
+-- | The IR-level half of FBIP reuse (Task 3): the two forms a later post-pass
+-- emits and the machine sites that execute them. A reuse pair is a
+-- @let tok = __rc_drop_reuse parent@ (the @drop_reuse@ intrinsic, returning a
+-- reuse token instead of unit) followed by a @let r = RReuseCon tok Con fields@
+-- (the @alloc_at@ allocation form, consuming the token). Both forms are produced
+-- ONLY by the not-yet-existing pairing post-pass, so these tests build the
+-- 'Anf.Expr' directly (no @.wok@ source, no 'Perceus.insertRC') and run it
+-- through 'RCM.runExprRC' --- exactly the way 'wokRcReuseTests' exercises the
+-- store-algebra layer, but here through the machine so the new 'evalRhsRC' arm
+-- and the prim-table entry are on the path.
+--
+-- The headline assertion is the win: a unique cons reuse nets 0 alloc / 0 free
+-- on the abstract backend (the only counted allocation over the whole run is the
+-- original 'Cons'; the pair adds nothing) and the program output is correct.
+-- The C ('CHeap') backend's reuse path is validated end-to-end in Task 5 via real
+-- programs through the post-pass; T3 asserts the abstract round-trip only.
+wokRcReuseIrTests :: TestTree
+wokRcReuseIrTests = testGroup "rc-reuse-ir"
+  [ testCase "RReuseCon over a __rc_drop_reuse'd unique cons nets 0 alloc / 0 free and outputs correctly" $ do
+      -- let nil = Nil                              -- inline immediate (no cell)
+      --     xs  = Cons 1 nil                       -- the ONLY counted alloc (1)
+      --     tok = __rc_drop_reuse xs               -- unique rc1: release children, keep shell
+      --     r   = RReuseCon tok Cons [2, nil]      -- reuse the shell (0 alloc / 0 free)
+      -- in r                                       -- => [2]
+      let dropReuseName = Name.Name PN.rcDropReuseName (Unique (-3))
+          e = runFresh $ do
+                nNil <- freshName (T.pack "nil")
+                nXs  <- freshName (T.pack "xs")
+                nTok <- freshName (T.pack "tok")
+                nR   <- freshName (T.pack "r")
+                pure $
+                  Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBnd nXs)
+                    (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar nNil])
+                  (Anf.Let (rcBnd nTok)
+                    (Anf.RApp (Anf.AVar dropReuseName) [Anf.AVar nXs])
+                  (Anf.Let (rcBnd nR)
+                    (Anf.RReuseCon (Anf.AVar nTok) (T.pack "Cons")
+                       [Anf.ALit (Anf.LInt 2), Anf.AVar nNil])
+                  (Anf.Ret (Anf.AVar nR)))))
+      RCM.runExprRC RCP.rcPrimTable Map.empty (St.initSentinel St.emptyStore) e >>= \case
+        Left err -> assertFailure ("rc-reuse-ir run failed: " <> show err)
+        Right (v, s) -> do
+          -- Output is correct: the revived shell holds 'Cons 2 Nil' => "[2]".
+          case St.renderRCValue s v of
+            Left err  -> assertFailure ("render failed: " <> show err)
+            Right txt -> txt @?= T.pack "[2]"
+          -- The win: the reuse pair nets 0 alloc / 0 free. The original 'Cons' is
+          -- the single counted allocation over the whole run (the inline 'Nil'
+          -- costs no cell), and the pair revives that same shell, so:
+          St.stAllocs (St.stStats s) @?= 1
+          St.stFrees  (St.stStats s) @?= 0
+          -- The result is the revived donor shell (reuse, not a fresh alloc): it
+          -- is a boxed dynamic cell still live at rc 1.
+          case v of
+            St.RVBox a -> case St.derefPure a s of
+              Right c -> St.cRc c @?= 1
+              Left de -> assertFailure ("deref of result: " <> show de)
+            other -> assertFailure ("expected a boxed cons result, got " <> show other)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FBIP reuse-pairing post-pass (Task 4): 'reusePairing' over the
+-- Perceus-instrumented module.
+--
+-- The golden dumps 'Perceus.prettyPerceus (reusePairing (insertRC cm))' for three
+-- HAND-BUILT modules (no '.wok' source, so the post-Perceus shape is exact and the
+-- slot-kind guard can be exercised directly):
+--
+--   * 'map+1'    ([U64] -> [U64], same slot kinds): the 'Cons' alt rewrites to
+--     '__rc_drop_reuse' + 'Cons@tok'; the nullary 'Nil' alt is NOT rewritten (an
+--     immediate is never a donor).
+--   * 'reverse'  (accumulator, target 'Cons' BEFORE the recursive call): the
+--     'Cons' alt rewrites; the token is born and consumed without crossing the
+--     call.
+--   * 'kindMap'  ([U64] -> [Char], kind-changing): the slot-kind signature guard
+--     (§6.3) REFUSES to pair (matched '[KLitInt, KPointer]' /= target
+--     '[KLitChar, KPointer]'), so it keeps a plain '__rc_drop' + 'RCon'. This is
+--     the regression test for the C descriptor mis-decode the guard prevents.
+--
+-- Plus a slot-class unit test and a balance-preserving check (balanceLint runs on
+-- 'insertRC cm' BEFORE the post-pass and is unaffected; the rewrite cannot
+-- unbalance it because the token is structurally affine).
+rcReusePairingTests :: TestTree
+rcReusePairingTests = testGroup "rc-reuse-pairing"
+  [ goldenVsString "map+1"
+      "test/rc-reuse-pairing/map.expected"
+      (reusePairingDump reuseMapModule)
+  , goldenVsString "reverse"
+      "test/rc-reuse-pairing/reverse.expected"
+      (reusePairingDump reuseReverseModule)
+  , goldenVsString "kindchange"
+      "test/rc-reuse-pairing/kindchange.expected"
+      (reusePairingDump reuseKindModule)
+  , goldenVsString "crosscon"
+      "test/rc-reuse-pairing/crosscon.expected"
+      (reusePairingDump reuseCrossConModule)
+  , testCase "cross-constructor reuse is REFUSED even with an identical slot-kind signature (F1)" $ do
+      -- Review finding F1: a target 'RCon' whose slot-kind signature equals the
+      -- matched cell's but whose CONSTRUCTOR DIFFERS must NOT be paired. The
+      -- §6.3 backend-lockstep + descriptor-validity argument holds only for
+      -- same-constructor reuse; a cross-constructor re-stamp could decode under a
+      -- stale tag-keyed descriptor (silent mis-decode) and diverge from the
+      -- abstract heap. So 'A x y -> ... B x y' (A, B same arity + same slot kinds)
+      -- keeps a plain '__rc_drop' + 'RCon' --- never a '__rc_drop_reuse'/'@_tok'.
+      let dumped = T.unpack (Anf.prettyModule (reusePairing (Perceus.insertRC reuseCrossConModule)))
+      assertBool "cross-con: no __rc_drop_reuse emitted"
+        (not ("__rc_drop_reuse" `Data.List.isInfixOf` dumped))
+      assertBool "cross-con: no @_tok reuse-con emitted"
+        (not ("@_tok" `Data.List.isInfixOf` dumped))
+      -- The plain drop is still present (correctness is unaffected; we just do not reuse).
+      assertBool "cross-con: plain __rc_drop is retained"
+        ("__rc_drop(" `Data.List.isInfixOf` dumped)
+  , testCase "an ROp between the parent-drop and the same-con RCon is NOT paired (FIX 1a)" $ do
+      -- A reuse token must NOT span an effect op: an op captures the continuation
+      -- (which would hold the still-unconsumed token), and the reserved shell has no
+      -- continuation-RC finalizer, so a token spanning an op under an aborting handler
+      -- would leak its shell. 'findTarget' STOPS at the 'ROp', so the alt keeps a plain
+      -- '__rc_drop' + 'RCon' --- no '__rc_drop_reuse', no 'RReuseCon'.
+      let dumped = T.unpack (Anf.prettyModule (reusePairing (Perceus.insertRC reuseOpModule)))
+      assertBool "ROp-span: no __rc_drop_reuse emitted"
+        (not ("__rc_drop_reuse" `Data.List.isInfixOf` dumped))
+      assertBool "ROp-span: no @_tok reuse-con emitted"
+        (not ("@_tok" `Data.List.isInfixOf` dumped))
+      -- No token was minted at all (the refusal mints nothing, Uniques stable).
+      assertEqual "ROp-span: zero reuse tokens minted"
+        [] (tokenUniques (reusePairing (Perceus.insertRC reuseOpModule)))
+  , testCase "continuationOwned is TOTAL over an RReuseCon frame body (FIX 1b, no crash)" $ do
+      -- The continuation-drop analysis ('continuationOwned' -> 'nonHeadOccs'/
+      -- 'dropTargets' in Wok.IR.Escape) must NOT crash if a captured continuation body
+      -- contains an 'RReuseCon' (a token in flight when an op captured the
+      -- continuation). 'escapingAtomsRhs' treats 'RReuseCon tok c fields' like
+      -- 'RCon c fields': the FIELD atoms are the owned moves; the uncounted affine
+      -- token contributes NOTHING. So 'continuationOwned' over a frame whose body is
+      -- @Ret r@ after @let r = RReuseCon tok Cons [y]@ owns exactly the field's cell.
+      let (prefix, ownedAddr) = buildReuseConFrame
+      -- The analysis runs (does not 'error') and returns the field's owned addr.
+      St.continuationOwned prefix @?= [ownedAddr]
+      -- Belt-and-braces: the raw Escape predicates are total over RReuseCon directly.
+      let body = Ret (AVar (Name (T.pack "r") (Unique 9102)))
+          rcBody = Let (Binder (Name (T.pack "r") (Unique 9102)) Unrestricted m2bBoxTy)
+                       (RReuseCon (AVar (Name (T.pack "tok") (Unique 9103)))
+                                  (T.pack "Cons") [AVar (Name (T.pack "y") (Unique 9101))])
+                       body
+      -- nonHeadOccs over the RReuseCon body counts the field (y), never the token.
+      assertEqual "nonHeadOccs over RReuseCon body == its field (tok ignored)"
+        (Set.fromList [Unique 9101, Unique 9102])
+        (Esc.nonHeadOccs Set.empty rcBody)
+      -- dropTargets is already total (no __rc_drop in the body -> empty, no crash).
+      Esc.dropTargets rcBody @?= Set.empty
+  , testCase "seedSupply scans handler arm bodies; minted token avoids arm-binder collision (F2)" $ do
+      -- Review finding F2: 'exprMaxU' must descend into a 'Handle's handler arm
+      -- bodies (mirroring 'Perceus.handlerMaxU'), else 'seedSupply' can seed BELOW
+      -- an arm binder's Unique and 'freshU' mints a colliding '_tok'.
+      --
+      -- 'reuseHandlerModule' has its largest Unique buried in an op-arm body, and a
+      -- reusable Cons-map pattern inside the handled expression. After the fix,
+      -- 'exprMaxU' accounts for the arm binder, and the minted token Unique must be
+      -- strictly above EVERY Unique present before the pass.
+      let instrumented = Perceus.insertRC reuseHandlerModule
+          armMaxBefore = maximum (map (RP.exprMaxU . Anf.tbBody) (Anf.cmBinds instrumented))
+          fused        = reusePairing instrumented
+          tokUs        = tokenUniques fused
+      -- exprMaxU sees the arm-buried Unique (1000), not just the surface binders.
+      assertBool ("exprMaxU accounts for the arm-buried Unique (got " <> show armMaxBefore <> ")")
+        (armMaxBefore >= 1000)
+      -- The pass minted at least one fresh token (the handled expr is reusable).
+      assertBool "reuse fired inside the handled expr (a _tok was minted)" (not (null tokUs))
+      -- Every minted token Unique is strictly above the largest pre-existing Unique,
+      -- so it cannot collide with the arm binder (the F2 collision the fix prevents).
+      assertBool ("minted token Unique(s) " <> show tokUs <> " exceed the pre-pass max " <> show armMaxBefore)
+        (all (> armMaxBefore) tokUs)
+  , testCase "slotClassOf maps the storage classes per the §6.3 table" $ do
+      RP.slotClassOf (Ty.CTCon Ty.TcU64 [])    @?= RP.KLitInt
+      RP.slotClassOf (Ty.CTCon Ty.TcU32 [])    @?= RP.KLitInt
+      RP.slotClassOf (Ty.CTCon Ty.TcChar [])   @?= RP.KLitChar
+      RP.slotClassOf (Ty.CTCon Ty.TcUnit [])   @?= RP.KLitUnit
+      RP.slotClassOf (Ty.CTCon Ty.TcString []) @?= RP.NonEncodable
+      RP.slotClassOf (Ty.CTCon Ty.TcBool [])   @?= RP.KPointer
+      RP.slotClassOf (Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]) @?= RP.KPointer
+      RP.slotClassOf (Ty.CTCon (Ty.TcTuple 2) [Ty.CTCon Ty.TcU64 [], Ty.CTCon Ty.TcU64 []])
+        @?= RP.KPointer
+  , testCase "reuse-compatible iff same arity AND equal class at every position" $ do
+      let intList = [Ty.CTCon Ty.TcU64 [], Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]]
+          chrList = [Ty.CTCon Ty.TcChar [], Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcChar []]]
+      -- map (a -> a) / reverse: identical signatures.
+      (RP.conSlotSig intList == RP.conSlotSig intList) @? "Int-list signatures match"
+      -- kind-changing map: same arity, DIFFERENT class at position 0.
+      (RP.conSlotSig intList /= RP.conSlotSig chrList) @? "Int vs Char signatures differ"
+      -- arity mismatch: never compatible.
+      (RP.conSlotSig intList /= RP.conSlotSig [Ty.CTCon Ty.TcU64 []]) @? "arity differs"
+  , testCase "post-pass is balance-preserving: balanceLint on insertRC is unaffected" $ do
+      -- The lint runs on the PRE-FBIP instrumented module (balanceLint re-runs
+      -- insertRC itself); it must stay clean. The post-pass output is then verified
+      -- to run on the machine without a balance regression by the runtime check
+      -- below.
+      Perceus.balanceLint reuseMapModule     @?= []
+      Perceus.balanceLint reuseReverseModule @?= []
+      Perceus.balanceLint reuseKindModule    @?= []
+  , testCase "rewritten map+1 RUNS identically to the non-reused version (output + balance)" $ do
+      -- The headline win: the reuse run nets ~0 net spine allocs, the non-reuse run
+      -- allocates the spine fresh, and BOTH produce the same output and balance to
+      -- the same baseline. (mapInc [1,2,3] == [2,3,4].)
+      let plain = Perceus.insertRC reuseMapRunModule
+          fused = reusePairing plain
+      plainR <- RCM.runModuleRC plain
+      fusedR <- RCM.runModuleRC fused
+      case (plainR, fusedR) of
+        (Right p, Right f) -> do
+          -- Output is byte-identical.
+          assertEqual "map+1 output identical (reuse vs non-reuse)"
+            (RCM.rcOutput p) (RCM.rcOutput f)
+          assertEqual "map+1 output is [2, 3, 4]"
+            (T.pack "[2, 3, 4]") (RCM.rcOutput f)
+          -- Both balance to baseline (no leak, no over-free).
+          assertEqual "non-reuse balances to baseline"
+            (RCM.rcBaseline p) (St.stLive (RCM.rcStats p))
+          assertEqual "reuse balances to baseline"
+            (RCM.rcBaseline f) (St.stLive (RCM.rcStats f))
+          -- The win: the fused run records strictly fewer allocator events on the
+          -- spine. A unique 3-element map reuses all three Cons shells, so the
+          -- fused allocs are below the non-reuse allocs.
+          assertBool
+            ("FBIP win: fused allocs (" <> show (St.stAllocs (RCM.rcStats f))
+               <> ") must be < non-reuse allocs (" <> show (St.stAllocs (RCM.rcStats p)) <> ")")
+            (St.stAllocs (RCM.rcStats f) < St.stAllocs (RCM.rcStats p))
+        (Left e, _) -> assertFailure ("non-reuse run failed: " <> show e)
+        (_, Left e) -> assertFailure ("reuse run failed: " <> show e)
+  ]
+
+-- | Dump 'Perceus.prettyPerceus (reusePairing (insertRC cm))' as golden bytes.
+reusePairingDump :: Anf.CoreModule -> IO BL.ByteString
+reusePairingDump cm =
+  pure (BL.pack (T.unpack (Anf.prettyModule (reusePairing (Perceus.insertRC cm))) <> "\n"))
+
+-- Hand-built modules for the reuse-pairing golden. Each is the ANF a real
+-- 'map'/'reverse' would elaborate to; binder types are FAITHFUL (so the slot-kind
+-- guard is exercised). A trivial 'main' keeps every module a valid 'CoreModule'.
+
+reuseU64, reuseListU64, reuseChar, reuseListChar :: Ty.CType
+reuseU64      = Ty.CTCon Ty.TcU64 []
+reuseListU64  = Ty.CTCon Ty.TcList [reuseU64]
+reuseChar     = Ty.CTCon Ty.TcChar []
+reuseListChar = Ty.CTCon Ty.TcList [reuseChar]
+
+reuseBnd :: T.Text -> Int -> Ty.CType -> Anf.Binder
+reuseBnd h u t = Anf.Binder (Name h (Unique u)) Anf.Unrestricted t
+
+reuseNm :: T.Text -> Int -> Name
+reuseNm h u = Name h (Unique u)
+
+-- mapInc xs = case xs of
+--   Cons x xx -> let y = x + 1 ; let ys = mapInc xx ; Cons y ys
+--   Nil       -> Nil
+reuseMapModule :: Anf.CoreModule
+reuseMapModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "mapInc" 10) [reuseBnd "xs" 11 reuseListU64]
+      (Anf.Case (Anf.AVar (reuseNm "xs" 11))
+        [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 12 reuseU64, reuseBnd "xx" 13 reuseListU64]
+            (Anf.Let (reuseBnd "y" 14 reuseU64)
+               (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+                  [Anf.AVar (reuseNm "x" 12), Anf.ALit (Anf.LInt 1)])
+            (Anf.Let (reuseBnd "ys" 15 reuseListU64)
+               (Anf.RApp (Anf.AVar (reuseNm "mapInc" 10)) [Anf.AVar (reuseNm "xx" 13)])
+            (Anf.Let (reuseBnd "r" 16 reuseListU64)
+               (Anf.RCon (T.pack "Cons") [Anf.AVar (reuseNm "y" 14), Anf.AVar (reuseNm "ys" 15)])
+            (Anf.Ret (Anf.AVar (reuseNm "r" 16))))))
+        , Anf.AltCon (T.pack "Nil") []
+            (Anf.Let (reuseBnd "n" 17 reuseListU64) (Anf.RCon (T.pack "Nil") [])
+              (Anf.Ret (Anf.AVar (reuseNm "n" 17))))
+        ])
+  , Anf.TopBind (reuseNm "main" 0) [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+  ]
+
+-- revAcc acc xs = case xs of
+--   Cons x xx -> let acc2 = Cons x acc ; revAcc acc2 xx
+--   Nil       -> acc
+reuseReverseModule :: Anf.CoreModule
+reuseReverseModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "revAcc" 20) [reuseBnd "acc" 21 reuseListU64, reuseBnd "xs" 22 reuseListU64]
+      (Anf.Case (Anf.AVar (reuseNm "xs" 22))
+        [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 23 reuseU64, reuseBnd "xx" 24 reuseListU64]
+            (Anf.Let (reuseBnd "acc2" 25 reuseListU64)
+               (Anf.RCon (T.pack "Cons") [Anf.AVar (reuseNm "x" 23), Anf.AVar (reuseNm "acc" 21)])
+            (Anf.Let (reuseBnd "rr" 27 reuseListU64)
+               (Anf.RApp (Anf.AVar (reuseNm "revAcc" 20))
+                  [Anf.AVar (reuseNm "acc2" 25), Anf.AVar (reuseNm "xx" 24)])
+            (Anf.Ret (Anf.AVar (reuseNm "rr" 27)))))
+        , Anf.AltCon (T.pack "Nil") [] (Anf.Ret (Anf.AVar (reuseNm "acc" 21)))
+        ])
+  , Anf.TopBind (reuseNm "main" 0) [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+  ]
+
+-- kindMap xs = case xs of            (Int -> Char: the slot-kind guard refuses)
+--   Cons x xx -> let c = toChar x ; let ys = kindMap xx ; Cons c ys
+--   Nil       -> Nil
+reuseKindModule :: Anf.CoreModule
+reuseKindModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "kindMap" 30) [reuseBnd "xs" 31 reuseListU64]
+      (Anf.Case (Anf.AVar (reuseNm "xs" 31))
+        [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 32 reuseU64, reuseBnd "xx" 33 reuseListU64]
+            (Anf.Let (reuseBnd "c" 34 reuseChar)
+               (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "toChar")) [Anf.AVar (reuseNm "x" 32)])
+            (Anf.Let (reuseBnd "ys" 35 reuseListChar)
+               (Anf.RApp (Anf.AVar (reuseNm "kindMap" 30)) [Anf.AVar (reuseNm "xx" 33)])
+            (Anf.Let (reuseBnd "r" 36 reuseListChar)
+               (Anf.RCon (T.pack "Cons") [Anf.AVar (reuseNm "c" 34), Anf.AVar (reuseNm "ys" 35)])
+            (Anf.Ret (Anf.AVar (reuseNm "r" 36))))))
+        , Anf.AltCon (T.pack "Nil") []
+            (Anf.Let (reuseBnd "n" 37 reuseListChar) (Anf.RCon (T.pack "Nil") [])
+              (Anf.Ret (Anf.AVar (reuseNm "n" 37))))
+        ])
+  , Anf.TopBind (reuseNm "main" 0) [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+  ]
+
+-- | A runnable version of 'reuseMapModule': @main = mapInc [1, 2, 3]@. Built with
+-- inline 'Nil' (the immediate) and three 'Cons' cells, so the reuse run revives
+-- all three shells while the non-reuse run allocates them fresh.
+reuseMapRunModule :: Anf.CoreModule
+reuseMapRunModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "mapInc" 10) [reuseBnd "xs" 11 reuseListU64]
+      (Anf.Case (Anf.AVar (reuseNm "xs" 11))
+        [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 12 reuseU64, reuseBnd "xx" 13 reuseListU64]
+            (Anf.Let (reuseBnd "y" 14 reuseU64)
+               (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+                  [Anf.AVar (reuseNm "x" 12), Anf.ALit (Anf.LInt 1)])
+            (Anf.Let (reuseBnd "ys" 15 reuseListU64)
+               (Anf.RApp (Anf.AVar (reuseNm "mapInc" 10)) [Anf.AVar (reuseNm "xx" 13)])
+            (Anf.Let (reuseBnd "r" 16 reuseListU64)
+               (Anf.RCon (T.pack "Cons") [Anf.AVar (reuseNm "y" 14), Anf.AVar (reuseNm "ys" 15)])
+            (Anf.Ret (Anf.AVar (reuseNm "r" 16))))))
+        , Anf.AltCon (T.pack "Nil") []
+            (Anf.Let (reuseBnd "n" 17 reuseListU64) (Anf.RCon (T.pack "Nil") [])
+              (Anf.Ret (Anf.AVar (reuseNm "n" 17))))
+        ])
+  , Anf.TopBind (reuseNm "main" 0) []
+      (Anf.Let (reuseBnd "nil" 40 reuseListU64) (Anf.RCon (T.pack "Nil") [])
+      (Anf.Let (reuseBnd "l3" 41 reuseListU64)
+         (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 3), Anf.AVar (reuseNm "nil" 40)])
+      (Anf.Let (reuseBnd "l2" 42 reuseListU64)
+         (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 2), Anf.AVar (reuseNm "l3" 41)])
+      (Anf.Let (reuseBnd "l1" 43 reuseListU64)
+         (Anf.RCon (T.pack "Cons") [Anf.ALit (Anf.LInt 1), Anf.AVar (reuseNm "l2" 42)])
+      (Anf.Let (reuseBnd "res" 44 reuseListU64)
+         (Anf.RApp (Anf.AVar (reuseNm "mapInc" 10)) [Anf.AVar (reuseNm "l1" 43)])
+      (Anf.Ret (Anf.AVar (reuseNm "res" 44))))))))
+  ]
+
+-- crossCon xs = case xs of      (review finding F1: A and B are same-type, same
+--   A x y -> let r = B x y ; r    arity, same slot-kind (both KPointer) constructors;
+--   B x y -> let r = A x y ; r    the cross-constructor rebuild must NOT be paired)
+--
+-- Both constructors carry two boxed (list) fields, so the matched and target
+-- slot-kind signatures are IDENTICAL ([KPointer, KPointer]). Only the
+-- same-constructor guard (F1) keeps this from being (unsoundly) reused.
+reuseCrossConModule :: Anf.CoreModule
+reuseCrossConModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "crossCon" 50) [reuseBnd "t" 51 reuseListU64]
+      (Anf.Case (Anf.AVar (reuseNm "t" 51))
+        [ Anf.AltCon (T.pack "A") [reuseBnd "x" 52 reuseListU64, reuseBnd "y" 53 reuseListU64]
+            (Anf.Let (reuseBnd "r" 54 reuseListU64)
+               (Anf.RCon (T.pack "B") [Anf.AVar (reuseNm "x" 52), Anf.AVar (reuseNm "y" 53)])
+            (Anf.Ret (Anf.AVar (reuseNm "r" 54))))
+        , Anf.AltCon (T.pack "B") [reuseBnd "x" 55 reuseListU64, reuseBnd "y" 56 reuseListU64]
+            (Anf.Let (reuseBnd "r" 57 reuseListU64)
+               (Anf.RCon (T.pack "A") [Anf.AVar (reuseNm "x" 55), Anf.AVar (reuseNm "y" 56)])
+            (Anf.Ret (Anf.AVar (reuseNm "r" 57))))
+        ])
+  , Anf.TopBind (reuseNm "main" 0) [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+  ]
+
+-- A module whose largest 'Unique' (1000) is buried in a handler op-arm body, with
+-- a reusable Cons-map pattern inside the HANDLED expression (review finding F2).
+-- 'exprMaxU' must descend into the arm body so 'seedSupply' seeds above 1000; the
+-- minted '_tok' must then exceed it (no collision with the arm binder).
+--
+--   hMap xs = handle (case xs of
+--                       Cons x xx -> let ys = hMap xx ; let r = Cons x ys ; r
+--                       Nil       -> Nil)
+--             { return v -> v
+--             ; op resume -> let big = 1 ; resume big }   (big : Unique 1000)
+reuseHandlerModule :: Anf.CoreModule
+reuseHandlerModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "hMap" 60) [reuseBnd "xs" 61 reuseListU64]
+      (Anf.Handle
+        (Anf.Case (Anf.AVar (reuseNm "xs" 61))
+          [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 62 reuseU64, reuseBnd "xx" 63 reuseListU64]
+              (Anf.Let (reuseBnd "ys" 64 reuseListU64)
+                 (Anf.RApp (Anf.AVar (reuseNm "hMap" 60)) [Anf.AVar (reuseNm "xx" 63)])
+              (Anf.Let (reuseBnd "r" 65 reuseListU64)
+                 (Anf.RCon (T.pack "Cons") [Anf.AVar (reuseNm "x" 62), Anf.AVar (reuseNm "ys" 64)])
+              (Anf.Ret (Anf.AVar (reuseNm "r" 65)))))
+          , Anf.AltCon (T.pack "Nil") []
+              (Anf.Let (reuseBnd "n" 66 reuseListU64) (Anf.RCon (T.pack "Nil") [])
+                (Anf.Ret (Anf.AVar (reuseNm "n" 66))))
+          ])
+        (Anf.Handler
+          ( reuseBnd "v" 67 reuseListU64, Anf.Ret (Anf.AVar (reuseNm "v" 67)) )
+          [ Anf.OpArm (T.pack "E") (T.pack "op") [] (reuseBnd "resume" 68 reuseU64)
+              -- The arm body binds 'big' at Unique 1000 -- LARGER than any binder
+              -- outside the handler. exprMaxU must see it.
+              (Anf.Let (reuseBnd "big" 1000 reuseU64) (Anf.RAtom (Anf.ALit (Anf.LInt 1)))
+                (Anf.Ret (Anf.AVar (reuseNm "big" 1000)))) ]
+          Nothing Nothing Nothing))
+  , Anf.TopBind (reuseNm "main" 0) [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+  ]
+
+-- A module where an EFFECT OP ('ROp') sits between the parent-drop point and the
+-- target 'RCon' on the Cons alt's straight-line tail (FIX 1a). 'findTarget' must
+-- STOP at the 'ROp' (an op captures the continuation, which would hold the still-
+-- unconsumed reuse token; the reserved shell has no continuation-RC finalizer, so a
+-- token spanning an op under an aborting handler would leak). So this alt is NOT
+-- rewritten: no '__rc_drop_reuse', no 'RReuseCon'. The 'Case' is inside a 'Handle'
+-- so 'insertRC' instruments the op normally and the parent drop is present.
+--
+--   opMap xs = handle (case xs of
+--                        Cons x xx -> let ys = opMap xx
+--                                     let _t = op E.tell [x]   -- the ROp on the tail
+--                                     let r  = Cons x ys ; r
+--                        Nil       -> Nil)
+--              { return v -> v ; op resume -> resume () }
+reuseOpModule :: Anf.CoreModule
+reuseOpModule = Anf.CoreModule
+  [ Anf.TopBind (reuseNm "opMap" 70) [reuseBnd "xs" 71 reuseListU64]
+      (Anf.Handle
+        (Anf.Case (Anf.AVar (reuseNm "xs" 71))
+          [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 72 reuseU64, reuseBnd "xx" 73 reuseListU64]
+              (Anf.Let (reuseBnd "ys" 74 reuseListU64)
+                 (Anf.RApp (Anf.AVar (reuseNm "opMap" 70)) [Anf.AVar (reuseNm "xx" 73)])
+              -- The effect op: token (born at the Cons match drop) would have to span
+              -- THIS op to reach the rebuild below. 'findTarget' refuses (FIX 1a).
+              (Anf.Let (reuseBnd "t" 75 reuseU64)
+                 (Anf.ROp Nothing (T.pack "E") (T.pack "tell") [Anf.AVar (reuseNm "x" 72)])
+              (Anf.Let (reuseBnd "r" 76 reuseListU64)
+                 (Anf.RCon (T.pack "Cons") [Anf.AVar (reuseNm "x" 72), Anf.AVar (reuseNm "ys" 74)])
+              (Anf.Ret (Anf.AVar (reuseNm "r" 76))))))
+          , Anf.AltCon (T.pack "Nil") []
+              (Anf.Let (reuseBnd "n" 77 reuseListU64) (Anf.RCon (T.pack "Nil") [])
+                (Anf.Ret (Anf.AVar (reuseNm "n" 77))))
+          ])
+        (Anf.Handler
+          ( reuseBnd "v" 78 reuseListU64, Anf.Ret (Anf.AVar (reuseNm "v" 78)) )
+          [ Anf.OpArm (T.pack "E") (T.pack "tell") [reuseBnd "w" 79 reuseU64]
+              (reuseBnd "resume" 80 reuseU64)
+              (Anf.Let (reuseBnd "u" 81 (Ty.CTCon Ty.TcUnit [])) (Anf.RAtom (Anf.ALit Anf.LUnit))
+                (Anf.Let (reuseBnd "rr" 82 reuseListU64)
+                   (Anf.RApp (Anf.AVar (reuseNm "resume" 80)) [Anf.AVar (reuseNm "u" 81)])
+                  (Anf.Ret (Anf.AVar (reuseNm "rr" 82))))) ]
+          Nothing Nothing Nothing))
+  , Anf.TopBind (reuseNm "main" 0) [] (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+  ]
+
+-- | Every '_tok'-hinted binder 'Unique' in a module (the reuse tokens minted by
+-- 'reusePairing'). Used by the F2 test to assert minted tokens exceed the
+-- pre-pass max Unique.
+tokenUniques :: Anf.CoreModule -> [Int]
+tokenUniques (Anf.CoreModule bs) = concatMap (tokE . Anf.tbBody) bs
+  where
+    tokB b = [ u | nameHintEq b, let Unique u = Name.nameUniq (Anf.bndName b) ]
+    nameHintEq b = Name.nameHint (Anf.bndName b) == T.pack "_tok"
+    tokE (Anf.Ret _)            = []
+    tokE (Anf.Let b _ e)        = tokB b ++ tokE e
+    tokE (Anf.LetRec defs e)    = concatMap (\(_, _, body) -> tokE body) defs ++ tokE e
+    tokE (Anf.Case _ alts)      = concatMap tokAlt alts
+    tokE (Anf.LetJoin _ _ jb e) = tokE jb ++ tokE e
+    tokE (Anf.Jump _ _)         = []
+    tokE (Anf.Handle e h)       =
+      tokE e ++ tokE (snd (Anf.hReturn h)) ++ concatMap (tokE . Anf.oaBody) (Anf.hOps h)
+    tokAlt (Anf.AltCon _ _ e) = tokE e
+    tokAlt (Anf.AltLit _ e)   = tokE e
+    tokAlt (Anf.AltDefault e) = tokE e
 
 rcMachineTests :: TestTree
 rcMachineTests = testGroup "rc machine"
@@ -9696,7 +10303,10 @@ rcDifferentialHarness path = do
           -- first-order corpus actually runs.
           let pruned = pruneToReachable cm
               refRes = Interp.runModule pruned
-          rcRes <- RCM.runModuleRC (Perceus.insertRC pruned)
+          -- FBIP reuse-pairing AFTER insertRC; the differential below asserts the
+          -- RC output equals the reference output bit-for-bit (reuse never changes
+          -- the value, only the allocation count).
+          rcRes <- RCM.runModuleRC (reusePairing (Perceus.insertRC pruned))
           case (refRes, rcRes) of
             (Right v, Right run) ->
               Interp.renderValue v @?= RCM.rcOutput run
@@ -9904,6 +10514,286 @@ assertParityBalanced label minAllocs absSt cSt bl = do
   assertEqual (label <> ": stLive returns to baseline (C)") bl (St.stLive cSt)
   assertEqual (label <> ": allocs - frees == baseline (C)")
     bl (St.stAllocs cSt - St.stFrees cSt)
+
+-- ---------------------------------------------------------------------------
+-- FBIP S2 differential-oracle corpus + fault injection (Task 5).
+--
+-- Six real '.wok' programs under 'test/rc-c-backend' that exercise the in-place
+-- reuse mechanism end-to-end on BOTH backends. They are listed explicitly (see
+-- 'rcFbipFiles', fed to 'rcCBackendParity') so each gets the standard output +
+-- abstract==C + balance-lint parity check, plus the per-file targeted assertions
+-- below (the FBIP WIN: fused allocs strictly below the non-FBIP 'insertRC'-only
+-- run; reuse fires vs falls back per the spec table §4.4).
+--
+-- The "win" is the SAME program run with vs without 'reusePairing': identical
+-- output, but the fused run records strictly fewer allocator events on a unique
+-- spine. 'rcFbipFused'/'rcFbipNonFused' run that pair and return the stats.
+
+-- | The FBIP S2 corpus, by path. Fed to 'rcCBackendParity' (parity check) and
+-- referenced by 'rcFbipTargeted' (the win + fire/fallback assertions).
+rcFbipFiles :: [FilePath]
+rcFbipFiles =
+  [ "test/rc-c-backend/fbip-map.wok"
+  , "test/rc-c-backend/fbip-reverse.wok"
+  , "test/rc-c-backend/fbip-shared.wok"
+  , "test/rc-c-backend/fbip-cons-nil.wok"
+  , "test/rc-c-backend/fbip-intwidth-flip.wok"
+  , "test/rc-c-backend/fbip-kindchange.wok"
+  ]
+
+-- | Load + elaborate + M1-guard + prune a corpus file to the pruned, elaborated
+-- module --- WITHOUT 'insertRC' or 'reusePairing' --- so a caller can apply each
+-- pipeline (fused vs non-FBIP) to the SAME source for the win comparison.
+rcFbipPrepareRaw :: FilePath -> IO Anf.CoreModule
+rcFbipPrepareRaw path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr) >> error "unreachable"
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s   -> assertFailure ("elaborate: " <> s) >> error "unreachable"
+        Right cm ->
+          case firstOrderNoHandlerViolations cm of
+            [] -> pure (pruneToReachable cm)
+            vs -> assertFailure (path <> ": handlers out of scope:\n"
+                                   <> unlines (map T.unpack vs)) >> error "unreachable"
+
+-- | Run a corpus file through the NON-FBIP pipeline ('insertRC' only) on the
+-- abstract heap. Returns @(output, stats)@.
+rcFbipNonFused :: FilePath -> IO (Text, St.Stats)
+rcFbipNonFused path = do
+  cm <- rcFbipPrepareRaw path
+  RCM.runModuleRC (Perceus.insertRC cm) >>= \case
+    Left e    -> assertFailure (path <> " (non-fused) FAILED: " <> show e) >> error "unreachable"
+    Right run -> pure (RCM.rcOutput run, RCM.rcStats run)
+
+-- | Run a corpus file through the FUSED pipeline ('reusePairing . insertRC') on
+-- the abstract heap. Returns @(output, stats)@.
+rcFbipFused :: FilePath -> IO (Text, St.Stats)
+rcFbipFused path = do
+  cm <- rcFbipPrepareRaw path
+  RCM.runModuleRC (reusePairing (Perceus.insertRC cm)) >>= \case
+    Left e    -> assertFailure (path <> " (fused) FAILED: " <> show e) >> error "unreachable"
+    Right run -> pure (RCM.rcOutput run, RCM.rcStats run)
+
+rcFbipTargeted :: TestTree
+rcFbipTargeted = testGroup "rc-fbip"
+  [ -- AC1a: map (+1) over a unique 3-element list. Reuse fires on every spine
+    -- cell; the fused run's allocs/frees drop by EXACTLY the spine length (3) vs
+    -- the non-FBIP run, collapsing the output spine to 0 net allocs. Output is
+    -- bit-identical fused-vs-non-fused; abstract == C (via rcCBackendParity).
+    testCase "fbip-map: reuse fires, allocs drop by the spine length (3), output [2, 3, 4]" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-map.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-map.wok"
+      assertEqual "output is [2, 3, 4]" (T.pack "[2, 3, 4]") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      -- The 3-cell input spine is built either way; the win is the 3-cell OUTPUT
+      -- spine collapsing to 0 net allocs.
+      assertEqual "non-fused allocs = input spine + output spine (3 + 3)" 6 (St.stAllocs nfSt)
+      assertEqual "fused allocs = input spine only (output spine reused in place)" 3 (St.stAllocs fSt)
+      assertEqual "fused frees collapse to the input spine too" 3 (St.stFrees fSt)
+      assertBool "FBIP win: fused allocs strictly below non-fused"
+        (St.stAllocs fSt < St.stAllocs nfSt)
+      assertEqual "allocs reduced by exactly the spine length (3)"
+        3 (St.stAllocs nfSt - St.stAllocs fSt)
+
+  , -- AC1b: accumulator reverse, target Cons built BEFORE the recursive call, so
+    -- the token is born and consumed without crossing the call. Each input spine
+    -- cell is reused to build the reversed spine; allocs drop by the spine length.
+    testCase "fbip-reverse: reuse fires, allocs drop by the spine length (3), output [3, 2, 1]" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-reverse.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-reverse.wok"
+      assertEqual "output is [3, 2, 1]" (T.pack "[3, 2, 1]") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      assertEqual "non-fused allocs = input spine + reversed spine (3 + 3)" 6 (St.stAllocs nfSt)
+      assertEqual "fused allocs = input spine only (reversed spine reused in place)" 3 (St.stAllocs fSt)
+      assertBool "FBIP win: fused allocs strictly below non-fused"
+        (St.stAllocs fSt < St.stAllocs nfSt)
+      assertEqual "allocs reduced by exactly the spine length (3)"
+        3 (St.stAllocs nfSt - St.stAllocs fSt)
+      -- Peak stays at the spine length (one cell churns at a time; no doubling).
+      assertEqual "peak does not rise above the spine length (3)" 3 (St.stPeak fSt)
+
+  , -- AC2: a list whose tail is SHARED (rc > 1). The runtime rc==1 gate yields a
+    -- NULL token for the shared cells, so reuse does NOT fire on them (fresh
+    -- alloc); only the UNIQUE head 'Cons 1' reuses. So the fused run saves exactly
+    -- ONE alloc (the head), not three. Output is correct on both backends.
+    testCase "fbip-shared: reuse does NOT fire on shared (rc>1) cells; only the unique head reuses" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-shared.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-shared.wok"
+      -- sumList [2,3,4] = 9 ; sumList [2,3] = 5 ; total 14.
+      assertEqual "output is 14" (T.pack "14") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      -- Only the unique head reuses; the 2 shared-tail cells allocate fresh. So
+      -- the fused run saves exactly ONE alloc vs the non-FBIP run.
+      assertEqual "fused saves exactly the one unique head cell (shared tail does not reuse)"
+        1 (St.stAllocs nfSt - St.stAllocs fSt)
+      assertBool "shared cells allocate fresh: fused allocs NOT collapsed to the input build"
+        (St.stAllocs fSt > 3)
+
+  , -- AC5: a single 'Cons x Nil' whose tail is the inline 'Nil' immediate. Reuse
+    -- fires on the one Cons shell; the immediate slot is handled (never a donor,
+    -- never double-freed). Fused saves the single output Cons.
+    testCase "fbip-cons-nil: Cons-with-inline-Nil reuses; immediate slot handled, output [42]" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-cons-nil.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-cons-nil.wok"
+      assertEqual "output is [42]" (T.pack "[42]") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      assertEqual "non-fused allocs = input Cons + output Cons (Nil is inline, no cell)" 2 (St.stAllocs nfSt)
+      assertEqual "fused allocs = input Cons only (output Cons reused in place)" 1 (St.stAllocs fSt)
+      assertEqual "the inline Nil is never a donor and never a fresh cell"
+        1 (St.stAllocs nfSt - St.stAllocs fSt)
+
+  , -- AC4: a map whose result crosses >= 2^63 (U64 head becomes non-encodable).
+    -- The §6.3 static guard still PAIRS (both fields are statically U64 ->
+    -- KLitInt), so a token is produced; but at runtime 'alloc_at' sees the new
+    -- node is NOT C-eligible while the reserved shell was, so it takes the §4.3
+    -- not-eligible branch: free the shell for real + alloc fresh (+1 / +1). Net:
+    -- the fused run allocates the SAME as the non-FBIP run. Output + counts match
+    -- abstract == C (verified by rcCBackendParity).
+    testCase "fbip-intwidth-flip: §4.3 not-eligible free+fresh (no net win), output correct" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-intwidth-flip.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-intwidth-flip.wok"
+      -- (2^63-8 + 8) + (2^63-8 + 9) + (2^63-8 + 10) = 3*2^63 + 3 = 27670116110564327427.
+      assertEqual "output is the sum of three >= 2^63 values" (T.pack "27670116110564327427") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      -- The token IS produced (the pairing fired) but every alloc_at frees the
+      -- reserved shell and allocates fresh, so there is NO net alloc win.
+      assertEqual "not-eligible branch nets the same alloc count as non-FBIP"
+        (St.stAllocs nfSt) (St.stAllocs fSt)
+      assertEqual "not-eligible branch nets the same free count as non-FBIP"
+        (St.stFrees nfSt) (St.stFrees fSt)
+
+  , -- AC3: a slot-kind-changing map (KLitInt head -> NonEncodable String head).
+    -- The §6.3 guard REFUSES to pair ([KLitInt,KPointer] /= [NonEncodable,
+    -- KPointer]), so the output spine allocates FRESH (no token, no reuse). This
+    -- is the regression guard against the C descriptor mis-decode. Output correct;
+    -- abstract == C. (Int->Char is not expressible in current wok -- no Char
+    -- literal/conversion -- so this uses the closest expressible kind-change,
+    -- KLitInt -> NonEncodable via String; the unit-level Int->Char kindchange
+    -- golden in 'rc-reuse-pairing' covers that case directly.)
+    testCase "fbip-kindchange: §6.3 guard refuses the pair (fresh alloc, no reuse), output 3" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-kindchange.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-kindchange.wok"
+      assertEqual "output is the list length 3" (T.pack "3") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      -- The guard refuses to pair, so fused == non-fused exactly (no token emitted).
+      assertEqual "kind-change refused: fused allocs identical to non-FBIP"
+        (St.stAllocs nfSt) (St.stAllocs fSt)
+      assertEqual "kind-change refused: fused frees identical to non-FBIP"
+        (St.stFrees nfSt) (St.stFrees fSt)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FBIP fault injection (Task 5, §10.3): the reuse oracle has TEETH.
+--
+-- A deliberately WRONG reuse pairing must be CAUGHT --- never a silent wrong
+-- answer. We exercise the cleanly-injectable wrong-ARITY fault: 'badArityReuse'
+-- is a surgical post-pass (analogous to 'Perceus.insertRCMutated') that rewrites
+-- the FIRST 'RReuseCon tok c fields' to drop its LAST field, so the token's
+-- reserved shell (recorded arity N) is asked to reuse an (N-1)-field node. The
+-- 'allocAt' arity guard ('nodeArity newNode == rsArity') then takes the §4.3
+-- not-eligible branch and the cell is rebuilt with a MISSING field --- a
+-- malformed 'Cons' (no tail) whose render/consume diverges from the correct fused
+-- run. The test asserts the mutated run is caught: it FAILS ('Left') or its output
+-- DIVERGES from the correct fused output (the differential tripwire), never a
+-- silent match.
+--
+-- This is the production 'reusePairing' output mutated by exactly one rewrite; the
+-- real pass is untouched (its §5.3 size-exactness invariant guarantees the arity
+-- always matches, so this fault cannot arise except by injection).
+rcFbipFaultInjection :: TestTree
+rcFbipFaultInjection = testGroup "rc-fbip-fault"
+  [ testCase "wrong-arity RReuseCon is caught (run fails or output diverges; never silent)" $ do
+      cm <- rcFbipPrepareRaw "test/rc-c-backend/fbip-map.wok"
+      let fused   = reusePairing (Perceus.insertRC cm)
+          mutated = badArityReuse fused
+      -- The mutation must actually change the module (an RReuseCon was present and
+      -- rewritten) --- otherwise the test would be vacuous.
+      assertBool "the bad-arity mutation actually fired (an RReuseCon was rewritten)"
+        (Anf.prettyModule mutated /= Anf.prettyModule fused)
+      goodR <- RCM.runModuleRC fused
+      badR  <- RCM.runModuleRC mutated
+      case (goodR, badR) of
+        (Right good, Right bad) ->
+          -- Both ran: the only acceptable outcome is a DIVERGENCE (the malformed
+          -- cell renders differently). A silent match would mean the oracle missed
+          -- the corruption.
+          assertBool
+            ("wrong-arity reuse produced a SILENT matching answer ("
+               <> T.unpack (RCM.rcOutput bad) <> ") --- the oracle has no teeth")
+            (RCM.rcOutput good /= RCM.rcOutput bad)
+        (Right _, Left _) ->
+          -- The mutated run failed loudly (a structural/UAF/double-free error).
+          -- Caught: this is the desired outcome.
+          pure ()
+        (Left e, _) ->
+          assertFailure ("the CORRECT fused run failed unexpectedly: " <> show e)
+  ]
+
+-- | Surgical bad-reuse mutation (TESTS ONLY): rewrite the FIRST 'RReuseCon tok c
+-- fields' encountered to drop its LAST field, so the reused node's arity is one
+-- below the token's reserved-shell arity. The production 'reusePairing' never
+-- emits this (its §5.3 size-exactness guarantees arity exactness); this is the
+-- fault injector that proves 'allocAt's arity guard + the differential oracle
+-- catch a wrong pairing rather than silently corrupting the heap.
+badArityReuse :: Anf.CoreModule -> Anf.CoreModule
+badArityReuse (Anf.CoreModule bs) =
+  Anf.CoreModule (snd (foldr stepB (False, []) bs))
+  where
+    stepB (Anf.TopBind n ps body) (done, acc) =
+      let (done', body') = goB done body
+      in (done', Anf.TopBind n ps body' : acc)
+
+    goB done e | done = (True, e)
+    goB _ (Anf.Let b (Anf.RReuseCon tok c fields) rest)
+      | not (null fields) =
+          -- Drop the LAST field via a total expression (CLAUDE.md: avoid partial
+          -- 'init'); 'reverse (drop 1 (reverse fields))' is total and behaves
+          -- identically on the non-empty list this guard admits.
+          (True, Anf.Let b (Anf.RReuseCon tok c (reverse (drop 1 (reverse fields)))) rest)
+    goB done (Anf.Let b r rest) =
+      let (done1, r')    = goRhsB done r
+          (done2, rest') = goB done1 rest
+      in (done2, Anf.Let b r' rest')
+    goB done (Anf.Case s alts) =
+      let (done', alts') = goAltsB done alts
+      in (done', Anf.Case s alts')
+    goB done (Anf.LetJoin j ps jb e) =
+      let (done1, jb') = goB done jb
+          (done2, e')  = goB done1 e
+      in (done2, Anf.LetJoin j ps jb' e')
+    goB done (Anf.LetRec defs e) =
+      let (done1, defs') = goDefsB done defs
+          (done2, e')    = goB done1 e
+      in (done2, Anf.LetRec defs' e')
+    goB done (Anf.Handle e h) =
+      let (done', e') = goB done e in (done', Anf.Handle e' h)
+    goB done e = (done, e)
+
+    goRhsB done (Anf.RLam ps e) =
+      let (done', e') = goB done e in (done', Anf.RLam ps e')
+    goRhsB done r = (done, r)
+
+    goAltsB done [] = (done, [])
+    goAltsB done (Anf.AltCon c bs' body : rest) =
+      let (done1, body') = goB done body
+          (done2, rest') = goAltsB done1 rest
+      in (done2, Anf.AltCon c bs' body' : rest')
+    goAltsB done (Anf.AltLit l body : rest) =
+      let (done1, body') = goB done body
+          (done2, rest') = goAltsB done1 rest
+      in (done2, Anf.AltLit l body' : rest')
+    goAltsB done (Anf.AltDefault body : rest) =
+      let (done1, body') = goB done body
+          (done2, rest') = goAltsB done1 rest
+      in (done2, Anf.AltDefault body' : rest')
+
+    goDefsB done [] = (done, [])
+    goDefsB done ((b, ps, body) : rest) =
+      let (done1, body') = goB done body
+          (done2, rest') = goDefsB done1 rest
+      in (done2, (b, ps, body') : rest')
 
 rcCBackendTargeted :: TestTree
 rcCBackendTargeted = testGroup "rc-c-backend-targeted"
@@ -10127,7 +11017,11 @@ rcStatsPrepare path = do
             vs -> assertFailure
               (path <> ": not a handler-free program (Handle/ROp out of scope):\n"
                  <> unlines (map T.unpack vs))
-          pure (Perceus.insertRC (pruneToReachable cm))
+          -- FBIP reuse-pairing runs AFTER insertRC everywhere the instrumented
+          -- module is EXECUTED (this prepare funnels Suite B stats + the C-backend
+          -- parity oracle). The differential oracle re-checks output + balance, so
+          -- a reuse win surfaces as an alloc/free count drop, never a wrong answer.
+          pure (reusePairing (Perceus.insertRC (pruneToReachable cm)))
 
 -- | Suite B heap-accounting assertion: run the instrumented module and check the
 -- baseline invariant.
@@ -10309,7 +11203,10 @@ rcPropertyTests =
 prop_rcDifferential :: Property
 prop_rcDifferential =
   forAllShrink genProgram shrinkProgram $ \cm -> QC.ioProperty $ do
-    rcRes <- RCM.runModuleRC (Perceus.insertRC cm)
+    -- FBIP reuse-pairing AFTER insertRC: random first-order programs exercise the
+    -- post-pass adversarially. The three oracle signals below (output / heap-empty
+    -- / balance) hold regardless of whether a pair fires.
+    rcRes <- RCM.runModuleRC (reusePairing (Perceus.insertRC cm))
     let refRes = Interp.runModule cm
         report =
           "instrumented ANF:\n"
@@ -13082,6 +13979,7 @@ allMentionedUniques = go
       ROp m _ _ as -> Set.unions (map atomVars (maybe as (: as) m))
       RRecord _ fl -> Set.unions (map (atomVars . snd) fl)
       RProj _ a    -> atomVars a
+      RReuseCon{}  -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
 
 -- | All sub-expressions of @e@ (including @e@ itself), so the drift guard probes
 -- 'captureEscapesBody' at every body position, not just the top.

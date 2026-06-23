@@ -166,6 +166,20 @@ escapingAtomsRhs (RApp _ as)      = as                          -- head EXEMPT
 escapingAtomsRhs (RCon _ as)      = as
 escapingAtomsRhs (RRecord _ flds) = map snd flds
 escapingAtomsRhs (RProj _ a)      = [a]
+-- The FBIP reuse form ('RReuseCon tok c fields') is introduced by a post-pass
+-- (Wok.IR.ReusePairing) that runs AFTER escape analysis, so it never reaches the
+-- COMPILE-TIME callers of this function. But this single source of truth IS on the
+-- RUNTIME continuation-drop path: 'Wok.Interp.RC.Value.continuationOwned' calls
+-- 'nonHeadOccs' (-> 'nonHeadOccsRhs' -> here) over a captured continuation body,
+-- which can legitimately contain an 'RReuseCon' if a token is in flight when an op
+-- captures the continuation. So this arm must be TOTAL (no crash), and it computes
+-- the SAME owned set as the equivalent 'RCon': the FIELD atoms are the moves (they
+-- escape, exactly like 'RCon's), while @tok@ is an uncounted affine ticket
+-- (@valueChildren (RVReuse _) = []@; never dup'd/drop'd) that contributes NOTHING
+-- to the owned/escaping set, so it is IGNORED. (S2 additionally forbids a token
+-- from spanning an effect op --- see Wok.IR.ReusePairing.findTarget's 'ROp' arm ---
+-- so this path is a defensive belt-and-braces total fallback, not a hot path.)
+escapingAtomsRhs (RReuseCon _ _ as) = as
 escapingAtomsRhs (ROp m _ _ as)   = maybe as (: as) m
 escapingAtomsRhs (RLam ps e)      =
   -- A value captured into a nested lambda ESCAPES (it outlives the build site
@@ -498,6 +512,14 @@ consumingOccs caps = goE
     -- an RProj parent as an admissible return-value escape, so a member that projects a
     -- capture stays rejected. Do NOT relax this to a borrow without re-proving #1 sound.
     goR (RProj _ a)      = watched a
+    -- 'consumingOccs' (unlike 'escapingAtomsRhs') is on the COMPILE-TIME boundary
+    -- guard path ONLY ('Wok.IR.Reachable.firstOrderNoHandlerViolations' ->
+    -- 'letRecMemberConsumesCaptureNonEscaping'), which runs on RAW pre-Perceus IR
+    -- before 'reusePairing' ever runs. It NEVER sees post-pass IR, so an 'RReuseCon'
+    -- here is genuinely unreachable and stays a LOUD error (the repo's
+    -- loud-on-violation convention). Contrast 'escapingAtomsRhs', which IS on the
+    -- runtime continuation-drop path and so is made total above.
+    goR (RReuseCon{})    = error "RReuseCon: produced only by reusePairing post-pass (consumingOccs is a compile-time boundary-guard analysis, never sees post-pass IR)"
     goR (ROp m _ _ as)   = Set.unions (map watched (maybe as (: as) m))
     goR (RLam ps e)      =
       -- A capture referenced inside a nested lambda body is moved into that

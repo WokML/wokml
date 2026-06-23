@@ -206,6 +206,16 @@ evalRhsRC prims b rhs body sc k s = case rhs of
     (a, s') <- alloc (NCon c vs) s
     cont (RVBox a) s'
 
+  -- The FBIP @alloc_at@ form (spec §9): an 'RCon' that consumes a reuse token.
+  -- Mirrors the 'RCon' arm but resolves the token atom too and routes through
+  -- 'allocAt', which writes the new node into the reserved shell when placement
+  -- matches (0 alloc / 0 free), else frees-and-allocates fresh.
+  RReuseCon tok c as -> do
+    tokVal <- liftRC (resolveRCAtom sc tok)
+    vs     <- liftRC (mapM (resolveRCAtom sc) as)
+    (a, s') <- allocAt tokVal (NCon c vs) s
+    cont (RVBox a) s'
+
   RRecord t flds -> do
     vs <- liftRC (mapM (\(l, a) -> (,) l <$> resolveRCAtom sc a) flds)
     (a, s') <- alloc (NRecord t (Map.fromList vs)) s
@@ -229,6 +239,7 @@ evalRhsRC prims b rhs body sc k s = case rhs of
       RVLit _           -> throwE (BadProjection l)
       RVRecMember{} -> throwE (BadProjection l)
       RVInst _ _    -> throwE (BadProjection l)
+      RVReuse _     -> throwE (BadProjection l)
 
   RApp f as -> do
     vs <- liftRC (mapM (resolveRCAtom sc) as)
@@ -282,14 +293,19 @@ callFn prims sc f args k s = case f of
       Just fv -> enterRC True prims fv args k s
       -- The general by-hint prim fallback is GONE (#12): a missing 'AVar' is a
       -- loud 'UnboundVar', not a same-named builtin (which now reaches us only as
-      -- an 'APrim'). The ONE exception is the two Perceus-SYNTHESIZED RC
-      -- intrinsics @__rc_dup@/@__rc_drop@: the Perceus pass emits them as
+      -- an 'APrim'). The ONE exception is the three Perceus-SYNTHESIZED RC
+      -- intrinsics @__rc_dup@/@__rc_drop@/@__rc_drop_reuse@: the Perceus pass emits them as
       -- 'AVar'-with-hint (post-elaboration, so they are never externs and cannot
       -- be 'APrim' -- spec Caveat A), and no user binding can forge them, so they
       -- are resolved by HINT here. A user binder merely hinted a surface prim
       -- (e.g. @+@) is NOT one of these and still errors 'UnboundVar'.
       Nothing
-        | nameHint n == PN.rcDupName || nameHint n == PN.rcDropName ->
+        | nameHint n == PN.rcDupName
+            || nameHint n == PN.rcDropName
+            || nameHint n == PN.rcDropReuseName ->
+            -- @__rc_drop_reuse@ joins @__rc_dup@/@__rc_drop@ as a
+            -- compiler-SYNTHESIZED RC intrinsic (emitted by the FBIP post-pass as
+            -- an 'AVar'-with-hint, never an extern), resolved here by HINT.
             case Map.lookup (nameHint n) prims of
               Just p  -> enterPrim prims p args k s
               Nothing -> throwE (UnboundVar (nameHint n))
@@ -536,6 +552,7 @@ enterRC borrowHead _ fv args k s = case fv of
             pure (RReturn (RVBox a') k s''')
       _ -> throwE (NotAFunction (Tx.pack "RVRecMember group addr is not NGroupCode"))
   RVInst _ _ -> throwE (NotAFunction (Tx.pack "applied an instance handle"))
+  RVReuse _  -> throwE (NotAFunction (Tx.pack "applied a reuse token"))
 
 -- | Apply a primitive to args, accumulating for currying and threading the
 -- store. Mirrors the reference 'enter' prim branch, sans the 'PRDrive'
@@ -578,6 +595,7 @@ matchAltsRC v alts sc k s = case v of
   RVLit l -> goLit l
   RVRecMember{} -> throwE (NonExhaustiveCase (Tx.pack "<closure>"))
   RVInst _ _    -> throwE (NonExhaustiveCase (Tx.pack "<instance>"))
+  RVReuse _     -> throwE (NonExhaustiveCase (Tx.pack "<reuse-token>"))
   where
     -- Boxed scrutinee: match constructor alts against the NCon node; literal
     -- alts and default still apply (a literal alt simply never matches a node).

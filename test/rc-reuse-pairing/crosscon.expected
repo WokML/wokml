@@ -1,0 +1,17 @@
+crossCon t =
+  case t of
+    A x.1 y.1 ->
+      let _dup.1 = __rc_dup(x.1)
+      let _dup.2 = __rc_dup(y.1)
+      let _drop.1 = __rc_drop(t)
+      let r.1 = B(x.1, y.1)
+      r.1
+    B x.2 y.2 ->
+      let _dup.3 = __rc_dup(x.2)
+      let _dup.4 = __rc_dup(y.2)
+      let _drop.2 = __rc_drop(t)
+      let r.2 = A(x.2, y.2)
+      r.2
+
+main =
+  0

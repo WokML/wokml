@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FBIP: functional but in-place reuse</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --warn:#c0392b; --ok:#2e8b57; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.62 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:46px 22px 96px}
+  h1{font-size:1.85rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.18rem;margin:48px 0 2px}
+  h2 .n{color:var(--mut);font-weight:400}
+  .sub,.cap{color:var(--mut)} .sub{margin:.2em 0 0} .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  p{margin:12px 0}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+
+  .toc{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:12px 18px;margin:20px 0;font-size:.9rem;columns:2;column-gap:28px}
+  .toc a{color:var(--accent);text-decoration:none} .toc a:hover{text-decoration:underline}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:210px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .box.ok{border-color:var(--ok);background:#edf7f1}
+  .box.warn{border-color:var(--warn);background:#fbeeec}
+  .box.wide{min-width:340px}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+  .arrow small{font-size:.62rem;text-transform:uppercase;letter-spacing:.06em}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0;width:100%}
+  .row>*{flex:1;min-width:170px}
+  .fork{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0}
+  .card,.step{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card h3{margin:0 0 6px;font-size:.98rem}
+  .step{display:flex;flex-direction:column;gap:9px;min-height:140px}
+  .step .line{font-family:ui-monospace,monospace;font-size:.7rem;color:var(--accent);min-height:3.4em}
+  .step .body{flex:1;display:grid;place-items:center}
+  .badge{display:inline-grid;place-items:center;min-width:26px;height:26px;padding:0 7px;border-radius:13px;background:var(--accent);color:#fff;font:700 .8rem ui-monospace,monospace}
+  .badge.zero{background:var(--ok)} .badge.peak{background:var(--warn)}
+  .label{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:18px 0}
+  .note b{color:var(--accent)}
+  .note.ok{border-left-color:var(--ok)} .note.ok b{color:var(--ok)}
+  .note.warn{border-left-color:var(--warn)} .note.warn b{color:var(--warn)}
+
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.9rem}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  thead th{background:var(--soft);font-size:.73rem;letter-spacing:.03em;text-transform:uppercase;color:var(--mut);font-weight:600}
+  td.m,th.m{font-family:ui-monospace,monospace;font-size:.82rem}
+  td.ok{color:var(--ok);font-weight:600} td.no{color:var(--warn);font-weight:600}
+  td.c{text-align:center}
+  .gloss th{width:170px;color:var(--accent);font-family:ui-monospace,monospace;font-size:.82rem}
+
+  /* a memory cell drawn as a block of rows */
+  .cells{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin:18px 0}
+  .cell{display:inline-block;border:1px solid var(--line);border-radius:8px;overflow:hidden;font-family:ui-monospace,monospace;font-size:.8rem;min-width:200px}
+  .cell.hi{border-color:var(--accent)} .cell.ok{border-color:var(--ok)}
+  .cell .hd{background:var(--soft);color:var(--mut);padding:6px 10px;border-bottom:1px solid var(--line);font-weight:700;display:flex;justify-content:space-between;gap:12px}
+  .cell.hi .hd{background:#eef4fb;color:var(--accent)} .cell.ok .hd{background:#edf7f1;color:var(--ok)}
+  .cell .fld{display:flex;justify-content:space-between;gap:14px;padding:5px 10px;border-bottom:1px solid var(--line)}
+  .cell .fld:last-child{border-bottom:0}
+  .cell .fld .o{color:var(--mut)}
+  .cell .ptr{color:var(--accent)} .cell .inert{color:var(--mut)} .cell .new{color:var(--ok);font-weight:600}
+  .xform{font-size:1.6rem;color:var(--accent)}
+  .rc{display:inline-block;min-width:1.4em;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>FBIP &mdash; functional but in-place</h1>
+  <p class="sub">How a just-dropped cell becomes the next cell you allocate, so pure functional code runs at mutation speed &mdash; without ever mutating anything the program can observe.</p>
+
+  <div class="toc">
+    <a href="#s1">1 &middot; The waste FBIP removes</a><br>
+    <a href="#s2">2 &middot; Terms, defined once</a><br>
+    <a href="#s3">3 &middot; What FBIP stands on (dependencies)</a><br>
+    <a href="#s4">4 &middot; Two operations and a one-use ticket</a><br>
+    <a href="#s5">5 &middot; What reuse does to one cell</a><br>
+    <a href="#s6">6 &middot; The gate: reuse is earned at runtime</a><br>
+    <a href="#s7">7 &middot; One map step, refcount by refcount</a><br>
+    <a href="#s8">8 &middot; A map, allocation by allocation</a><br>
+    <a href="#s9">9 &middot; Two heaps, kept in lockstep</a><br>
+    <a href="#s10">10 &middot; Where the pairing is decided</a><br>
+    <a href="#s11">11 &middot; How small is the first slice</a>
+  </div>
+
+  <!-- 1 -->
+  <h2 id="s1"><span class="n">1 &middot;</span> The waste FBIP removes</h2>
+  <p>Run <code>map f [1,2,3]</code> today. The three old <code>Cons</code> cells die on the way down the list; three brand-new <code>Cons</code> cells are born on the way back up. Same shape in, same shape out &mdash; but the allocator did <b>three frees and three allocations</b> for a list that never changed length.</p>
+  <div class="grid">
+    <div class="step"><div class="line">descend: match each Cons, drop its shell</div><div class="body"><span class="badge peak">3</span></div><div class="label">cells freed</div></div>
+    <div class="step"><div class="line">bottom of recursion</div><div class="body"><span class="badge zero">0</span></div><div class="label">list cells alive</div></div>
+    <div class="step"><div class="line">ascend: rebuild Cons (f x) ...</div><div class="body"><span class="badge peak">3</span></div><div class="label">cells allocated</div></div>
+  </div>
+  <p class="cap">fig 1 &mdash; the same three cells, demolished then rebuilt. FBIP recycles them instead.</p>
+
+  <!-- 2 -->
+  <h2 id="s2"><span class="n">2 &middot;</span> Terms, defined once</h2>
+  <p>Everything below is built from these. Skim them now; the diagrams reuse them verbatim.</p>
+  <table class="gloss">
+    <tbody>
+      <tr><th>cell</th><td>One heap-allocated value: a small header (<code>rc</code>, <code>tag</code>, <code>arity</code>) followed by its fields. A list node <code>Cons x rest</code> is a 2-field cell.</td></tr>
+      <tr><th>refcount (rc)</th><td>How many live references point at a cell. The runtime keeps this number. wok has <b>no garbage collector</b> &mdash; a cell is freed the instant its rc hits 0.</td></tr>
+      <tr><th>unique</th><td><code>rc == 1</code>: you hold the <i>only</i> reference. Nobody else can observe the cell, so it is safe to recycle it in place. This is the whole license for FBIP.</td></tr>
+      <tr><th>Perceus</th><td>The compile-time pass (Reinking et&nbsp;al., 2021) that inserts the <code>dup</code>/<code>drop</code> calls so refcounts stay correct. wok already runs it; FBIP extends it.</td></tr>
+      <tr><th>dup / drop</th><td><code>__rc_dup x</code> increments x's rc (take a co-owner). <code>__rc_drop x</code> decrements it (release; free at 0). The cell's <b>last</b> drop is where reuse can happen.</td></tr>
+      <tr><th>cascade</th><td>When a cell is freed, the refs it held to its <b>children</b> are dropped in turn &mdash; which may free them, recursively. FBIP keeps this; it only changes what happens to the parent <i>shell</i>.</td></tr>
+      <tr><th>drop_reuse</th><td>A last-drop that, when the cell is unique, releases the children (the cascade) but <b>returns the empty shell</b> instead of handing it to the free list.</td></tr>
+      <tr><th>alloc_at</th><td>An allocation that accepts a reuse token: if the shell fits, re-stamp its header and overwrite its slots; otherwise allocate fresh.</td></tr>
+      <tr><th>reuse token</th><td>A one-use ticket passed from <code>drop_reuse</code> to <code>alloc_at</code> &mdash; either a real freed shell, or <b>NULL</b> (cell was shared, nothing to reuse).</td></tr>
+      <tr><th>arity</th><td>The number of fields in a cell. In wok a cell is <code>8 + 8&times;arity</code> bytes, so <b>arity fixes the byte size</b> &mdash; "same size" and "same arity" are one question.</td></tr>
+      <tr><th>descriptor</th><td>A per-constructor table (keyed by <code>tag</code>) recording each slot's kind &mdash; wok's "info table". It tells <code>alloc_at</code> the shell's size statically.</td></tr>
+      <tr><th>immediate</th><td>A nullary constructor (<code>Nil</code>, <code>None</code>, <code>True</code>) stored <i>inline</i> with no cell at all. It has no shell, so it is never a reuse donor.</td></tr>
+      <tr><th>abstract heap</th><td>The reference backend: cells live as entries in an <code>IntMap</code>. Easy to inspect; used as the oracle's source of truth.</td></tr>
+      <tr><th>C arena</th><td>The real backend: a slab allocator with a <code>freelist[arity]</code> per size class. The production memory path.</td></tr>
+      <tr><th>differential oracle</th><td>The test harness that runs <b>both</b> backends on every program and asserts the output is bit-for-bit identical and the alloc/free/peak counts match.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- 3 -->
+  <h2 id="s3"><span class="n">3 &middot;</span> What FBIP stands on</h2>
+  <p>FBIP is the capstone of a stack of slices that are already merged. It is not a from-scratch feature &mdash; it is the moment the earlier pieces line up. Read the tower bottom-up: each layer hands the one above exactly what FBIP needs.</p>
+  <div class="flow">
+    <div class="box hi wide">FBIP &mdash; in-place reuse<small>this slice: drop_reuse + alloc_at + the pairing</small></div>
+    <div class="arrow"><small>rests on &darr;</small></div>
+    <div class="box wide">Perceus + one-shot / escape analyses<small>already insert drop/dup &mdash; the pairing hooks in here; uniqueness for the later static path</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box wide">immediates<small>nullary cons are inline &mdash; the arity-0 free list stays clean; immediates are never donors</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box wide">layout compaction &rarr; the descriptor<small>size = arity, known statically &mdash; alloc_at can check "does the shell fit?"</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box wide">the slab arena<small>real allocator with freelist[arity] &mdash; the thing reuse bypasses for matched pairs</small></div>
+  </div>
+  <p class="cap">fig 3 &mdash; the dependency tower. FBIP adds the top box; everything under it shipped already.</p>
+  <table>
+    <thead><tr><th>FBIP needs&hellip;</th><th>&hellip;which this merged slice provides</th></tr></thead>
+    <tbody>
+      <tr><td>somewhere for a freed cell to come from / go to</td><td class="m">slab arena &mdash; <code>freelist[arity]</code>; reuse just skips it</td></tr>
+      <tr><td>to know a shell's size without reading runtime tags</td><td class="m">compaction descriptor &mdash; <code>size = 8 + 8&times;arity</code>, static</td></tr>
+      <tr><td>a clean hot path, and donors that are always real cells</td><td class="m">immediates &mdash; nullary values carry no shell</td></tr>
+      <tr><td>a place to decide which drop feeds which alloc</td><td class="m">Perceus pass &mdash; already walks every drop &amp; alloc site</td></tr>
+      <tr><td>(later) to prove rc==1 and elide the runtime check</td><td class="m">one-shot / multiplicity + escape analyses</td></tr>
+      <tr><td>proof it changed nothing observable</td><td class="m">differential oracle &mdash; output + counts, both backends</td></tr>
+    </tbody>
+  </table>
+
+  <!-- 4 -->
+  <h2 id="s4"><span class="n">4 &middot;</span> Two operations and a one-use ticket</h2>
+  <p>FBIP splits the work into a matched pair, exactly as Koka does. A <b>drop</b> that would have freed a unique cell instead hands back the empty shell as a <b>reuse token</b>; a later <b>allocation</b> of the same size accepts that token and re-stamps the shell in place.</p>
+  <svg viewBox="0 0 760 220" role="img" aria-label="drop_reuse produces a token that alloc_at consumes">
+    <defs>
+      <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/>
+      </marker>
+    </defs>
+    <g font-family="ui-monospace,monospace" font-size="12.5">
+      <rect x="40" y="86" width="190" height="48" rx="9" fill="#f5f7f9" stroke="#dfe3e8"/>
+      <text x="135" y="106" text-anchor="middle">drop_reuse(cell)</text>
+      <text x="135" y="123" text-anchor="middle" font-size="10.5" fill="#6b7280">dec rc; drop children</text>
+
+      <rect x="300" y="92" width="160" height="36" rx="18" fill="#eef4fb" stroke="#2f6fb0"/>
+      <text x="380" y="115" text-anchor="middle" fill="#2f6fb0">reuse token</text>
+
+      <rect x="530" y="86" width="190" height="48" rx="9" fill="#edf7f1" stroke="#2e8b57"/>
+      <text x="625" y="106" text-anchor="middle" fill="#2e8b57">alloc_at(token, ...)</text>
+      <text x="625" y="123" text-anchor="middle" font-size="10.5" fill="#6b7280">re-stamp header + slots</text>
+
+      <g stroke="#6b7280" fill="none" stroke-width="1.5">
+        <path d="M230,110 L296,110" marker-end="url(#a)"/>
+        <path d="M460,110 L526,110" marker-end="url(#a)"/>
+      </g>
+
+      <!-- the two escape hatches -->
+      <rect x="262" y="22" width="236" height="30" rx="8" fill="#fff" stroke="#dfe3e8"/>
+      <text x="380" y="42" text-anchor="middle" font-size="11" fill="#6b7280">rc still &gt; 0 &rarr; token is NULL (shared)</text>
+      <rect x="262" y="168" width="236" height="30" rx="8" fill="#fff" stroke="#dfe3e8"/>
+      <text x="380" y="188" text-anchor="middle" font-size="11" fill="#6b7280">NULL token &rarr; fresh allocation</text>
+      <g stroke="#dfe3e8" fill="none" stroke-width="1.2" stroke-dasharray="3 3">
+        <path d="M135,86 C135,55 200,40 260,38"/>
+        <path d="M625,134 C625,162 560,180 500,182"/>
+      </g>
+    </g>
+  </svg>
+  <p class="cap">fig 4 &mdash; <code>drop_reuse</code> &rarr; token &rarr; <code>alloc_at</code>. Either box can bail to the safe slow path (dotted).</p>
+
+  <!-- 5 -->
+  <h2 id="s5"><span class="n">5 &middot;</span> What reuse does to one cell</h2>
+  <p>The shell keeps its address. Its <b>children are released</b> (their refcounts drop, cascading if they hit zero), the <b>header is re-stamped</b> (fresh count, possibly a new constructor tag), and the <b>slots are overwritten</b> with the new fields. Nothing about the cell's identity is observable to the program &mdash; this is the data-rewrite that makes pure code fast.</p>
+  <div class="cells">
+    <div class="cell hi">
+      <div class="hd"><span>Cons @0x40</span><span>rc 1</span></div>
+      <div class="fld"><span class="o">slot 0</span><span>x</span></div>
+      <div class="fld"><span class="o">slot 1</span><span class="ptr">&rarr; rest</span></div>
+    </div>
+    <div class="xform">&rarr;</div>
+    <div class="cell ok">
+      <div class="hd"><span>Cons @0x40</span><span>rc 1</span></div>
+      <div class="fld"><span class="o">slot 0</span><span class="new">f x</span></div>
+      <div class="fld"><span class="o">slot 1</span><span class="new ptr">&rarr; map f rest</span></div>
+    </div>
+  </div>
+  <p class="cap">fig 5 &mdash; same block at <code>0x40</code>, same arity, new contents. The old <code>x</code> / <code>rest</code> refs were released first.</p>
+  <div class="note"><b>Size must match exactly.</b> A wok cell is <code>8 + 8&times;arity</code> bytes &mdash; size is a pure function of arity, so "same byte size" and "same arity" are the <i>same</i> question. Reuse only fires arity-for-arity. The tag may change (a 2-field <code>Cons</code> shell could become any other 2-field constructor); the count of slots may not.</p>
+
+  <!-- 6 -->
+  <h2 id="s6"><span class="n">6 &middot;</span> The gate: reuse is earned at runtime</h2>
+  <p>The compiler <i>pairs</i> a drop with an allocation statically, but whether the cell is actually recycled is decided at runtime by its reference count. This is what makes FBIP safe without a clever uniqueness proof: if the cell is shared, you simply allocate fresh.</p>
+  <div class="fork">
+    <div class="box hi">drop_reuse: decrement the count</div>
+    <div class="arrow">&darr;</div>
+    <div class="row">
+      <div class="box ok">count hit <b>0</b> (unique)<small>release children, return the shell as the token &mdash; <b>0 frees, 0 allocs</b> across the pair</small></div>
+      <div class="box">count still <b>&gt; 0</b> (shared)<small>token is NULL; <code>alloc_at</code> allocates a fresh cell &mdash; identical to today</small></div>
+    </div>
+  </div>
+  <p class="cap">fig 6 &mdash; the MVP gate. Static "this is provably unique, skip the check" is a later specialization.</p>
+
+  <!-- 7 -->
+  <h2 id="s7"><span class="n">7 &middot;</span> One map step, refcount by refcount</h2>
+  <p>Here is a single iteration of <code>map f (Cons x rest)</code> when the <code>Cons</code> cell is unique. Follow the cell's <code>rc</code> and the two children. The key move is steps 2&ndash;3: the alt <code>dup</code>s the children it keeps, then <code>drop_reuse</code> releases the cell's own refs to them &mdash; ownership of <code>x</code> and <code>rest</code> transfers from the dying cell to the new bindings, perfectly balanced, while the shell falls out as a token.</p>
+  <table>
+    <thead><tr><th class="m">#</th><th>what runs</th><th class="m c">Cons</th><th class="m c">x</th><th class="m c">rest</th></tr></thead>
+    <tbody>
+      <tr><td class="m c">1</td><td>match <code>Cons x rest</code> &mdash; read the two slots (no counts change yet)</td><td class="m c">1</td><td class="m c">k</td><td class="m c">m</td></tr>
+      <tr><td class="m c">2</td><td><code>dup x; dup rest</code> &mdash; the alt keeps both (for <code>f x</code> and the recursion)</td><td class="m c">1</td><td class="m c">k+1</td><td class="m c">m+1</td></tr>
+      <tr><td class="m c">3</td><td><code>drop_reuse(Cons)</code> &mdash; 1&rarr;0, <b>unique</b>; release the cell's child refs; keep the shell as <b>token</b></td><td class="m c ok">token</td><td class="m c">k</td><td class="m c">m</td></tr>
+      <tr><td class="m c">4</td><td><code>rest' = map f rest</code> &mdash; recurse; the token rides in the pending continuation</td><td class="m c ok">held</td><td class="m c">k</td><td class="m c">m&minus;1</td></tr>
+      <tr><td class="m c">5</td><td><code>y = f x</code> &mdash; consumes the kept <code>x</code> unit</td><td class="m c ok">held</td><td class="m c">k&minus;1</td><td class="m c">&middot;</td></tr>
+      <tr><td class="m c">6</td><td><code>alloc_at(token, Cons, y, rest')</code> &mdash; reuse the shell; write the new slots</td><td class="m c ok">1</td><td class="m c">&middot;</td><td class="m c">&middot;</td></tr>
+      <tr><td class="m c">7</td><td>return the cell &mdash; same block, new contents</td><td class="m c">1</td><td class="m c">&middot;</td><td class="m c">&middot;</td></tr>
+    </tbody>
+  </table>
+  <p class="cap">fig 7 &mdash; <code>k</code>, <code>m</code> are whatever the children's counts were on entry; they end exactly one lower (the cell's old ref to each is gone). The cell itself: in at rc 1, out at rc 1, never freed, never allocated.</p>
+  <div class="note"><b>Reading the dance:</b> dup (+1) then drop_reuse's child-release (&minus;1) cancel for <code>x</code> and <code>rest</code> &mdash; net zero, the references just moved from the cell's slots into <code>y = f x</code> and the recursive call. If the cell had <i>not</i> been unique at step 3, <code>drop_reuse</code> would have only decremented it (still alive for the other owner) and returned NULL, and step 6 would allocate fresh &mdash; same answer, one real alloc.</p>
+
+  <!-- 8 -->
+  <h2 id="s8"><span class="n">8 &middot;</span> A map, allocation by allocation</h2>
+  <p>Now zoom out to the whole list. The token from each step is <b>held across the recursive call</b> (it rides in the pending continuation, as in step 4 above). On the way back up, each held shell is the cell the new <code>Cons</code> is built into. Watch the running allocation count.</p>
+  <div class="grid">
+    <div class="step"><div class="line">match Cons 1 &rarr; drop_reuse &rarr; token A held</div><div class="body"><span class="badge zero">0</span></div><div class="label">net allocs</div></div>
+    <div class="step"><div class="line">match Cons 2 &rarr; token B held</div><div class="body"><span class="badge zero">0</span></div><div class="label">net allocs</div></div>
+    <div class="step"><div class="line">match Cons 3 &rarr; token C held; hit Nil</div><div class="body"><span class="badge zero">0</span></div><div class="label">net allocs</div></div>
+    <div class="step"><div class="line">unwind: alloc_at into C, then B, then A</div><div class="body"><span class="badge zero">0</span></div><div class="label">net allocs</div></div>
+  </div>
+  <p class="cap">fig 8 &mdash; three shells held at the bottom become the three new shells on the way up. <b>0 allocs, 0 frees</b> vs. today's 3 + 3.</p>
+  <div class="note ok"><b>The deliverable is the count, not the clock.</b> The interpreter makes no wall-clock claim. The win is the deterministic, oracle-visible <i>collapse</i> in allocation count: <code>map</code> over N elements goes from 2N allocator events to ~0. (For a tail-recursive accumulator like <code>reverse</code>, the token is consumed immediately, so peak live memory drops too &mdash; one cell churns in place.)</p>
+
+  <!-- 9 -->
+  <h2 id="s9"><span class="n">9 &middot;</span> Two heaps, kept in lockstep</h2>
+  <p>wok runs every program twice &mdash; once on the abstract <code>IntMap</code> heap, once on the real C arena &mdash; and the differential oracle checks the output is bit-for-bit identical <i>and</i> the alloc/free/peak counts match. FBIP must be a <b>shared</b> change so both heaps recycle in the same way and stay in step.</p>
+  <table>
+    <thead><tr><th>step</th><th>abstract heap (IntMap)</th><th>C arena</th></tr></thead>
+    <tbody>
+      <tr><td class="m">a live cell is</td><td>an index <code>i</code> in <code>stCells</code></td><td>a pointer <code>p</code></td></tr>
+      <tr><td class="m">a normal free</td><td>delete <code>i</code>, add to <code>stDead</code>, <code>frees++</code></td><td>push to <code>freelist[arity]</code>, <code>frees++</code></td></tr>
+      <tr><td class="m">drop_reuse (rc&rarr;0)</td><td>remove <code>i</code>, <b>not</b> <code>stDead</code>, <b>no</b> <code>frees++</code>; token = <code>i</code></td><td>dec&rarr;0, <b>skip</b> the free list, <b>no</b> <code>frees++</code>; token = <code>p</code></td></tr>
+      <tr><td class="m">alloc_at (token)</td><td>write new cell at <code>i</code>, <b>no</b> <code>allocs++</code></td><td>re-stamp header at <code>p</code>, <b>no</b> <code>allocs++</code></td></tr>
+      <tr><td class="m">fires when</td><td class="ok">rc == 1</td><td class="ok">rc == 1</td></tr>
+    </tbody>
+  </table>
+  <p>Because both heaps carry the <i>same</i> reference counts at every step, reuse fires on the <i>same</i> cells on both sides. Neither bumps a counter on a fired pair, so both record the same reduced totals &mdash; the oracle stays green and the reduction is the visible result.</p>
+  <div class="note warn"><b>One honest trade.</b> Today a dangling read on the abstract heap is caught loudly (the index is in <code>stDead</code>). A reused index is live again, so a genuine use-after-free could read the new contents instead of erroring &mdash; exactly the masking the C arena already has from its free list. The <code>rc==1</code> gate guarantees no such reference exists when reuse fires; the malloc-backed ASan build remains the sharp net.</p>
+
+  <!-- 10 -->
+  <h2 id="s10"><span class="n">10 &middot;</span> Where the pairing is decided</h2>
+  <p>The runtime just executes <code>drop_reuse</code> / <code>alloc_at</code>. The intelligence &mdash; <i>which</i> drop feeds <i>which</i> allocation &mdash; lives in the Perceus reference-counting pass, on top of the analysis that already inserts <code>drop</code>s and <code>dup</code>s. It is a local pattern: a unique boxed cell dropped at a pattern match, with a same-arity allocation it dominates downstream.</p>
+  <div class="flow">
+    <div class="box">Perceus pass<small>already inserts dup / drop</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box hi">reuse pairing<small>this drop &rarr; that same-arity alloc; thread the token between them</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box">instrumented IR<small>drop becomes drop_reuse; the alloc becomes alloc_at(token)</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box ok">interpreter<small>runs it against the arena &mdash; the alloc count collapses</small></div>
+  </div>
+  <p class="cap">fig 10 &mdash; static pairing, dynamic reuse. Reuse is a DATA op driven by a compiler analysis; no codegen needed for this slice.</p>
+
+  <!-- 11 -->
+  <h2 id="s11"><span class="n">11 &middot;</span> How small is the first slice?</h2>
+  <p>Three rungs. The recommendation is the middle one: it delivers the iconic case and forces the token to be a real first-class value, while stopping short of conditional reuse.</p>
+  <div class="grid">
+    <div class="card"><span class="label">S1 &middot; simplest</span><h3>reverse only</h3><p>Drop and rebuild are adjacent &mdash; the token never crosses a call. Always consumed. Peak drops. But the least iconic demo.</p></div>
+    <div class="card" style="border-top:3px solid var(--accent)"><span class="label">S2 &middot; recommended</span><h3>map + reverse</h3><p>Token is held across the recursive call (free in the interpreter &mdash; it's just a value). Single path, always consumed. The headline "map &rarr; ~0 allocs".</p></div>
+    <div class="card"><span class="label">S3 &middot; later</span><h3>+ filter</h3><p>A branch drops without rebuilding, so the token needs a "free it for real" path too. Conditional-reuse accounting on top of S2.</p></div>
+  </div>
+  <p class="cap">fig 11 &mdash; deferred beyond the slice: tree insert/balance (cross-constructor, multi-arity), static rc-elision, filter's conditional drop.</p>
+
+  <div class="note ok"><b>The point:</b> the cell that dies and the cell that's born are the same block. The compiler pairs them; the runtime recycles only when the count proves it's safe; both heaps do it identically, so the oracle sees the allocation count fall to zero with the answer unchanged.</div>
+
+</div>
+</body>
+</html>

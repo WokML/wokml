@@ -1,0 +1,16 @@
+kindMap xs =
+  case xs of
+    Cons x xx ->
+      let _dup = __rc_dup(xx)
+      let _drop.1 = __rc_drop(xs)
+      let c = toChar(x)
+      let ys = kindMap(xx)
+      let r = Cons(c, ys)
+      r
+    Nil ->
+      let _drop.2 = __rc_drop(xs)
+      let n = Nil
+      n
+
+main =
+  0

@@ -99,6 +99,78 @@ int main(void) {
         wok_heap_free(h);               /* arena: frees all slabs (LSan-clean) */
     }
 
+    /* --- FBIP reuse round-trip: drop_reuse -> alloc_at re-stamps in place ----------- */
+    {
+        WokHeap* h = wok_heap_new();
+        WokObj* p = wok_alloc(h, 3u, 2u);   /* the donor cell, arity 2 */
+        wok_slot_set(p, 0u, 10u);
+        wok_slot_set(p, 1u, 20u);
+        uint64_t allocs_before = wok_stat_allocs(h);
+        uint64_t frees_before  = wok_stat_frees(h);
+        int64_t  live_before   = wok_stat_live(h);
+
+        assert(wok_dec(p) == 0u);           /* unique drop: rc 1 -> 0, do NOT free */
+        WokObj* q = wok_alloc_at(h, 9u, 2u, p);   /* re-stamp the same shell */
+
+        assert(q == p);                                  /* reuse: same physical cell */
+        assert(wok_tag(q) == 9u);                        /* new tag */
+        assert(wok_arity(q) == 2u);                      /* same arity */
+        assert(wok_stat_allocs(h) == allocs_before);     /* NO alloc recorded */
+        assert(wok_stat_frees(h)  == frees_before);      /* NO free recorded */
+        assert(wok_stat_live(h)   == live_before);       /* live unchanged (reserved -> revived) */
+#ifndef WOK_RC_MALLOC
+        assert(wok_stat_reused_inplace(h) == 1u);        /* arena: one in-place reuse */
+#else
+        assert(wok_stat_reused_inplace(h) == 0u);        /* malloc backend: always 0 */
+#endif
+
+        /* fresh slots write+read correctly into the re-stamped shell */
+        wok_slot_set(q, 0u, 100u);
+        wok_slot_set(q, 1u, 200u);
+        assert(wok_slot_get(q, 0u) == 100u);
+        assert(wok_slot_get(q, 1u) == 200u);
+
+        /* clean teardown: rc 1 -> 0, then real free */
+        assert(wok_dec(q) == 0u);
+        wok_free(h, q);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
+    /* --- FBIP not-eligible fallback: reserve a shell, allocate over it, free it ------
+       The alloc_at "not eligible" branch (spec section 4.3) does NOT re-stamp the
+       reserved shell -- it frees it for real and allocates fresh. This exercises that
+       free path AND the reserve-window-vs-allocation discipline: while the shell is
+       reserved (rc==0, NOT on the free list, NOT handed back), an intervening
+       wok_alloc must return a DIFFERENT pointer -- the reserved shell is never handed
+       out. Then wok_free on the reserved shell (the not-eligible fallback) tears down
+       cleanly. Under WOK_RC_MALLOC + -fsanitize=address this closes the oracle hole
+       over the new reserved-shell free path: no UAF, no double-free. */
+    {
+        WokHeap* h = wok_heap_new();
+        WokObj* p = wok_alloc(h, 3u, 2u);         /* the would-be donor shell, arity 2 */
+        wok_slot_set(p, 0u, 11u);
+        wok_slot_set(p, 1u, 22u);
+        assert(wok_dec(p) == 0u);                 /* unique drop: rc 1 -> 0, RESERVE (no free) */
+
+        /* Intervening allocation: the reserved shell is NOT on the free list and must
+           not be handed back. (Same arity, to prove it is the RESERVATION -- not an
+           arity-class miss -- that keeps the shell out of circulation.) */
+        WokObj* other = wok_alloc(h, 4u, 2u);
+        assert(other != p);                       /* reserved shell never handed out */
+
+        /* The not-eligible fallback: free the reserved shell for real. rc is already 0
+           (reserved), exactly the state wok_free expects, so this is the genuine
+           reserve-then-free path. */
+        wok_free(h, p);
+
+        /* `other` lives on independently; clean teardown. */
+        assert(wok_dec(other) == 0u);
+        wok_free(h, other);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
     printf("OK\n");
     return 0;
 }

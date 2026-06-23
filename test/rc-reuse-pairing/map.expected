@@ -1,0 +1,16 @@
+mapInc xs =
+  case xs of
+    Cons x xx ->
+      let _dup = __rc_dup(xx)
+      let _tok = __rc_drop_reuse(xs)
+      let y = +(x, 1)
+      let ys = mapInc(xx)
+      let r = Cons@_tok(y, ys)
+      r
+    Nil ->
+      let _drop = __rc_drop(xs)
+      let n = Nil
+      n
+
+main =
+  0

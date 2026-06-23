@@ -32,7 +32,10 @@ common knowledge.
 - **[K]** general/common knowledge (GHC info tables, ZGC/Shenandoah, LuaJIT GC).
 - **[W]** wok decisions: `docs/superpowers/specs/2026-06-21-c-runtime-allocator-ncon-design.md`,
   `…/2026-06-21-c-runtime-arena-allocator-design.md`, `…/2026-06-22-layout-compaction-design.md`,
+  `…/2026-06-22-layout-compaction-slice2-design.md`, `…/2026-06-23-fbip-reuse-design.md`,
   and the auto-memory notes.
+- **[W: fbip spec]** `docs/superpowers/specs/2026-06-23-fbip-reuse-design.md` — FBIP S2
+  in-place reuse design: token, ops, pairing pass, slot-kind guard, oracle invariants.
 
 ---
 
@@ -57,6 +60,34 @@ common knowledge.
   block**) + `alloc_at` (a later constructor reuses that exact pointer, re-stamps the header).
   Reuse token = a block pointer. **Size-class fit is the compiler's responsibility**, trusted
   by the runtime.  [R1: `refcount.c:213-231`, `kklib.h:650,654-667,662`]
+- **wok FBIP S2 (IMPLEMENTED, `feat/fbip-reuse-s2`, 1307 green):** both heaps — abstract
+  `IntMap` index-recycle AND C arena pointer re-stamp via `wok_alloc_at`; a first-class affine
+  `RVReuse` token (`RVReuse Nothing` = shared/NULL, `RVReuse (Just ReuseSlot)` = reserved
+  shell). The **pairing** is a `reusePairing` **post-pass** run *after* `insertRC` (auditable,
+  balance-preserving; does NOT thread through `ownExpr`/`balanceLint`). The **§6.3 slot-kind
+  guard** refuses to pair constructors with differing per-field storage classes (a
+  `Cons`-of-`Int` shell cannot absorb a `Cons`-of-`Char` — the tag-keyed C descriptor would
+  mis-decode). The pairing is **SAME-constructor only** (review finding F1): the target `RCon`
+  must use the *same* constructor as the matched cell, not merely the same slot-kind signature.
+  Cross-constructor reuse is unsound here — a different target tag could carry a stale tag-keyed
+  C descriptor (mis-decode) AND the abstract heap (no descriptor) would reuse unconditionally,
+  diverging between backends. `nodeCEligible` is **value-only** (no descriptor, no tag-table) so both backends
+  decide reuse identically; the only residual runtime difference is an `Int`/`U64` field crossing
+  the `≥ 2^63` boundary. **Runtime `rc == 1` gate**: a shared cell returns NULL, `alloc_at`
+  allocates fresh — correctness never depends on the pairing analysis. Strings are
+  non-encodable abstract literals (future Array-like `String` = separate track); the slot-kind
+  guard refuses to pair across the string boundary; FBIP still reuses string-bearing cells on
+  the abstract heap by index at zero extra cost. **Measured collapse:** `map`/`reverse` over a
+  3-element list 6 allocs/6 frees → 3/3 (spine = 0 net); output bit-for-bit identical on both
+  backends verified by the differential oracle. **EFFECT-SAFETY RESIDUAL (S2 is NOT fully
+  effect-safe):** the pairing scan refuses to span a *direct* `ROp` (so a token never crosses
+  an explicit effect op), and `continuationOwned` is total over an `RReuseCon` (an in-flight
+  token in a captured continuation frees its **fields**, like an `RCon`, never crashes). But a
+  token can still span an **effectful CALL** (an `RApp` whose callee performs an op), and the
+  reserved shell has **no finalizer** in the M2b/M3 continuation-RC owned set — so under an
+  *aborting* handler the shell leaks (fields are freed, shell is not). The S2 corpus is
+  effect-free, so this is **unobservable** there; a Koka-style reuse-token finalizer in the
+  continuation owned set is a **deferred follow-on**.  [W: fbip spec]
 - **Context threading:** Koka threads a `kk_context_t* ctx` through every function; `free`/
   reclaim take the ctx (no pointer-masking needed at the RC layer).  [K, P1]
 
@@ -145,6 +176,7 @@ common knowledge.
   8-aligned, read as-is), `01` = H-addr (`(i<<2)|1`), `11` = inline immediate (`(tag<<2)|3`);
   `10` unused. Koka-style bit 0 = pointer-vs-value; `KPointer` subsumes pointer-or-immediate
   (no new `SlotKind`). The cross-heap C-vs-H split rides in bit 1.  [W]
-- **Extreme-perf roadmap (follow-on slices):** FBIP in-place reuse → escape→stack/region
-  allocation → reuse specialization + rc elision → monomorphize/unbox. All enabled by the
-  descriptor + arena + the analyses; none folded into the layout slice.  [W, P1]
+- **Extreme-perf roadmap (follow-on slices):** ~~FBIP in-place reuse~~ (DONE, S2 above) →
+  **escape→stack/region allocation** (head) → reuse specialization + rc elision →
+  monomorphize/unbox. All enabled by the descriptor + arena + the analyses; none folded into
+  the layout slice.  [W, P1]

@@ -32,6 +32,7 @@ module Wok.IR.PrimNames
   ( -- * RC intrinsics (Perceus-inserted)
     rcDupName
   , rcDropName
+  , rcDropReuseName
     -- * M3 stored-continuation cell prims
   , contCellNewName
   , contStoreName
@@ -59,6 +60,17 @@ rcDupName = Tx.pack "__rc_dup"
 -- | @__rc_drop x@: decref @x@'s handle (freeing at zero), returns @()@.
 rcDropName :: Text
 rcDropName = Tx.pack "__rc_drop"
+
+-- | @__rc_drop_reuse x@: the FBIP @drop_reuse@ intrinsic. Like @__rc_drop@ it
+-- decrefs @x@'s handle, but when the decrement hits zero (the cell is unique) it
+-- RETAINS the freed shell and returns it as an affine reuse token
+-- ('Wok.Interp.RC.Value.RVReuse') instead of unit; a shared or uncounted handle
+-- yields a NULL token. Synthesized ONLY by the FBIP reuse-pairing post-pass and,
+-- like @__rc_dup@/@__rc_drop@, recognized by HINT TEXT (no user binding can forge
+-- it); its sole consumer is an 'Wok.IR.Anf.RReuseCon' on the same straight-line
+-- path. See spec 2026-06-23-fbip-reuse-design §5.2.
+rcDropReuseName :: Text
+rcDropReuseName = Tx.pack "__rc_drop_reuse"
 
 -- | @__cont_cell_new ()@: allocate a fresh EMPTY continuation cell (M3 §4.1).
 contCellNewName :: Text

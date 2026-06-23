@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+
+-- FBIP headline (Task 5): 'map (\x -> x + 1)' over a unique literal int list.
+-- 'mapInc xs = case xs of Cons x xx -> Cons (x + 1) (mapInc xx) ; Nil -> Nil'
+-- lowers to the single-path shape 'reusePairing' recognizes: the 'Cons' alt
+-- drops the matched (unique) scrutinee cell and rebuilds a same-arity, same-
+-- slot-kind 'Cons', so each of the N spine cells is reused in place (rc == 1
+-- gate fires). The FUSED run records ~0 net spine allocs; the non-FBIP
+-- ('insertRC'-only) run allocates the spine fresh. Output is identical and the
+-- abstract and C backends agree on the (reduced) counts.
+
+data List = Nil | Cons U64 List
+
+mapInc : List -> List
+mapInc xs = case xs of
+  Nil       -> Nil
+  Cons x xx -> Cons (x + 1) (mapInc xx)
+
+main = mapInc (Cons 1 (Cons 2 (Cons 3 Nil)))

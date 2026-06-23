@@ -2,7 +2,7 @@
 module Wok.Interp.RC.Heap
   ( WokObj, WokHeap
   , wokHeapNew, wokHeapFree
-  , wokAlloc, wokDup, wokDec, wokFree
+  , wokAlloc, wokAllocAt, wokDup, wokDec, wokFree
   , wokSlotSet, wokSlotGet, wokTag, wokArity
   , wokStatAllocs, wokStatFrees, wokStatLive, wokStatPeak
   , wokStatPeakBytes
@@ -18,6 +18,7 @@ data WokHeap  -- phantom: pointer to a per-run heap context
 foreign import ccall unsafe "wok_heap_new"  wokHeapNew  :: IO (Ptr WokHeap)
 foreign import ccall unsafe "wok_heap_free" wokHeapFree :: Ptr WokHeap -> IO ()
 foreign import ccall unsafe "wok_alloc"     wokAlloc    :: Ptr WokHeap -> Word32 -> Word32 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_alloc_at"  wokAllocAt  :: Ptr WokHeap -> Word32 -> Word32 -> Ptr WokObj -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_dup"       wokDup      :: Ptr WokObj -> IO ()
 foreign import ccall unsafe "wok_dec"       wokDec      :: Ptr WokObj -> IO Word64
 foreign import ccall unsafe "wok_free"      wokFree     :: Ptr WokHeap -> Ptr WokObj -> IO ()

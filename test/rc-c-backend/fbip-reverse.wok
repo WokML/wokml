@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- FBIP reverse (Task 5): accumulator 'reverse' whose target 'Cons' is built
+-- BEFORE the recursive call, so the reuse token is born and consumed without
+-- crossing the call (the simplest shape; peak drops to one churning cell). Each
+-- 'Cons' shell from the input spine is reused in place to build the accumulator
+-- spine, so the FUSED run records ~0 net spine allocs vs the non-FBIP run, with
+-- identical output on both backends.
+
+data List = Nil | Cons U64 List
+
+rev : List -> List -> List
+rev acc xs = case xs of
+  Nil       -> acc
+  Cons x xx -> rev (Cons x acc) xx
+
+main = rev Nil (Cons 1 (Cons 2 (Cons 3 Nil)))

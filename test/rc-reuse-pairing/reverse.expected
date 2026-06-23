@@ -1,0 +1,14 @@
+revAcc acc xs =
+  case xs of
+    Cons x xx ->
+      let _dup = __rc_dup(xx)
+      let _tok = __rc_drop_reuse(xs)
+      let acc2 = Cons@_tok(x, acc)
+      let rr = revAcc(acc2, xx)
+      rr
+    Nil ->
+      let _drop = __rc_drop(xs)
+      acc
+
+main =
+  0

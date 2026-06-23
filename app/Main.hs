@@ -14,6 +14,7 @@ import Wok.IR.Multiplicity (prettyMultiplicity)
 import Wok.IR.PrimNames (onceSinkNames)
 import qualified Wok.IR.Perceus as Perceus
 import Wok.IR.Reachable (pruneToReachable)
+import Wok.IR.ReusePairing (reusePairing)
 import qualified Wok.Interp as Interp
 import qualified Wok.Interp.RC.Heap as Heap
 import qualified Wok.Interp.RC.Machine as RCM
@@ -100,7 +101,11 @@ runApp entry extras mode = do
           rcResult <- Control.Exception.bracket
             Heap.wokHeapNew
             Heap.wokHeapFree
-            (\hp -> RCM.runModuleRCWith (CHeap hp) (Perceus.insertRC (pruneToReachable cm)))
+            -- FBIP reuse-pairing runs AFTER insertRC (and after balanceLint),
+            -- rewriting the map/reverse single-path shapes into runtime-conditional
+            -- in-place reuse (spec 2026-06-23-fbip-reuse-design §6).
+            (\hp -> RCM.runModuleRCWith (CHeap hp)
+                      (reusePairing (Perceus.insertRC (pruneToReachable cm))))
           case rcResult of
             Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure
             Right run -> TIO.putStr (RCM.renderRcStats run)

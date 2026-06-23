@@ -112,6 +112,10 @@ evalRhs prims sup b rhs body sc k = case rhs of
     case v of
       VRecord _ m -> maybe (Left (BadProjection l)) cont (Map.lookup l m)
       _           -> Left (BadProjection l)
+  -- The FBIP reuse form is produced ONLY by the RC reuse-pairing post-pass and
+  -- only ever executed by the RC machine; the reference interpreter never runs
+  -- on post-pass output, so reaching it here is an internal pipeline error.
+  RReuseCon{} -> error "RReuseCon: produced only by reusePairing post-pass (never reaches the reference machine)"
   RApp f as -> do
     fv <- resolveAtom prims sc f
     vs <- mapM (resolveAtom prims sc) as

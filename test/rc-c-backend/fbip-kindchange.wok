@@ -1,0 +1,35 @@
+module Main
+import Std.Base
+
+-- FBIP slot-kind-change refusal (Task 5, §6.3): a map that changes a field's
+-- STORAGE CLASS. The matched cell is 'ConsI U64 ListI' (head slot 'KLitInt'); the
+-- rebuilt cell is 'ConsS String ListS' (head slot 'NonEncodable'). The §6.3
+-- slot-kind-signature guard compares [KLitInt, KPointer] /= [NonEncodable,
+-- KPointer] and REFUSES to pair, so the map keeps a plain '__rc_drop' + 'RCon':
+-- it allocates the output spine FRESH (no reuse). This is the regression guard
+-- against the C descriptor mis-decode (re-stamping an Int cell with a String
+-- payload would decode the string handle as an Int on readback). Output and
+-- counts must still match abstract == C.
+--
+-- ('Int -> Char' is not expressible in current wok --- there is no Char literal
+-- or U64->Char conversion --- so we use the closest expressible kind-change,
+-- KLitInt -> NonEncodable via String, which exercises the same §6.3 guard. The
+-- unit-level kindchange golden in 'rc-reuse-pairing' covers Int->Char directly.)
+
+data ListI = NilI | ConsI U64 ListI
+data ListS = NilS | ConsS String ListS
+
+label : U64 -> String
+label _ = "n"
+
+mapLabel : ListI -> ListS
+mapLabel xs = case xs of
+  NilI       -> NilS
+  ConsI x xx -> ConsS (label x) (mapLabel xx)
+
+lenS : ListS -> U64
+lenS xs = case xs of
+  NilS       -> 0
+  ConsS _ ys -> 1 + lenS ys
+
+main = lenS (mapLabel (ConsI 1 (ConsI 2 (ConsI 3 NilI))))

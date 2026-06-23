@@ -211,6 +211,7 @@ rhsMaxU (RLam ps e)      = maximum (exprMaxU e : map (uOf . bndName) ps)
 rhsMaxU (ROp m _ _ as)   = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
 rhsMaxU (RRecord _ flds) = foldr (max . atomMaxU . snd) (-1) flds
 rhsMaxU (RProj _ a)      = atomMaxU a
+rhsMaxU (RReuseCon tok _ as) = foldr (max . atomMaxU) (atomMaxU tok) as
 
 atomMaxU :: Atom -> Int
 atomMaxU (AVar n) = uOf n
@@ -1107,6 +1108,9 @@ ownedOccs ctx delta rhs = case rhs of
   RCon _ as      -> count as
   RRecord _ flds -> count (map snd flds)
   RProj _ _      -> Map.empty                 -- borrow, not a move
+  -- The FBIP reuse form is introduced by a post-pass that runs AFTER this pass
+  -- (and after 'balanceLint'); ownership accounting never sees it.
+  RReuseCon{}    -> error "RReuseCon: produced only by reusePairing post-pass (after insertRC/balanceLint)"
   -- A closure build is a heap allocation whose fields are its free owned boxed
   -- captures, exactly like an 'RCon': each capture is MOVED into the closure cell
   -- (one unit per captured variable). This routes the build through the same
@@ -1154,6 +1158,7 @@ moveOperandUniques rhs = case rhs of
   RCon _ as      -> atomUs as
   RRecord _ flds -> atomUs (map snd flds)
   RProj _ _      -> []
+  RReuseCon{}    -> error "RReuseCon: produced only by reusePairing post-pass (after insertRC/balanceLint)"
   RLam ps e      ->
     Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps))
   ROp _ _ _ as   -> atomUs as
@@ -1979,6 +1984,7 @@ moveAtoms resume rhs = case rhs of
   RCon _ as      -> as
   RRecord _ flds -> map snd flds
   RProj _ _      -> []   -- borrow
+  RReuseCon{}    -> error "RReuseCon: produced only by reusePairing post-pass (after insertRC/balanceLint)"
   RLam ps e ->
     [ AVar (Name (Tx.pack "") u)
     | u <- Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps)) ]

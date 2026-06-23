@@ -7,6 +7,7 @@ module Wok.Interp.RC.Value
   , HeapBackend (..)
     -- * Runtime values
   , RCValue (..)
+  , ReuseSlot (..)
   , REnv
   , valueChildren
   , countedRefs
@@ -35,6 +36,9 @@ module Wok.Interp.RC.Value
   , emptyStore
   , alloc
   , allocPure
+  , allocAt
+  , nodeCEligible
+  , dropReuse
   , allocStatic
   , writeStatic
   , writeNode
@@ -71,6 +75,7 @@ module Wok.Interp.RC.Value
   , decodeSlotC
   ) where
 
+import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, except)
 import Data.Bits (shiftL, shiftR, toIntegralSized, (.&.), (.|.))
@@ -81,6 +86,7 @@ import Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
@@ -148,6 +154,28 @@ data RCValue
     -- is an UNBOXED IDENTITY pair --- it owns no counted heap cell, so
     -- 'valueChildren' is empty and dup/drop of it are inert (no counted ref to
     -- acquire or release).
+  | RVReuse (Maybe ReuseSlot)
+    -- ^ An affine in-place-reuse ticket (FBIP, spec §4.1): a one-use token
+    -- produced by 'dropReuse' and consumed by 'allocAt'. 'RVReuse Nothing' is
+    -- NULL (the donor cell was shared or uncounted, nothing to reuse);
+    -- 'RVReuse (Just slot)' carries a reserved shell of a recorded arity.
+    --
+    -- The token is AFFINE (produced once, consumed once) and owns no counted
+    -- child: 'valueChildren (RVReuse _) = []'. Its reserved shell's children
+    -- were already released at 'dropReuse'; the shell is owned solely by the
+    -- token until 'allocAt' either revives or frees it, so dup/drop of an
+    -- 'RVReuse' are inert (no counted ref to acquire or release).
+  deriving (Eq, Show)
+
+-- | A reserved shell carried by a reuse token (FBIP, spec §4.1). Recorded at
+-- 'dropReuse' time so 'allocAt' can decide reuse-vs-fresh from backend-independent
+-- data (arity + the C-eligibility bit), keeping the abstract and C backends in
+-- lockstep.
+data ReuseSlot = ReuseSlot
+  { rsAddr      :: Addr     -- ^ the reserved shell ('HAddr' index or 'CAddr' pointer)
+  , rsArity     :: Word32   -- ^ the shell's physical arity (= byte size)
+  , rsCEligible :: Bool     -- ^ whether the OLD node was C-heap-eligible ('nodeCEligible')
+  }
   deriving (Eq, Show)
 
 -- | The counted heap addresses reachable from an 'RCValue'. This is the single
@@ -159,11 +187,15 @@ data RCValue
 --     The @groupAddr@ is static/immortal and therefore UNCOUNTED; it is
 --     deliberately excluded.
 --   * 'RVInst'      — no counted children (an unboxed identity pair).
+--   * 'RVReuse'     — no counted children (an affine reuse ticket; its reserved
+--     shell's children were already released at 'dropReuse', so the token is
+--     inert to dup/drop).
 valueChildren :: RCValue -> [Addr]
 valueChildren (RVLit _)          = []
 valueChildren (RVBox a)          = [a]
 valueChildren (RVRecMember _ _ e) = [e]
 valueChildren (RVInst _ _)        = []
+valueChildren (RVReuse _)         = []
 
 -- | The counted addresses a set of values references (skip static). The SINGLE
 -- unit of both capture-incref and free-cascade, via 'valueChildren' --- so every
@@ -826,6 +858,30 @@ allocPure n s =
          }
      )
 
+-- | The pure, VALUE-ONLY half of 'allocNCon's C-eligibility decision (FBIP,
+-- spec §4.3): 'True' iff the node is an 'NCon' of arity <= 255 whose every field
+-- is encodable ('encodeSlotC'). A function of the node's VALUES ONLY --- no
+-- 'Store', no descriptor lookup, no @tag < 65536@ check.
+--
+-- It deliberately OMITS 'allocNCon's descriptor-mismatch and tag-bound checks
+-- (spec §4.3/§6.3): those depend on store state that differs between backends,
+-- and the pairing post-pass's static slot-kind guard already guarantees no
+-- descriptor mismatch can arise at a reuse site, so the tag bound is unreachable
+-- there. Restricting to the value-only check is what keeps the abstract and C
+-- backends' reuse decisions identical; the only residual runtime difference it
+-- captures is integer width within @KLitInt@ (a small int encodes, a @>= 2^63@
+-- natural does not).
+nodeCEligible :: Node -> Bool
+nodeCEligible (NCon _ vs) = length vs <= 255 && all (isJust . encodeSlotC) vs
+nodeCEligible _           = False
+
+-- | The field count of a node (FBIP placement match). Only an 'NCon' has a
+-- meaningful physical arity for reuse; every other node kind reports 0 (it is
+-- never C-eligible and never a reuse donor/target in this slice).
+nodeArity :: Node -> Word32
+nodeArity (NCon _ vs) = fromIntegral (length vs)
+nodeArity _           = 0
+
 -- | Allocate a node into the STATIC immortal region. Returns a NEGATIVE 'Addr'
 -- and the updated 'Store'. Unlike 'alloc', this does NOT touch 'stStats': a
 -- static cell is never counted in 'stLive'/'stAllocs', is never increfed or
@@ -1144,6 +1200,155 @@ cascadeChildren (NCont prefix _) = continuationOwned prefix
 cascadeChildren other            = countedRefs (nodeValues other)
 
 -- ---------------------------------------------------------------------------
+-- FBIP in-place reuse (spec §4.2, §4.3): drop_reuse / alloc_at on the abstract
+-- heap. The counted analogue of the last step of 'dropAddr', minus the shell
+-- free: release a dying cell's children but RETAIN its shell as a reuse token,
+-- then either revive that shell at the next same-shaped allocation (0 alloc / 0
+-- free) or free it for real and allocate fresh.
+
+-- | Release a cell's children but RETAIN its shell as a reuse token (spec §4.2).
+-- The counted analogue of 'dropAddr's free branch with the shell free removed:
+--
+--   * 'Inline' / static 'HAddr' (uncounted): never a donor --- a decrement is a
+--     no-op on an uncounted address, exactly as today --- so '(RVReuse Nothing, s)'.
+--   * dynamic 'HAddr i', @rc > 1@: decrement in place (NO 'recordFree', mirroring
+--     'dropAddrStepPure's decrement branch), return '(RVReuse Nothing, s')'.
+--   * dynamic 'HAddr i', @rc == 1@ (unique, 'NCon' only for now): compute the
+--     arity, the C-eligibility bit ('nodeCEligible'), and the cascade children
+--     ('cascadeChildren'); REMOVE @i@ from 'stCells' WITHOUT adding it to 'stDead'
+--     and WITHOUT 'recordFree' (the shell is reserved, still counted in 'stLive');
+--     drop every child via the existing 'dropAddr' worklist; return the token.
+--
+-- ORDERING (the M2b/M3 discipline, spec §4.2): collect children -> reserve the
+-- shell (remove from 'stCells', skip the free) -> process the children. The shell
+-- is held by the token; its bytes stay intact until 'allocAt'.
+--
+-- A 'CAddr' donor mirrors 'dropAddr's free branch MINUS the 'wokFree' and the
+-- 'bumpFreeStats': @wok_dec@; if the new rc /= 0 the cell is still shared -> NULL
+-- token; if it hits 0 the cell is unique, so decode the children (the same
+-- 'countedRefs'-over-decoded-slots cascade 'dropAddr' uses --- a 'CAddr' is always
+-- an 'NCon'), retain the shell as the token WITHOUT returning it to the runtime
+-- (no free list push, no stat bump), then drop the children via the worklist. A
+-- live 'CAddr' was C-eligible by construction, so @rsCEligible = True@.
+dropReuse :: Addr -> Store -> RC (RCValue, Store)
+dropReuse (Inline _) s = pure (RVReuse Nothing, s)              -- uncounted: never a donor
+dropReuse (CAddr p)  s = do
+  newrc <- liftIO (H.wokDec p)
+  if newrc /= 0
+    then pure (RVReuse Nothing, s)                             -- shared: NULL token
+    else do
+      arity <- liftIO (H.wokArity p)
+      kids  <- countedRefs <$> liftIO (readCConValues p s)     -- decode children BEFORE reserving
+      -- reserve the shell: do NOT wokFree, do NOT bumpFreeStats.
+      s'    <- foldM (flip dropAddr) s kids
+      pure (RVReuse (Just (ReuseSlot (CAddr p) arity True)), s')
+dropReuse a@(HAddr i) s
+  | isStaticAddr a = pure (RVReuse Nothing, s)                  -- uncounted: never a donor
+  | otherwise = do
+      c <- liftRC (derefPure a s)
+      if cRc c <= 1
+        then do
+          -- unique: reserve the shell, then cascade the children (collect-before-free).
+          let node  = cNode c
+              arity = nodeArity node
+              elig  = nodeCEligible node
+              kids  = cascadeChildren node
+              s'    = s { stCells = IM.delete i (stCells s) }
+          s'' <- foldM (flip dropAddr) s' kids
+          pure (RVReuse (Just (ReuseSlot (HAddr i) arity elig)), s'')
+        else
+          -- shared: decrement in place, NO recordFree, NULL token.
+          let s' = s { stCells = IM.insert i c { cRc = cRc c - 1 } (stCells s) }
+          in pure (RVReuse Nothing, s')
+
+-- | Consume a reuse token, writing the new node into the reserved shell when its
+-- placement matches, else freeing the shell and allocating fresh (spec §4.3).
+--
+--   * 'RVReuse Nothing' (NULL): 'alloc' fresh (the existing chokepoint; normal
+--     'recordAlloc'). The shared-cell / uncounted-donor path.
+--   * 'RVReuse (Just (ReuseSlot a ar oldElig))': reuse-eligible iff
+--     @nodeArity newNode == ar && nodeCEligible newNode == oldElig@ (both backends
+--     compute this from the same value-only data -> identical decision).
+--       - eligible, @a == HAddr i@: write @Cell 1 newNode@ at @i@, NO 'recordAlloc',
+--         'stNext' untouched; return @(HAddr i, s')@. 0 alloc / 0 free.
+--       - eligible, @a == CAddr p@: re-stamp the shell in place ('reuseCConAt':
+--         @wok_alloc_at@ + per-slot @wok_slot_set@, mirroring 'allocNCon's
+--         'doAlloc' minus the alloc and minus 'recordAlloc'); return @(CAddr p, s')@.
+--         0 alloc / 0 free.
+--       - NOT eligible, @a == HAddr i@: free @i@ for real ('stDead' + 'recordFree'),
+--         then 'alloc' fresh. +1 alloc / +1 free.
+--       - NOT eligible, @a == CAddr p@: 'wokFree' + 'bumpFreeStats', then 'alloc'
+--         fresh. +1 alloc / +1 free. (Only an integer-width flip --- an encodable
+--         input crossing @>= 2^63@ --- reaches this on a 'CAddr', spec §4.3.)
+--
+-- A non-'RVReuse' first argument is an internal error (loud 'Left').
+allocAt :: RCValue -> Node -> Store -> RC (Addr, Store)
+allocAt (RVReuse Nothing)               newNode s = alloc newNode s
+allocAt (RVReuse (Just (ReuseSlot a ar oldElig))) newNode s = case a of
+  HAddr i
+    | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
+        pure (HAddr i, s { stCells = IM.insert i (Cell 1 newNode) (stCells s) })
+    | otherwise ->
+        alloc newNode (s { stDead  = IS.insert i (stDead s)
+                         , stStats = recordFree (stStats s) })
+  CAddr p
+    | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
+        reuseCConAt p newNode s
+    | otherwise -> do
+        hp <- heapPtr s
+        liftIO (H.wokFree hp p)
+        alloc newNode (bumpFreeStats s)
+  Inline _ -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline immediate")))
+allocAt v _ _ =
+  liftRC (Left (PrimError (Tx.pack ("alloc_at: expected a reuse token, got " <> show v))))
+
+-- | Re-stamp a reserved C shell in place with a new 'NCon' (FBIP, spec §4.3). The
+-- exact 'allocNCon' 'CHeap' 'doAlloc' path MINUS the 'wokAlloc' (replaced by
+-- 'wokAllocAt' on the donor pointer) and MINUS 'recordAlloc' (a reused cell records
+-- no allocation). The caller has already established reuse-eligibility
+-- (@nodeArity == rsArity && nodeCEligible == True@), so every field encodes; the
+-- descriptor handling mirrors 'allocNCon' faithfully (intern, first-kind-wins). By
+-- the pairing post-pass's static slot-kind guard (spec §6.3) the new node shares the
+-- old cell's slot-kind signature, so the tag-keyed descriptor stays valid on a
+-- cross-constructor re-stamp; recording it here keeps this path self-contained when
+-- exercised directly (the standalone C test / Task 5 corpus) rather than only after
+-- an 'allocNCon' of the same tag.
+reuseCConAt :: Ptr WokObj -> Node -> Store -> RC (Addr, Store)
+reuseCConAt p (NCon con vs) s = do
+  hp <- heapPtr s
+  case traverse encodeSlotC vs of
+    Nothing -> liftRC (Left (PrimError (Tx.pack "reuseCConAt: reuse-eligible node failed to encode")))
+    Just encoded -> do
+      let (tid, s1) = internTag con s
+          newKinds  = map fst encoded
+      -- DEFENSIVE DESCRIPTOR CHECK (review finding). 'allocNCon' falls BACK to the
+      -- abstract heap on a descriptor mismatch (first-kind-wins for a nominal /
+      -- polymorphic constructor); 'reuseCConAt' instead re-stamps the EXISTING C
+      -- shell, so a stale tag-keyed descriptor would silently MIS-DECODE the payload
+      -- on readback. The F1 same-constructor restriction + the §6.3 static slot-kind
+      -- guard make a mismatch UNREACHABLE here (the matched and target constructors
+      -- share a signature, so the new kinds equal the recorded ones). Rather than a
+      -- silent fallback, this is a LOUD tripwire (the repo's loud-on-violation
+      -- convention): should a future relaxation (cross-constructor reuse) break the
+      -- invariant, it fails clearly instead of mis-decoding. The matching path is
+      -- behaviourally identical to before.
+      case IM.lookup (fromIntegral tid) (stConDesc s1) of
+        Just existing
+          | existing /= newKinds ->
+              liftRC (Left (PrimError (Tx.pack
+                "reuseCConAt: descriptor mismatch (cross-constructor reuse must be unreachable)")))
+        _ -> pure ()
+      let s2 = case IM.lookup (fromIntegral tid) (stConDesc s1) of
+                 Just _  -> s1   -- known tag: descriptor already recorded (and verified equal above)
+                 Nothing -> s1 { stConDesc = IM.insert (fromIntegral tid) newKinds (stConDesc s1) }
+      _ <- liftIO (H.wokAllocAt hp tid (fromIntegral (length vs)) p)
+      liftIO $ mapM_ (\(i, (_, w)) -> H.wokSlotSet p (fromIntegral i) w)
+                     (zip [0 :: Int ..] encoded)
+      pure (CAddr p, s2)
+reuseCConAt _ n _ =
+  liftRC (Left (PrimError (Tx.pack ("reuseCConAt: expected an NCon, got " <> show n))))
+
+-- ---------------------------------------------------------------------------
 -- Primitives
 --
 -- The RC analogue of 'Wok.Interp.Value.Prim'. The crucial difference is that
@@ -1220,6 +1425,7 @@ renderValueWith drf = goVal
       goNode s (cNode c)
     goVal _ RVRecMember{}          = pure (Tx.pack "<closure>")
     goVal _ (RVInst _ _)           = pure (Tx.pack "<instance>")
+    goVal _ (RVReuse _)            = pure (Tx.pack "<reuse-token>")
 
     goNode _ (NCon t []) | t == Tx.pack "Nil" = pure (Tx.pack "[]")
     goNode s (NCon t [h, tl]) | t == Tx.pack "Cons" = goList s h tl
@@ -1262,6 +1468,7 @@ renderValueWith drf = goVal
           RVLit _       -> improper acc v
           RVRecMember{} -> improper acc v
           RVInst _ _    -> improper acc v
+          RVReuse _     -> improper acc v
         improper acc v = do
           rest <- goVal s v
           pure (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (reverse acc)
