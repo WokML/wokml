@@ -71,16 +71,20 @@ FBIP adds **one** new layer on top; everything under it shipped already.
   never via a C cell — so "set strings aside" costs FBIP nothing.
 - **A reuse token spanning an effect operation** — refused statically (§6.2): the pairing
   scan stops at the first `ROp` on the alt's straight-line tail, so a token never crosses an
-  effect op. **Residual (honest):** the refusal handles the *direct* `ROp` form, but a token
-  can still in principle span an **effectful CALL** — an `RApp` to a function that *itself*
-  performs an op — because the scan rides past an ordinary `RApp` (it must, to ride past the
-  recursive `map`/`reverse` call). Under an *aborting* handler, dropping the captured
-  continuation frees the token's **fields** (`continuationOwned` is total over `RReuseCon` —
-  the fields are the owned moves) but **not the reserved shell** (the token has no finalizer
-  in the M2b/M3 continuation-RC owned set), so the shell leaks. The S2 corpus is **effect-free**,
-  so this is **unobservable** there. **Full effect-safety** — a Koka-style reuse-token
-  finalizer wired into the continuation-RC owned set so an abort reclaims the reserved shell —
-  is a **deferred follow-on**, not part of S2.
+  explicit effect op. **Residual (CLOSED):** the refusal handles the *direct* `ROp` form, but
+  a token can still in principle span an **effectful CALL** — an `RApp` to a function that
+  *itself* performs an op — because the scan rides past an ordinary `RApp` (it must, to ride
+  past the recursive `map`/`reverse` call). Under an *aborting* handler, dropping the captured
+  continuation would free the token's **fields** (`continuationOwned` is total over `RReuseCon`)
+  but **not the reserved shell** — a leak. This residual is **closed by the E+ lazy-reclaim
+  slice** (`docs/superpowers/specs/2026-06-23-fbip-effect-safety-design.md`, implemented on
+  `feat/fbip-reuse-s2`, 1322 green, ASan clean): a `stReserved` set tracks every in-flight
+  reservation; when a handler aborts and the continuation is dropped, `continuationReservations`
+  walks the frame prefix and `freeReservation` reclaims any stranded shells. Resume is
+  untouched — reuse still fires under a resuming handler. Verified end-to-end via a teeth
+  check (disabling the reclaim makes it leak; both backends agree). The S2 corpus is
+  **effect-free**, so the residual was unobservable in the original S2 tests; the E+ tests
+  are in the effect-safety spec above.
 
 > Cross-*constructor* reuse (a `Cons` shell becoming a *different* 2-field constructor, even
 > one with an identical slot-kind signature) is **NOT supported in S2** (review finding F1).
@@ -347,15 +351,17 @@ in such an alt:
 The straight-line scan **refuses to span an `ROp` (an effect operation)** as well as an
 `RLam` / nested `Case` / `LetJoin` (review finding). An `ROp` captures the continuation — the
 suspended tail, which would hold the still-unconsumed reuse token (an `RReuseCon`), is handed
-to the handler; the reserved shell has **no finalizer** wired into the M2b/M3 continuation-RC
-owned set, so a token spanning an effect op under an *aborting* handler would leak its reserved
-shell (§2 Out, §6 residual). S2 forbids the token from spanning an effect op outright, so the
-scan stops at the first `ROp` and the pair is never formed. (The S2 corpus is effect-free, so
-the headline `map`/`reverse` shapes never reach this refusal.) Handler-arm bodies
-(`hReturn`/`hOps`) are **intentionally not traversed in S2** — handler arms are M2-effect
-territory, outside S2's `map`/`reverse` scope; a reusable pair missed inside an arm is a
-forgone optimization, never wrong behavior. So the pass descends into the *handled* expression
-of a `Handle` but stops at its arms.
+to the handler; under an *aborting* handler a token spanning an effectful call could leak its
+reserved shell (§2, residual now CLOSED — see `docs/superpowers/specs/2026-06-23-fbip-effect-safety-design.md`).
+S2 forbids the token from spanning a *direct* `ROp` outright, so the scan stops at the first
+`ROp` and the pair is never formed. The residual case — a token spanning an **effectful CALL**
+(`RApp` to a callee that performs an op) — is closed by E+ lazy reclaim: `stReserved` + abort-time
+`continuationReservations` reclaim any stranded shells; resume is untouched. (The S2 corpus
+is effect-free, so the headline `map`/`reverse` shapes never reach this refusal.) Handler-arm
+bodies (`hReturn`/`hOps`) are **intentionally not traversed in S2** — handler arms are
+M2-effect territory, outside S2's `map`/`reverse` scope; a reusable pair missed inside an arm
+is a forgone optimization, never wrong behavior. So the pass descends into the *handled*
+expression of a `Handle` but stops at its arms.
 
 When both hold, rewrite: `let _ = __rc_drop p` → `let tok = __rc_drop_reuse p` (fresh `tok`,
 from a `Unique` supply seeded above the whole module), and the target `let r = RCon c' fields`

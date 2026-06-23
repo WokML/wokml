@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+
+-- FBIP effect-safety (E+ lazy reclaim), resume case. An effectful map under a
+-- RESUMING handler: 'mapF' rebuilds a same-shape 'Cons' over the unique scrutinee
+-- spine (so 'reusePairing' mints a reuse token on each spine cell), with an
+-- effectful call 'bump r x' (a 'Reader.ask' that the handler tail-resumes) sitting
+-- BETWEEN the parent-drop and the 'Cons' rebuild. Because 'findTarget' rides past
+-- an 'RApp', the token spans the effectful call; on each resume the reservation
+-- rides along (untouched) and the spliced 'alloc_at' reuses the shell in place.
+-- So reuse SURVIVES the resume: the fused run's spine allocs collapse exactly as
+-- in the pure map. Output is the input list each incremented by the asked
+-- constant; the heap returns to baseline.
+data List = Nil | Cons U64 List
+
+effect Reader = { ask : U64 }
+
+bump : Reader -> U64 -> U64 with Reader
+bump r x = let n = r.ask in x + n
+
+mapF : Reader -> List -> List with Reader
+mapF r xs = case xs of
+  Nil       -> Nil
+  Cons x xx -> Cons (bump r x) (mapF r xx)
+
+reader : U64 -> (Reader -> a with Reader + eff e) -> a with eff e
+reader n c = with self = Reader { ask -> n } in c self
+
+prog : Reader -> List with Reader
+prog r = mapF r (Cons 1 (Cons 2 (Cons 3 Nil)))
+
+main : List
+main = reader 10 prog

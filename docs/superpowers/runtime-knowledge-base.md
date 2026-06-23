@@ -79,15 +79,18 @@ common knowledge.
   guard refuses to pair across the string boundary; FBIP still reuses string-bearing cells on
   the abstract heap by index at zero extra cost. **Measured collapse:** `map`/`reverse` over a
   3-element list 6 allocs/6 frees → 3/3 (spine = 0 net); output bit-for-bit identical on both
-  backends verified by the differential oracle. **EFFECT-SAFETY RESIDUAL (S2 is NOT fully
-  effect-safe):** the pairing scan refuses to span a *direct* `ROp` (so a token never crosses
-  an explicit effect op), and `continuationOwned` is total over an `RReuseCon` (an in-flight
-  token in a captured continuation frees its **fields**, like an `RCon`, never crashes). But a
-  token can still span an **effectful CALL** (an `RApp` whose callee performs an op), and the
-  reserved shell has **no finalizer** in the M2b/M3 continuation-RC owned set — so under an
-  *aborting* handler the shell leaks (fields are freed, shell is not). The S2 corpus is
-  effect-free, so this is **unobservable** there; a Koka-style reuse-token finalizer in the
-  continuation owned set is a **deferred follow-on**.  [W: fbip spec]
+  backends verified by the differential oracle. **EFFECT-SAFETY RESIDUAL: CLOSED by E+ lazy reclaim**
+  (`feat/fbip-reuse-s2`, 1322 green, ASan clean; spec:
+  `docs/superpowers/specs/2026-06-23-fbip-effect-safety-design.md`).
+  The pairing scan refuses to span a *direct* `ROp`, and `continuationOwned` is total over
+  an `RReuseCon` (in-flight token in a captured continuation frees its **fields**, never
+  crashes). But a token can still span an **effectful CALL** (`RApp` whose callee performs
+  an op); under an *aborting* handler the reserved shell would leak (fields freed, shell not).
+  **Closed by:** a `stReserved` set tracks every in-flight reservation; when a handler aborts
+  and the continuation is dropped, `continuationReservations` walks the frame prefix and
+  `freeReservation` reclaims stranded shells. Resume is **untouched** — reuse still fires
+  under a resuming handler (allocs 9→6 verified). Verified end-to-end via a teeth check
+  (disabling reclaim makes it leak; both backends agree).  [W: fbip spec, W: effect-safety spec]
 - **Context threading:** Koka threads a `kk_context_t* ctx` through every function; `free`/
   reclaim take the ctx (no pointer-masking needed at the RC layer).  [K, P1]
 

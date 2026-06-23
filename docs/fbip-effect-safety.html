@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FBIP reuse × effects × abort</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --warn:#c0392b; --ok:#2e8b57; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.62 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:880px;margin:0 auto;padding:46px 22px 96px}
+  h1{font-size:1.85rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.18rem;margin:48px 0 2px}
+  h2 .n{color:var(--mut);font-weight:400}
+  .sub,.cap{color:var(--mut)} .sub{margin:.2em 0 0} .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  p{margin:12px 0}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:210px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .box.ok{border-color:var(--ok);background:#edf7f1}
+  .box.warn{border-color:var(--warn);background:#fbeeec}
+  .box.wide{min-width:340px}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0;width:100%}
+  .row>*{flex:1;min-width:200px}
+  .fork{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:14px}
+  .card h3{margin:0 0 4px;font-size:.98rem}
+  .card .tag{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+  .card.rec{border-top:3px solid var(--accent)} .card.full{border-top:3px solid var(--ok)}
+  .step{border:1px solid var(--line);border-radius:8px;padding:13px;display:flex;flex-direction:column;gap:9px;min-height:120px}
+  .step .line{font-family:ui-monospace,monospace;font-size:.7rem;color:var(--accent);min-height:3.2em}
+  .step .body{flex:1;display:grid;place-items:center}
+  .gridT{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0}
+  .badge{display:inline-grid;place-items:center;min-width:26px;height:26px;padding:0 8px;border-radius:13px;background:var(--accent);color:#fff;font:700 .76rem ui-monospace,monospace}
+  .badge.zero{background:var(--ok)} .badge.bad{background:var(--warn)}
+  .label{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:18px 0}
+  .note b{color:var(--accent)}
+  .note.ok{border-left-color:var(--ok)} .note.ok b{color:var(--ok)}
+  .note.warn{border-left-color:var(--warn)} .note.warn b{color:var(--warn)}
+
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.9rem}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  thead th{background:var(--soft);font-size:.73rem;letter-spacing:.03em;text-transform:uppercase;color:var(--mut);font-weight:600}
+  td.m,th.m{font-family:ui-monospace,monospace;font-size:.82rem}
+  td.ok{color:var(--ok);font-weight:600} td.no{color:var(--warn);font-weight:600} td.c{text-align:center}
+
+  .tl{display:flex;align-items:stretch;gap:0;margin:18px 0;overflow-x:auto}
+  .tl .t{flex:1;min-width:120px;border:1px solid var(--line);border-right:0;padding:10px;font-size:.82rem}
+  .tl .t:last-child{border-right:1px solid var(--line)}
+  .tl .t.hi{background:#eef4fb} .tl .t.warn{background:#fbeeec}
+  .tl .t .k{font-family:ui-monospace,monospace;font-size:.7rem;color:var(--accent);display:block;margin-bottom:4px}
+  .tl .t.warn .k{color:var(--warn)}
+  .hold{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--mut);text-align:center;margin:-8px 0 6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>FBIP reuse, meet effects &amp; abort</h1>
+  <p class="sub">A reuse token is a tiny in-flight reservation. What happens to it when an effect operation captures the continuation it's sitting in — and the handler throws that continuation away?</p>
+
+  <!-- 1 -->
+  <h2><span class="n">1 &middot;</span> The token is a reservation held across a gap</h2>
+  <p>FBIP works by reserving a dying cell's shell at <code>drop_reuse</code> and re-stamping it at a later <code>alloc_at</code>. Between those two points the token is <b>in flight</b> — it owns a reserved shell that lives on no list, waiting to be revived. For pure <code>map</code>/<code>reverse</code> the gap is just the recursive call, and the <code>alloc_at</code> always runs.</p>
+  <div class="tl">
+    <div class="t hi"><span class="k">drop_reuse xs</span>reserve the Cons shell → token born</div>
+    <div class="t"><span class="k">map f xx</span>recursive call (the gap)</div>
+    <div class="t hi"><span class="k">alloc_at(token)</span>re-stamp the shell → token consumed</div>
+  </div>
+  <p class="cap">fig 1 &mdash; the token lives across the gap; in pure code the right end always fires.</p>
+
+  <!-- 2 -->
+  <h2><span class="n">2 &middot;</span> An effect op in the gap captures the pending alloc_at</h2>
+  <p>Now put an effect operation in the gap. When <code>op()</code> fires, the machine <b>reifies the continuation</b> — everything still pending, including the not-yet-run <code>alloc_at</code> — into a heap object (an <code>NCont</code>), and hands it to the handler. The in-flight token is now sitting <i>inside</i> that captured continuation.</p>
+  <div class="tl">
+    <div class="t hi"><span class="k">drop_reuse xs</span>token born, shell reserved</div>
+    <div class="t warn"><span class="k">op()</span>captures the continuation →<br><b>pending alloc_at(token)</b> is now inside the NCont</div>
+    <div class="t"><span class="k">handler decides…</span>resume or abort?</div>
+  </div>
+  <p class="cap">fig 2 &mdash; the reserved shell is trapped inside a reified continuation the program no longer controls.</p>
+
+  <!-- 3 -->
+  <h2><span class="n">3 &middot;</span> The handler's two choices — and where the shell goes</h2>
+  <div class="fork">
+    <div class="box hi">handler holds the captured continuation</div>
+    <div class="arrow">&darr;</div>
+    <div class="row">
+      <div class="box ok"><b>resume</b><small>the continuation runs; the pending <code>alloc_at</code> fires and consumes the token. Shell revived. <span class="mono">fine</span></small></div>
+      <div class="box warn"><b>abort</b><small>the continuation is thrown away; the <code>alloc_at</code> <b>never runs</b>. Nothing revives or frees the reserved shell. <span class="mono">orphaned</span></small></div>
+    </div>
+  </div>
+  <p class="cap">fig 3 &mdash; resume is safe; abort orphans the reservation.</p>
+  <div class="note warn"><b>Two things could go wrong on abort — one already fixed.</b> When the captured continuation is dropped, the runtime walks its frames (<code>continuationOwned</code>) to free what they own. (1) That walk used to hit the <code>RReuseCon</code> and <code>error</code> out → <b>interpreter crash</b>. <span class="mono">FIXED</span> — the analysis is now total over <code>RReuseCon</code> (treats its fields like a plain <code>Cons</code>). (2) The reserved shell is owned by the <i>token</i>, which is uncounted, so the walk frees the fields but not the shell → <b>leak</b>. <span class="mono">OPEN</span> — this is what we're here to design.</div>
+
+  <!-- 4 -->
+  <h2><span class="n">4 &middot;</span> Where we are now</h2>
+  <p>Two guards already ship, so the leak is the <i>only</i> residual and it's narrow:</p>
+  <div class="gridT">
+    <div class="step"><div class="line">pairing refuses to span a bare op</div><div class="body"><span class="badge zero">safe</span></div><div class="label">drop ; op() ; Cons → not paired</div></div>
+    <div class="step"><div class="line">continuation walk total over RReuseCon</div><div class="body"><span class="badge zero">no crash</span></div><div class="label">abort never errors</div></div>
+    <div class="step"><div class="line">token spans an effectful CALL, handler aborts</div><div class="body"><span class="badge bad">leak</span></div><div class="label">reserved shell orphaned</div></div>
+  </div>
+  <p class="cap">fig 4 &mdash; residual: <code>drop_reuse xs ; let y = f x ; Cons …</code> where <code>f</code> performs an op deep inside, under an aborting handler.</p>
+
+  <!-- 5 -->
+  <h2><span class="n">5 &middot;</span> The load-bearing invariant</h2>
+  <div class="note ok"><b>A reservation never crosses a handler boundary.</b> The pairing already refuses to span a <code>Handle</code> (and now an <code>ROp</code>). So a token's <code>drop_reuse</code> and its <code>alloc_at</code> always sit inside the same handler region. Consequence: <b>at any op, every in-flight reservation is trapped in the continuation being captured right now</b> — there is nowhere else for it to be. That single fact is what makes the cheap fix below correct.</div>
+
+  <!-- 6 -->
+  <h2><span class="n">6 &middot;</span> The sweet spot: be lazy, reclaim at abort</h2>
+  <p>The performance question is "does reuse survive a <b>resume</b>?" — because resume is the common case. Eager E (cash out at capture) frees the shell <i>before</i> knowing the handler will resume, so it always loses. The fix is to do <b>nothing</b> at capture and resolve at the fork the <code>NCont</code> already implements:</p>
+  <div class="fork">
+    <div class="box hi">op captures the continuation<small>do NOTHING — the reservation rides along, untouched</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="row">
+      <div class="box ok"><b>resume</b><small>prefix splices back, the pending <code>alloc_at</code> finds its shell right where it left it → <b>reuses in place</b> (same as B)</small></div>
+      <div class="box ok"><b>abort</b><small>the abort path ALREADY walks the prefix to free its owned set; also free the in-flight reuse-token shells it finds → <b>no leak</b></small></div>
+    </div>
+  </div>
+  <p class="cap">fig 6 &mdash; E+ (lazy reclaim). A reservation can only be orphaned at an abort (§5), so reclaim it there and nowhere else.</p>
+
+  <!-- 7 -->
+  <h2><span class="n">7 &middot;</span> Four directions, ranked</h2>
+  <div class="grid">
+    <div class="card rec"><span class="tag">E+ &middot; recommended</span><h3>Lazy reclaim</h3><p>Do nothing at capture. Resume reuses in place; abort frees the in-flight token shells via the walk it already does.</p><p class="mono" style="font-size:.74rem;color:var(--ok)">+ reuse survives a resume (B-level perf)<br>+ no node kind, no counted token, no C marker, no global set<br>+ one site: the abort walk<br>&minus; one targeted special-case at abort</p></div>
+    <div class="card full"><span class="tag">B &middot; the pure version</span><h3>Counted reserved cell</h3><p>The shell becomes a counted <code>NReserved</code> placeholder; the token is a counted ref; RC frees it on abort and transfers it on reuse — zero special-casing.</p><p class="mono" style="font-size:.74rem;color:var(--mut)">+ RC-uniform, fully principled<br>&minus; new node + counted token + C-heap "reserved" marker<br>&minus; most invasive</p></div>
+    <div class="card"><span class="tag">E &middot; the blunt runtime one</span><h3>Cash out at capture</h3><p>Free every reservation the instant a continuation is captured.</p><p class="mono" style="font-size:.74rem;color:var(--warn)">+ dead simple<br>&minus; loses reuse on EVERY capture, even resume</p></div>
+    <div class="card"><span class="tag">C &middot; static</span><h3>Effect-gated pairing</h3><p>Only pair when the spanned calls are provably effect-free (wok has effect rows).</p><p class="mono" style="font-size:.74rem;color:var(--mut)">+ no runtime cost<br>&minus; couples the pass to effect typing; <code>map effectfulF</code> loses reuse</p></div>
+  </div>
+  <table>
+    <thead><tr><th>property</th><th class="c">E (eager)</th><th class="c">E+ (lazy)</th><th class="c">B (counted)</th></tr></thead>
+    <tbody>
+      <tr><td>closes the leak</td><td class="c ok">yes</td><td class="c ok">yes</td><td class="c ok">yes</td></tr>
+      <tr><td>reuse survives a resume</td><td class="c no">no</td><td class="c ok">yes</td><td class="c ok">yes</td></tr>
+      <tr><td>new node kind / counted token</td><td class="c ok">no</td><td class="c ok">no</td><td class="c no">yes</td></tr>
+      <tr><td>C-heap "reserved" marker</td><td class="c ok">no</td><td class="c ok">no</td><td class="c no">yes</td></tr>
+      <tr><td>in-flight reservation set</td><td class="c">free-at-capture set</td><td class="c ok">small filter set</td><td class="c">C reserved marker</td></tr>
+      <tr><td>blast radius</td><td class="c">capture site</td><td class="c ok">abort walk</td><td class="c no">node + RC + C heap</td></tr>
+    </tbody>
+  </table>
+  <div class="note ok"><b>The recommendation:</b> <b>E+ (lazy reclaim)</b>. It matches B's performance — reuse survives a resume — at roughly E's cost: no new node kind, no counted token, no C-heap marker. It needs one tiny structure — a <code>stReserved</code> set in the <code>Store</code> (insert at <code>drop_reuse</code>, remove at <code>alloc_at</code>) — so the abort collector can tell an in-flight reservation from a spent token still lingering in an environment. The new code is that set's two hot-path updates, a collector (<code>continuationReservations</code>, a sibling of the existing <code>continuationOwned</code>), and a special-free step in the <code>NCont</code> drop. B stays on the shelf as the "everything-is-RC, zero special-cases" version if we ever want to retire that one special-case at the cost of the C-heap marker.</div>
+
+</div>
+</body>
+</html>

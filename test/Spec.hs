@@ -207,6 +207,7 @@ main = do
     , rcM3NodeTests
     , wokRcHeapTests
     , wokRcReuseTests
+    , wokRcReservedTests
     , wokRcReuseIrTests
     , rcReusePairingTests
     , rcMachineTests
@@ -319,6 +320,8 @@ main = do
     --   Naive dedup of the owned set collapses [A,A] to [A], freeing rc 2->1
     --   and leaving the cell LIVE (a leak). Per-entry free is required.
     , rcM3PropertyTests
+    , rcReclaimTests
+    , rcEffectSafetyTests
     , rcM2bRejectTests
     , rcM3StoreTests rcM3Files
     , rcM3RejectTests
@@ -6759,6 +6762,288 @@ rcM3NodeTests = testGroup "rc m3 node"
   ]
 
 -- ---------------------------------------------------------------------------
+-- FBIP effect-safety (E+ lazy reclaim) Task 2: the abort-time reclaim
+-- ('continuationReservations' + 'freeReservation' + the 'NCont'-drop wiring).
+--
+-- When an 'NCont' cell is dropped (a handler discards a captured continuation
+-- -- an ABORT, a mid-run control-flow event, NOT program shutdown), the in-flight
+-- FBIP reuse reservations trapped in its prefix would otherwise leak: their paired
+-- 'allocAt' never runs. 'continuationReservations' collects those still-reserved
+-- shells (filtered by 'stReserved', so a SPENT token lingering in an env is
+-- excluded); 'freeReservation' frees one; 'dropAddr' folds the free over the
+-- collected set when it frees an 'NCont' (spec §3.2-§3.4).
+--
+-- These low-level Store tests pin the collector and the reclaim wiring in
+-- isolation, mirroring the off-books reservation 'dropReuse' performs (remove the
+-- donor from 'stCells', add its address to 'stReserved') without running the full
+-- pairing.
+rcReclaimTests :: TestTree
+rcReclaimTests = testGroup "rc-reclaim"
+  [ testCase "collector returns the in-flight addr, excludes spent, dedups" $ do
+      -- A KLetRC prefix whose scope env binds two binders to reuse tokens: one
+      -- whose shell is still reserved (in-flight) and one whose shell is no longer
+      -- reserved (spent). A THIRD binding aliases the in-flight token under a
+      -- different Unique so the collector must dedup it to a single address.
+      let inflight = St.HAddr 7   -- in stReserved
+          spent    = St.HAddr 8   -- NOT in stReserved (consumed)
+          slotIn   = St.ReuseSlot inflight 2 True
+          slotSp   = St.ReuseSlot spent 2 True
+          env      = Map.fromList
+            [ (Unique 9001, St.RVReuse (Just slotIn))
+            , (Unique 9002, St.RVReuse (Just slotSp))
+            , (Unique 9003, St.RVReuse (Just slotIn))  -- alias of inflight (dedup)
+            ]
+          sc       = St.RCScope env Map.empty
+          rBndr    = Binder (Name (T.pack "r") (Unique 9000)) Unrestricted m2bBoxTy
+          prefix   = St.KLetRC rBndr (Ret (ALit LUnit)) sc St.KDoneRC
+          reserved = Set.fromList [inflight]
+      St.continuationReservations prefix reserved @?= [inflight]
+  , testCase "dropping an NCont reclaims its prefix's in-flight reservation" $ do
+      -- Build an NCont whose prefix holds an in-flight reservation. The donor shell
+      -- is reserved off-books through the REAL 'dropReuse' path (rc==1 unique donor
+      -- -> removed from stCells, added to stReserved, NOT recordFree'd) so the
+      -- in-flight state is exactly the production one. Dropping the NCont must
+      -- reclaim that reserved shell: it ends freed (a use-after-free deref) and out
+      -- of stReserved, and stLive returns to the post-reserve baseline minus the
+      -- NCont shell.
+      let s0          = St.emptyStore
+          (donor, s1) = St.allocPure (St.NCon (T.pack "Shell") [St.RVLit (LInt 1)]) s0
+      -- Reserve the donor via dropReuse (the real off-books reservation path).
+      reserveRes <- runExceptT (St.dropReuse donor s1)
+      (tok, sR) <- case reserveRes of
+        Left e  -> assertFailure ("dropReuse failed: " <> show e) >> error "unreachable"
+        Right r -> pure r
+      slot <- case tok of
+        St.RVReuse (Just sl) -> pure sl
+        other -> assertFailure ("expected a reuse token, got " <> show other) >> error "unreachable"
+      -- The reserved shell is in flight (in stReserved, off the live cell map).
+      St.stReserved sR @?= Set.singleton donor
+      let baseline    = St.stLive (St.stStats sR)   -- the reserved shell still counts as live
+          env         = Map.fromList [(Unique 9101, St.RVReuse (Just slot))]
+          sc          = St.RCScope env Map.empty
+          rBndr       = Binder (Name (T.pack "r") (Unique 9100)) Unrestricted m2bBoxTy
+          prefix      = St.KLetRC rBndr (Ret (ALit LUnit)) sc St.KDoneRC
+          cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
+          (contAddr, s2) = St.allocPure cont sR
+      -- The collector sees the in-flight reservation.
+      St.continuationReservations prefix (St.stReserved s2) @?= [donor]
+      res <- runExceptT (St.dropAddr contAddr s2)
+      case res of
+        Left e   -> assertFailure ("NCont drop failed: " <> show e)
+        Right s3 -> do
+          -- The reserved shell is reclaimed: gone from stReserved and freed (a
+          -- deref now fails as use-after-free); stLive is back to the post-reserve
+          -- baseline (the reserved shell + the NCont shell are both freed -> the
+          -- baseline minus the NCont cell we added).
+          Set.member donor (St.stReserved s3) @?= False
+          case St.derefPure donor s3 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "reserved shell was not reclaimed (still live)"
+          -- Post-reserve baseline already counts the reserved shell. We added the
+          -- NCont (baseline + 1); dropping it frees the NCont shell AND reclaims the
+          -- reserved shell (two frees) -> baseline - 1.
+          St.stLive (St.stStats s3) @?= baseline - 1
+  , testCase "dropping an NCont with only a spent token reclaims nothing extra" $ do
+      -- The same shape, but the donor is NOT in stReserved (its alloc_at already
+      -- ran: spent). The collector must skip it, so the NCont drop frees only its
+      -- own shell and never touches the spent token's (now revived/freed) cell.
+      let s0          = St.emptyStore
+          (donor, s1) = St.allocPure (St.NCon (T.pack "Shell") [St.RVLit (LInt 1)]) s0
+          -- Spent: the token's value lingers in the env, but the address is NOT in
+          -- stReserved. The cell is left LIVE (revived by the consume) to model the
+          -- post-alloc_at state; freeing it would corrupt the heap.
+          baseline    = St.stLive (St.stStats s1)
+          slot        = St.ReuseSlot donor 1 True
+          env         = Map.fromList [(Unique 9201, St.RVReuse (Just slot))]
+          sc          = St.RCScope env Map.empty
+          rBndr       = Binder (Name (T.pack "r") (Unique 9200)) Unrestricted m2bBoxTy
+          prefix      = St.KLetRC rBndr (Ret (ALit LUnit)) sc St.KDoneRC
+          cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
+          (contAddr, s2) = St.allocPure cont s1   -- stReserved is empty here
+      St.continuationReservations prefix (St.stReserved s2) @?= []
+      res <- runExceptT (St.dropAddr contAddr s2)
+      case res of
+        Left e   -> assertFailure ("NCont drop failed: " <> show e)
+        Right s3 -> do
+          -- Only the NCont shell was freed; the spent token's cell is untouched.
+          St.stLive (St.stStats s3) @?= baseline  -- the live donor cell remains
+          case St.derefPure donor s3 of
+            Left e  -> assertFailure ("spent token's cell was wrongly freed: " <> show e)
+            Right _ -> pure ()
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FBIP effect-safety (E+ lazy reclaim) Task 3: the END-TO-END differential
+-- oracle. The Task-2 reclaim ('rcReclaimTests' above) is pinned at the Store
+-- level on hand-built 'NCont' prefixes; THIS group proves the same mechanism on
+-- real '.wok' programs run through the production pipeline (elaborate -> prune ->
+-- 'reusePairing . insertRC' -> run) on BOTH backends.
+--
+-- THE SHAPE (spec §7, the de-risk). An effectful map under a handler: a separate
+-- effectful function 'f' performs an op, and 'mapF f xs' rebuilds a same-shape
+-- 'Cons' over the unique scrutinee spine, so the 'Cons x xx' arm lowers to
+--
+--     let _tok = __rc_drop_reuse(xs)   -- a reuse token is minted on the donor
+--     let t.2  = f(e, x)               -- an EFFECTFUL RApp ('e.op') in between
+--     let t.4  = Cons@_tok(t.2, t.3)   -- the alloc_at consuming the token
+--
+-- The token spans the effectful call: 'ReusePairing.findTarget' rides PAST an
+-- 'RApp' (only 'ROp'/'RLam'/'Handle' stop it), so the reuse pairing fires even
+-- though 'f' performs an op internally. This is exactly the residual E+ closes:
+-- the reservation is in flight WHILE the op's continuation is captured.
+--
+--   * 'fbip-effect-abort.wok': the op-arm ABORTS (returns 'None', never resumes),
+--     so the captured continuation -- holding the pending 'Cons@_tok' rebuild,
+--     i.e. the in-flight reservation -- is DROPPED. Before Task 2 the reserved
+--     shell was orphaned (a leak: stLive > baseline; the C arena warned "live
+--     cells"). The abort reclaim frees it, so the heap returns to baseline. This
+--     run goes through the C backend, exercising 'freeReservation's 'CAddr' arm
+--     (the reserved 'Cons' shell is an encodable NCon that landed on the C heap).
+--   * 'fbip-effect-resume.wok': the op-arm RESUMES. The reservation rides along in
+--     'stReserved' untouched; the spliced 'alloc_at' reuses the shell in place.
+--     So reuse SURVIVES the resume: the fused run's allocs collapse by exactly the
+--     output spine length vs the non-fused ('insertRC'-only) run.
+rcEffectSafetyTests :: TestTree
+rcEffectSafetyTests = testGroup "rc-effect-safety"
+  [ -- DE-RISK (criterion 1, pinned in code): the effectful map under a handler
+    -- reaches the pairing AND emits the effectful op alongside it. Asserted on the
+    -- abort program's fused IR: all three primitives -- a '__rc_drop_reuse' donor,
+    -- the '@_tok' reuse-con, and the effectful op (Exn.throw) -- are emitted in
+    -- 'mapF's fused IR (presence, not order). If this ever stops firing, the
+    -- abort/resume runs below would no longer exercise the reservation path and
+    -- this guard fails loudly.
+    testCase "de-risk: the effectful map under a handler PAIRS (op emitted alongside the reuse token)" $ do
+      cm <- rcEffectSafetyPrepare "test/rc-c-backend/fbip-effect-abort.wok"
+      let dumped = T.unpack (Anf.prettyModule (reusePairing (Perceus.insertRC cm)))
+      assertBool "a reuse token is minted on the map spine donor (__rc_drop_reuse)"
+        ("__rc_drop_reuse(" `Data.List.isInfixOf` dumped)
+      assertBool "the rebuilt Cons consumes the token (@_tok), i.e. the pairing fired"
+        ("@_tok" `Data.List.isInfixOf` dumped)
+      -- The effectful op call ('e.Exn.throw') sits in the same module: the token
+      -- genuinely spans an effectful RApp (not a pure map).
+      assertBool "the map's element function performs an effect op (Exn.throw)"
+        ("Exn.throw" `Data.List.isInfixOf` dumped)
+      -- Resume program too: same pairing fires across its effectful op.
+      cmR <- rcEffectSafetyPrepare "test/rc-c-backend/fbip-effect-resume.wok"
+      let dumpedR = T.unpack (Anf.prettyModule (reusePairing (Perceus.insertRC cmR)))
+      assertBool "resume program also pairs (token spans Reader.ask)"
+        ("@_tok" `Data.List.isInfixOf` dumpedR && "Reader.ask" `Data.List.isInfixOf` dumpedR)
+
+  , -- ABORT = NO LEAK (criterion 2). The effectful map under an ABORTING handler.
+    -- Run on BOTH backends; assert no crash, the correct value, abstract == C, the
+    -- C heap actually exercised (so 'freeReservation's CAddr arm runs on the
+    -- reclaimed shell), and -- the regression -- the heap returns to baseline (no
+    -- leaked reservation). This FAILS before Task 2 (frees one short of allocs,
+    -- stLive == baseline + 1) and passes now.
+    testCase "abort: effectful map under an aborting handler does not leak (abstract == C)" $ do
+      (absR, cR, cAllocs) <- runBothBackendsUnchecked "test/rc-c-backend/fbip-effect-abort.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "output is None (the abort default)" (T.pack "None") (RCM.rcOutput c)
+          assertEqual "abstract output == C output" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "abstract allocs == C allocs"
+            (St.stAllocs (RCM.rcStats a)) (St.stAllocs (RCM.rcStats c))
+          assertEqual "abstract frees == C frees"
+            (St.stFrees (RCM.rcStats a)) (St.stFrees (RCM.rcStats c))
+          assertEqual "abstract peak == C peak"
+            (St.stPeak (RCM.rcStats a)) (St.stPeak (RCM.rcStats c))
+          -- The headline: the reserved shell trapped in the dropped continuation is
+          -- reclaimed, so frees == allocs and stLive returns to baseline. Before
+          -- Task 2 this was a leak (frees == allocs - 1).
+          assertEqual "no leak (C): stLive returns to baseline"
+            (RCM.rcBaseline c) (St.stLive (RCM.rcStats c))
+          assertEqual "no leak (C): allocs - frees == baseline"
+            (RCM.rcBaseline c) (St.stAllocs (RCM.rcStats c) - St.stFrees (RCM.rcStats c))
+          -- The reclaimed shell is a 'Cons' (an encodable NCon) that landed on the
+          -- C heap, so the abort reclaim genuinely runs 'freeReservation's CAddr arm
+          -- ('wok_free'). Read the C heap's OWN counter to prove the C path fired
+          -- (not an all-abstract fallback that would never reach the CAddr arm).
+          assertBool "C heap genuinely exercised (the reclaimed shell is a CAddr)"
+            (cAllocs > 0)
+        (Left e, _) -> assertFailure ("abstract backend FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C backend FAILED: " <> show e)
+
+  , -- RESUME = REUSE SURVIVES (criterion 3). The same effectful map under a
+    -- RESUMING handler. The reuse pairing must STILL fire across the resume: the
+    -- fused ('reusePairing . insertRC') run allocates strictly fewer cells than the
+    -- non-fused ('insertRC' only) run -- by exactly the output spine length -- and
+    -- both produce the correct output. Plus abstract == C on the fused run.
+    testCase "resume: reuse survives the resume (fused allocs drop by the spine length)" $ do
+      cm <- rcEffectSafetyPrepare "test/rc-c-backend/fbip-effect-resume.wok"
+      nf <- RCM.runModuleRCUnchecked (Perceus.insertRC cm) >>= \case
+        Left e  -> assertFailure ("non-fused run FAILED: " <> show e) >> error "unreachable"
+        Right r -> pure r
+      fu <- RCM.runModuleRCUnchecked (reusePairing (Perceus.insertRC cm)) >>= \case
+        Left e  -> assertFailure ("fused run FAILED: " <> show e) >> error "unreachable"
+        Right r -> pure r
+      -- reader 10 over [1,2,3] increments each element by the asked constant (10).
+      assertEqual "output is [11, 12, 13]" (T.pack "[11, 12, 13]") (RCM.rcOutput fu)
+      assertEqual "fused output == non-fused output"
+        (RCM.rcOutput nf) (RCM.rcOutput fu)
+      -- The FBIP win survives the resume: the fused run reuses the 3-cell output
+      -- spine in place, so it allocates exactly 3 fewer cells than the non-fused
+      -- run (which builds it fresh). If E+ broke reuse across a resume this would
+      -- collapse to zero saving.
+      assertBool "FBIP win: fused allocs strictly below non-fused"
+        (St.stAllocs (RCM.rcStats fu) < St.stAllocs (RCM.rcStats nf))
+      assertEqual "allocs reduced by exactly the output spine length (3)"
+        3 (St.stAllocs (RCM.rcStats nf) - St.stAllocs (RCM.rcStats fu))
+      -- The fused run is heap-balanced (no leak from the spliced-in reservation).
+      assertEqual "fused run returns to baseline (no leak through the resume)"
+        (RCM.rcBaseline fu) (St.stLive (RCM.rcStats fu))
+      -- abstract == C on the fused run.
+      (absR, cR, cAllocs) <- runBothBackendsUnchecked "test/rc-c-backend/fbip-effect-resume.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == C output" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "abstract allocs == C allocs"
+            (St.stAllocs (RCM.rcStats a)) (St.stAllocs (RCM.rcStats c))
+          assertEqual "abstract frees == C frees"
+            (St.stFrees (RCM.rcStats a)) (St.stFrees (RCM.rcStats c))
+          assertEqual "no leak (C): stLive returns to baseline"
+            (RCM.rcBaseline c) (St.stLive (RCM.rcStats c))
+          assertBool "C heap genuinely exercised" (cAllocs > 0)
+        (Left e, _) -> assertFailure ("abstract backend FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C backend FAILED: " <> show e)
+  ]
+
+-- | Load + elaborate + prune an effect-safety '.wok' program to its pruned
+-- 'CoreModule', WITHOUT the 'firstOrderNoHandlerViolations' guard (these programs
+-- DELIBERATELY use a handler, so the guard would reject them). The caller applies
+-- 'insertRC'/'reusePairing' and runs through the UNCHECKED runner. Mirrors
+-- 'rcFbipPrepareRaw' but admits handlers.
+rcEffectSafetyPrepare :: FilePath -> IO Anf.CoreModule
+rcEffectSafetyPrepare path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure ("loader: " <> show lerr) >> error "unreachable"
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s   -> assertFailure ("elaborate: " <> s) >> error "unreachable"
+        Right cm -> pure (pruneToReachable cm)
+
+-- | Run an effect-safety program through BOTH backends via the UNCHECKED runner
+-- (so the handler is admitted), applying the production fused pipeline
+-- ('reusePairing . insertRC'). Mirrors 'withBothBackends' but bypasses the
+-- handler guard and returns the two 'RCRun's plus the C heap's OWN alloc counter
+-- (read before the heap is freed) so a caller can prove the C path fired.
+runBothBackendsUnchecked
+  :: FilePath
+  -> IO ( Either IV.RuntimeError RCM.RCRun
+        , Either IV.RuntimeError RCM.RCRun
+        , Word64 )
+runBothBackendsUnchecked path = do
+  cm <- rcEffectSafetyPrepare path
+  let fused = reusePairing (Perceus.insertRC cm)
+  absR <- RCM.runModuleRCUncheckedWith St.AbstractHeap fused
+  hp   <- Heap.wokHeapNew
+  (cR, cAllocs) <- (do c <- RCM.runModuleRCUncheckedWith (St.CHeap hp) fused
+                       a <- Heap.wokStatAllocs hp
+                       pure (c, a))
+                   `Control.Exception.finally` Heap.wokHeapFree hp
+  pure (absR, cR, cAllocs)
+
+-- ---------------------------------------------------------------------------
 -- M3-b (Task 3): the stored-continuation differential oracle.
 --
 -- Each 'test/rc-m3/*.wok' program routes a captured continuation THROUGH a
@@ -7676,6 +7961,87 @@ wokRcReuseTests = testGroup "rc-reuse"
   , testCase "valueChildren of a reuse token is empty (inert to dup/drop)" $ do
       St.valueChildren (St.RVReuse Nothing) @?= []
       St.valueChildren (St.RVReuse (Just (St.ReuseSlot (St.HAddr 7) 2 True))) @?= []
+  ]
+
+-- | The in-flight reservation set ('stReserved', effect-safety Task 1). A
+-- 'dropReuse' that reserves a shell inserts its 'rsAddr' into 'stReserved'; an
+-- 'allocAt' that consumes a 'Just' token (on EITHER the reuse re-stamp or the
+-- not-eligible free+fresh path) removes it. So a complete reuse pair nets back to
+-- the prior set, while a reservation whose 'allocAt' has not run lingers in the
+-- set --- exactly the addresses the later abort-reclaim collector consults.
+wokRcReservedTests :: TestTree
+wokRcReservedTests = testGroup "rc-reserved"
+  [ testCase "dropReuse reserves a unique shell -> rsAddr in stReserved" $ do
+      -- A unique 'Cons 1 Nil' (the Nil tail is an inline immediate, so the Cons
+      -- is the only counted cell). dropReuse reserves its shell; its address is
+      -- now tracked as in-flight.
+      r <- runExceptT $ do
+             (nil, s1)  <- St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+             (cons, s2) <- St.alloc
+                             (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 1), St.RVBox nil]) s1
+             (tok, s3)  <- St.dropReuse cons s2
+             pure (cons, tok, s3)
+      case r of
+        Left e -> assertFailure ("dropReuse failed: " <> show e)
+        Right (cons, tok, s3) -> do
+          case tok of
+            St.RVReuse (Just (St.ReuseSlot a _ _)) -> a @?= cons
+            other -> assertFailure ("expected a Just reuse token, got " <> show other)
+          Set.member cons (St.stReserved s3) @? "the reserved shell must be in stReserved"
+  , testCase "allocAt reuse releases the reservation -> stReserved nets empty after the pair" $ do
+      -- The reuse re-stamp path: dropReuse inserts, allocAt (same-arity) consumes
+      -- and removes. The set returns to its prior (empty) value.
+      r <- runExceptT $ do
+             (nil, s1)  <- St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+             (cons, s2) <- St.alloc
+                             (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 1), St.RVBox nil]) s1
+             let newNode = St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 2), St.RVBox nil]
+                 reservedBefore = St.stReserved s2
+             (tok, s3)  <- St.dropReuse cons s2
+             (a, s4)    <- St.allocAt tok newNode s3
+             pure (cons, a, reservedBefore, s3, s4)
+      case r of
+        Left e -> assertFailure ("reuse pair failed: " <> show e)
+        Right (cons, a, reservedBefore, s3, s4) -> do
+          a @?= cons                                           -- same shell revived
+          Set.member cons (St.stReserved s3) @? "reserved while in flight"
+          Set.notMember cons (St.stReserved s4) @? "released after allocAt reuse"
+          St.stReserved s4 @?= reservedBefore                  -- nets back to prior
+  , testCase "allocAt not-eligible (arity mismatch) releases the reservation" $ do
+      -- The not-eligible free+fresh path also consumes the token, so its address
+      -- is removed from stReserved even though the shell is freed (not revived).
+      r <- runExceptT $ do
+             (cons, s1) <- St.alloc
+                             (St.NCon (T.pack "Cons")
+                                [St.RVLit (Anf.LInt 1), St.RVLit (Anf.LInt 2)]) St.emptyStore
+             let newNode = St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 9)]  -- arity 1 != donor 2
+                 reservedBefore = St.stReserved s1
+             (tok, s2)  <- St.dropReuse cons s1
+             (a, s3)    <- St.allocAt tok newNode s2
+             pure (cons, a, reservedBefore, s2, s3)
+      case r of
+        Left e -> assertFailure ("not-eligible fallback failed: " <> show e)
+        Right (cons, a, reservedBefore, s2, s3) -> do
+          (a /= cons) @? "fresh alloc must not revive the freed donor"
+          Set.member cons (St.stReserved s2) @? "reserved while in flight"
+          Set.notMember cons (St.stReserved s3) @? "released after not-eligible allocAt"
+          St.stReserved s3 @?= reservedBefore
+  , testCase "shared cell (rc>1) dropReuse does NOT insert (RVReuse Nothing)" $ do
+      -- A cons shared at rc 2: dropReuse decrements in place and returns a NULL
+      -- token; nothing is reserved, so stReserved is untouched.
+      r <- runExceptT $ do
+             (nil, s1)  <- St.alloc (St.NCon (T.pack "Nil") []) St.emptyStore
+             (cons, s2) <- St.alloc
+                             (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt 1), St.RVBox nil]) s1
+             s3 <- St.incref cons s2          -- share it: rc 2
+             let reservedBefore = St.stReserved s3
+             (tok, s4)  <- St.dropReuse cons s3
+             pure (tok, reservedBefore, s4)
+      case r of
+        Left e -> assertFailure ("shared dropReuse failed: " <> show e)
+        Right (tok, reservedBefore, s4) -> do
+          tok @?= St.RVReuse Nothing
+          St.stReserved s4 @?= reservedBefore                  -- untouched
   ]
 
 -- | The IR-level half of FBIP reuse (Task 3): the two forms a later post-pass

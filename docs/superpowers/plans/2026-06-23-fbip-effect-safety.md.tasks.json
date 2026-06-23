@@ -1,0 +1,33 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-23-fbip-effect-safety.md",
+  "tasks": [
+    {
+      "id": 12,
+      "subject": "Task 1: stReserved set + hot-path updates",
+      "status": "completed",
+      "description": "Add `stReserved :: Set Addr` to Store + emptyStore; insert in dropReuse reserve, delete in allocAt (both consume paths); rc-reserved unit tests (spec §3.1). Files: src/Wok/Interp/RC/Value.hs, test/Spec.hs.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"rc-reserved\\\"'\", \"acceptanceCriteria\": [\"stReserved field + emptyStore\", \"dropReuse inserts\", \"allocAt removes both paths\", \"reuse net-unchanged\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "Task 2: continuationReservations + freeReservation + abort reclaim",
+      "status": "completed",
+      "blockedBy": [12],
+      "description": "continuationReservations (sibling of continuationOwned), freeReservation special-free, reclaimIfNCont wired into IO dropAddr HAddr branch; rc-reclaim collector + hand-built NCont-drop tests (spec §3.2-§3.4). Files: src/Wok/Interp/RC/Value.hs, test/Spec.hs.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"rc-reclaim\\\"'\", \"acceptanceCriteria\": [\"collector in/excludes/dedups\", \"freeReservation HAddr/CAddr\", \"NCont drop reclaims once\", \"hand-built no-leak\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "Task 3: E2E effect-safety tests (abort no-leak; resume reuse-survives)",
+      "status": "completed",
+      "blockedBy": [13],
+      "description": "De-risk effectful-map-under-handler reaches RC + pairs; abort test (no leak, stLive baseline, abstract==C); resume test (reuse survives, abstract==C); hand-built fallback if not expressible (spec §7). Files: test/Spec.hs, test/rc-c-backend/fbip-effect-*.wok.\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\", \"test/rc-c-backend/fbip-effect-abort.wok\", \"test/rc-c-backend/fbip-effect-resume.wok\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"rc-effect-safety\\\"'\", \"acceptanceCriteria\": [\"de-risk pairs+runs\", \"abort no-leak abstract==C\", \"resume reuse-survives abstract==C\", \"fallback documented\"], \"modelTier\": \"complex\"}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "Task 4: Docs — mark residual closed",
+      "status": "completed",
+      "blockedBy": [14],
+      "description": "Mark FBIP effectful-abort residual CLOSED in the S2 spec + KB; effect-safety spec Status IMPLEMENTED (spec §6). Files: the two specs + runtime-knowledge-base.md.\n\n```json:metadata\n{\"files\": [\"docs/superpowers/specs/2026-06-23-fbip-reuse-design.md\", \"docs/superpowers/runtime-knowledge-base.md\", \"docs/superpowers/specs/2026-06-23-fbip-effect-safety-design.md\"], \"verifyCommand\": \"cabal test wok-tests\", \"acceptanceCriteria\": [\"S2 spec + KB residual closed\", \"effect-safety spec IMPLEMENTED\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-23T00:00:00Z"
+}

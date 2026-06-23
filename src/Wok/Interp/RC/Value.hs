@@ -19,6 +19,8 @@ module Wok.Interp.RC.Value
   , RCKont (..)
   , kontDepth
   , continuationOwned
+  , continuationReservations
+  , freeReservation
   , moveOutCont
   , moveOutContPure
   , spliceKont
@@ -415,6 +417,103 @@ continuationOwned = dedup . go
           | otherwise                = a : goD (Set.insert (u, a) seen) rest
         goD seen ((Nothing, a) : rest) = a : goD seen rest
 
+-- | The IN-FLIGHT FBIP RESERVATIONS trapped in a captured continuation prefix
+-- (FBIP effect-safety, spec §3.2). The sibling of 'continuationOwned': it walks
+-- the SAME frames, but instead of resolving owned bindings it scans every runtime
+-- value the frames carry for a live reuse token whose reserved shell has not yet
+-- been consumed.
+--
+-- For each frame, every value in scope is examined: an 'RVReuse (Just (ReuseSlot
+-- a _ _))' contributes @a@ IFF @a@ is still in the supplied 'stReserved' set. That
+-- membership test is the IN-FLIGHT FILTER (spec §3.1, §4): a SPENT token (its
+-- 'allocAt' already ran, so 'allocAt' deleted @a@ from 'stReserved') still has its
+-- 'RVReuse (Just …)' value lingering in the env, but its shell is now LIVE
+-- (revived) or already freed --- freeing it would corrupt the heap. The filter
+-- excludes exactly those.
+--
+-- DEDUP. A token live across several frames (e.g. captured in several scopes)
+-- yields its address from each; the result is deduped by address so the shell is
+-- reclaimed exactly once.
+--
+-- WHERE THE VALUES LIVE. 'KLetRC' and 'KHandleRC' carry an 'RCScope' (the values
+-- are 'rscEnv'); 'KAppRC' carries a list of over-application argument values. A
+-- reuse token reaches a captured prefix as one of those values. 'KDropCellRC'
+-- carries only a bare 'Addr' (a closure cell to drop), never a value, so it holds
+-- no token. 'KDoneRC' is the terminator.
+--
+-- This is a VALUE-DIRECTED scan --- simpler than 'continuationOwned's body
+-- analysis (no 'nonHeadOccs'/'dropTargets'/'freeVarsExpr'), because a reservation
+-- is identified by its value shape, not by a Perceus move/drop position. It runs
+-- ONLY on abort (an 'NCont' drop).
+continuationReservations :: RCKont -> Set.Set Addr -> [Addr]
+continuationReservations k0 reserved = dedup (go k0)
+  where
+    go :: RCKont -> [Addr]
+    go KDoneRC               = []
+    go (KLetRC _ _ sc k)     = fromValues (Map.elems (rscEnv sc)) ++ go k
+    go (KAppRC vs k)         = fromValues vs ++ go k
+    -- PARAM-ONLY, mirroring 'continuationOwned's KHandleRC arm: a nested handler
+    -- frame in the captured prefix OWNS only its parameter slot; the rest of its
+    -- 'hsc' is the captured ENCLOSING scope (a DIFFERENT continuation's bindings).
+    -- Scanning the whole 'rscEnv' here could surface an enclosing/foreign
+    -- reservation. An in-flight reservation of THIS continuation is always reached
+    -- via its own 'KLetRC' frame (where the donor binding lives), so restricting to
+    -- the 'hParam' binder loses nothing AND avoids reclaiming a foreign reservation
+    -- (robust against a future ROp-relaxation that lets reservations escape an arm).
+    go (KHandleRC h _ sc k)  =
+      [ a
+      | Just pb <- [hParam h]
+      , Just v  <- [Map.lookup (binderUnique pb) (rscEnv sc)]
+      , RVReuse (Just (ReuseSlot a _ _)) <- [v]
+      , Set.member a reserved ]
+      ++ go k
+    go (KDropCellRC _ k)     = go k
+    fromValues vs = [ a | RVReuse (Just (ReuseSlot a _ _)) <- vs, Set.member a reserved ]
+    dedup = goD Set.empty
+      where
+        goD _ [] = []
+        goD seen (a : rest)
+          | Set.member a seen = goD seen rest
+          | otherwise         = a : goD (Set.insert a seen) rest
+
+-- | The SPECIAL-FREE for a reclaimed FBIP reservation (FBIP effect-safety, spec
+-- §3.3). Called on each address 'continuationReservations' returns when an
+-- 'NCont' is dropped (abort). A reserved shell is OFF-BOOKS --- 'dropReuse' removed
+-- it from the live cell map without a 'recordFree' and without returning it to the
+-- runtime --- so the generic 'dropAddr' cascade cannot find it; this is its sole
+-- free path on the abort branch.
+--
+--   * 'HAddr i': the shell is absent from 'stCells' (reserved off-books). Mark it
+--     dead ('stDead'), 'recordFree' it (it was still counted in 'stLive' while
+--     reserved), and drop it from 'stReserved'. DEFENSIVE: if @i@ is ALREADY in
+--     'stDead' this is an internal double-reclaim (a reservation freed twice) ---
+--     fail loudly rather than silently corrupt the accounting.
+--   * 'CAddr p': the C shell's rc is 0 (decremented to 0 by 'dropReuse' but not
+--     returned). 'wok_free' it (NO child cascade --- its children were released at
+--     'dropReuse'), 'recordFree', drop from 'stReserved'.
+--   * 'Inline': an immediate is never reserved (uncounted, never a donor), so this
+--     is a no-op for totality.
+freeReservation :: Addr -> Store -> RC Store
+freeReservation (Inline _) s = pure s  -- immediate: never reserved (uncounted donor), no-op for totality
+freeReservation a s
+  -- UNIFORM double-reclaim guard (applies to BOTH HAddr and CAddr arms): a legit
+  -- reclaim always has @a ∈ stReserved@ ('continuationReservations' only yields
+  -- in-stReserved addrs), so an address ABSENT from 'stReserved' has already been
+  -- consumed/reclaimed --- fail loudly rather than silently corrupt the accounting.
+  -- (HAddr alone previously caught this via 'stDead'; CAddr had no analogue.)
+  | not (Set.member a (stReserved s)) =
+      liftRC (Left (PrimError (Tx.pack
+        ("internal: double-reclaim of reservation addr " <> show a
+          <> " (not in stReserved)"))))
+freeReservation a@(HAddr i) s =
+  pure s { stDead     = IS.insert i (stDead s)
+         , stStats    = recordFree (stStats s)
+         , stReserved = Set.delete a (stReserved s) }
+freeReservation a@(CAddr p) s = do
+  hp <- heapPtr s
+  liftIO (H.wokFree hp p)
+  pure (bumpFreeStats s) { stReserved = Set.delete a (stReserved s) }
+
 -- | Resume move-out (M2b-1 Task 5; spec §4.3 RESUME, §4.5.0): free the 'NCont'
 -- shell WITHOUT cascading its children, and return the captured frame prefix +
 -- handler-reinstall info. One-shot guarantees @rc == 1@ (the single owner is
@@ -611,6 +710,14 @@ data Store = Store
     -- ^ tag-id -> per-slot kind descriptor, recorded by 'allocNCon' on first
     -- intern. 'readCCell' and the 'CAddr' arm of 'dropAddr' consult this to
     -- decode raw slot words back into 'RCValue's without a per-slot tag word.
+  , stReserved   :: Set.Set Addr
+    -- ^ addresses currently reserved by a live (in-flight) FBIP reuse token: a
+    -- shell whose 'dropReuse' has run but whose paired 'allocAt' has not yet
+    -- consumed it (FBIP effect-safety, spec §3.1). 'dropReuse' inserts the
+    -- reserved 'rsAddr'; 'allocAt' removes it on every consume path. A spent
+    -- token's value may linger in an env, but its address is no longer here ---
+    -- which is what keeps the abort-reclaim collector from freeing a revived or
+    -- already-freed cell.
   }
 
 -- | Which heap an 'NCon' is allocated into. 'AbstractHeap' is the default and is
@@ -663,6 +770,7 @@ emptyStore = Store
   , stTagFwd     = Map.empty
   , stTagRev     = IM.empty
   , stConDesc    = IM.empty
+  , stReserved   = Set.empty
   }
 
 -- | Intern a constructor name to its stable tag-id, allocating a fresh id on
@@ -1107,10 +1215,31 @@ dropAddr a0 s0 = go [a0] s0
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats s)
     go (a@(HAddr _) : rest) s = do
-      (mkids, s') <- liftRC (dropAddrStepPure a s)
+      -- ABORT RECLAIM (FBIP effect-safety, spec §3.4). If @a@ is an 'NCont' about
+      -- to be freed (rc reaching 0 -- a handler discarding a captured continuation),
+      -- first reclaim the in-flight FBIP reservations trapped in its prefix. Their
+      -- paired 'allocAt' never runs (the continuation is gone), so the abort is
+      -- their only free path. This precedes the cell's own free + owned-set cascade
+      -- ('dropAddrStepPure' below); the reserved shells are DISJOINT from the owned
+      -- set (off-books vs. live captured bindings), so the two frees never conflict.
+      sReclaimed <- reclaimIfNCont a s
+      (mkids, s') <- liftRC (dropAddrStepPure a sReclaimed)
       case mkids of
         Nothing   -> go rest s'         -- just decremented (rc > 1) or static no-op
         Just kids -> go (kids ++ rest) s'
+
+    -- Peek @a@: if it is an 'NCont' cell at rc <= 1 (about to be freed) and not
+    -- already dead, fold 'freeReservation' over the in-flight reservations its
+    -- prefix carries. Otherwise the store is unchanged. The double-deref (peek here,
+    -- then 'dropAddrStepPure' derefs again) is acceptable: abort is the rare path.
+    reclaimIfNCont :: Addr -> Store -> RC Store
+    reclaimIfNCont (HAddr i) s =
+      case IM.lookup i (stCells s) of
+        Just (Cell rc (NCont prefix _))
+          | rc <= 1 && not (IS.member i (stDead s)) ->
+              foldM (flip freeReservation) s (continuationReservations prefix (stReserved s))
+        _ -> pure s
+    reclaimIfNCont _ s = pure s
 
 -- | The C-heap free-stats bump, mirroring the abstract path's free accounting in
 -- 'dropAddrStepPure' (frees + 1, live - 1). The C runtime keeps its own
@@ -1239,9 +1368,11 @@ dropReuse (CAddr p)  s = do
     else do
       arity <- liftIO (H.wokArity p)
       kids  <- countedRefs <$> liftIO (readCConValues p s)     -- decode children BEFORE reserving
-      -- reserve the shell: do NOT wokFree, do NOT bumpFreeStats.
+      -- reserve the shell: do NOT wokFree, do NOT bumpFreeStats. Track it as
+      -- in-flight so the abort-reclaim collector can find it (spec §3.1).
       s'    <- foldM (flip dropAddr) s kids
-      pure (RVReuse (Just (ReuseSlot (CAddr p) arity True)), s')
+      let s'' = s' { stReserved = Set.insert (CAddr p) (stReserved s') }
+      pure (RVReuse (Just (ReuseSlot (CAddr p) arity True)), s'')
 dropReuse a@(HAddr i) s
   | isStaticAddr a = pure (RVReuse Nothing, s)                  -- uncounted: never a donor
   | otherwise = do
@@ -1255,7 +1386,9 @@ dropReuse a@(HAddr i) s
               kids  = cascadeChildren node
               s'    = s { stCells = IM.delete i (stCells s) }
           s'' <- foldM (flip dropAddr) s' kids
-          pure (RVReuse (Just (ReuseSlot (HAddr i) arity elig)), s'')
+          -- track the reserved shell as in-flight (spec §3.1).
+          let s''' = s'' { stReserved = Set.insert (HAddr i) (stReserved s'') }
+          pure (RVReuse (Just (ReuseSlot (HAddr i) arity elig)), s''')
         else
           -- shared: decrement in place, NO recordFree, NULL token.
           let s' = s { stCells = IM.insert i c { cRc = cRc c - 1 } (stCells s) }
@@ -1284,21 +1417,26 @@ dropReuse a@(HAddr i) s
 -- A non-'RVReuse' first argument is an internal error (loud 'Left').
 allocAt :: RCValue -> Node -> Store -> RC (Addr, Store)
 allocAt (RVReuse Nothing)               newNode s = alloc newNode s
-allocAt (RVReuse (Just (ReuseSlot a ar oldElig))) newNode s = case a of
-  HAddr i
-    | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
-        pure (HAddr i, s { stCells = IM.insert i (Cell 1 newNode) (stCells s) })
-    | otherwise ->
-        alloc newNode (s { stDead  = IS.insert i (stDead s)
-                         , stStats = recordFree (stStats s) })
-  CAddr p
-    | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
-        reuseCConAt p newNode s
-    | otherwise -> do
-        hp <- heapPtr s
-        liftIO (H.wokFree hp p)
-        alloc newNode (bumpFreeStats s)
-  Inline _ -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline immediate")))
+allocAt (RVReuse (Just (ReuseSlot a ar oldElig))) newNode s0 =
+  -- Consuming the token: release its in-flight reservation on EVERY consume path
+  -- (reuse re-stamp AND not-eligible free+fresh) so the abort-reclaim collector
+  -- no longer sees it (spec §3.1).
+  let s = s0 { stReserved = Set.delete a (stReserved s0) }
+  in case a of
+       HAddr i
+         | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
+             pure (HAddr i, s { stCells = IM.insert i (Cell 1 newNode) (stCells s) })
+         | otherwise ->
+             alloc newNode (s { stDead  = IS.insert i (stDead s)
+                              , stStats = recordFree (stStats s) })
+       CAddr p
+         | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
+             reuseCConAt p newNode s
+         | otherwise -> do
+             hp <- heapPtr s
+             liftIO (H.wokFree hp p)
+             alloc newNode (bumpFreeStats s)
+       Inline _ -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline immediate")))
 allocAt v _ _ =
   liftRC (Left (PrimError (Tx.pack ("alloc_at: expected a reuse token, got " <> show v))))
 

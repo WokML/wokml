@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+
+-- FBIP effect-safety (E+ lazy reclaim), abort case (the leak regression). An
+-- effectful map under an ABORTING handler: 'mapF' rebuilds a same-shape 'Cons'
+-- over the unique scrutinee spine (so 'reusePairing' mints a reuse token per
+-- spine cell), with an effectful call 'bump e x' (a 'Exn.throw') sitting BETWEEN
+-- the token's 'drop_reuse' and the 'Cons' rebuild ('alloc_at'). When 'throw' fires
+-- mid-spine, the handler ABORTS (the 'throw' arm returns 'None', never calling
+-- resume), so the captured continuation -- which holds the pending 'Cons@tok'
+-- rebuild, i.e. an IN-FLIGHT reservation -- is DROPPED. Before E+ that reserved
+-- shell was orphaned (a leak: stLive > baseline). The Task-2 abort reclaim frees
+-- it, so the heap returns to baseline. Output is 'None'; abstract == C.
+data List = Nil | Cons U64 List
+
+effect Exn = { throw : U64 -> U64 }
+
+bump : Exn -> U64 -> U64 with Exn
+bump e x = let n = e.throw x in x + n
+
+mapF : Exn -> List -> List with Exn
+mapF e xs = case xs of
+  Nil       -> Nil
+  Cons x xx -> Cons (bump e x) (mapF e xx)
+
+run : (Exn -> a with Exn + eff r) -> Option a with eff r
+run c = with self = Exn { throw n k -> None ; v -> Some v } in c self
+
+prog : Exn -> List with Exn
+prog e = mapF e (Cons 1 (Cons 2 (Cons 3 Nil)))
+
+main : Option List
+main = run prog
