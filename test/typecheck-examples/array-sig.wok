@@ -1,0 +1,6 @@
+module Main
+import Std.Base
+
+-- Array is a kind (* -> *) tycon: `Array a` is well-kinded in a signature.
+f : Array a -> U64
+f arr = 0

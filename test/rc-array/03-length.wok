@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Verify that 'length' reports the correct count after 'new', 'fromList', and
+-- 'resize'.
+--
+-- Plan:
+--   a0 = new 5 0       -> length = 5
+--   a1 = fromList [1, 2, 3] -> length = 3
+--   a2 = resize a1 7 0  -> length = 7
+--   a3 = resize a2 2 0  -> length = 2
+--   main = length a0 + length a1 + length a2 + length a3
+--        = 5 + 3 + 7 + 2 = 17
+
+main : U64
+main =
+  let a0  = new 5 0 in
+  let n0  = length a0 in
+  let a1  = fromList [1, 2, 3] in
+  let n1  = length a1 in
+  let a2  = resize a1 7 0 in
+  let n2  = length a2 in
+  let a3  = resize a2 2 0 in
+  let n3  = length a3 in
+  n0 + n1 + n2 + n3

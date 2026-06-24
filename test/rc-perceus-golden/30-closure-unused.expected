@@ -1,13 +1,13 @@
 main =
   let t.3 = Box(99)
   let b = t.3
-  let t.2 = \n -> join j74(r) =
+  let t.2 = \n -> join j81(r) =
     let t.1 = +(n, r)
     t.1
   case b of
     Box v ->
       let _drop.1 = __rc_drop(b)
-      jump j74(v)
+      jump j81(v)
   let f = t.2
   let _drop.2 = __rc_drop(f)
   123

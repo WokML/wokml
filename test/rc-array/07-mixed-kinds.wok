@@ -1,0 +1,39 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Mix element kinds: inline/uncounted U64 scalars alongside boxed/counted list
+-- cells.  This exercises the countedRefs cascade on a heterogeneous NArray:
+-- the U64 slots contribute nothing to the RC cascade while the list-cell slots
+-- each carry a ref count that must be decremented on drop.
+--
+-- Plan:
+--   inner = [7, 8]                  -- a list (boxed, counted)
+--   arr0 = fromList [1, 2, 3]       -- Array U64 (inline elements)
+--   n    = length arr0              -- 3
+--   arr1 = fromList [inner, inner]  -- Array [U64] (boxed elements; inner rc=2)
+--   xs   = toList arr1              -- back to [[7,8],[7,8]]
+--   h    = head of xs               -- [7,8]
+--   s    = sum of h                 -- 7 + 8 = 15
+--   main = n + s                    -- 3 + 15 = 18
+
+sumList : [U64] -> U64
+sumList xs = case xs of
+  []     -> 0
+  h :: t -> h + sumList t
+
+headList : [[U64]] -> [U64]
+headList xs = case xs of
+  []     -> []
+  h :: _ -> h
+
+main : U64
+main =
+  let inner = [7, 8] in
+  let arr0  = fromList [1, 2, 3] in
+  let n     = length arr0 in
+  let arr1  = fromList [inner, inner] in
+  let xs    = toList arr1 in
+  let h     = headList xs in
+  let s     = sumList h in
+  n + s

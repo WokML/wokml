@@ -2,6 +2,7 @@ module Wok.Interp.RC.Prim
   ( rcPrimTable
   ) where
 
+import Control.Monad (foldM)
 import Control.Monad.Trans.Except (throwE)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -11,7 +12,7 @@ import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.RC.Value
   ( RC, liftRC, RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
   , Node (..), Cell (..), Store, alloc, deref, incref, dropAddr, dropReuse, writeNode
-  , continuationOwned )
+  , continuationOwned, valueChildren )
 import Wok.Interp.Value (RuntimeError (..))
 
 -- | The RC primitive table. Mirrors the reference 'Wok.Interp.Prim.primTable'
@@ -48,6 +49,13 @@ prims =
   , contCellNew
   , contStore
   , contTake
+  , arrayNew
+  , arrayFromList
+  , arrayToList
+  , arrayIndex
+  , arrayLength
+  , arraySet
+  , arrayResize
   ]
 
 -- ---------------------------------------------------------------------------
@@ -395,3 +403,227 @@ dropBoxed (RVInst _ _)       s = pure s
 -- A reuse token owns no counted child ('valueChildren (RVReuse _) = []'), so a
 -- drop of one is inert --- consistent with its affine handling everywhere else.
 dropBoxed (RVReuse _)        s = pure s
+
+-- ---------------------------------------------------------------------------
+-- Array primitives (Slice A, spec §4)
+--
+-- These seven prims implement the complete RC accounting for the boxed fixed-size
+-- array 'NArray'. Each prim OWNS (consumes) its arguments (operands move in) and
+-- must drop or transfer them into the result. RC deltas per op:
+--   new/fromList/set/resize  = +1 alloc
+--   index/length             = 0 alloc
+--   toList                   = +N alloc (N Cons cells + 1 Nil)
+--
+-- Nil is a nullary constructor: 'alloc (NCon "Nil" [])' returns an 'Inline'
+-- immediate (no counted cell, no alloc stat bump). The actual delta for toList
+-- is +N Cons cells; the Nil is stat-invisible.
+
+-- ---------------------------------------------------------------------------
+-- Array prim helpers
+
+-- | Incref all counted children of an 'RCValue' once. Mirrors @__rc_dup@ over a
+-- value-level reference: for 'RVBox a' this is 'incref a'; for 'RVLit'/'RVInst'
+-- this is a no-op (no counted children). Used to give the array its own ref to
+-- each element.
+dupValue :: RCValue -> Store -> RC Store
+dupValue v s = foldM (flip incref) s (valueChildren v)
+
+-- | Decref all counted children of an 'RCValue' once (freeing at zero). Mirrors
+-- @__rc_drop@ over a value-level reference. Used to drop a value that is owned
+-- but should not enter the result.
+dropValue :: RCValue -> Store -> RC Store
+dropValue v s = foldM (flip dropAddr) s (valueChildren v)
+
+-- | Apply 'dupValue' k times; no-op for k <= 0.  Used by 'new' and 'resize' to
+-- hand k owned references to a fill value (the prim already holds one; 'dupN
+-- (k-1)' supplies the remaining k-1).
+dupN :: Int -> RCValue -> Store -> RC Store
+dupN k v s
+  | k <= 0    = pure s
+  | otherwise = foldM (\st _ -> dupValue v st) s [(1 :: Int) .. k]
+
+-- | Extract a non-negative integer index from a 'U64' literal argument.
+asIndex :: RCValue -> Either RuntimeError Int
+asIndex (RVLit (LInt n))
+  | n < 0                           = Left (PrimError (Tx.pack "Array: negative index"))
+  | n > toInteger (maxBound :: Int) = Left (PrimError (Tx.pack "Array: index out of range"))
+  | otherwise                       = Right (fromInteger n)
+asIndex _ = Left (PrimError (Tx.pack "Array: expected U64 index"))
+
+-- | Total safe list index: returns 'Just' the element at position i, or
+-- 'Nothing' if i is out of range. Never uses @(!!)@ or 'head'.
+atIndex :: Int -> [a] -> Maybe a
+atIndex i xs = case drop i xs of
+  (x : _) -> Just x
+  []       -> Nothing
+
+-- | Deref an array handle and return its element list. Fails with 'PrimError'
+-- if the value is not a boxed 'NArray'.
+arrayElems :: RCValue -> Store -> RC [RCValue]
+arrayElems (RVBox a) s = do
+  c <- deref a s
+  case cNode c of
+    NArray vs -> pure vs
+    _         -> throwE (PrimError (Tx.pack "Array: not an array"))
+arrayElems _ _ = throwE (PrimError (Tx.pack "Array: not an array"))
+
+-- ---------------------------------------------------------------------------
+-- The seven Array prims
+
+-- | @new k v@: allocate an array of length k, all slots filled with v. The
+-- prim owns one ref to v on entry; it arranges k refs into the result.
+-- RC: if k == 0, drop v; else incref v ×(k-1), alloc. Net +1 alloc.
+arrayNew :: RCPrim
+arrayNew = RCPrim PN.arrayNewName 2 [] $ \args s -> case args of
+  [kv, v] -> do
+    k <- liftRC (asIndex kv)
+    if k <= 0
+      then do
+        s1 <- dropValue v s
+        (a, s2) <- alloc (NArray []) s1
+        pure (PRDone (RVBox a), s2)
+      else do
+        -- We own 1 ref; array needs k; incref k-1 more.
+        s1 <- dupN (k - 1) v s
+        (a, s2) <- alloc (NArray (replicate k v)) s1
+        pure (PRDone (RVBox a), s2)
+  _ -> throwE (ArityError (Tx.pack "Array.new"))
+
+-- | @fromList xs@: build an array from a wok Cons/Nil list. Each element is
+-- incref'd once into the array (transfer). The list is then dropped; if unique
+-- the spine is freed and original element refs released (net zero per element).
+-- RC: +1 alloc (the NArray cell).
+arrayFromList :: RCPrim
+arrayFromList = RCPrim PN.arrayFromListName 1 [] $ \args s -> case args of
+  [xs] -> do
+    (elems, s1) <- collectList xs s
+    (na, s2)    <- alloc (NArray elems) s1
+    s3          <- dropValue xs s2
+    pure (PRDone (RVBox na), s3)
+  _ -> throwE (ArityError (Tx.pack "Array.fromList"))
+
+-- | @toList arr@: convert array to a Cons/Nil list. Each element is incref'd
+-- into its Cons cell; the array is dropped (cascade releases arr's element refs
+-- and the cell). RC: +N alloc (N Cons cells; Nil is inline, stat-invisible).
+arrayToList :: RCPrim
+arrayToList = RCPrim PN.arrayToListName 1 [] $ \args s -> case args of
+  [arr@(RVBox a)] -> do
+    vs        <- arrayElems arr s
+    (lst, s1) <- buildList vs s
+    s2        <- dropAddr a s1
+    pure (PRDone lst, s2)
+  _ -> throwE (ArityError (Tx.pack "Array.toList"))
+
+-- | @index arr i@: bounds-checked element lookup. Incref the element (result
+-- owns it); drop the array (cascade frees the rest). RC: 0 alloc.
+arrayIndex :: RCPrim
+arrayIndex = RCPrim PN.arrayIndexName 2 [] $ \args s -> case args of
+  [arr@(RVBox a), iv] -> do
+    i  <- liftRC (asIndex iv)
+    vs <- arrayElems arr s
+    case atIndex i vs of
+      Nothing -> throwE (PrimError (Tx.pack "Array.index: out of bounds"))
+      Just el -> do
+        s1 <- dupValue el s
+        s2 <- dropAddr a s1
+        pure (PRDone el, s2)
+  _ -> throwE (ArityError (Tx.pack "Array.index"))
+
+-- | @length arr@: return the element count; consume the array. RC: 0 alloc.
+arrayLength :: RCPrim
+arrayLength = RCPrim PN.arrayLengthName 1 [] $ \args s -> case args of
+  [arr@(RVBox a)] -> do
+    vs <- arrayElems arr s
+    s1 <- dropAddr a s
+    pure (PRDone (RVLit (LInt (toInteger (length vs)))), s1)
+  _ -> throwE (ArityError (Tx.pack "Array.length"))
+
+-- | @set arr i v@: copy-on-write update. Build a new element list with slot i
+-- replaced by v (moved in) and all other slots incref'd. Alloc the new array.
+-- Drop the input (cascade releases old arr[i]; survivors net 0). RC: +1 alloc.
+arraySet :: RCPrim
+arraySet = RCPrim PN.arraySetName 3 [] $ \args s -> case args of
+  [arr@(RVBox a), iv, v] -> do
+    i  <- liftRC (asIndex iv)
+    vs <- arrayElems arr s
+    if i >= length vs
+      then throwE (PrimError (Tx.pack "Array.set: out of bounds"))
+      else do
+        let newVs = [ if j == i then v else el | (j, el) <- zip [0 ..] vs ]
+        -- Incref each survivor (j /= i); slot i is v, already owned.
+        s1 <- foldM
+                (\st (j, el) -> if j == i then pure st else dupValue el st)
+                s
+                (zip [0 :: Int ..] vs)
+        (na, s2) <- alloc (NArray newVs) s1
+        -- Consume input: cascade drops each old arr[j]; old arr[i] is released,
+        -- survivors net to 0 (one incref above, one drop here).
+        s3 <- dropAddr a s2
+        pure (PRDone (RVBox na), s3)
+  _ -> throwE (ArityError (Tx.pack "Array.set"))
+
+-- | @resize arr m fill@: copy-on-write resize to length m. Kept prefix (length
+-- t = min(m,n)) is incref'd; fill gets k = max(0,m-n) refs. Alloc new array.
+-- Drop input (cascade: kept prefix nets 0, truncated tail released). RC: +1 alloc.
+arrayResize :: RCPrim
+arrayResize = RCPrim PN.arrayResizeName 3 [] $ \args s -> case args of
+  [arr@(RVBox a), mv, fill] -> do
+    m  <- liftRC (asIndex mv)
+    vs <- arrayElems arr s
+    let n    = length vs
+        t    = max 0 (min m n)
+        k    = max 0 (m - n)
+        kept = take t vs
+        newVs = kept ++ replicate k fill
+    -- Incref each kept element (one copy into the new array).
+    s1 <- foldM (flip dupValue) s kept
+    -- fill: we own 1 ref; new array needs k refs total.
+    --   k == 0: drop fill (not needed).
+    --   k >= 1: incref fill k-1 times (we contribute the last ref by moving in).
+    s2 <- if k <= 0
+            then dropValue fill s1
+            else dupN (k - 1) fill s1
+    (na, s3) <- alloc (NArray newVs) s2
+    -- Consume input: kept prefix nets 0; truncated tail [t, n) is released.
+    s4 <- dropAddr a s3
+    pure (PRDone (RVBox na), s4)
+  _ -> throwE (ArityError (Tx.pack "Array.resize"))
+
+-- ---------------------------------------------------------------------------
+-- List-walking helpers for fromList / toList
+
+-- | Walk a Cons/Nil list, increfing each head element and collecting them.
+-- The list spine is consumed separately by the caller ('dropValue xs'). Handles
+-- both 'HAddr' Cons cells and 'Inline' Nil immediates (deref synthesizes the
+-- NCon for an Inline addr).
+collectList :: RCValue -> Store -> RC ([RCValue], Store)
+collectList v s = case v of
+  RVBox a -> do
+    c <- deref a s
+    case cNode c of
+      NCon con [h, tl]
+        | con == Tx.pack "Cons" -> do
+            s1          <- dupValue h s
+            (rest, s2)  <- collectList tl s1
+            pure (h : rest, s2)
+      NCon con []
+        | con == Tx.pack "Nil" -> pure ([], s)
+      _ -> throwE (PrimError (Tx.pack "Array.fromList: not a list"))
+  _ -> throwE (PrimError (Tx.pack "Array.fromList: not a list"))
+
+-- | Build a Cons/Nil list from an element vector, increfing each element into
+-- its Cons cell. The list is built right-to-left (foldr-style). The Nil
+-- terminator is an inline immediate (stat-invisible; no alloc stat bump).
+buildList :: [RCValue] -> Store -> RC (RCValue, Store)
+buildList vs0 s0 = do
+  -- Nil is a nullary NCon; alloc routes it to allocInline (an Inline immediate,
+  -- no heap cell, no alloc stat bump).
+  (nilAddr, s1) <- alloc (NCon (Tx.pack "Nil") []) s0
+  go vs0 (RVBox nilAddr, s1)
+  where
+    go [] acc = pure acc
+    go (x : xs) (tl, st) = do
+      (rest, st1) <- go xs (tl, st)
+      st2 <- dupValue x st1
+      (cell, st3) <- alloc (NCon (Tx.pack "Cons") [x, rest]) st2
+      pure (RVBox cell, st3)

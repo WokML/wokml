@@ -116,6 +116,17 @@ main = do
   -- explicitly so the FBIP parity + targeted assertions reference each file by
   -- name. Fed to 'rcCBackendParity' for the output + abstract==C + balance-lint
   -- parity check.
+  -- Slice A Array corpus: programs importing Std.Array that exercise the seven
+  -- ops end-to-end through both the reference interpreter and the RC interpreter.
+  -- These are handler-free (no Handle/ROp), so they go into the same differential
+  -- (Suite A) and heap-accounting (Suite B) groups as 'test/rc-examples'.
+  rcArrayFiles <- findByExtension [".wok"] "test/rc-array"
+  -- Slice A Array out-of-bounds error corpus: programs that INTENTIONALLY trigger a
+  -- PrimError (e.g. Array.index out of bounds). Both interpreters return Left, so
+  -- 'rcDifferentialHarness' treats the pair as AGREEMENT (both-fail = pass). These
+  -- programs must NOT go into the stats or C-backend-parity groups, which call
+  -- 'assertFailure' on any Left result.
+  rcArrayOobFiles <- findByExtension [".wok"] "test/rc-array-oob"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -205,6 +216,8 @@ main = do
     , rcDropTests
     , rcIncrefTests
     , rcM3NodeTests
+    , rcArrayNodeTests
+    , rcArrayPrimTests
     , wokRcHeapTests
     , wokRcReuseTests
     , wokRcReservedTests
@@ -266,11 +279,11 @@ main = do
         | f <- perceusHandlerFiles ]
     , testGroup "rc differential"
         [ testCase (takeBaseName f) (rcDifferentialHarness f)
-        | f <- perceusFiles ++ rcM2bFiles ]
+        | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ]
     , testGroup "rc stats"
         [ testGroup "heap accounting"
             [ testCase (takeBaseName f) (rcStatsHarness f)
-            | f <- perceusFiles ++ rcM2bFiles ]
+            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ]
         , testGroup "golden"
             [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
             | f <- perceusFiles ]
@@ -281,7 +294,7 @@ main = do
     -- through both the abstract heap and the C heap, asserting output + alloc-stat
     -- parity; plus targeted cross-heap/fallback/deep tests and the slot
     -- encode/decode round-trip property.
-    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles)
+    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles)
     , rcCBackendTargeted
     , rcFbipTargeted
     , rcFbipFaultInjection
@@ -289,6 +302,7 @@ main = do
     , rcPropertyTests
     , rcM2a1PropertyTests
     , rcM2bPropertyTests
+    , rcArrayPropertyTests
     -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
     -- hardening; each test group verifies the floor bites when disabled):
     --
@@ -3175,17 +3189,19 @@ loaderTests = testGroup "loader"
       case res of
         Right (entryName, modules) -> do
           entryName @?= T.pack "Main"
-          -- Two preludes are always embedded: Std.Base and Std.Control (the
-          -- latter imports Std.Base). Std.Base must come first (nothing it
-          -- depends on); Main and Std.Control follow in some dependency-valid
-          -- order. Assert the leading prelude + the full set rather than a
-          -- brittle exact permutation of the tail.
+          -- Three preludes are always embedded: Std.Base, Std.Control (imports
+          -- Std.Base), and Std.Array (imports Std.Base). Std.Base must come
+          -- first (nothing it depends on); the others follow in some
+          -- dependency-valid order. Assert the leading prelude + the full set
+          -- rather than a brittle exact permutation of the tail.
           let names = map Loader.lmName modules
           case names of
             (n0 : _) -> n0 @?= T.pack "Std.Base"
             []       -> assertFailure "expected a non-empty module list"
           Data.List.sort names @?=
-            Data.List.sort [T.pack "Std.Base", T.pack "Std.Control", T.pack "Main"]
+            Data.List.sort
+              [ T.pack "Std.Base", T.pack "Std.Control"
+              , T.pack "Std.Array", T.pack "Main" ]
         Left err -> assertFailure ("unexpected error: " ++ show err)
 
   , testCase "rejects file missing a module header" $ do
@@ -4642,7 +4658,14 @@ interpPrimTests :: TestTree
 interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
-        @?= Data.List.sort (map T.pack ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","__coro_susp","__coro_unwrap","__coro_resume","__coro_done","__coro_cancel","__coerce","__drive_conc","__cont_cell_new","__cont_store","__cont_take"])
+        @?= Data.List.sort (map T.pack
+              [ "+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$"
+              , "__coro_susp","__coro_unwrap","__coro_resume","__coro_done"
+              , "__coro_cancel","__coerce","__drive_conc"
+              , "__cont_cell_new","__cont_store","__cont_take"
+              -- Std.Array prims (Slice A)
+              , "new","fromList","toList","index","length","set","resize"
+              ])
   , testCase "addition" $
       case runPrim (T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
@@ -4686,6 +4709,43 @@ interpPrimTests = testGroup "InterpPrim"
           t @?= T.pack "K"
           IV.renderValue arg @?= T.pack "1"
         other -> assertFailure (show2 other)
+  -- ------------------------------------------------------------------
+  -- Overflow regression (Finding 1), reference side: index/new/set/resize
+  -- with index >= 2^63 must raise PrimError on the reference interpreter,
+  -- symmetrically with the RC interpreter. The pre-fix behaviour was
+  -- fromInteger wrapping to a negative Int, making bounds checks pass.
+  -- ------------------------------------------------------------------
+  , testCase "Ref overflow: index 2^63 raises PrimError (out of range)" $
+      let arr = IV.VCon (T.pack "Array") [li 0, li 1, li 2]
+          idx = li (2^(63 :: Int))
+      in case runPrim (T.pack "index") [arr, idx] of
+           Left (IV.PrimError m)
+             | T.pack "out of range" `T.isInfixOf` m -> pure ()
+           Left e  -> assertFailure ("Ref overflow index: expected PrimError out-of-range, got: " <> show e)
+           Right _ -> assertFailure "Ref overflow index: prim succeeded unexpectedly with 2^63"
+  , testCase "Ref overflow: new size 2^63 raises PrimError (out of range)" $
+      let kv = li (2^(63 :: Int))
+      in case runPrim (T.pack "new") [kv, li 0] of
+           Left (IV.PrimError m)
+             | T.pack "out of range" `T.isInfixOf` m -> pure ()
+           Left e  -> assertFailure ("Ref overflow new: expected PrimError out-of-range, got: " <> show e)
+           Right _ -> assertFailure "Ref overflow new: prim succeeded unexpectedly with 2^63"
+  , testCase "Ref overflow: set index 2^63 raises PrimError (out of range)" $
+      let arr = IV.VCon (T.pack "Array") [li 0, li 1, li 2]
+          idx = li (2^(63 :: Int))
+      in case runPrim (T.pack "set") [arr, idx, li 99] of
+           Left (IV.PrimError m)
+             | T.pack "out of range" `T.isInfixOf` m -> pure ()
+           Left e  -> assertFailure ("Ref overflow set: expected PrimError out-of-range, got: " <> show e)
+           Right _ -> assertFailure "Ref overflow set: prim succeeded unexpectedly with 2^63"
+  , testCase "Ref overflow: resize size 2^63 raises PrimError (out of range)" $
+      let arr = IV.VCon (T.pack "Array") [li 0, li 1]
+          mv  = li (2^(63 :: Int))
+      in case runPrim (T.pack "resize") [arr, mv, li 0] of
+           Left (IV.PrimError m)
+             | T.pack "out of range" `T.isInfixOf` m -> pure ()
+           Left e  -> assertFailure ("Ref overflow resize: expected PrimError out-of-range, got: " <> show e)
+           Right _ -> assertFailure "Ref overflow resize: prim succeeded unexpectedly with 2^63"
   ]
   where
     show2 (Left e)  = "Left " <> show e
@@ -7042,6 +7102,107 @@ runBothBackendsUnchecked path = do
                        pure (c, a))
                    `Control.Exception.finally` Heap.wokHeapFree hp
   pure (absR, cR, cAllocs)
+
+-- ---------------------------------------------------------------------------
+-- RC Array node tests (Array Slice A, Task 1: the NArray heap node)
+--
+-- 'NArray [RCValue]' is a fixed-size, homogeneous, boxed array on the abstract
+-- 'IntMap' heap (no C cell in Slice A). Each element slot is an ordinary counted
+-- child reached through 'nodeValues'/'countedRefs', so the generic cascade frees
+-- one ref per counted element exactly once -- no new 'cascadeChildren' arm. These
+-- store-layer tests exercise the accounting in isolation, mirroring 'rcM3NodeTests'
+-- for 'NContCell' and 'rcDropTests' for 'NCon'. (No type or prim yet.)
+
+rcArrayNodeTests :: TestTree
+rcArrayNodeTests = testGroup "rc array node"
+  [ testCase "nodeValues returns the element list verbatim" $ do
+      let e1 = St.RVLit (Anf.LInt 1)
+          e2 = St.RVLit (Anf.LInt 2)
+      St.nodeValues (St.NArray [e1, e2]) @?= [e1, e2]
+      St.nodeValues (St.NArray []) @?= []
+  , testCase "renderRCValue prints an array like a list" $ do
+      -- Render an array of three boxed nullary cells. The renderer derefs each
+      -- handle, so we use real allocated Nil cells; expected text is [[], [], []].
+      let s0          = St.emptyStore
+          (a, s1)     = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (b, s2)     = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (c, s3)     = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          (arr, s4)   = St.allocPure (St.NArray [St.RVBox a, St.RVBox b, St.RVBox c]) s3
+      case St.renderRCValue s4 (St.RVBox arr) of
+        Right t -> t @?= T.pack "[[], [], []]"
+        Left e  -> assertFailure ("render failed: " <> show e)
+  , testCase "renderRCValue prints an empty array as []" $ do
+      let (arr, s1) = St.allocPure (St.NArray []) St.emptyStore
+      case St.renderRCValue s1 (St.RVBox arr) of
+        Right t -> t @?= T.pack "[]"
+        Left e  -> assertFailure ("render failed: " <> show e)
+  , testCase "drop at rc 1 cascades one drop per boxed-counted element" $ do
+      -- Two pre-allocated counted cells referenced as boxed elements. Dropping the
+      -- array at rc 1 frees the array cell and each element exactly once; the heap
+      -- returns to baseline.
+      let s0          = St.emptyStore
+          baseline    = St.stLive (St.stStats s0)
+          (e1, s1)    = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e2, s2)    = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (arr, s3)   = St.allocPure (St.NArray [St.RVBox e1, St.RVBox e2]) s2
+      -- The array counts both elements as children via the generic cascade.
+      St.cascadeChildren (St.NArray [St.RVBox e1, St.RVBox e2]) @?= [e1, e2]
+      St.stLive (St.stStats s3) @?= baseline + 3
+      case St.dropAddrPure arr s3 of
+        Left e  -> assertFailure ("array drop failed: " <> show e)
+        Right s4 -> do
+          St.stLive (St.stStats s4) @?= baseline
+          St.stFrees (St.stStats s4) - St.stFrees (St.stStats s3) @?= 3
+          case St.derefPure e1 s4 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "element 1 was not freed through the cascade"
+          case St.derefPure e2 s4 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "element 2 was not freed through the cascade"
+  , testCase "inline/uncounted elements add no children: drop frees only the array cell" $ do
+      -- An array of literal (inline, uncounted) elements has NO counted children;
+      -- dropping it frees one cell only -- no spurious child drops.
+      let s0          = St.emptyStore
+          baseline    = St.stLive (St.stStats s0)
+          elems       = [St.RVLit (Anf.LInt 1), St.RVLit (Anf.LInt 2)]
+          (arr, s1)   = St.allocPure (St.NArray elems) s0
+      St.cascadeChildren (St.NArray elems) @?= []
+      St.stLive (St.stStats s1) @?= baseline + 1
+      case St.dropAddrPure arr s1 of
+        Left e  -> assertFailure ("array drop failed: " <> show e)
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          St.stFrees (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
+  , testCase "incref then two drops: freed once, cascades once (no double-free)" $ do
+      -- An array shared at rc 2: the first drop only decrements (the array and its
+      -- element survive), the second frees the array and cascades to the element
+      -- exactly once. The stDead double-free guard never trips.
+      let s0          = St.emptyStore
+          baseline    = St.stLive (St.stStats s0)
+          (e1, s1)    = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (arr, s2)   = St.allocPure (St.NArray [St.RVBox e1]) s1
+      case St.increfPure arr s2 of
+        Left e  -> assertFailure ("incref failed: " <> show e)
+        Right s3 ->
+          case St.dropAddrPure arr s3 of
+            Left e  -> assertFailure ("first drop failed: " <> show e)
+            Right s4 -> do
+              -- Nothing freed yet: array still live at rc 1, element untouched.
+              St.stFrees (St.stStats s4) - St.stFrees (St.stStats s2) @?= 0
+              St.stLive (St.stStats s4) @?= baseline + 2
+              case St.derefPure arr s4 of
+                Left e  -> assertFailure ("array freed too early: " <> show e)
+                Right _ ->
+                  case St.dropAddrPure arr s4 of
+                    Left e  -> assertFailure ("second drop failed: " <> show e)
+                    Right s5 -> do
+                      -- Array + element freed exactly once each; heap balanced.
+                      St.stLive (St.stStats s5) @?= baseline
+                      St.stFrees (St.stStats s5) - St.stFrees (St.stStats s2) @?= 2
+                      case St.derefPure e1 s5 of
+                        Left _  -> pure ()
+                        Right _ -> assertFailure "element was not freed on the final drop"
+  ]
 
 -- ---------------------------------------------------------------------------
 -- M3-b (Task 3): the stored-continuation differential oracle.
@@ -16418,3 +16579,993 @@ rcM2b2ContinuationOwnedTests =
     , testCase "continuationOwned: same Unique at DIFFERENT addrs: both freed ((Unique,Addr) keying)"
         continuationOwnedSameUniqueDiffAddr
     ]
+
+-- ---------------------------------------------------------------------------
+-- RC Array prim tests (Array Slice A, Task 3)
+--
+-- These tests call 'rpFn' directly on constructed 'RCValue's + a 'Store'.
+-- They verify behaviour, alloc/free deltas, bounds-error paths, and that
+-- dropping the result returns 'stLive' to baseline (no leak, no double-free).
+-- The prim table is keyed by bare name (e.g. T.pack "new"), per the plan.
+--
+-- RC accounting (spec §4 summary):
+--   new / fromList / set / resize : +1 alloc (the NArray cell)
+--   index / length                : 0 alloc
+--   toList                        : +N alloc (N Cons cells; Nil is inline,
+--                                   stat-invisible)
+
+-- | Helper: look up a prim in 'RCP.rcPrimTable' or fail.
+lookupPrim :: Text -> IO St.RCPrim
+lookupPrim name =
+  case Map.lookup name RCP.rcPrimTable of
+    Just p  -> pure p
+    Nothing -> assertFailure ("rcPrimTable is missing prim: " <> T.unpack name)
+
+-- | Helper: call 'rpFn' with args and an initial store, asserting it returns
+-- @Right (PRDone result, store')@.
+callPrim :: St.RCPrim -> [St.RCValue] -> St.Store
+         -> IO (St.RCValue, St.Store)
+callPrim p args s = do
+  res <- runExceptT (St.rpFn p args s)
+  case res of
+    Right (St.PRDone v, s') -> pure (v, s')
+    Right _  -> assertFailure "expected PRDone from array prim, got PRApply"
+    Left e   -> assertFailure ("array prim raised: " <> show e)
+
+-- | Helper: assert that 'rpFn' raises a 'PrimError' whose message contains the
+-- given substring.
+expectPrimError :: St.RCPrim -> [St.RCValue] -> St.Store -> String -> IO ()
+expectPrimError p args s needle = do
+  res <- runExceptT (St.rpFn p args s)
+  case res of
+    Left (IV.PrimError m)
+      | T.pack needle `T.isInfixOf` m -> pure ()
+    Left e  -> assertFailure ("expected PrimError containing " <> show needle
+                               <> ", got: " <> show e)
+    Right _ -> assertFailure ("expected PrimError containing " <> show needle
+                               <> ", but prim succeeded")
+
+-- | Helper: drop an 'RCValue' back to a baseline store level using 'dropAddr'
+-- on any counted addresses. Returns the updated store.
+dropResult :: St.RCValue -> St.Store -> IO St.Store
+dropResult v s =
+  case St.valueChildren v of
+    []  -> pure s
+    as  -> do
+      res <- runExceptT (Control.Monad.foldM (flip St.dropAddr) s as)
+      case res of
+        Right s' -> pure s'
+        Left e   -> assertFailure ("dropResult failed: " <> show e)
+
+rcArrayPrimTests :: TestTree
+rcArrayPrimTests = testGroup "rc array prims"
+  [ -- ------------------------------------------------------------------
+    -- new
+    -- ------------------------------------------------------------------
+    testCase "new 3 v: alloc +2 (array + element shared at rc 3); drop-to-baseline" $ do
+      -- Allocate one boxed element e1. Call new 3 (RVBox e1).
+      -- The prim incref's e1 twice (dupN 2) and allocs the NArray.
+      -- Live delta from prim: +1 (NArray cell; e1 was already live).
+      -- Dropping the array cascades 3 drops of e1 (rc 3->0, freed).
+      pNew <- lookupPrim (T.pack "new")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e1, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          v        = St.RVBox e1
+          k        = St.RVLit (Anf.LInt 3)
+      (arr, s2) <- callPrim pNew [k, v] s1
+      -- NArray allocated; e1 still live (refcount 3).
+      St.stLive (St.stStats s2) @?= baseline + 2
+      St.stAllocs (St.stStats s2) - St.stAllocs (St.stStats s1) @?= 1
+      s3 <- dropResult arr s2
+      St.stLive (St.stStats s3) @?= baseline
+
+  , testCase "new 0 v: drop v then alloc empty array; +1 alloc total" $ do
+      pNew <- lookupPrim (T.pack "new")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e1, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          v        = St.RVBox e1
+          k        = St.RVLit (Anf.LInt 0)
+      (arr, s2) <- callPrim pNew [k, v] s1
+      -- e1 was dropped (rc 1 -> 0, freed); empty NArray allocated.
+      St.stLive (St.stStats s2) @?= baseline + 1
+      St.stAllocs (St.stStats s2) - St.stAllocs (St.stStats s1) @?= 1
+      s3 <- dropResult arr s2
+      St.stLive (St.stStats s3) @?= baseline
+
+  , testCase "new: result renders as an array of the fill value" $ do
+      pNew <- lookupPrim (T.pack "new")
+      let s0 = St.emptyStore
+          (e1, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          v = St.RVBox e1
+          k = St.RVLit (Anf.LInt 2)
+      (arr, s2) <- callPrim pNew [k, v] s1
+      -- e1 has rc=2; array contains two refs to it.  Render: [[], []]
+      case St.renderRCValue s2 arr of
+        Right t -> t @?= T.pack "[[], []]"
+        Left e  -> assertFailure ("render failed: " <> show e)
+      -- cleanup
+      _ <- dropResult arr s2
+      pure ()
+
+  -- ------------------------------------------------------------------
+  -- length
+  -- ------------------------------------------------------------------
+  , testCase "length: returns correct count, 0 alloc, drops array" $ do
+      pLength <- lookupPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e1, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e2, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (arr, s3) = St.allocPure (St.NArray [St.RVBox e1, St.RVBox e2]) s2
+          allocsBefore = St.stAllocs (St.stStats s3)
+      (lenVal, s4) <- callPrim pLength [St.RVBox arr] s3
+      lenVal @?= St.RVLit (Anf.LInt 2)
+      -- 0 new allocs from length
+      St.stAllocs (St.stStats s4) @?= allocsBefore
+      -- array + elements freed (cascade), heap back to baseline
+      St.stLive (St.stStats s4) @?= baseline
+
+  , testCase "length of empty array: returns 0, drops array, baseline" $ do
+      pLength <- lookupPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (arr, s1) = St.allocPure (St.NArray []) s0
+          allocsBefore = St.stAllocs (St.stStats s1)
+      (lenVal, s2) <- callPrim pLength [St.RVBox arr] s1
+      lenVal @?= St.RVLit (Anf.LInt 0)
+      St.stAllocs (St.stStats s2) @?= allocsBefore
+      St.stLive (St.stStats s2) @?= baseline
+
+  -- ------------------------------------------------------------------
+  -- index
+  -- ------------------------------------------------------------------
+  , testCase "index: returns correct element, increfs it, drops array" $ do
+      pIndex <- lookupPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (e2, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          (arr, s4) = St.allocPure
+                        (St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2])
+                        s3
+          allocsBefore = St.stAllocs (St.stStats s4)
+      (result, s5) <- callPrim pIndex [St.RVBox arr, St.RVLit (Anf.LInt 1)] s4
+      -- result should be e1 (index 1)
+      result @?= St.RVBox e1
+      -- 0 new allocs
+      St.stAllocs (St.stStats s5) @?= allocsBefore
+      -- array freed + e0 freed + e2 freed; e1 survives (incref'd for result)
+      -- so live = baseline + 1 (e1)
+      St.stLive (St.stStats s5) @?= baseline + 1
+      -- drop the result to return to baseline
+      s6 <- dropResult result s5
+      St.stLive (St.stStats s6) @?= baseline
+
+  , testCase "index: out-of-bounds raises PrimError" $ do
+      pIndex <- lookupPrim (T.pack "index")
+      let s0 = St.emptyStore
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (arr, s2) = St.allocPure (St.NArray [St.RVBox e0]) s1
+      -- index 1 in a 1-element array is OOB
+      expectPrimError pIndex [St.RVBox arr, St.RVLit (Anf.LInt 1)] s2
+        "out of bounds"
+
+  , testCase "index: exact last element (n-1) succeeds; n is out-of-bounds" $ do
+      pIndex <- lookupPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (arr, s2) = St.allocPure (St.NArray [St.RVBox e0]) s1
+      -- index 0 succeeds
+      (result, s3) <- callPrim pIndex [St.RVBox arr, St.RVLit (Anf.LInt 0)] s2
+      result @?= St.RVBox e0
+      St.stLive (St.stStats s3) @?= baseline + 1
+      s4 <- dropResult result s3
+      St.stLive (St.stStats s4) @?= baseline
+      -- A separate attempt at index 1 raises an error (1-element array).
+      let (e0b, sb1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (arrb, sb2) = St.allocPure (St.NArray [St.RVBox e0b]) sb1
+      expectPrimError pIndex [St.RVBox arrb, St.RVLit (Anf.LInt 1)] sb2
+        "out of bounds"
+
+  -- ------------------------------------------------------------------
+  -- set (copy-on-write)
+  -- ------------------------------------------------------------------
+  , testCase "set: replaces slot, +1 alloc, drops old array; drop-to-baseline" $ do
+      pSet <- lookupPrim (T.pack "set")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (e2, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          -- v_new: a fresh boxed element to write into slot 1
+          (vn, s4) = St.allocPure (St.NCon (T.pack "Nil") []) s3
+          (arr, s5) = St.allocPure
+                        (St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2])
+                        s4
+          allocsBefore = St.stAllocs (St.stStats s5)
+      (newArr, s6) <- callPrim pSet
+                        [St.RVBox arr, St.RVLit (Anf.LInt 1), St.RVBox vn]
+                        s5
+      -- +1 alloc for the new NArray
+      St.stAllocs (St.stStats s6) - allocsBefore @?= 1
+      -- old arr freed; old e1 freed (rc 1->0); e0 and e2 survive (incref'd)
+      -- new arr live + e0 + e2 + vn = 4 cells
+      St.stLive (St.stStats s6) @?= baseline + 4
+      s7 <- dropResult newArr s6
+      St.stLive (St.stStats s7) @?= baseline
+
+  , testCase "set: out-of-bounds raises PrimError" $ do
+      pSet <- lookupPrim (T.pack "set")
+      let s0 = St.emptyStore
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (vn, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (arr, s3) = St.allocPure (St.NArray [St.RVBox e0]) s2
+      expectPrimError pSet [St.RVBox arr, St.RVLit (Anf.LInt 1), St.RVBox vn]
+        s3 "out of bounds"
+
+  -- ------------------------------------------------------------------
+  -- resize
+  -- ------------------------------------------------------------------
+  , testCase "resize grow: adds fill slots, +1 alloc, drop-to-baseline" $ do
+      pResize <- lookupPrim (T.pack "resize")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (fill, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          (arr, s4) = St.allocPure
+                        (St.NArray [St.RVBox e0, St.RVBox e1])
+                        s3
+          allocsBefore = St.stAllocs (St.stStats s4)
+          -- resize to length 4 (k=2 new fill slots)
+          m = St.RVLit (Anf.LInt 4)
+      (newArr, s5) <- callPrim pResize [St.RVBox arr, m, St.RVBox fill] s4
+      St.stAllocs (St.stStats s5) - allocsBefore @?= 1
+      -- old arr freed; new arr + e0 + e1 + fill (rc 2) still live
+      -- e0 incref'd (kept), e1 incref'd (kept), fill incref'd once (k-1=1)
+      -- live: baseline + 4 (e0, e1, fill, newArr)
+      St.stLive (St.stStats s5) @?= baseline + 4
+      s6 <- dropResult newArr s5
+      St.stLive (St.stStats s6) @?= baseline
+
+  , testCase "resize shrink: drops truncated tail, +1 alloc, drop-to-baseline" $ do
+      pResize <- lookupPrim (T.pack "resize")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (e2, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          (fill, s4) = St.allocPure (St.NCon (T.pack "Nil") []) s3
+          (arr, s5) = St.allocPure
+                        (St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2])
+                        s4
+          allocsBefore = St.stAllocs (St.stStats s5)
+          -- resize to length 1 (k=0, t=1; e1 and e2 are truncated)
+          m = St.RVLit (Anf.LInt 1)
+      (newArr, s6) <- callPrim pResize [St.RVBox arr, m, St.RVBox fill] s5
+      St.stAllocs (St.stStats s6) - allocsBefore @?= 1
+      -- fill dropped (k=0); old arr freed, e1 freed, e2 freed; e0 incref'd
+      -- live: baseline + 2 (e0 + newArr); fill freed too since k=0
+      St.stLive (St.stStats s6) @?= baseline + 2
+      s7 <- dropResult newArr s6
+      St.stLive (St.stStats s7) @?= baseline
+
+  , testCase "resize to same length: effectively a copy, +1 alloc, drop-to-baseline" $ do
+      pResize <- lookupPrim (T.pack "resize")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (fill, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (arr, s3) = St.allocPure (St.NArray [St.RVBox e0]) s2
+          allocsBefore = St.stAllocs (St.stStats s3)
+          m = St.RVLit (Anf.LInt 1)
+      (newArr, s4) <- callPrim pResize [St.RVBox arr, m, St.RVBox fill] s3
+      St.stAllocs (St.stStats s4) - allocsBefore @?= 1
+      -- fill dropped (k=0), old arr freed, e0 incref'd; live = baseline+2 (e0+newArr)
+      St.stLive (St.stStats s4) @?= baseline + 2
+      s5 <- dropResult newArr s4
+      St.stLive (St.stStats s5) @?= baseline
+
+  -- ------------------------------------------------------------------
+  -- fromList
+  -- ------------------------------------------------------------------
+  , testCase "fromList: builds array from Cons/Nil list, +1 alloc, drop-to-baseline" $ do
+      pFromList <- lookupPrim (T.pack "fromList")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          -- Build list [e0, e1]: Cons(e0, Cons(e1, Nil))
+          -- Nil is inline (no alloc stat bump); Cons cells are HAddr.
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          -- allocPure always returns an HAddr for non-nullary NCon.
+          -- For Nil (nullary), use alloc which returns Inline (stat-invisible).
+          -- We build using allocPure to keep it simple -- allocPure of Nil gives
+          -- an HAddr cell, which is fine for testing the prim logic.
+          (nilCell, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          (cons1,   s4) = St.allocPure
+                            (St.NCon (T.pack "Cons") [St.RVBox e1, St.RVBox nilCell])
+                            s3
+          (cons0,   s5) = St.allocPure
+                            (St.NCon (T.pack "Cons") [St.RVBox e0, St.RVBox cons1])
+                            s4
+          -- xs = Cons(e0, Cons(e1, Nil)); live: e0, e1, nilCell, cons1, cons0 = 5 cells
+          allocsBefore = St.stAllocs (St.stStats s5)
+      (arr, s6) <- callPrim pFromList [St.RVBox cons0] s5
+      -- collectList incref's e0 and e1 each once (rc goes 1->2 each).
+      -- dropValue xs drops cons0 (rc 1->0 freed): cascade drops cons1 (freed),
+      -- cascade drops nilCell (freed), e0 (rc 2->1), e1 (rc 2->1).
+      -- NArray alloc: +1.
+      -- live after: e0 (rc=1 in array), e1 (rc=1 in array), arr = 3 cells
+      St.stAllocs (St.stStats s6) - allocsBefore @?= 1
+      St.stLive (St.stStats s6) @?= baseline + 3
+      s7 <- dropResult arr s6
+      St.stLive (St.stStats s7) @?= baseline
+
+  -- ------------------------------------------------------------------
+  -- toList
+  -- ------------------------------------------------------------------
+  , testCase "toList: builds Cons list from array, N allocs (Cons cells), drop-to-baseline" $ do
+      pToList <- lookupPrim (T.pack "toList")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1)  = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2)  = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (arr, s3) = St.allocPure (St.NArray [St.RVBox e0, St.RVBox e1]) s2
+          allocsBefore = St.stAllocs (St.stStats s3)
+      (lst, s4) <- callPrim pToList [St.RVBox arr] s3
+      -- arr freed (cascade: e0.rc 2->1, e1.rc 2->1); 2 Cons cells allocated;
+      -- Nil is inline (0 alloc). Net: +2 alloc, live = baseline + 4 (e0,e1,cons0,cons1)
+      St.stAllocs (St.stStats s4) - allocsBefore @?= 2
+      St.stLive (St.stStats s4) @?= baseline + 4
+      -- render to verify shape
+      case St.renderRCValue s4 lst of
+        Right t -> t @?= T.pack "[[], []]"
+        Left e  -> assertFailure ("render failed: " <> show e)
+      s5 <- dropResult lst s4
+      St.stLive (St.stStats s5) @?= baseline
+
+  , testCase "toList of empty array: returns [] (Nil inline), 0 alloc, drop-to-baseline" $ do
+      pToList <- lookupPrim (T.pack "toList")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (arr, s1) = St.allocPure (St.NArray []) s0
+          allocsBefore = St.stAllocs (St.stStats s1)
+      (lst, s2) <- callPrim pToList [St.RVBox arr] s1
+      -- arr freed (empty, no elements); Nil is inline (0 alloc); net 0
+      St.stAllocs (St.stStats s2) @?= allocsBefore
+      St.stLive (St.stStats s2) @?= baseline
+      -- Nil inline: lst is RVBox (Inline _), rendering as []
+      case St.renderRCValue s2 lst of
+        Right t -> t @?= T.pack "[]"
+        Left e  -> assertFailure ("render of empty list failed: " <> show e)
+      -- No counted children in Nil, so dropResult is a no-op
+      s3 <- dropResult lst s2
+      St.stLive (St.stStats s3) @?= baseline
+
+  -- ------------------------------------------------------------------
+  -- Overflow regression (Finding 1): index >= 2^63 must raise PrimError
+  --
+  -- Before the asIndex/asIndexInt fix, a U64 index >= 2^63 was passed via
+  -- fromInteger to Int, wrapping to a NEGATIVE Int (e.g. 2^63 -> minBound),
+  -- which made the bounds check negative and index returned arr[0] instead
+  -- of out-of-bounds, and set leaked its value. Now both sides reject with
+  -- PrimError "Array: index out of range".
+  -- ------------------------------------------------------------------
+  , testCase "RC overflow: index 2^63 raises PrimError (out of range, not arr[0])" $ do
+      pNew   <- lookupPrim (T.pack "new")
+      pIndex <- lookupPrim (T.pack "index")
+      let s0   = St.emptyStore
+          nVal = St.RVLit (Anf.LInt 3)
+          vVal = St.RVLit (Anf.LInt 0)
+          iVal = St.RVLit (Anf.LInt (2^(63 :: Int)))
+      (arr, s1) <- callPrim pNew [nVal, vVal] s0
+      expectPrimError pIndex [arr, iVal] s1 "out of range"
+
+  , testCase "RC overflow: new size 2^63 raises PrimError (out of range)" $ do
+      pNew <- lookupPrim (T.pack "new")
+      let s0   = St.emptyStore
+          kVal = St.RVLit (Anf.LInt (2^(63 :: Int)))
+          vVal = St.RVLit (Anf.LInt 0)
+      expectPrimError pNew [kVal, vVal] s0 "out of range"
+
+  , testCase "RC overflow: set index 2^63 raises PrimError (out of range, no value leak)" $ do
+      pNew <- lookupPrim (T.pack "new")
+      pSet <- lookupPrim (T.pack "set")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          nVal     = St.RVLit (Anf.LInt 3)
+          vVal     = St.RVLit (Anf.LInt 0)
+          iVal     = St.RVLit (Anf.LInt (2^(63 :: Int)))
+          -- boxed v so we can detect a leak if the prim forgets to drop it
+          (boxedV, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+      (arr, s2) <- callPrim pNew [nVal, vVal] s1
+      -- set with overflow index must error; arr and boxedV must not leak
+      res <- runExceptT (St.rpFn pSet [arr, iVal, St.RVBox boxedV] s2)
+      case res of
+        Left (IV.PrimError m)
+          | T.pack "out of range" `T.isInfixOf` m -> do
+              -- arr and boxedV were not consumed; drop them to return to baseline
+              s3 <- dropResult arr s2
+              s4 <- dropResult (St.RVBox boxedV) s3
+              St.stLive (St.stStats s4) @?= baseline
+        Left e  -> assertFailure ("RC overflow set: expected PrimError out-of-range, got: " <> show e)
+        Right _ -> assertFailure "RC overflow set: prim succeeded unexpectedly with 2^63 index"
+
+  , testCase "RC overflow: resize size 2^63 raises PrimError (out of range)" $ do
+      pNew    <- lookupPrim (T.pack "new")
+      pResize <- lookupPrim (T.pack "resize")
+      let s0   = St.emptyStore
+          nVal = St.RVLit (Anf.LInt 2)
+          mVal = St.RVLit (Anf.LInt (2^(63 :: Int)))
+          vVal = St.RVLit (Anf.LInt 0)
+      (arr, s1) <- callPrim pNew [nVal, vVal] s0
+      expectPrimError pResize [arr, mVal, St.RVLit (Anf.LInt 0)] s1 "out of range"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Suite H: Array QuickCheck properties (Slice A Task 5)
+--
+-- These properties pin the observable semantics of the seven array ops as
+-- stated in spec §8 and exercise all three element-slot buckets:
+--   * inline/uncounted  — RVLit (LInt n)   : U64 scalars
+--   * immediate         — RVBox (Inline t)  : nullary constructors (e.g. ()
+--                         interned as "Unit"; uncounted, no cascade child)
+--   * boxed/counted     — RVBox (HAddr a)   : an NCon cell with a ref count
+--
+-- Every property:
+--   (a) uses 'callPrim' so RC accounting is exercised (not bypassed);
+--   (b) drops every live result before returning, asserting the heap returns
+--       to baseline;
+--   (c) never uses partial functions — 'atIndex' is the guarded helper.
+--
+-- Properties are driven by 'QC.ioProperty' (the prims live in IO via
+-- 'runExceptT') and run 100 cases each (the default QuickCheck count).
+-- ---------------------------------------------------------------------------
+
+-- | Generate a small non-negative integer suitable as an array length or
+-- index.  Kept small (0..7) so tests run fast and shrinking is meaningful.
+genSmallNat :: QC.Gen Int
+genSmallNat = choose (0, 7)
+
+-- | Build an 'NArray' from a list of already-allocated 'RCValue's by calling
+-- the 'fromList' prim.  The prim consumes the Cons/Nil list spine passed to it
+-- and acquires its own ref to each element.  We construct the list using
+-- 'allocPure' (so we have HAddr Cons cells) and pass the head to 'fromList'.
+buildArrayFromElems :: [St.RCValue] -> St.Store -> IO (St.RCValue, St.Store)
+buildArrayFromElems elems s0 = do
+  pFromList <- lookupPrim (T.pack "fromList")
+  -- Build Cons/Nil spine; Nil via runExceptT so it is an Inline immediate
+  nilRes <- runExceptT (St.alloc (St.NCon (T.pack "Nil") []) s0)
+  (nilAddr, sn) <- case nilRes of
+    Right r -> pure r
+    Left e  -> assertFailure ("buildArrayFromElems: nil alloc: " <> show e)
+  let nilVal = St.RVBox nilAddr
+      -- fold right over elems to build Cons chain (we own refs to elements
+      -- already; fromList will incref each when it collects them, then
+      -- dropValue xs will decrement via the spine cascade).
+      buildSpine [] (lst, st) = pure (lst, st)
+      buildSpine (v : vs) (tl, st) = do
+        (rest, st1) <- buildSpine vs (tl, st)
+        let (cellAddr, st2) = St.allocPure
+                                (St.NCon (T.pack "Cons") [v, rest])
+                                st1
+        pure (St.RVBox cellAddr, st2)
+  (xs, s1) <- buildSpine elems (nilVal, sn)
+  callPrim pFromList [xs] s1
+
+-- | Build two independent arrays from the SAME list of elements (each gets
+-- its own copies via two separate 'buildArrayFromElems' calls so there is no
+-- sharing between them).
+buildTwoArrays :: [St.RCValue] -> St.Store
+               -> IO (St.RCValue, St.RCValue, St.Store)
+buildTwoArrays elems s0 = do
+  -- Allocate two copies of each element for the second array, then build both.
+  (arr1, s1) <- buildArrayFromElems elems s0
+  -- The original element values in 'elems' were consumed by the first array
+  -- (fromList incref's each element into the array, then dropValue xs
+  -- decrements the list's refs -- since each element appears once in xs and
+  -- once in the array, the net is the array holds rc=1 per element and the
+  -- original HAddr/RVLit is still valid).
+  -- For the second array we allocate fresh independent element values.
+  (elems2, s2) <- allocFreshElems (length elems) s1
+  (arr2, s3) <- buildArrayFromElems elems2 s2
+  pure (arr1, arr2, s3)
+  where
+    allocFreshElems n s =
+      let go 0 st acc = pure (acc, st)
+          go k st acc = do
+            let (a, st') = St.allocPure (St.NCon (T.pack "Nil") []) st
+            go (k - 1) st' (St.RVBox a : acc)
+      in go n s []
+
+-- | Total element lookup at a list position (mirrors 'atIndex' in Prim.hs).
+safeAt :: Int -> [a] -> Maybe a
+safeAt i xs = case drop i xs of
+  (x : _) -> Just x
+  []       -> Nothing
+
+-- | Drop every live 'RCValue' in a list back to store baseline.
+dropAll :: [St.RCValue] -> St.Store -> IO St.Store
+dropAll []       s = pure s
+dropAll (v : vs) s = dropResult v s >>= dropAll vs
+
+-- | Assert that two 'RCValue's are equal, with a counterexample label.
+assertEqVal :: String -> St.RCValue -> St.RCValue -> IO ()
+assertEqVal msg a b = assertEqual msg a b
+
+-- -------------------------------------------------------------------------
+-- Individual property implementations
+-- -------------------------------------------------------------------------
+
+-- P1: toList (fromList xs) == xs
+-- Build an array from a random list of U64 elements, call toList, and compare
+-- the resulting list value with the original element list element-by-element.
+prop_arrayRoundtrip :: Property
+prop_arrayRoundtrip =
+  QC.forAll (QC.listOf (choose (0, 100) :: QC.Gen Integer)) $ \ns ->
+    QC.ioProperty $ do
+      pFromList <- lookupPrim (T.pack "fromList")
+      pToList   <- lookupPrim (T.pack "toList")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          elems    = map (\n -> St.RVLit (Anf.LInt n)) ns
+      -- Build a Cons/Nil spine and call fromList
+      nilRes <- runExceptT (St.alloc (St.NCon (T.pack "Nil") []) s0)
+      (nilAddr, sn) <- case nilRes of
+        Right r -> pure r
+        Left e  -> assertFailure ("P1 nil alloc: " <> show e)
+      let nilVal = St.RVBox nilAddr
+          buildSpine [] (lst, st) = pure (lst, st)
+          buildSpine (v : vs) (tl, st) = do
+            (rest, st1) <- buildSpine vs (tl, st)
+            let (ca, st2) = St.allocPure (St.NCon (T.pack "Cons") [v, rest]) st1
+            pure (St.RVBox ca, st2)
+      (xs, s1) <- buildSpine elems (nilVal, sn)
+      (arr, s2) <- callPrim pFromList [xs] s1
+      -- Call length to get the expected count
+      -- (arr is consumed by length, so we first need toList -- use index loop)
+      -- Actually: call toList to get the list back
+      (lst, s3) <- callPrim pToList [arr] s2
+      -- Verify length via pLength on a fresh array built from the same list
+      -- element-by-element indexing is complex; instead verify the list renders
+      -- identically to what we built.  Build a fresh expected list to compare.
+      -- We compare by extracting elements one at a time from the result list
+      -- (call fromList again and then index) -- but the simplest correct check:
+      -- fromList then toList is an identity on the VALUE rendering.
+      -- Build reference list rendering from the original elements:
+      let refRender = renderListOfInt ns
+      case St.renderRCValue s3 lst of
+        Left e  -> do
+          _ <- dropResult lst s3
+          assertFailure ("P1 render failed: " <> show e)
+        Right got -> do
+          s4 <- dropResult lst s3
+          St.stLive (St.stStats s4) @?= baseline
+          return (got == refRender)
+  where
+    renderListOfInt ns =
+      T.pack ("[" <> go ns <> "]")
+      where
+        go []       = ""
+        go [x]      = show x
+        go (x : xs) = show x <> ", " <> go xs
+
+-- P2: index (set a i v) i == v
+-- For a non-empty array and a valid index i, setting slot i to v and then
+-- indexing i yields v.
+prop_arraySetIndex :: Property
+prop_arraySetIndex =
+  QC.forAll (QC.choose (1, 6) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (0, n - 1) :: QC.Gen Int) $ \i ->
+  QC.forAll (QC.choose (0, 1000) :: QC.Gen Integer) $ \vn ->
+    QC.ioProperty $ do
+      pNew   <- lookupPrim (T.pack "new")
+      pSet   <- lookupPrim (T.pack "set")
+      pIndex <- lookupPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          v        = St.RVLit (Anf.LInt vn)
+          kVal     = St.RVLit (Anf.LInt (fromIntegral n))
+          iVal     = St.RVLit (Anf.LInt (fromIntegral i))
+      -- Build array of n zeros
+      (arr0, s1) <- callPrim pNew [kVal, St.RVLit (Anf.LInt 0)] s0
+      -- Set slot i to v
+      (arr1, s2) <- callPrim pSet [arr0, iVal, v] s1
+      -- Index slot i
+      (el, s3) <- callPrim pIndex [arr1, iVal] s2
+      let ok = el == St.RVLit (Anf.LInt vn)
+      s4 <- dropResult el s3
+      St.stLive (St.stStats s4) @?= baseline
+      pure ok
+
+-- P3: j /= i ==> index (set a i v) j == index a j
+-- Setting slot i does not change slot j for j /= i.
+prop_arraySetIndexOther :: Property
+prop_arraySetIndexOther =
+  QC.forAll (QC.choose (2, 6) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (0, n - 1) :: QC.Gen Int) $ \i ->
+  QC.forAll
+    (QC.suchThat (QC.choose (0, n - 1) :: QC.Gen Int) (/= i)) $ \j ->
+  QC.forAll (QC.listOf1
+    (QC.choose (1, 1000) :: QC.Gen Integer) `QC.suchThat` \xs -> length xs == n) $ \initVals ->
+    QC.ioProperty $ do
+      pSet      <- lookupPrim (T.pack "set")
+      pIndex    <- lookupPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          elems    = map (\x -> St.RVLit (Anf.LInt x)) initVals
+          iVal     = St.RVLit (Anf.LInt (fromIntegral i))
+          jVal     = St.RVLit (Anf.LInt (fromIntegral j))
+          vVal     = St.RVLit (Anf.LInt 999)
+      -- Build array 1 (for the set+index path)
+      (arr1, s1) <- buildArrayFromElems elems s0
+      -- Build array 2 (for the unmodified index path)
+      (arr2, s2) <- buildArrayFromElems elems s1
+      -- index arr2 at j (gives expected value)
+      (expected, s3) <- callPrim pIndex [arr2, jVal] s2
+      -- set arr1 at i, then index at j
+      (arr1', s4) <- callPrim pSet [arr1, iVal, vVal] s3
+      (got, s5) <- callPrim pIndex [arr1', jVal] s4
+      let ok = got == expected
+      s6 <- dropResult got s5
+      s7 <- dropResult expected s6
+      St.stLive (St.stStats s7) @?= baseline
+      pure ok
+
+-- P4: length (new k v) == k
+prop_arrayLengthNew :: Property
+prop_arrayLengthNew =
+  QC.forAll genSmallNat $ \k ->
+    QC.ioProperty $ do
+      pNew    <- lookupPrim (T.pack "new")
+      pLength <- lookupPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          kVal     = St.RVLit (Anf.LInt (fromIntegral k))
+          vVal     = St.RVLit (Anf.LInt 0)
+      (arr, s1)    <- callPrim pNew [kVal, vVal] s0
+      (lenVal, s2) <- callPrim pLength [arr] s1
+      St.stLive (St.stStats s2) @?= baseline
+      return (lenVal == St.RVLit (Anf.LInt (fromIntegral k)))
+
+-- P5: length (set a i v) == length a
+prop_arrayLengthSet :: Property
+prop_arrayLengthSet =
+  QC.forAll (QC.choose (1, 6) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (0, n - 1) :: QC.Gen Int) $ \i ->
+    QC.ioProperty $ do
+      pNew    <- lookupPrim (T.pack "new")
+      pSet    <- lookupPrim (T.pack "set")
+      pLength <- lookupPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          kVal     = St.RVLit (Anf.LInt (fromIntegral n))
+          iVal     = St.RVLit (Anf.LInt (fromIntegral i))
+          vVal     = St.RVLit (Anf.LInt 99)
+      -- Build two arrays of length n (one for each length call, since length
+      -- consumes its argument).
+      (arr1, s1) <- callPrim pNew [kVal, St.RVLit (Anf.LInt 0)] s0
+      (arr2, s2) <- callPrim pNew [kVal, St.RVLit (Anf.LInt 0)] s1
+      -- Get length of the original array
+      (len1, s3) <- callPrim pLength [arr1] s2
+      -- Set slot i on arr2, then get its length
+      (arr2', s4) <- callPrim pSet [arr2, iVal, vVal] s3
+      (len2, s5) <- callPrim pLength [arr2'] s4
+      St.stLive (St.stStats s5) @?= baseline
+      return (len1 == len2)
+
+-- P6: length (resize a m f) == m
+prop_arrayLengthResize :: Property
+prop_arrayLengthResize =
+  QC.forAll (QC.choose (0, 5) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (0, 7) :: QC.Gen Int) $ \m ->
+    QC.ioProperty $ do
+      pNew    <- lookupPrim (T.pack "new")
+      pResize <- lookupPrim (T.pack "resize")
+      pLength <- lookupPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          nVal     = St.RVLit (Anf.LInt (fromIntegral n))
+          mVal     = St.RVLit (Anf.LInt (fromIntegral m))
+          fillVal  = St.RVLit (Anf.LInt 0)
+      (arr, s1)    <- callPrim pNew [nVal, fillVal] s0
+      (arr', s2)   <- callPrim pResize [arr, mVal, fillVal] s1
+      (lenVal, s3) <- callPrim pLength [arr'] s2
+      St.stLive (St.stStats s3) @?= baseline
+      return (lenVal == St.RVLit (Anf.LInt (fromIntegral m)))
+
+-- P7a: growing (resize a m fill) and then indexing a new tail slot yields
+--      fill.  Only applicable when m > n.
+prop_arrayResizeGrowFill :: Property
+prop_arrayResizeGrowFill =
+  QC.forAll (QC.choose (0, 4) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (n + 1, n + 4) :: QC.Gen Int) $ \m ->
+  QC.forAll (QC.choose (0, 999) :: QC.Gen Integer) $ \fillN ->
+    QC.ioProperty $ do
+      pNew    <- lookupPrim (T.pack "new")
+      pResize <- lookupPrim (T.pack "resize")
+      pIndex  <- lookupPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          nVal     = St.RVLit (Anf.LInt (fromIntegral n))
+          mVal     = St.RVLit (Anf.LInt (fromIntegral m))
+          fillVal  = St.RVLit (Anf.LInt fillN)
+          -- First new slot is at index n
+          iVal     = St.RVLit (Anf.LInt (fromIntegral n))
+      (arr0, s1) <- callPrim pNew [nVal, St.RVLit (Anf.LInt 0)] s0
+      (arr1, s2) <- callPrim pResize [arr0, mVal, fillVal] s1
+      (el, s3)   <- callPrim pIndex [arr1, iVal] s2
+      let ok = el == St.RVLit (Anf.LInt fillN)
+      s4 <- dropResult el s3
+      St.stLive (St.stStats s4) @?= baseline
+      pure ok
+
+-- P7b: shrinking (resize a m fill) drops the tail; slots in [0, m) are
+--      preserved.  Only applicable when m < n and m > 0.
+prop_arrayResizeShrinkKeep :: Property
+prop_arrayResizeShrinkKeep =
+  QC.forAll (QC.choose (2, 6) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (1, n - 1) :: QC.Gen Int) $ \m ->
+  QC.forAll (QC.choose (0, m - 1) :: QC.Gen Int) $ \i ->
+  QC.forAll (QC.listOf1 (QC.choose (1, 999) :: QC.Gen Integer)
+    `QC.suchThat` \xs -> length xs == n) $ \initVals ->
+    QC.ioProperty $ do
+      pResize   <- lookupPrim (T.pack "resize")
+      pIndex    <- lookupPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          elems    = map (\x -> St.RVLit (Anf.LInt x)) initVals
+          mVal     = St.RVLit (Anf.LInt (fromIntegral m))
+          iVal     = St.RVLit (Anf.LInt (fromIntegral i))
+          fillVal  = St.RVLit (Anf.LInt 0)
+          -- Expected value at slot i in the original array
+          expected = St.RVLit (Anf.LInt (initVals !! i))
+      -- Build array from elems, then resize down to m
+      (arr0, s1) <- buildArrayFromElems elems s0
+      (arr1, s2) <- callPrim pResize [arr0, mVal, fillVal] s1
+      (el, s3)   <- callPrim pIndex [arr1, iVal] s2
+      let ok = el == expected
+      s4 <- dropResult el s3
+      St.stLive (St.stStats s4) @?= baseline
+      pure ok
+
+-- P8a: index out of bounds raises PrimError.
+prop_arrayIndexOOB :: Property
+prop_arrayIndexOOB =
+  QC.forAll (QC.choose (0, 5) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (n, n + 4) :: QC.Gen Int) $ \i ->
+    QC.ioProperty $ do
+      pNew   <- lookupPrim (T.pack "new")
+      pIndex <- lookupPrim (T.pack "index")
+      let s0   = St.emptyStore
+          nVal = St.RVLit (Anf.LInt (fromIntegral n))
+          iVal = St.RVLit (Anf.LInt (fromIntegral i))
+      (arr, s1) <- callPrim pNew [nVal, St.RVLit (Anf.LInt 0)] s0
+      -- index i >= n should raise PrimError; the prim CONSUMES arr
+      res <- runExceptT (St.rpFn pIndex [arr, iVal] s1)
+      case res of
+        Left (IV.PrimError m)
+          | T.pack "out of bounds" `T.isInfixOf` m -> pure True
+        Left e  -> do
+          assertFailure ("P8a: expected PrimError out-of-bounds, got: " <> show e)
+        Right (St.PRDone el, s2) -> do
+          -- Unexpected success: clean up the returned element before failing.
+          _ <- dropResult el s2
+          assertFailure ("P8a: index " <> show i <> " on length-" <> show n
+                           <> " array succeeded unexpectedly")
+        Right _ -> assertFailure "P8a: got PRApply, expected PRDone or error"
+
+-- P8b: set out of bounds raises PrimError.
+prop_arraySetOOB :: Property
+prop_arraySetOOB =
+  QC.forAll (QC.choose (0, 5) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (n, n + 4) :: QC.Gen Int) $ \i ->
+    QC.ioProperty $ do
+      pNew <- lookupPrim (T.pack "new")
+      pSet <- lookupPrim (T.pack "set")
+      let s0   = St.emptyStore
+          nVal = St.RVLit (Anf.LInt (fromIntegral n))
+          iVal = St.RVLit (Anf.LInt (fromIntegral i))
+          vVal = St.RVLit (Anf.LInt 42)
+      (arr, s1) <- callPrim pNew [nVal, St.RVLit (Anf.LInt 0)] s0
+      -- set i >= n should raise PrimError; the prim CONSUMES arr
+      res <- runExceptT (St.rpFn pSet [arr, iVal, vVal] s1)
+      case res of
+        Left (IV.PrimError m)
+          | T.pack "out of bounds" `T.isInfixOf` m -> pure True
+        Left e  ->
+          assertFailure ("P8b: expected PrimError out-of-bounds, got: " <> show e)
+        Right (St.PRDone newArr, s2) -> do
+          _ <- dropResult newArr s2
+          assertFailure ("P8b: set " <> show i <> " on length-" <> show n
+                           <> " array succeeded unexpectedly")
+        Right _ -> assertFailure "P8b: got PRApply"
+
+-- P9: boxed elements are reference-counted correctly.
+-- Build an array of boxed (counted) NCon cells, call toList, then drop.
+-- The heap must return to baseline: every counted element is freed exactly once.
+prop_arrayBoxedRCBalance :: Property
+prop_arrayBoxedRCBalance =
+  QC.forAll (QC.choose (0, 4) :: QC.Gen Int) $ \n ->
+    QC.ioProperty $ do
+      pToList <- lookupPrim (T.pack "toList")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          -- Allocate n boxed cells (HAddr NCon "Nil" []) as elements.
+          allocN k st =
+            let go 0 s acc = pure (acc, s)
+                go r s acc =
+                  let (a, s') = St.allocPure (St.NCon (T.pack "Nil") []) s
+                  in go (r - 1) s' (St.RVBox a : acc)
+            in go k st []
+      (elems, s1) <- allocN n s0
+      -- Build array directly (bypass fromList for isolation: use allocPure)
+      let (arrAddr, s2) = St.allocPure (St.NArray elems) s1
+          arrVal = St.RVBox arrAddr
+          -- After allocPure, each element has rc=1 (owned by the array).
+          -- toList dup-increfs each element into a Cons cell, then dropAddr arr
+          -- decrements each.  Net: each element rc goes 1 -> 2 -> 1.
+          -- +n alloc (Cons cells); array freed; elements survive in list.
+      (lst, s3) <- callPrim pToList [arrVal] s2
+      s4 <- dropResult lst s3
+      -- All elements freed; heap back to baseline.
+      pure (St.stLive (St.stStats s4) == baseline)
+
+-- P10: set with boxed elements: RC accounting correct (drop-to-baseline).
+-- Build an array of boxed NCon cells, set one slot to a fresh boxed element,
+-- then drop the result. The replaced element must be freed (cascade from the
+-- old array drop) and survivors must be exactly refcounted.
+prop_arraySetBoxed :: Property
+prop_arraySetBoxed =
+  QC.forAll (QC.choose (1, 4) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (0, n - 1) :: QC.Gen Int) $ \i ->
+    QC.ioProperty $ do
+      pSet <- lookupPrim (T.pack "set")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      -- Allocate n boxed elements (HAddr NCon "Nil" [])
+      let allocBoxed k st =
+            let go 0 s acc = pure (acc, s)
+                go r s acc =
+                  let (a, s') = St.allocPure (St.NCon (T.pack "Nil") []) s
+                  in go (r - 1) s' (St.RVBox a : acc)
+            in go k st []
+      (elems, s1) <- allocBoxed n s0
+      -- Allocate fresh replacement element
+      let (newElemAddr, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          newElem = St.RVBox newElemAddr
+      -- Build array directly (rc=1 per element, owned by array)
+      let (arrAddr, s3) = St.allocPure (St.NArray elems) s2
+          iVal = St.RVLit (Anf.LInt (fromIntegral i))
+      -- Call set: old arr consumed, new arr produced with slot i replaced
+      (newArr, s4) <- callPrim pSet [St.RVBox arrAddr, iVal, newElem] s3
+      s5 <- dropResult newArr s4
+      -- All elements freed, heap at baseline
+      pure (St.stLive (St.stStats s5) == baseline)
+
+-- P11: resize with boxed elements: drop-to-baseline for both grow and shrink.
+-- Exercises that truncated tail elements are freed and fill elements are
+-- correctly incref'd for growth -- the key accounting path for boxed elements.
+prop_arrayResizeBoxed :: Property
+prop_arrayResizeBoxed =
+  QC.forAll (QC.choose (0, 4) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.choose (0, 6) :: QC.Gen Int) $ \m ->
+    QC.ioProperty $ do
+      pResize <- lookupPrim (T.pack "resize")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      -- Allocate n boxed elements
+      let allocBoxed k st =
+            let go 0 s acc = pure (acc, s)
+                go r s acc =
+                  let (a, s') = St.allocPure (St.NCon (T.pack "Nil") []) s
+                  in go (r - 1) s' (St.RVBox a : acc)
+            in go k st []
+      (elems, s1) <- allocBoxed n s0
+      -- Allocate a boxed fill element
+      let (fillAddr, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          fillVal = St.RVBox fillAddr
+          mVal    = St.RVLit (Anf.LInt (fromIntegral m))
+      -- Build array directly
+      let (arrAddr, s3) = St.allocPure (St.NArray elems) s2
+      (newArr, s4) <- callPrim pResize [St.RVBox arrAddr, mVal, fillVal] s3
+      s5 <- dropResult newArr s4
+      pure (St.stLive (St.stStats s5) == baseline)
+
+-- P12: resize to 0 with boxed elements: full truncation drops all N elements.
+-- This boundary (m=0) was excluded from P7b's generator (m >= 1). All N boxed
+-- elements must be freed; result is an empty array; stLive returns to baseline.
+prop_arrayResizeToZeroBoxed :: Property
+prop_arrayResizeToZeroBoxed =
+  QC.forAll (QC.choose (0, 5) :: QC.Gen Int) $ \n ->
+    QC.ioProperty $ do
+      pResize <- lookupPrim (T.pack "resize")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      -- Allocate n boxed elements
+      let allocBoxed k st =
+            let go 0 s acc = pure (acc, s)
+                go r s acc =
+                  let (a, s') = St.allocPure (St.NCon (T.pack "Nil") []) s
+                  in go (r - 1) s' (St.RVBox a : acc)
+            in go k st []
+      (elems, s1) <- allocBoxed n s0
+      -- Boxed fill element (will be dropped because k=0 when m=0)
+      let (fillAddr, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          fillVal = St.RVBox fillAddr
+          mVal    = St.RVLit (Anf.LInt 0)
+      let (arrAddr, s3) = St.allocPure (St.NArray elems) s2
+      (newArr, s4) <- callPrim pResize [St.RVBox arrAddr, mVal, fillVal] s3
+      -- newArr must be an empty array
+      elems' <- case St.renderRCValue s4 newArr of
+        Right t -> pure t
+        Left e  -> assertFailure ("P12 render failed: " <> show e)
+      s5 <- dropResult newArr s4
+      -- All elements freed, heap back to baseline
+      pure (St.stLive (St.stStats s5) == baseline && elems' == T.pack "[]")
+
+-- P13: fromList with boxed elements: RC accounting correct (drop-to-baseline).
+-- Exercises that fromList correctly incref's boxed elements into the array and
+-- the list spine is consumed without double-free.
+prop_arrayFromListBoxed :: Property
+prop_arrayFromListBoxed =
+  QC.forAll (QC.choose (0, 4) :: QC.Gen Int) $ \n ->
+    QC.ioProperty $ do
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      -- Allocate n boxed elements
+      let allocBoxed k st =
+            let go 0 s acc = pure (acc, s)
+                go r s acc =
+                  let (a, s') = St.allocPure (St.NCon (T.pack "Nil") []) s
+                  in go (r - 1) s' (St.RVBox a : acc)
+            in go k st []
+      (elems, s1) <- allocBoxed n s0
+      -- Build array via fromList (exercises the incref path for boxed elements)
+      (arr, s2) <- buildArrayFromElems elems s1
+      s3 <- dropResult arr s2
+      pure (St.stLive (St.stStats s3) == baseline)
+
+-- -------------------------------------------------------------------------
+-- Registration
+-- -------------------------------------------------------------------------
+
+rcArrayPropertyTests :: TestTree
+rcArrayPropertyTests =
+  localOption (QuickCheckTests 100) $
+    testGroup "rc array properties (Suite H: Slice A semantics)"
+      [ testProperty "P1: toList (fromList xs) == xs (U64 elements)"
+          prop_arrayRoundtrip
+      , testProperty "P2: index (set a i v) i == v"
+          prop_arraySetIndex
+      , testProperty "P3: j /= i => index (set a i v) j == index a j"
+          prop_arraySetIndexOther
+      , testProperty "P4: length (new k v) == k"
+          prop_arrayLengthNew
+      , testProperty "P5: length (set a i v) == length a"
+          prop_arrayLengthSet
+      , testProperty "P6: length (resize a m f) == m"
+          prop_arrayLengthResize
+      , testProperty "P7a: grow then index new tail slot yields fill"
+          prop_arrayResizeGrowFill
+      , testProperty "P7b: shrink then index kept slot yields original value"
+          prop_arrayResizeShrinkKeep
+      , testProperty "P8a: index out of bounds raises PrimError"
+          prop_arrayIndexOOB
+      , testProperty "P8b: set out of bounds raises PrimError"
+          prop_arraySetOOB
+      , testProperty "P9: boxed (counted) elements: heap returns to baseline after toList+drop"
+          prop_arrayBoxedRCBalance
+      , testProperty "P10: set with boxed elements: drop-to-baseline (RC accounting)"
+          prop_arraySetBoxed
+      , testProperty "P11: resize grow/shrink with boxed elements: drop-to-baseline"
+          prop_arrayResizeBoxed
+      , testProperty "P12: resize to 0 with boxed elements: full truncation, drop-to-baseline"
+          prop_arrayResizeToZeroBoxed
+      , testProperty "P13: fromList with boxed elements: drop-to-baseline (RC accounting)"
+          prop_arrayFromListBoxed
+      ]

@@ -832,6 +832,7 @@ resolveTyCon name
   | name == Tx.pack "Bool"   = TcBool
   | name == Tx.pack "()"     = TcUnit
   | name == Tx.pack "[]"     = TcList
+  | name == Tx.pack "Array"  = TcArray
   | otherwise                       = TcUser name
 
 -- | The concurrency carriers (spec §3.3) whose payload type is restricted to
@@ -3775,6 +3776,8 @@ prettyCType (CTCon TcBool   []) = Tx.pack "Bool"
 prettyCType (CTCon TcUnit   []) = Tx.pack "()"
 prettyCType (CTCon TcList [x]) =
   Tx.concat [Tx.pack "[", prettyCType x, Tx.pack "]"]
+prettyCType (CTCon TcArray [x]) =
+  Tx.concat [Tx.pack "Array ", prettyCTypeAtom x]
 prettyCType (CTCon (TcTuple _) xs) =
   Tx.concat
     [ Tx.pack "("

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok &mdash; scoped regions vs reference counting</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --good:#1a7f4b; --warn:#c0392b; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:780px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.85rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.18rem;margin:46px 0 2px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:210px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;margin:18px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card.hi{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+  .card h3{margin:0 0 2px;font-size:.98rem}
+  .card .tag{font-size:.72rem;color:var(--mut);margin-bottom:9px}
+  .card.hi .tag{color:var(--accent);font-weight:600}
+  .prop{display:flex;justify-content:space-between;font-size:.8rem;padding:3px 0;border-top:1px dashed var(--line)}
+  .prop .k{color:var(--mut)}
+  .yes{color:var(--good);font-weight:600}
+  .no{color:var(--warn)}
+  .part{color:var(--accent);font-weight:600}
+  .card p{font-size:.8rem;color:var(--mut);margin:9px 0 0}
+
+  .label{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:22px 0}
+  .note b{color:var(--accent)}
+  svg{display:block;max-width:100%;height:auto;margin:6px auto 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Scoped regions vs reference counting</h1>
+  <p class="sub">How a region frees memory, why plain RC-inside-a-region is slower than a true region, and how escape analysis recovers the speed &mdash; without ever building copy-out.</p>
+
+  <!-- 1 -->
+  <h2>1 &middot; Two questions: <i>where</i>, and <i>when</i></h2>
+  <p>Memory answers two separate questions. A region (an effect handler&rsquo;s scratch arena) decides <b>where</b> a value lives; reference counting decides <b>when</b> it dies. Keeping them apart is what makes the safe design safe &mdash; and it turns the whole choice into one routing decision <i>at each allocation</i>.</p>
+  <svg viewBox="0 0 460 200" role="img" aria-label="allocation routed by escape analysis">
+    <defs>
+      <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/>
+      </marker>
+    </defs>
+    <g font-family="ui-monospace,monospace" font-size="12">
+      <rect x="135" y="12" width="190" height="42" rx="8" fill="#f5f7f9" stroke="#dfe3e8"/>
+      <text x="230" y="30" text-anchor="middle">allocate in region scope</text>
+      <text x="230" y="46" text-anchor="middle" font-size="10.5" fill="#6b7280">escape analysis classifies it</text>
+
+      <rect x="18"  y="138" width="200" height="48" rx="8" fill="#eef4fb" stroke="#2f6fb0"/>
+      <text x="118" y="158" text-anchor="middle" fill="#2f6fb0">arena (uncounted)</text>
+      <text x="118" y="174" text-anchor="middle" font-size="10.5" fill="#2f6fb0">freed in one shot at close</text>
+
+      <rect x="242" y="138" width="200" height="48" rx="8" fill="#f5f7f9" stroke="#dfe3e8"/>
+      <text x="342" y="158" text-anchor="middle">RC heap (counted)</text>
+      <text x="342" y="174" text-anchor="middle" font-size="10.5" fill="#6b7280">freed when rc hits 0</text>
+
+      <g stroke="#6b7280" fill="none" stroke-width="1.4">
+        <path d="M200,54 C 150,86 118,104 118,136" marker-end="url(#a)"/>
+        <path d="M260,54 C 320,86 342,104 342,136" marker-end="url(#a)"/>
+      </g>
+      <text x="96"  y="104" font-size="10.5" fill="#2f6fb0">proven local</text>
+      <text x="320" y="104" font-size="10.5" fill="#6b7280">might escape</text>
+    </g>
+  </svg>
+  <p class="cap">fig 1 &mdash; one decision per allocation; the escapee is <i>born</i> in the RC heap, so nothing is ever copied out</p>
+
+  <!-- 2 -->
+  <h2>2 &middot; Why RC-in-a-region is slower than a true region</h2>
+  <p>RC&rsquo;s real cost is <b>write traffic</b>: every <code>dup</code>/<code>drop</code> writes an object&rsquo;s header. At teardown a true region resets one pointer; plain RC must walk every count to zero first.</p>
+  <div class="grid">
+    <div class="card hi"><span class="label">true region</span><h3>O(1) free</h3><p>Reset the bump pointer / return slabs. The whole cohort dies for the price of one operation &mdash; <b>zero</b> per-object work.</p></div>
+    <div class="card"><span class="label">plain RC</span><h3>O(N) drops</h3><p>Every object&rsquo;s rc walks to 0 &mdash; N header writes + branches + cascade &mdash; <i>before</i> the slabs come back. Dirties N cachelines.</p></div>
+  </div>
+  <div class="note"><b>Shape matters:</b> the gap is large only for <b>deeply-boxed</b> cohorts (trees, lists, a boxed <code>Array a</code>) whose drop cascades into N children. For <b>flat / unboxed</b> data (<code>Array U64</code>, <code>Array Char</code>) the drop is already O(1) &mdash; RC and a true region cost the same. In wok this shows up directly: the differential oracle counts <code>frees</code>, so a true region nets O(1) cohort-frees and plain RC nets O(N).</div>
+
+  <!-- 3 -->
+  <h2>3 &middot; Four ways to free a region</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>F &middot; forbid-escape</h3><div class="tag">uncounted &middot; bulk-free</div>
+      <div class="prop"><span class="k">escape allowed</span><span class="no">no &mdash; compile error</span></div>
+      <div class="prop"><span class="k">skip-RC speed</span><span class="yes">yes</span></div>
+      <div class="prop"><span class="k">no copy machinery</span><span class="yes">yes</span></div>
+      <p>Fast and simple, but restrictive: a value that escapes is rejected.</p>
+    </div>
+    <div class="card">
+      <h3>R &middot; RC-referenceable</h3><div class="tag">counted &middot; rc-driven</div>
+      <div class="prop"><span class="k">escape allowed</span><span class="yes">yes &mdash; just works</span></div>
+      <div class="prop"><span class="k">skip-RC speed</span><span class="no">no</span></div>
+      <div class="prop"><span class="k">no copy machinery</span><span class="yes">yes</span></div>
+      <p>Safest &amp; simplest, but pays full RC; arena = locality + reclaim, not speed.</p>
+    </div>
+    <div class="card hi">
+      <h3>R + escape</h3><div class="tag">recommended &middot; routed</div>
+      <div class="prop"><span class="k">escape allowed</span><span class="yes">yes</span></div>
+      <div class="prop"><span class="k">skip-RC speed</span><span class="part">where provable</span></div>
+      <div class="prop"><span class="k">no copy machinery</span><span class="yes">yes</span></div>
+      <p>Route per alloc-site: local&rarr;arena, escapee&rarr;RC heap. Recovers the speed by analysis.</p>
+    </div>
+    <div class="card">
+      <h3>D &middot; copy-out</h3><div class="tag">arena-first &middot; promote</div>
+      <div class="prop"><span class="k">escape allowed</span><span class="yes">yes</span></div>
+      <div class="prop"><span class="k">skip-RC speed</span><span class="yes">yes</span></div>
+      <div class="prop"><span class="k">no copy machinery</span><span class="no">no</span></div>
+      <p>Optimistic &amp; flexible, but needs a deep-copy walker + a fresh soundness proof (novel).</p>
+    </div>
+  </div>
+
+  <!-- 4 -->
+  <h2>4 &middot; Pick two &mdash; and how analysis dissolves it</h2>
+  <p>Without escape analysis, three properties trade off and any single design gets only <b>two</b>. Escape analysis is a <i>third axis</i>: deciding placement per allocation lets you keep <b>escape</b> and <b>simplicity</b> while clawing back the <b>speed</b> for everything it can prove local.</p>
+  <svg viewBox="0 0 480 372" role="img" aria-label="tradeoff triangle: pick two">
+    <g font-family="ui-monospace,monospace" font-size="12">
+      <path d="M240,52 L70,322 L410,322 Z" fill="#f5f7f9" stroke="#dfe3e8" stroke-width="1.3"/>
+
+      <!-- vertices -->
+      <text x="240" y="40" text-anchor="middle" fill="#6b7280">skip-RC speed &middot; O(1) free</text>
+      <text x="58"  y="342" text-anchor="start" fill="#6b7280">escape allowed</text>
+      <text x="422" y="342" text-anchor="end"  fill="#6b7280">simple &middot; no copy</text>
+
+      <!-- edge designs (each has the two adjacent vertices, lacks the opposite) -->
+      <circle cx="155" cy="187" r="5" fill="#6b7280"/>
+      <text x="146" y="182" text-anchor="end">D</text>
+      <text x="146" y="196" text-anchor="end" font-size="10" fill="#6b7280">copy-out</text>
+
+      <circle cx="325" cy="187" r="5" fill="#6b7280"/>
+      <text x="334" y="182" text-anchor="start">F</text>
+      <text x="334" y="196" text-anchor="start" font-size="10" fill="#6b7280">forbid</text>
+
+      <circle cx="240" cy="322" r="5" fill="#6b7280"/>
+      <text x="240" y="312" text-anchor="middle">R</text>
+
+      <!-- center: R+escape lifted off the plane by the analysis axis -->
+      <circle cx="240" cy="222" r="8" fill="#2f6fb0"/>
+      <text x="240" y="248" text-anchor="middle" fill="#2f6fb0" font-weight="700">R + escape</text>
+      <g stroke="#2f6fb0" fill="none" stroke-width="1" stroke-dasharray="3 3" opacity="0.7">
+        <path d="M240,222 L240,60"/>
+        <path d="M240,222 L80,316"/>
+        <path d="M240,222 L400,316"/>
+      </g>
+    </g>
+  </svg>
+  <p class="cap">fig 4 &mdash; F/R/D each sit on one edge (two vertices, lacking the third); R+escape reaches all three, paying instead in analysis precision</p>
+
+  <!-- 5 -->
+  <h2>5 &middot; The ladder: RC floor, analysis on top, copy-out never</h2>
+  <div class="flow">
+    <div class="box">ship plain <b>R</b><small>counted, escape just works &mdash; safe &amp; simple, no new analysis</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box hi">layer escape-routing<small>local&rarr;uncounted arena, escapee&rarr;RC heap &mdash; reclaim the speed</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="box">approach true-region speed<small>O(1) cohort frees for everything proven local; unprovable degrades to RC</small></div>
+  </div>
+  <p class="cap">fig 5 &mdash; each rung is sound on its own; <code>D</code> (copy-out) is never on the path</p>
+
+  <div class="note"><b>The point:</b> escape analysis is the <i>dial</i> between all-RC (<code>R</code>) and all-skip (<code>F</code>), turned per allocation-site. RC is the floor that keeps it sound; deciding placement up front means copy-out is the one piece of machinery you never have to build.</div>
+
+</div>
+</body>
+</html>

@@ -205,6 +205,9 @@ renderValue :: Value -> Text
 renderValue (VLit l) = renderLit l
 renderValue (VCon "Nil" [])        = Tx.pack "[]"
 renderValue v@(VCon "Cons" [_, _]) = renderList v
+-- Arrays are rendered as [a, b, c] to match the RC interpreter's NArray renderer.
+renderValue (VCon "Array" vs)      =
+  Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") (map renderValue vs) <> Tx.pack "]"
 renderValue (VCon tag vs)
   | Just n <- tupleArity tag, length vs == n =
       Tx.pack "(" <> Tx.intercalate (Tx.pack ", ") (map renderValue vs) <> Tx.pack ")"

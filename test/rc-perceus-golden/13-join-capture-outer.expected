@@ -1,15 +1,15 @@
 prependHead tag xs =
-  join j76(r) =
+  join j83(r) =
     let h = r
     let t = Cell(h, tag)
     t
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      jump j76(0)
+      jump j83(0)
     Cons y _ ->
       let _drop.2 = __rc_drop(xs)
-      jump j76(y)
+      jump j83(y)
 
 main =
   let t.1 = Nil

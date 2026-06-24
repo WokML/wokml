@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Verify copy-on-write set: the updated array carries the new value at index i,
+-- all other slots unchanged; the original is consumed (not shared).
+--
+-- Plan:
+--   arr0 = new 4 0           -- [0, 0, 0, 0]
+--   arr1 = set arr0 0 100    -- [100, 0, 0, 0]
+--   arr2 = set arr1 2 200    -- [100, 0, 200, 0]
+--   arr3 = set arr2 3 300    -- [100, 0, 200, 300]
+--   v0   = index arr3 0      -- 100
+--   v1   = index arr3 1      -- 0
+--   v2   = index arr3 2      -- 200
+--   v3   = index arr3 3      -- 300
+--   main = v0 + v1 + v2 + v3 -- 600
+
+main : U64
+main =
+  let arr0 = new 4 0 in
+  let arr1 = set arr0 0 100 in
+  let arr2 = set arr1 2 200 in
+  let arr3 = set arr2 3 300 in
+  let v0   = index arr3 0 in
+  let v1   = index arr3 1 in
+  let v2   = index arr3 2 in
+  let v3   = index arr3 3 in
+  v0 + v1 + v2 + v3

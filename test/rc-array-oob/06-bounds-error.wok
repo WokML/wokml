@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Out-of-bounds index: both the reference interpreter and the RC interpreter
+-- must raise a PrimError.  The differential harness treats (Left, Left) as
+-- agreement, so this program exercises the shared error path.
+--
+-- arr = new 3 0    -- [0, 0, 0] (valid indices: 0, 1, 2)
+-- index arr 3      -- index 3 is out of bounds -> PrimError
+
+main : U64
+main =
+  let arr = new 3 0 in
+  index arr 3

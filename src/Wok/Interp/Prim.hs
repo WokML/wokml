@@ -10,6 +10,7 @@ import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.Value
   ( Prim (..), PrimResult (..), PrimTable, RuntimeError (..), Value (..), renderValue )
 
+
 primTable :: PrimTable
 primTable = Map.fromList [ (primName p, p) | p <- prims ]
 
@@ -38,6 +39,13 @@ prims =
   , contCellNewP
   , contStoreP
   , contTakeP
+  , arrayNewP
+  , arrayFromListP
+  , arrayToListP
+  , arrayIndexP
+  , arrayLengthP
+  , arraySetP
+  , arrayResizeP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -216,6 +224,17 @@ asInt :: Value -> Either RuntimeError Integer
 asInt (VLit (LInt n)) = Right n
 asInt v = Left (PrimError (Tx.pack "expected U64, got " <> renderValue v))
 
+-- | Extract a non-negative array index/length from a U64 literal, rejecting
+-- negatives. This mirrors the RC interpreter's 'asIndex' exactly so the two
+-- sides of the differential oracle stay in lockstep on out-of-range inputs (a
+-- negative argument must FAIL on both sides, not succeed on one).
+asIndexInt :: Value -> Either RuntimeError Int
+asIndexInt (VLit (LInt n))
+  | n < 0                           = Left (PrimError (Tx.pack "Array: negative index"))
+  | n > toInteger (maxBound :: Int) = Left (PrimError (Tx.pack "Array: index out of range"))
+  | otherwise                       = Right (fromInteger n)
+asIndexInt v = Left (PrimError (Tx.pack "Array: expected U64 index, got " <> renderValue v))
+
 asBool :: Value -> Either RuntimeError Bool
 asBool v@(VCon t []) =
   case () of
@@ -281,3 +300,92 @@ dollarP :: Prim
 dollarP = mkPrim (Tx.pack "$") 2 $ \args -> case args of
   [f, x] -> Right (PRApply f [x])
   _      -> Left (ArityError (Tx.pack "$"))
+
+-- ---------------------------------------------------------------------------
+-- Std.Array prims (reference interpreter side, Slice A).
+--
+-- Arrays are represented as @VCon "Array" [v1, v2, ...]@, a direct-field
+-- constructor holding one 'Value' slot per element. 'renderValue' has a
+-- matching special case that renders this as @[v1, v2, ...]@, byte-identical
+-- with the RC interpreter's 'NArray' renderer; this keeps the differential
+-- oracle honest when the program's 'main' returns an array value.
+--
+-- There is no reference-side RC accounting (the reference machine has no
+-- store), so these prims focus purely on value semantics, matching the
+-- observable behaviour described in spec §4.
+
+-- | @new k v@: build an array of length k with every slot filled by v.
+arrayNewP :: Prim
+arrayNewP = mkPrim PN.arrayNewName 2 $ \args -> case args of
+  [k, v] -> do
+    n <- asIndexInt k
+    Right (PRDone (VCon (Tx.pack "Array") (replicate n v)))
+  _ -> Left (ArityError PN.arrayNewName)
+
+-- | @fromList xs@: convert a Cons/Nil list to an array.
+-- The representation is @VCon "Array" [v1, v2, ...]@.
+arrayFromListP :: Prim
+arrayFromListP = mkPrim PN.arrayFromListName 1 $ \args -> case args of
+  [xs] -> do
+    vs <- collectList xs
+    Right (PRDone (VCon (Tx.pack "Array") vs))
+  _ -> Left (ArityError PN.arrayFromListName)
+  where
+    collectList (VCon t [])       | t == Tx.pack "Nil"  = Right []
+    collectList (VCon t [h, tl])  | t == Tx.pack "Cons" = do
+      rest <- collectList tl
+      Right (h : rest)
+    collectList v = Left (PrimError (Tx.pack "Array.fromList: not a list: " <> renderValue v))
+
+-- | @toList arr@: convert an array to a Cons/Nil list.
+arrayToListP :: Prim
+arrayToListP = mkPrim PN.arrayToListName 1 $ \args -> case args of
+  [VCon t vs] | t == Tx.pack "Array" ->
+    Right (PRDone (foldr (\v tl -> VCon (Tx.pack "Cons") [v, tl]) (VCon (Tx.pack "Nil") []) vs))
+  [v] -> Left (PrimError (Tx.pack "Array.toList: not an array: " <> renderValue v))
+  _   -> Left (ArityError PN.arrayToListName)
+
+-- | @index arr i@: look up the element at position i (0-based, bounds-checked).
+arrayIndexP :: Prim
+arrayIndexP = mkPrim PN.arrayIndexName 2 $ \args -> case args of
+  [VCon t vs, iv] | t == Tx.pack "Array" -> do
+    i <- asIndexInt iv
+    case drop i vs of
+      (x : _) -> Right (PRDone x)
+      []      -> Left (PrimError (Tx.pack "Array.index: out of bounds"))
+  [v, _] -> Left (PrimError (Tx.pack "Array.index: not an array: " <> renderValue v))
+  _      -> Left (ArityError PN.arrayIndexName)
+
+-- | @length arr@: return the element count.
+arrayLengthP :: Prim
+arrayLengthP = mkPrim PN.arrayLengthName 1 $ \args -> case args of
+  [VCon t vs] | t == Tx.pack "Array" ->
+    Right (PRDone (VLit (LInt (fromIntegral (length vs)))))
+  [v] -> Left (PrimError (Tx.pack "Array.length: not an array: " <> renderValue v))
+  _   -> Left (ArityError PN.arrayLengthName)
+
+-- | @set arr i v@: copy-on-write slot update (bounds-checked).
+arraySetP :: Prim
+arraySetP = mkPrim PN.arraySetName 3 $ \args -> case args of
+  [VCon t vs, iv, v] | t == Tx.pack "Array" -> do
+    i <- asIndexInt iv
+    if i >= length vs
+      then Left (PrimError (Tx.pack "Array.set: out of bounds"))
+      else
+        let updated = [ if j == i then v else el
+                      | (j, el) <- zip [(0 :: Int) ..] vs ]
+        in Right (PRDone (VCon (Tx.pack "Array") updated))
+  [v, _, _] -> Left (PrimError (Tx.pack "Array.set: not an array: " <> renderValue v))
+  _         -> Left (ArityError PN.arraySetName)
+
+-- | @resize arr m fill@: copy-on-write resize to length m, using fill for new slots.
+arrayResizeP :: Prim
+arrayResizeP = mkPrim PN.arrayResizeName 3 $ \args -> case args of
+  [VCon t vs, mv, fill] | t == Tx.pack "Array" -> do
+    m <- asIndexInt mv
+    let n    = length vs
+        kept = take m vs
+        ext  = replicate (max 0 (m - n)) fill
+    Right (PRDone (VCon (Tx.pack "Array") (kept ++ ext)))
+  [v, _, _] -> Left (PrimError (Tx.pack "Array.resize: not an array: " <> renderValue v))
+  _         -> Left (ArityError PN.arrayResizeName)

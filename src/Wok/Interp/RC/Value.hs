@@ -570,6 +570,18 @@ spliceKont prefix tl = go prefix
 -- storable wok value kinds.
 data Node
   = NCon Text [RCValue]
+  | NArray [RCValue]
+  -- ^ A fixed-size, homogeneous, BOXED array (Array Slice A): a contiguous run of
+  -- element slots, each an ordinary counted child. Lives on the abstract 'IntMap'
+  -- heap on BOTH backends (it is not an 'NCon', so 'alloc' routes it to 'allocPure'
+  -- and it is never C-eligible). The array's length is @length vs@.
+  --
+  -- RC DISCIPLINE. The cell OWNS one ref to each COUNTED element; uncounted slots
+  -- (inline immediates, literals, static handles) contribute nothing. Release
+  -- routes through the GENERIC cascade ('cascadeChildren' falls through to
+  -- 'countedRefs . nodeValues'), so freeing an array drops each counted element
+  -- exactly once -- no special 'NCont'-style routing. 'dup' bumps only the array
+  -- cell (elements shared via the cell, identical to 'NCon').
   | NRecord Text (Map Text RCValue)
   | NClosure REnv [Binder] Expr CaptureMode
   -- ^ The 'REnv' captures live RC values. Compare 'VClosure' in
@@ -1306,6 +1318,9 @@ dropAddrPure a0 s0 = go [a0] s0
 -- release and acquire --- no container-kind special cases and no borrowed-set.
 nodeValues :: Node -> [RCValue]
 nodeValues (NCon _ vs)          = vs
+-- Every element slot is a counted child; the generic cascade frees each counted
+-- one exactly once (uncounted slots are skipped by 'countedRefs').
+nodeValues (NArray vs)          = vs
 nodeValues (NRecord _ m)        = Map.elems m
 nodeValues (NClosure env _ _ _) = Map.elems env
 nodeValues (NGroupCode _)       = []
@@ -1575,6 +1590,11 @@ renderValueWith drf = goVal
     goNode s (NCon c vs) = do
       parts <- mapM (goVal s) vs
       pure (c <> Tx.pack "(" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack ")")
+    -- Render an array as @[a, b, c]@: each slot is rendered in order, elements
+    -- comma-separated. An empty array is @[]@.
+    goNode s (NArray vs) = do
+      parts <- mapM (goVal s) vs
+      pure (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack "]")
     goNode s (NRecord t m) = do
       parts <- mapM (\(l, fv) -> do tv <- goVal s fv
                                     pure (l <> Tx.pack " = " <> tv)) (Map.toList m)

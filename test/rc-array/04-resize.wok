@@ -1,0 +1,27 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Exercise resize: grow, shrink, and same-size, then verify element values via
+-- index.
+--
+-- Plan:
+--   arr0 = new 2 0            -- [0, 0]
+--   arr1 = set arr0 0 10      -- [10, 0]
+--   arr2 = set arr1 1 20      -- [10, 20]
+--   arr3 = resize arr2 4 99   -- [10, 20, 99, 99]  (grow: 2 fill slots)
+--   arr4 = resize arr3 2 0    -- [10, 20]           (shrink back)
+--   v0   = index arr3 2       -- 99   (fill slot survives grow)
+--   v1   = index arr4 0       -- 10   (kept slot survives shrink)
+--   main = v0 + v1            -- 99 + 10 = 109
+
+main : U64
+main =
+  let arr0 = new 2 0 in
+  let arr1 = set arr0 0 10 in
+  let arr2 = set arr1 1 20 in
+  let arr3 = resize arr2 4 99 in
+  let arr4 = resize arr3 2 0 in
+  let v0   = index arr3 2 in
+  let v1   = index arr4 0 in
+  v0 + v1

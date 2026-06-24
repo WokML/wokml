@@ -1,0 +1,14 @@
+module Std.Array
+import Std.Base
+
+-- Array a is a fixed-size, homogeneous array with boxed element slots.
+-- The tycon is pre-registered in the compiler's initial environment
+-- (kind * -> *, arity 1); no extern type declaration is needed here.
+
+extern new      : U64 -> a -> Array a
+extern fromList : [a] -> Array a
+extern toList   : Array a -> [a]
+extern index    : Array a -> U64 -> a
+extern length   : Array a -> U64
+extern set      : Array a -> U64 -> a -> Array a
+extern resize   : Array a -> U64 -> a -> Array a

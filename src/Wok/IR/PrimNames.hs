@@ -46,6 +46,15 @@ module Wok.IR.PrimNames
   , contStoreKey
   , contTakeKey
   , coroSuspKey
+    -- * Std.Array prim names
+  , stdArrayModule
+  , arrayNewName
+  , arrayFromListName
+  , arrayToListName
+  , arrayIndexName
+  , arrayLengthName
+  , arraySetName
+  , arrayResizeName
   ) where
 
 import Data.Set (Set)
@@ -118,3 +127,38 @@ contTakeKey = (contStoreModule, contTakeName)
 -- | Qualified @(module, name)@ identity key for @__coro_susp@.
 coroSuspKey :: (Text, Text)
 coroSuspKey = (contStoreModule, coroSuspName)
+
+-- ---------------------------------------------------------------------------
+-- Std.Array prim names
+
+-- | The defining module of the Array prelude externs.
+stdArrayModule :: Text
+stdArrayModule = Tx.pack "Std.Array"
+
+-- | @new k v@: allocate an array of length k filled with v (Array Slice A).
+arrayNewName :: Text
+arrayNewName = Tx.pack "new"
+
+-- | @fromList xs@: build an array from a wok list.
+arrayFromListName :: Text
+arrayFromListName = Tx.pack "fromList"
+
+-- | @toList arr@: convert an array to a wok list.
+arrayToListName :: Text
+arrayToListName = Tx.pack "toList"
+
+-- | @index arr i@: look up element at index i (bounds-checked).
+arrayIndexName :: Text
+arrayIndexName = Tx.pack "index"
+
+-- | @length arr@: return the number of elements.
+arrayLengthName :: Text
+arrayLengthName = Tx.pack "length"
+
+-- | @set arr i v@: copy-on-write slot update.
+arraySetName :: Text
+arraySetName = Tx.pack "set"
+
+-- | @resize arr m fill@: copy-on-write resize to length m with fill for new slots.
+arrayResizeName :: Text
+arrayResizeName = Tx.pack "resize"

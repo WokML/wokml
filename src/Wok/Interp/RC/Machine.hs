@@ -621,6 +621,7 @@ matchAltsRC v alts sc k s = case v of
 
 nodeTag :: Node -> Text
 nodeTag (NCon t _)    = t
+nodeTag (NArray _)    = Tx.pack "<array>"
 nodeTag (NRecord t _) = t
 nodeTag NClosure{}    = Tx.pack "<closure>"
 nodeTag (NGroupCode _) = Tx.pack "<closure>"

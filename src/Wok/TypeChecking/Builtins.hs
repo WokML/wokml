@@ -36,6 +36,7 @@ initialEnv = emptyEnv
       , ("Char",   TyConInfo KStar 0 [] False [])
       , ("()",     TyConInfo KStar 0 [] False [])
       , ("[]",     TyConInfo listKind 1 [] False [KStar])
+      , ("Array",  TyConInfo listKind 1 [] False [KStar])
       ] ++ [ (tupleName n, TyConInfo (tupleKind n) n [] False (replicate n KStar)) | n <- [2 .. 16] ]
 
     conEntries :: [(Text, ConInfo)]

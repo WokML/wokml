@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Exercise all seven Array ops and return a U64 result so that both the
+-- reference interpreter and the RC interpreter produce identical scalar output.
+--
+-- Plan:
+--   arr0 = new 3 0          -- [0, 0, 0]
+--   arr1 = set arr0 1 42    -- [0, 42, 0]
+--   v    = index arr1 1     -- 42
+--   n    = length arr1      -- 3
+--   arr2 = resize arr1 5 7  -- [0, 42, 0, 7, 7]
+--   xs   = toList arr2      -- [0, 42, 0, 7, 7] as a list
+--   arr3 = fromList xs      -- [0, 42, 0, 7, 7] as an array
+--   m    = length arr3      -- 5
+--   main = v + n + m        -- 42 + 3 + 5 = 50
+
+main : U64
+main =
+  let arr0 = new 3 0 in
+  let arr1 = set arr0 1 42 in
+  let v    = index arr1 1 in
+  let n    = length arr1 in
+  let arr2 = resize arr1 5 7 in
+  let xs   = toList arr2 in
+  let arr3 = fromList xs in
+  let m    = length arr3 in
+  v + n + m

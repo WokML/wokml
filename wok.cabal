@@ -10,6 +10,7 @@ build-type:         Simple
 extra-doc-files:    CHANGELOG.md
 data-files:         prelude/Std/Base.wok
                     prelude/Std/Control.wok
+                    prelude/Std/Array.wok
 
 -- Plain -Wall, used by the generated parser sublibrary (BNFC/alex/happy
 -- output carries unavoidable warnings, so it must NOT be -Werror).

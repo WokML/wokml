@@ -397,6 +397,8 @@ prettyCTypeLocal (CTCon TcBool   [])  = Tx.pack "Bool"
 prettyCTypeLocal (CTCon TcUnit   [])  = Tx.pack "()"
 prettyCTypeLocal (CTCon TcList [x])   =
   Tx.pack "[" <> prettyCTypeLocal x <> Tx.pack "]"
+prettyCTypeLocal (CTCon TcArray [x])  =
+  Tx.pack "Array " <> prettyCTypeLocal x
 prettyCTypeLocal (CTCon (TcTuple _) xs) =
   Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map prettyCTypeLocal xs)
