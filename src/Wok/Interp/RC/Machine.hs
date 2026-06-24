@@ -1004,8 +1004,10 @@ renderRcStats :: RCRun -> Text
 renderRcStats run =
   let st = rcStats run
    in Tx.unlines
-        [ Tx.pack "allocs   = " <> Tx.pack (show (stAllocs st))
-        , Tx.pack "frees    = " <> Tx.pack (show (stFrees st))
-        , Tx.pack "peakLive = " <> Tx.pack (show (stPeak st))
-        , Tx.pack "baseline = " <> Tx.pack (show (rcBaseline run))
+        [ Tx.pack "allocs    = " <> Tx.pack (show (stAllocs st))
+        , Tx.pack "frees     = " <> Tx.pack (show (stFrees st))
+        , Tx.pack "peakLive  = " <> Tx.pack (show (stPeak st))
+        , Tx.pack "curBytes  = " <> Tx.pack (show (stCurBytes st))
+        , Tx.pack "peakBytes = " <> Tx.pack (show (stPeakBytes st))
+        , Tx.pack "baseline  = " <> Tx.pack (show (rcBaseline run))
         ]

@@ -171,6 +171,113 @@ int main(void) {
         wok_heap_free(h);
     }
 
+    /* --- WokArray: alloc/len/elemkind/slot round-trip --------------------------------- */
+    {
+        WokHeap* h = wok_heap_new();
+
+        /* Basic round-trip: len=3, elemkind=0 */
+        WokObj* arr = wok_array_alloc(h, 3u, 0u);
+        assert(wok_tag(arr)              == WOK_ARRAY_TAG);
+        assert(wok_array_len(arr)        == 3u);
+        assert(wok_array_elemkind(arr)   == 0u);
+
+        wok_array_slot_set(arr, 0u, 11u);
+        wok_array_slot_set(arr, 1u, 22u);
+        wok_array_slot_set(arr, 2u, 33u);
+        assert(wok_array_slot_get(arr, 0u) == 11u);
+        assert(wok_array_slot_get(arr, 1u) == 22u);
+        assert(wok_array_slot_get(arr, 2u) == 33u);
+
+        /* peak_bytes: 16 + 8*3 = 40 bytes */
+        assert(wok_stat_peak_bytes(h) == 40u);
+
+        assert(wok_dec(arr) == 0u);
+        wok_free(h, arr);
+        assert(wok_stat_live(h) == 0);
+
+        /* Shared free-list with NCon arity=4: len=3 -> class=4, NCon arity=4 -> class=4.
+           After freeing the array, a wok_alloc for arity=4 must return the SAME pointer
+           (arena only; malloc backend makes no reuse promise). */
+        WokObj* ncon = wok_alloc(h, 7u, 4u);
+#ifndef WOK_RC_MALLOC
+        assert(ncon == arr);              /* pointer-identity reuse: cross-shape, same size class */
+        assert(wok_stat_reused(h) == 1u); /* a freelist pop, not a fresh bump */
+#else
+        (void)arr;
+#endif
+        assert(wok_tag(ncon)   == 7u);
+        assert(wok_arity(ncon) == 4u);
+        assert(wok_dec(ncon) == 0u);
+        wok_free(h, ncon);
+        wok_heap_free(h);
+    }
+
+    /* --- WokArray: len=0 (smallest array, 16 bytes, class 1) -------------------------- */
+    {
+        WokHeap* h = wok_heap_new();
+        WokObj* empty = wok_array_alloc(h, 0u, 0u);
+        assert(wok_tag(empty)          == WOK_ARRAY_TAG);
+        assert(wok_array_len(empty)    == 0u);
+        /* peak_bytes: 16 + 8*0 = 16 bytes (the smallest array cell) */
+        assert(wok_stat_peak_bytes(h) == 16u);
+        assert(wok_dec(empty) == 0u);
+        wok_free(h, empty);
+        assert(wok_stat_live(h) == 0);
+
+        /* class = len+1 = 1, shared with NCon arity 1 (also 16 bytes). The freed empty
+           array recycles into freelist[1]; an arity-1 NCon reuses the same cell (arena). */
+        WokObj* ncon = wok_alloc(h, 9u, 1u);
+#ifndef WOK_RC_MALLOC
+        assert(ncon == empty);            /* arena: routed to freelist[1], not malloc */
+        assert(wok_stat_reused(h) == 1u);
+#else
+        (void)empty;
+#endif
+        assert(wok_dec(ncon) == 0u);
+        wok_free(h, ncon);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
+    /* --- WokArray: large path (len >= 63 -> malloc) ----------------------------------- */
+    {
+        WokHeap* h = wok_heap_new();
+        WokObj* big = wok_array_alloc(h, 100u, 1u);
+        assert(wok_tag(big)            == WOK_ARRAY_TAG);
+        assert(wok_array_len(big)      == 100u);
+        assert(wok_array_elemkind(big) == 1u);
+
+        wok_array_slot_set(big, 0u,  0xABCDu);
+        wok_array_slot_set(big, 99u, 0xDEADu);
+        assert(wok_array_slot_get(big, 0u)  == 0xABCDu);
+        assert(wok_array_slot_get(big, 99u) == 0xDEADu);
+
+        /* peak_bytes: 16 + 8*100 = 816 bytes */
+        assert(wok_stat_peak_bytes(h) == 816u);
+
+        assert(wok_dec(big) == 0u);
+        wok_free(h, big);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
+    /* --- wok_free tag-first dispatch: no misroute on array freed after NCon ----------- */
+    {
+        /* Allocate an NCon (arity=2, class=2, bytes=24) then an array (len=1, class=2,
+           bytes=24). They share the same free-list class. Free both; verify live==0 and
+           no abort (a misroute would read elemkind as arity -> wrong byte size -> corrupt
+           cur_bytes -> live check would see a bad value). */
+        WokHeap* h = wok_heap_new();
+        WokObj* ncon = wok_alloc(h, 5u, 2u);
+        WokObj* arr  = wok_array_alloc(h, 1u, 0u);
+        assert(wok_dec(ncon) == 0u);
+        wok_free(h, ncon);
+        assert(wok_dec(arr) == 0u);
+        wok_free(h, arr);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
     printf("OK\n");
     return 0;
 }

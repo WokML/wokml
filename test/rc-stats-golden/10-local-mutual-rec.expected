@@ -1,4 +1,6 @@
-allocs   = 0
-frees    = 0
-peakLive = 0
-baseline = 0
+allocs    = 0
+frees     = 0
+peakLive  = 0
+curBytes  = 0
+peakBytes = 0
+baseline  = 0

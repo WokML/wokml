@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok — Array Slice B: the C WokArray cell, and what's next</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --good:#1a7f4b; --warn:#c0392b; --hand:#8e44ad; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.8rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.16rem;margin:46px 0 2px}
+  h3{font-size:.97rem;margin:18px 0 4px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  p{margin:.7em 0}
+
+  .addrlab{font-family:ui-monospace,monospace;font-size:.66rem;color:var(--mut);display:flex;justify-content:space-between;margin:14px 0 -2px}
+  .mem{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;font-family:ui-monospace,monospace;font-size:.72rem;margin:2px 0}
+  .seg{padding:8px 7px;border-right:1px solid var(--line);text-align:center;white-space:nowrap;min-width:0}
+  .seg:last-child{border-right:none}
+  .seg small{display:block;color:var(--mut);font-size:.85em;font-weight:400}
+  .seg.hdr{background:#eceff3;color:var(--mut)}
+  .seg.arr{background:#eef4fb;color:var(--accent)}
+  .seg.elem{background:#eef7f0;color:var(--good)}
+  .seg.ptr{background:#fdeef6;color:var(--hand)}
+  .seg.free{flex:1;background:repeating-linear-gradient(45deg,#fbfcfd,#fbfcfd 6px,#f1f3f5 6px,#f1f3f5 12px);color:var(--mut)}
+  .wide{flex:2}
+  .arrowdown{color:var(--hand);font-family:ui-monospace,monospace;font-size:.8rem;margin:1px 0 1px 60px}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:16px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:200px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .arrow{color:var(--mut);margin:3px 0}
+
+  .ladder{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:16px 0;font-family:ui-monospace,monospace;font-size:.73rem}
+  .rung{border:1px solid var(--line);background:var(--soft);border-radius:7px;padding:8px 10px;min-width:88px;text-align:center}
+  .rung small{display:block;color:var(--mut);font-size:.84em;font-weight:400;margin-top:2px}
+  .rung.done{background:#eef7f0;border-color:var(--good);color:var(--good)}
+  .rung.here{background:#eef4fb;border-color:var(--accent);color:var(--accent);box-shadow:0 0 0 2px #e3eef9}
+  .rung.next{background:#f4ecfa;border-color:var(--hand);color:var(--hand)}
+  .chev{align-self:center;color:var(--mut);padding:0 6px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card .lab{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .card h3{margin:0 0 6px;font-size:.95rem}
+  .card p{font-size:.83rem;margin:6px 0 0}
+  .card.good{border-color:var(--good)} .card.good h3{color:var(--good)}
+
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.82rem}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  .ok{color:var(--good);font-weight:600}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0}
+  .note b{color:var(--accent)}
+  .note.next{border-left-color:var(--hand)} .note.next b{color:var(--hand)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Array Slice B — a real C cell for <code>Array a</code></h1>
+  <p class="sub">What shipped: the wok array stopped being a Haskell-side simulation and became a genuine C allocator citizen — with byte-size-class placement and a bit-for-bit <code>peak_bytes</code> oracle. Plus where the array story goes next.</p>
+
+  <!-- 1 -->
+  <h2>1 &middot; The shift: interpreter-resident &rarr; real allocator layout</h2>
+  <p>Before (Slice A), an <code>Array a</code> was an <code>NArray [RCValue]</code> living on the abstract <code>IntMap</code> heap — a model, not memory. Slice B gives the <b>production (C) backend</b> a real <code>WokArray</code> cell in the arena; the abstract <code>NArray</code> is kept <i>only</i> as the differential oracle&rsquo;s reference to check the C cell against.</p>
+  <div class="grid">
+    <div class="card"><span class="lab">abstract backend (test oracle)</span><h3>NArray [RCValue]</h3><p>Stays on the <code>IntMap</code> heap. The simple, obviously-correct reference the C cell is proven equal to, program-by-program.</p></div>
+    <div class="card good"><span class="lab">C backend (production)</span><h3>WokArray cell</h3><p>Real contiguous memory in the slab arena (or <code>malloc</code> for big ones). One allocation, one indirection, byte-accurate.</p></div>
+  </div>
+
+  <!-- 2 -->
+  <h2>2 &middot; The cell in memory</h2>
+  <p>A 16-byte header (the <code>WokObj</code> prefix, with <code>tag = WOK_ARRAY_TAG</code> and the <code>arity</code> byte repurposed as <code>elemkind</code>) then a runtime <code>len</code> and the inline slots. Each slot is an 8-byte word: a flat scalar for <code>Array U64</code>, a pointer for boxed elements (this is exactly Koka&rsquo;s <code>vector</code>).</p>
+  <div class="addrlab"><span>one contiguous block &mdash; byte size = 16 + 8&middot;len</span><span></span></div>
+  <div class="mem" style="max-width:680px">
+    <div class="seg arr">rc&middot;tag&middot;elemkind<small>offset 0&ndash;7</small></div>
+    <div class="seg arr">len = 3<small>offset 8</small></div>
+    <div class="seg elem wide">slot0<small>+16</small></div>
+    <div class="seg elem wide">slot1<small>+24</small></div>
+    <div class="seg elem wide">slot2<small>+32</small></div>
+  </div>
+  <p class="cap">fig 2 &mdash; <code>elemkind</code> (uniform, since <code>Array a</code> is monomorphic) decides how every slot is read: a raw scalar (uncounted) or a tagged pointer (counted child)</p>
+
+  <!-- 3 -->
+  <h2>3 &middot; Where it lives: one byte-size class, shared with constructors</h2>
+  <p>The arena&rsquo;s free-lists are unified by <b>total bytes</b>: <code>class = bytes/8 &minus; 1</code>. A constructor of arity <code>a</code> is class <code>a</code>; an array of length <code>L</code> is class <code>L+1</code> — and they share the same free-list slot, so a freed array can be recycled as an equal-size constructor and vice versa.</p>
+  <div class="flow">
+    <div class="box">allocate an array<small>byte size = 16 + 8&middot;len</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="row" style="display:flex;gap:12px">
+      <div class="box hi">len &le; 62 (&le; 512 B)<small>slab arena: pop freelist[len+1], else bump</small></div>
+      <div class="box">len &ge; 63<small>malloc (large object)</small></div>
+    </div>
+  </div>
+  <p class="cap">fig 3 &mdash; shape-agnostic recycling: <code>freelist[L+1]</code> holds both <code>WokArray</code>(len L) and <code>NCon</code>(arity L+1) — identical byte size</p>
+
+  <!-- 4 -->
+  <h2>4 &middot; The invariant that proves it: <code>peak_bytes</code></h2>
+  <p>This slice promoted <code>peak_bytes</code> (the high-water of live heap bytes) from a C-only benchmark stat into a <b>bit-for-bit differential-oracle invariant</b>. The abstract heap now computes the bytes each node <i>would</i> occupy as a C cell (<code>wouldBeCBytes</code>: <code>8+8&middot;arity</code> for a constructor, <code>16+8&middot;len</code> for an array, 0 for anything that never becomes a C cell), and the oracle asserts it equals the C runtime&rsquo;s own count on every test program.</p>
+  <table>
+    <tr><th>node</th><th>C charges</th><th>abstract <code>wouldBeCBytes</code></th><th>oracle</th></tr>
+    <tr><td>C-eligible <code>NCon</code> arity a</td><td class="mono">8 + 8a</td><td class="mono">8 + 8a</td><td class="ok">equal</td></tr>
+    <tr><td><code>WokArray</code> len n</td><td class="mono">16 + 8n</td><td class="mono">16 + 8n</td><td class="ok">equal</td></tr>
+    <tr><td>closure / env / non-C node</td><td class="mono">0 (not a C cell)</td><td class="mono">0</td><td class="ok">equal</td></tr>
+  </table>
+  <p class="cap">fig 4 &mdash; two independent accounting systems forced to agree &mdash; a strong cross-check, not a self-test</p>
+
+  <!-- 5 -->
+  <h2>5 &middot; What this slice deliberately did NOT do</h2>
+  <p>The brainstorm aimed at unboxed/flat arrays, but the codebase forced a sharper, smaller scope:</p>
+  <div class="grid">
+    <div class="card"><span class="lab">finding</span><h3>Only U64 / U32 exist</h3><p>No sub-word ints, no floats. So there are no element types denser than a word to pack.</p></div>
+    <div class="card"><span class="lab">finding</span><h3>Scalars are already inline</h3><p>A boxed <code>Array U64</code> already stores the integers inline. So &ldquo;flat&rdquo; would be identical — no win today.</p></div>
+    <div class="card"><span class="lab">consequence</span><h3>One polymorphic <code>Array a</code></h3><p>No <code>Array&rarr;Vector</code> rename, no new type, no allowlist. The flat-vs-boxed split dissolved.</p></div>
+  </div>
+
+  <!-- 6 -->
+  <h2>6 &middot; What&rsquo;s next &mdash; the slice ladder forward</h2>
+  <div class="ladder">
+    <div class="rung done">A<small>boxed Array<br>(merged)</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung here">B<small>C cell + byte class<br>+ peak_bytes<br>(this slice)</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung next">C<small>in-place set<br>rc==1</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">D<small>sub-word/float<br>+ unboxed structs</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">regions<small>arenas,<br>LoCal</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">String<small>flat bytes</small></div>
+  </div>
+  <div class="grid">
+    <div class="card"><span class="lab">slice C</span><h3>In-place <code>set</code> under rc==1</h3><p>Today <code>set</code> is copy-on-write (a whole new array). When the array is uniquely owned (<code>rc==1</code>), mutate the one slot in place — the FBIP gate applied to arrays.</p></div>
+    <div class="card"><span class="lab">slice D</span><h3>Sub-word / float types + unboxed structs</h3><p>This is when the deferred machinery <i>earns its keep</i>: add real <code>U8</code>/<code>F64</code>/&hellip; types, then pack them flat. Sub-word strides make <code>peak_bytes</code> rounding real; packed <code>Vec4</code>-style structs add the element layout descriptor + materialize-on-<code>index</code>.</p></div>
+    <div class="card"><span class="lab">later</span><h3>Regions, String, <code>ArrayOf n a</code></h3><p>Effect-scoped arenas + LoCal serialization; <code>String</code> as flat bytes (not <code>Array Char</code>); and length-indexed <code>ArrayOf n a</code> — which the runtime <code>len</code> kept here already founds.</p></div>
+  </div>
+  <div class="note next"><b>The throughline:</b> Slice B is the real-memory foundation. Slice D is where the original &ldquo;byte-size class + capacity rounding + packed structs&rdquo; ideas finally pay off — once the language has the element types that make unboxing a genuine win.</div>
+
+  <div class="note"><b>Review status:</b> per-task two-stage reviews + an Opus full-branch deep review (verdict: ready to merge) + an xhigh <code>/code-review</code> that surfaced and fixed two latent defects (a tag-reservation collision and a <code>peak_bytes</code> charge asymmetry, both only reachable past 65536 distinct constructors). 1397 tests green, sanitizers clean.</div>
+
+</div>
+</body>
+</html>

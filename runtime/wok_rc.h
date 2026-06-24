@@ -55,4 +55,26 @@ WOK_PURE uint64_t wok_stat_slabs(const WokHeap* h);
    real figure under WOK_RC_MALLOC; bound in Haskell as wokStatPeakBytes for benchmarking. */
 WOK_PURE uint64_t wok_stat_peak_bytes(const WokHeap* h);
 
+/* ---- WokArray: a real C array cell (Slice B) ----------------------------------------
+   Layout (always 8-aligned):
+     offset  0  uint32 rc       \
+     offset  4  uint16 tag       |  8-byte WokObj-compatible prefix: wok_dup/wok_dec/wok_tag
+     offset  6  uint8  elemkind  |  read offsets 0-7 unchanged; tag == WOK_ARRAY_TAG marks
+     offset  7  uint8  scan      /  an array; elemkind stores the element SlotKind (C: opaque)
+     offset  8  uint64 len       <- runtime element count (word 2)
+     offset 16  uint64 slots[len] <- len 8-byte slots
+   Byte size = 16 + 8*len.  Size class = bytes/8 - 1 = len + 1.
+   len <= 62 (class < WOK_NUM_CLASSES 64) -> arena free-list; len >= 63 -> malloc.
+   The arena free-list[len+1] is SHARED with NCon arity (len+1): identical byte size,
+   shape-agnostic recycling.
+   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFF. */
+
+#define WOK_ARRAY_TAG 0xFFFFu
+
+WokObj*  wok_array_alloc(WokHeap* h, uint64_t len, uint8_t elemkind); /* rc=1, tag=WOK_ARRAY_TAG, slots undef */
+WOK_PURE uint64_t wok_array_len(const WokObj* p);
+WOK_PURE uint32_t wok_array_elemkind(const WokObj* p);
+void     wok_array_slot_set(WokObj* p, uint64_t i, uint64_t word);
+WOK_PURE uint64_t wok_array_slot_get(const WokObj* p, uint64_t i);
+
 #endif /* WOK_RC_H */

@@ -217,6 +217,7 @@ main = do
     , rcIncrefTests
     , rcM3NodeTests
     , rcArrayNodeTests
+    , rcArrayCCellTests
     , rcArrayPrimTests
     , wokRcHeapTests
     , wokRcReuseTests
@@ -6846,8 +6847,8 @@ rcReclaimTests = testGroup "rc-reclaim"
       -- different Unique so the collector must dedup it to a single address.
       let inflight = St.HAddr 7   -- in stReserved
           spent    = St.HAddr 8   -- NOT in stReserved (consumed)
-          slotIn   = St.ReuseSlot inflight 2 True
-          slotSp   = St.ReuseSlot spent 2 True
+          slotIn   = St.ReuseSlot inflight 2 True 24
+          slotSp   = St.ReuseSlot spent 2 True 24
           env      = Map.fromList
             [ (Unique 9001, St.RVReuse (Just slotIn))
             , (Unique 9002, St.RVReuse (Just slotSp))
@@ -6857,7 +6858,7 @@ rcReclaimTests = testGroup "rc-reclaim"
           rBndr    = Binder (Name (T.pack "r") (Unique 9000)) Unrestricted m2bBoxTy
           prefix   = St.KLetRC rBndr (Ret (ALit LUnit)) sc St.KDoneRC
           reserved = Set.fromList [inflight]
-      St.continuationReservations prefix reserved @?= [inflight]
+      St.continuationReservations prefix reserved @?= [(inflight, 24)]
   , testCase "dropping an NCont reclaims its prefix's in-flight reservation" $ do
       -- Build an NCont whose prefix holds an in-flight reservation. The donor shell
       -- is reserved off-books through the REAL 'dropReuse' path (rc==1 unique donor
@@ -6886,7 +6887,7 @@ rcReclaimTests = testGroup "rc-reclaim"
           cont        = St.NCont prefix (m2b2NoParamHandler, 0, St.emptyRCScope)
           (contAddr, s2) = St.allocPure cont sR
       -- The collector sees the in-flight reservation.
-      St.continuationReservations prefix (St.stReserved s2) @?= [donor]
+      St.continuationReservations prefix (St.stReserved s2) @?= [(donor, 16)]
       res <- runExceptT (St.dropAddr contAddr s2)
       case res of
         Left e   -> assertFailure ("NCont drop failed: " <> show e)
@@ -6913,7 +6914,7 @@ rcReclaimTests = testGroup "rc-reclaim"
           -- stReserved. The cell is left LIVE (revived by the consume) to model the
           -- post-alloc_at state; freeing it would corrupt the heap.
           baseline    = St.stLive (St.stStats s1)
-          slot        = St.ReuseSlot donor 1 True
+          slot        = St.ReuseSlot donor 1 True 16
           env         = Map.fromList [(Unique 9201, St.RVReuse (Just slot))]
           sc          = St.RCScope env Map.empty
           rBndr       = Binder (Name (T.pack "r") (Unique 9200)) Unrestricted m2bBoxTy
@@ -7202,6 +7203,239 @@ rcArrayNodeTests = testGroup "rc array node"
                       case St.derefPure e1 s5 of
                         Left _  -> pure ()
                         Right _ -> assertFailure "element was not freed on the final drop"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC Array C-cell store-algebra tests (Array Slice B, Task 6)
+--
+-- These complement 'rcArrayNodeTests' (which operates on the abstract heap) by
+-- repeating the same store-algebra invariants on the REAL C cell path.  Each
+-- test allocates a 'WokHeap', builds a CHeap-backend 'Store', runs 'alloc' /
+-- 'incref' / 'dropAddr' via 'runExceptT', then asserts both the Haskell-side
+-- 'stLive' and the C runtime's 'wok_stat_live' counter return to baseline.
+-- Passing both counters is what proves the C cell -- not just the abstract
+-- mirror -- was genuinely exercised.
+--
+-- Two sub-cases pin the two important element-kind branches of the C cascade:
+--
+--   inline-element (Array U64 = KLitInt elemkind): teardown skips every slot
+--   (raw-lit, uncounted).  Only the array cell itself is freed; cascade emits
+--   zero child drops.
+--
+--   pointer-scheme (Array (NCon children) = KPointer elemkind): each counted
+--   child (CAddr or HAddr) is dropped exactly once; uncounted Inline slots are
+--   skipped.  The heap returns to baseline with no double-free.
+
+rcArrayCCellTests :: TestTree
+rcArrayCCellTests = testGroup "rc array C-cell store algebra"
+  [ -- -----------------------------------------------------------------------
+    -- Inline-element array (KLitInt elemkind): cascade emits zero child drops.
+    --
+    -- Build 'Array U64 = [1, 2, 3]' on a real WokHeap.  Before the drop:
+    -- stLive == baseline + 1 (the array cell) and wok_stat_live == 1.
+    -- After 'dropAddr' the array: stLive == baseline and wok_stat_live == 0,
+    -- confirming no spurious child drops fired and no C-heap leak occurred.
+    testCase "inline-element array (KLitInt): drop frees only the array cell, cascade empty" $ do
+      hp <- Heap.wokHeapNew
+      let s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+          elems = [ St.RVLit (Anf.LInt 1)
+                  , St.RVLit (Anf.LInt 2)
+                  , St.RVLit (Anf.LInt 3)
+                  ]
+      r <- runExceptT $ do
+             (arr, s1) <- St.alloc (St.NArray elems) s0
+             pure (arr, s1)
+      (arr, s1) <- case r of
+        Left e  -> assertFailure ("alloc NArray failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- The array cell is live; no child cells (raw-lit elements are inline).
+      St.stLive (St.stStats s1) @?= baseline + 1
+      cLive0 <- Heap.wokStatLive hp
+      assertEqual "wok_stat_live == 1 after array alloc" (1 :: Int64) cLive0
+      -- Drop the array.
+      r2 <- runExceptT (St.dropAddr arr s1)
+      case r2 of
+        Left e  -> do
+          Heap.wokHeapFree hp
+          assertFailure ("dropAddr array failed: " <> show e)
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          St.stFrees (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop (heap at baseline, no leak)" (0 :: Int64) cLive1
+          Heap.wokHeapFree hp
+
+  , -- -----------------------------------------------------------------------
+    -- Pointer-scheme array (KPointer elemkind): each counted child dropped once.
+    --
+    -- Allocate two one-field NCon children on the C heap (they become CAddr),
+    -- then build 'Array (NCon) = [RVBox child1, RVBox child2]'.  Before the
+    -- drop: stLive == baseline + 3 (2 children + 1 array) and wok_stat_live == 3.
+    -- After 'dropAddr' the array:
+    --   * the cascade decodes the two KPointer slots and drops child1/child2;
+    --   * stLive == baseline and wok_stat_live == 0;
+    --   * no double-free (stFrees incremented by exactly 3: array + 2 children).
+    testCase "pointer-scheme array (KPointer): each counted child dropped once, no double-free" $ do
+      hp <- Heap.wokHeapNew
+      let s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT $ do
+             -- Allocate two one-field NCons (C-eligible: arity 1, field is LInt).
+             (c1, s1) <- St.alloc (St.NCon (T.pack "Some") [St.RVLit (Anf.LInt 10)]) s0
+             (c2, s2) <- St.alloc (St.NCon (T.pack "Some") [St.RVLit (Anf.LInt 20)]) s1
+             -- Build the pointer-scheme array; elements are RVBox (CAddr ...).
+             (arr, s3) <- St.alloc (St.NArray [St.RVBox c1, St.RVBox c2]) s2
+             pure (c1, c2, arr, s3)
+      (c1, c2, arr, s3) <- case r of
+        Left e  -> assertFailure ("setup failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- Three cells live: child1, child2, the array.
+      St.stLive (St.stStats s3) @?= baseline + 3
+      cLive0 <- Heap.wokStatLive hp
+      assertEqual "wok_stat_live == 3 after alloc (2 children + 1 array)" (3 :: Int64) cLive0
+      -- Drop the array; the cascade must drop child1 and child2 exactly once.
+      r2 <- runExceptT (St.dropAddr arr s3)
+      case r2 of
+        Left e  -> do
+          Heap.wokHeapFree hp
+          assertFailure ("dropAddr array failed: " <> show e)
+        Right s4 -> do
+          St.stLive (St.stStats s4) @?= baseline
+          -- 3 frees: the array cell + both children.
+          St.stFrees (St.stStats s4) - St.stFrees (St.stStats s3) @?= 3
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after cascade (heap at baseline)" (0 :: Int64) cLive1
+          -- No double-free: children must be gone (deref on a CAddr has no
+          -- pure reconstruction, so we verify via wok_stat_allocs == wok_stat_frees).
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "C heap: allocs == frees (fully balanced)" cAllocs cFrees
+          -- Verify the children are absent from the abstract store too (no HAddr
+          -- was produced for c1/c2 since they are CAddr; assert the cascade
+          -- registered 3 total frees on the Haskell-side stats).
+          assertBool "children were counted CAddr slots (non-vacuity: 3 frees recorded)"
+            (St.stFrees (St.stStats s4) - St.stFrees (St.stStats s0) == 3)
+          -- Deref pure does not apply to CAddr; confirm the array addr is a CAddr
+          -- (i.e. actually routed to the C heap, not an HAddr fallback).
+          assertBool "array was allocated on the C heap (arr is a CAddr)"
+            (case arr of St.CAddr _ -> True; _ -> False)
+          assertBool "c1 was allocated on the C heap (c1 is a CAddr)"
+            (case c1 of St.CAddr _ -> True; _ -> False)
+          assertBool "c2 was allocated on the C heap (c2 is a CAddr)"
+            (case c2 of St.CAddr _ -> True; _ -> False)
+          Heap.wokHeapFree hp
+
+  , -- -----------------------------------------------------------------------
+    -- Shared array (rc 2): first drop only decrements, second drop frees + cascades.
+    --
+    -- Build a pointer-scheme array at rc 1, incref to rc 2.  First 'dropAddr'
+    -- must leave wok_stat_live unchanged (still 3).  Second 'dropAddr' must free
+    -- the array AND its children, returning both counters to baseline.
+    testCase "shared pointer-scheme array: dup+2xdrop frees exactly once, no double-free" $ do
+      hp <- Heap.wokHeapNew
+      let s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT $ do
+             (c1, s1) <- St.alloc (St.NCon (T.pack "Leaf") [St.RVLit (Anf.LInt 42)]) s0
+             (arr, s2) <- St.alloc (St.NArray [St.RVBox c1]) s1
+             s3 <- St.incref arr s2
+             pure (c1, arr, s3)
+      (c1, arr, s3) <- case r of
+        Left e  -> assertFailure ("setup failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- Shared at rc 2: stLive == baseline + 2 (child + array).
+      St.stLive (St.stStats s3) @?= baseline + 2
+      cLive0 <- Heap.wokStatLive hp
+      assertEqual "wok_stat_live == 2 after dup (array shared at rc 2)" (2 :: Int64) cLive0
+      -- First drop: only decrements (rc 2 -> 1).
+      r2 <- runExceptT (St.dropAddr arr s3)
+      s4 <- case r2 of
+        Left e  -> do { Heap.wokHeapFree hp; assertFailure ("first drop failed: " <> show e) }
+        Right s -> pure s
+      St.stLive (St.stStats s4) @?= baseline + 2
+      cLive1 <- Heap.wokStatLive hp
+      assertEqual "wok_stat_live == 2 after first drop (rc 2 -> 1, no free yet)" (2 :: Int64) cLive1
+      -- Second drop: rc 1 -> 0, array freed, cascade drops child.
+      r3 <- runExceptT (St.dropAddr arr s4)
+      case r3 of
+        Left e  -> do
+          Heap.wokHeapFree hp
+          assertFailure ("second drop failed: " <> show e)
+        Right s5 -> do
+          St.stLive (St.stStats s5) @?= baseline
+          cLive2 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after final drop (heap at baseline)" (0 :: Int64) cLive2
+          -- Exactly 2 frees: the array cell and the one child.
+          St.stFrees (St.stStats s5) - St.stFrees (St.stStats s3) @?= 2
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "C heap: allocs == frees (fully balanced)" cAllocs cFrees
+          assertBool "c1 is a CAddr (non-vacuity: C heap was exercised)"
+            (case c1 of St.CAddr _ -> True; _ -> False)
+          Heap.wokHeapFree hp
+
+  , -- -----------------------------------------------------------------------
+    -- Cross-heap child: a C 'WokArray' slot holding an HAddr (abstract-heap)
+    -- child.  This is the one cascade sub-case the CAddr-child cases above do
+    -- not cover: the array lives on the C heap, but one of its KPointer slots
+    -- points at a cell on the ABSTRACT 'IntMap' heap.
+    --
+    -- 'allocPure' always allocates on the abstract heap (an HAddr) regardless of
+    -- the backend, so it forces a genuine cross-heap edge even under a 'CHeap'
+    -- store.  'encodeSlotC' packs an HAddr as a KPointer slot @(i << 2) | 1@,
+    -- so the array's elemkind is KPointer and the teardown loop must decode the
+    -- slot back to the HAddr and route the drop to the abstract-heap step.
+    --
+    -- Before the drop: stLive == baseline + 2 (the abstract child + the C array),
+    -- wok_stat_live == 1 (only the array is on the C heap).  After 'dropAddr':
+    --   * the C array cell is freed: wok_stat_live returns to 0;
+    --   * the HAddr child's abstract cell is dropped exactly once (a UAF deref);
+    --   * stLive returns to baseline; stFrees +2 (array + child); no double-free.
+    testCase "cross-heap child (HAddr in a C array slot): cascade drops the abstract child once" $ do
+      hp <- Heap.wokHeapNew
+      let s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+          -- 'allocPure' forces the child onto the ABSTRACT heap (an HAddr) even
+          -- though the backend is 'CHeap'.
+          (child, s1) = St.allocPure (St.NCon (T.pack "Abstract") [St.RVLit (Anf.LInt 7)]) s0
+      -- Non-vacuity: the child must be an HAddr (abstract heap), not a CAddr.
+      assertBool "child is an HAddr (abstract-heap node; the cross-heap edge)"
+        (case child of St.HAddr _ -> True; _ -> False)
+      r <- runExceptT $ do
+             (arr, s2) <- St.alloc (St.NArray [St.RVBox child]) s1
+             pure (arr, s2)
+      (arr, s2) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp; assertFailure ("alloc NArray failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      -- The array lands on the C heap (it is a CAddr); the child stays abstract.
+      assertBool "array is a CAddr (lands on the C heap)"
+        (case arr of St.CAddr _ -> True; _ -> False)
+      -- Two cells live: the abstract child + the C array.
+      St.stLive (St.stStats s2) @?= baseline + 2
+      cLive0 <- Heap.wokStatLive hp
+      assertEqual "wok_stat_live == 1 (only the array is on the C heap)" (1 :: Int64) cLive0
+      -- Drop the array; the cascade must decode the KPointer slot to the HAddr
+      -- child and drop it on the abstract heap exactly once.
+      r2 <- runExceptT (St.dropAddr arr s2)
+      case r2 of
+        Left e  -> do
+          Heap.wokHeapFree hp
+          assertFailure ("dropAddr array failed: " <> show e)
+        Right s3 -> do
+          St.stLive (St.stStats s3) @?= baseline
+          -- 2 frees: the C array cell + the abstract child.
+          St.stFrees (St.stStats s3) - St.stFrees (St.stStats s2) @?= 2
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop (C array cell freed)" (0 :: Int64) cLive1
+          -- The abstract child must be gone: a pure deref now fails (use-after-free).
+          -- This is the load-bearing check -- it fails if the cross-heap HAddr child
+          -- leaked (deref would still succeed) or was double-dropped (the drop above
+          -- would have raised before reaching here).
+          case St.derefPure child s3 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "cross-heap HAddr child was not freed through the array cascade"
+          Heap.wokHeapFree hp
   ]
 
 -- ---------------------------------------------------------------------------
@@ -8121,7 +8355,7 @@ wokRcReuseTests = testGroup "rc-reuse"
             Left e  -> assertFailure ("fresh node deref: " <> show e)
   , testCase "valueChildren of a reuse token is empty (inert to dup/drop)" $ do
       St.valueChildren (St.RVReuse Nothing) @?= []
-      St.valueChildren (St.RVReuse (Just (St.ReuseSlot (St.HAddr 7) 2 True))) @?= []
+      St.valueChildren (St.RVReuse (Just (St.ReuseSlot (St.HAddr 7) 2 True 24))) @?= []
   ]
 
 -- | The in-flight reservation set ('stReserved', effect-safety Task 1). A
@@ -8146,7 +8380,7 @@ wokRcReservedTests = testGroup "rc-reserved"
         Left e -> assertFailure ("dropReuse failed: " <> show e)
         Right (cons, tok, s3) -> do
           case tok of
-            St.RVReuse (Just (St.ReuseSlot a _ _)) -> a @?= cons
+            St.RVReuse (Just (St.ReuseSlot a _ _ _)) -> a @?= cons
             other -> assertFailure ("expected a Just reuse token, got " <> show other)
           Set.member cons (St.stReserved s3) @? "the reserved shell must be in stReserved"
   , testCase "allocAt reuse releases the reservation -> stReserved nets empty after the pair" $ do
@@ -10946,29 +11180,33 @@ rcCBackendParity files = testGroup "rc-c-backend-parity"
 
 -- | The single shared core for BOTH C-backend groups: prepare the module, run it
 -- through the abstract heap, then through a FRESH C heap, read the C heap's OWN
--- allocation counter ('Heap.wokStatAllocs') BEFORE freeing it, and return the raw
--- @(abstractResult, cResult, cHeapAllocs)@. The C heap is freed via 'finally' so a
--- thrown exception during the C run cannot leak the 'Ptr WokHeap'; the counter is
--- read before the free on the success path.
+-- allocation counter ('Heap.wokStatAllocs') and peak-bytes counter
+-- ('Heap.wokStatPeakBytes') BEFORE freeing it, and return the raw
+-- @(abstractResult, cResult, cHeapAllocs, cPeakBytes)@. The C heap is freed via
+-- 'finally' so a thrown exception during the C run cannot leak the 'Ptr WokHeap';
+-- the counters are read before the free on the success path.
 withBothBackends
   :: FilePath
   -> IO ( Either IV.RuntimeError RCM.RCRun
         , Either IV.RuntimeError RCM.RCRun
+        , Word64
         , Word64 )
 withBothBackends path = do
   cm   <- rcParityPrepare path
   absR <- RCM.runModuleRCWith St.AbstractHeap cm
   hp   <- Heap.wokHeapNew
-  (cR, cAllocs) <- (do c <- RCM.runModuleRCWith (St.CHeap hp) cm
-                       a <- Heap.wokStatAllocs hp
-                       pure (c, a))
-                   `Control.Exception.finally` Heap.wokHeapFree hp
-  pure (absR, cR, cAllocs)
+  (cR, cAllocs, cPeakBytes) <-
+    (do c  <- RCM.runModuleRCWith (St.CHeap hp) cm
+        a  <- Heap.wokStatAllocs hp
+        pb <- Heap.wokStatPeakBytes hp
+        pure (c, a, pb))
+    `Control.Exception.finally` Heap.wokHeapFree hp
+  pure (absR, cR, cAllocs, cPeakBytes)
 
 -- | Run one corpus program through both backends and assert parity.
 rcParityHarness :: FilePath -> Assertion
 rcParityHarness path = do
-  (absR, cR, _cAllocs) <- withBothBackends path
+  (absR, cR, _cAllocs, cPeakBytes) <- withBothBackends path
   case (absR, cR) of
     (Right a, Right c) -> do
       assertEqual (path <> ": output parity")
@@ -10979,6 +11217,11 @@ rcParityHarness path = do
         (St.stFrees (RCM.rcStats a)) (St.stFrees (RCM.rcStats c))
       assertEqual (path <> ": peak parity")
         (St.stPeak (RCM.rcStats a)) (St.stPeak (RCM.rcStats c))
+      -- peak_bytes parity: the abstract stPeakBytes must match the C runtime's
+      -- wok_stat_peak_bytes (read before wok_heap_free). Both charge the same
+      -- bytes per node via wouldBeCBytes, so the high-water marks must agree.
+      assertEqual (path <> ": peak_bytes parity")
+        (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
       -- Both backends must agree on the immortal baseline, and the C run must
       -- return its live count to exactly that baseline (no leak, no over-free).
       assertEqual (path <> ": baseline parity")
@@ -11017,7 +11260,7 @@ rcParityHarness path = do
 -- all-falling-back to the abstract store.
 runBothBackends :: FilePath -> IO (Text, St.Stats, St.Stats, Int, Word64)
 runBothBackends path = do
-  (absR, cR, cAllocs) <- withBothBackends path
+  (absR, cR, cAllocs, _cPeakBytes) <- withBothBackends path
   case (absR, cR) of
     (Right a, Right c) ->
       pure (RCM.rcOutput c, RCM.rcStats a, RCM.rcStats c, RCM.rcBaseline c, cAllocs)

@@ -98,6 +98,80 @@ The whole `NCon` falls back to the Haskell `IntMap` heap (as an `HAddr`) when AN
 The fallback is alloc-site heap selection (everything downstream dispatches on `Addr`), and
 is **never runtime promotion** — a value is built once on whichever heap fits it.
 
+## WokArray cell (boxed arrays)
+
+An array is the first **runtime-sized** cell: its length is a value, not a compile-time
+constant, so it cannot fit in the `uint8 arity` field. A `WokArray` is a **16-byte header**
+plus a runtime number of 8-byte slots (cf. `NCon`'s 8-byte header + arity-many slots). It reuses
+the `WokObj` struct (same 8-byte prefix, so `wok_dup`/`wok_dec`/`wok_tag` work unchanged); there is
+no separate `WokArray` typedef. `tag == WOK_ARRAY_TAG` marks it an array, the `arity` byte is
+repurposed to hold `elemkind`, and the element count `len` lives at offset 8 with the slots at
+offset 16:
+
+```c
+/* layout (reinterprets WokObj; no separate struct) */
+offset 0   uint32_t rc        /* reference count (>= 1 while live)                              */
+offset 4   uint16_t tag       /* WOK_ARRAY_TAG = 0xFFFF                                          */
+offset 6   uint8_t  elemkind  /* the WokObj `arity` byte, repurposed: element SlotKind (uniform) */
+offset 7   uint8_t  scan      /* unchanged WokObj field (reserved, 0)                            */
+offset 8   uint64_t len       /* element count                                                  */
+offset 16  uint64_t slots[]   /* `len` raw 8-byte words                                          */
+```
+
+- Total cell size is `16 + 8 * len` bytes.
+- The `tag` is always `WOK_ARRAY_TAG` (0xFFFF), reserved Haskell-side (`internTag`).
+- The `elemkind` (a `SlotKind`) is uniform: all slots decode the same way (raw int, char, unit,
+  or pointer). Teardown is driven by `elemkind`: raw-lit kinds (`KLitInt`/`KLitChar`/`KLitUnit`)
+  mean zero counted children (uncounted drop), while `KPointer` means each slot is reference-counted
+  (`CAddr` or `HAddr`) or an inline immediate and must be dropped per the slot-encoding rules.
+- Slots reuse the same inline-or-pointer 2-bit encoding as `NCon` slots: scalar values inline
+  (`KLitInt`/`KLitChar`/`KLitUnit`) or pointer-scheme (`KPointer` with low-2-bits discriminating
+  `CAddr`/`HAddr`/`Inline`).
+
+### Byte-size class unification
+
+Both `NCon` and `WokArray` share the slab arena via a **unified byte-size class**: `class = bytes/8 - 1`.
+
+- An `NCon` of arity `a` has size `8 + 8*a` → class `a` (unchanged).
+- A `WokArray` of length `L` has size `16 + 8*L` → class `L+1`.
+- Arrays and NCons of the same class share `freelist[class]`: a WokArray of length `L` can
+  reuse a freed NCon of arity `L+1` (both occupy `(L+1)*8 + 8` bytes), and vice versa.
+  This is shape-agnostic recycling.
+
+Arrays with `len <= 62` (≤ 512 B) use the slab arena; `len >= 63` (> 512 B) bypass the arena
+and call `malloc` directly (the same threshold that applies to `NCon` arity).
+
+### ABI
+
+```c
+WokObj*  wok_array_alloc(WokHeap* h, uint64_t len, uint8_t elemkind);  // rc=1, tag=WOK_ARRAY_TAG
+uint64_t wok_array_len(const WokObj* p);       // WOK_PURE
+uint32_t wok_array_elemkind(const WokObj* p);  // WOK_PURE
+void     wok_array_slot_set(WokObj* p, uint64_t i, uint64_t word);
+uint64_t wok_array_slot_get(const WokObj* p, uint64_t i);  // WOK_PURE
+```
+
+Slots hold the same pre-encoded 8-byte words as `NCon` slots: `wok_array_slot_set`/`get` move a
+single raw `word` in/out (at offset `16 + 8*i`). The 2-bit slot encoding/decoding is done
+Haskell-side (`encodeSlotC`/`decodeSlotC`) using the cell's `elemkind`; the C side treats the
+word as opaque.
+
+### Unified byte accounting
+
+The `wok_stat_peak_bytes` counter now accounts for both NCon and WokArray cells:
+
+- An `NCon` of arity `a` charges `8 + 8*a` bytes.
+- A `WokArray` of length `L` charges `16 + 8*L` bytes.
+
+The C runtime re-derives the byte size from the cell header at free time — `wok_free` reads the
+`tag` first: `WOK_ARRAY_TAG` → `16 + 8*len`, otherwise `8 + 8*arity` — so it stores no per-cell
+byte field. (The Haskell abstract heap is the side that stores a per-`Cell` `cBytes`: a
+descriptor-mismatch fallback there charges 0 bytes, so re-deriving via `wouldBeCBytes` would be
+unsound. That is an abstract-interpreter detail, not part of the C ABI.)
+
+The differential oracle validates that abstract-interpreter `stPeakBytes` matches the C
+runtime's `wok_stat_peak_bytes` on all test-suite runs.
+
 ## Function ABI
 
 All state lives in a per-run, opaque `WokHeap` context — there is **no global runtime

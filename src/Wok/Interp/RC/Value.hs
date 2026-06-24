@@ -40,6 +40,7 @@ module Wok.Interp.RC.Value
   , allocPure
   , allocAt
   , nodeCEligible
+  , wouldBeCBytes
   , dropReuse
   , allocStatic
   , writeStatic
@@ -75,6 +76,10 @@ module Wok.Interp.RC.Value
   , SlotKind (..)
   , encodeSlotC
   , decodeSlotC
+    -- * Array C-cell support
+  , wokArrayTag
+  , slotKindToElemKind
+  , elemKindToSlotKind
   ) where
 
 import Control.Monad (foldM)
@@ -92,7 +97,7 @@ import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import Foreign.Ptr (Ptr, ptrToWordPtr, wordPtrToPtr, WordPtr (..))
 import Wok.Interp.RC.Heap (WokObj, WokHeap)
 import qualified Wok.Interp.RC.Heap as H
@@ -177,6 +182,10 @@ data ReuseSlot = ReuseSlot
   { rsAddr      :: Addr     -- ^ the reserved shell ('HAddr' index or 'CAddr' pointer)
   , rsArity     :: Word32   -- ^ the shell's physical arity (= byte size)
   , rsCEligible :: Bool     -- ^ whether the OLD node was C-heap-eligible ('nodeCEligible')
+  , rsBytes     :: Int      -- ^ bytes charged to 'stCurBytes' at the original alloc
+                            --   (the 'cBytes' of the reserved cell, preserved here so
+                            --   'allocAt' can restore it in the revived cell and
+                            --   'freeReservation' can balance 'recordFree' correctly)
   }
   deriving (Eq, Show)
 
@@ -445,10 +454,10 @@ continuationOwned = dedup . go
 -- analysis (no 'nonHeadOccs'/'dropTargets'/'freeVarsExpr'), because a reservation
 -- is identified by its value shape, not by a Perceus move/drop position. It runs
 -- ONLY on abort (an 'NCont' drop).
-continuationReservations :: RCKont -> Set.Set Addr -> [Addr]
+continuationReservations :: RCKont -> Set.Set Addr -> [(Addr, Int)]
 continuationReservations k0 reserved = dedup (go k0)
   where
-    go :: RCKont -> [Addr]
+    go :: RCKont -> [(Addr, Int)]
     go KDoneRC               = []
     go (KLetRC _ _ sc k)     = fromValues (Map.elems (rscEnv sc)) ++ go k
     go (KAppRC vs k)         = fromValues vs ++ go k
@@ -461,20 +470,20 @@ continuationReservations k0 reserved = dedup (go k0)
     -- the 'hParam' binder loses nothing AND avoids reclaiming a foreign reservation
     -- (robust against a future ROp-relaxation that lets reservations escape an arm).
     go (KHandleRC h _ sc k)  =
-      [ a
+      [ (a, b)
       | Just pb <- [hParam h]
       , Just v  <- [Map.lookup (binderUnique pb) (rscEnv sc)]
-      , RVReuse (Just (ReuseSlot a _ _)) <- [v]
+      , RVReuse (Just (ReuseSlot a _ _ b)) <- [v]
       , Set.member a reserved ]
       ++ go k
     go (KDropCellRC _ k)     = go k
-    fromValues vs = [ a | RVReuse (Just (ReuseSlot a _ _)) <- vs, Set.member a reserved ]
+    fromValues vs = [ (a, b) | RVReuse (Just (ReuseSlot a _ _ b)) <- vs, Set.member a reserved ]
     dedup = goD Set.empty
       where
         goD _ [] = []
-        goD seen (a : rest)
+        goD seen ((a, b) : rest)
           | Set.member a seen = goD seen rest
-          | otherwise         = a : goD (Set.insert a seen) rest
+          | otherwise         = (a, b) : goD (Set.insert a seen) rest
 
 -- | The SPECIAL-FREE for a reclaimed FBIP reservation (FBIP effect-safety, spec
 -- §3.3). Called on each address 'continuationReservations' returns when an
@@ -493,9 +502,9 @@ continuationReservations k0 reserved = dedup (go k0)
 --     'dropReuse'), 'recordFree', drop from 'stReserved'.
 --   * 'Inline': an immediate is never reserved (uncounted, never a donor), so this
 --     is a no-op for totality.
-freeReservation :: Addr -> Store -> RC Store
-freeReservation (Inline _) s = pure s  -- immediate: never reserved (uncounted donor), no-op for totality
-freeReservation a s
+freeReservation :: (Addr, Int) -> Store -> RC Store
+freeReservation (Inline _, _) s = pure s  -- immediate: never reserved (uncounted donor), no-op for totality
+freeReservation (a, _) s
   -- UNIFORM double-reclaim guard (applies to BOTH HAddr and CAddr arms): a legit
   -- reclaim always has @a ∈ stReserved@ ('continuationReservations' only yields
   -- in-stReserved addrs), so an address ABSENT from 'stReserved' has already been
@@ -505,14 +514,22 @@ freeReservation a s
       liftRC (Left (PrimError (Tx.pack
         ("internal: double-reclaim of reservation addr " <> show a
           <> " (not in stReserved)"))))
-freeReservation a@(HAddr i) s =
+freeReservation (a@(HAddr i), bytes) s =
+  -- Charge the same bytes that were charged at allocation ('rsBytes', forwarded by
+  -- 'continuationReservations'). This is 0 for descriptor-mismatch fallbacks and
+  -- the full cell cost for genuine C-eligible first-kind NCons allocated on the
+  -- abstract heap.
   pure s { stDead     = IS.insert i (stDead s)
-         , stStats    = recordFree (stStats s)
+         , stStats    = recordFree bytes (stStats s)
          , stReserved = Set.delete a (stReserved s) }
-freeReservation a@(CAddr p) s = do
+freeReservation (a@(CAddr p), bytes) s = do
+  -- Charge the same bytes that were charged at allocation ('rsBytes', forwarded by
+  -- 'continuationReservations'). For a C-eligible NCon this is provably 8 + 8*arity
+  -- (the wok_alloc layout), and arity is immutable, so using the stored delta
+  -- avoids a redundant 'H.wokArity' FFI read while staying behavior-identical.
   hp <- heapPtr s
   liftIO (H.wokFree hp p)
-  pure (bumpFreeStats s) { stReserved = Set.delete a (stReserved s) }
+  pure (bumpFreeStats bytes s) { stReserved = Set.delete a (stReserved s) }
 
 -- | Resume move-out (M2b-1 Task 5; spec §4.3 RESUME, §4.5.0): free the 'NCont'
 -- shell WITHOUT cascading its children, and return the captured frame prefix +
@@ -538,9 +555,10 @@ moveOutContPure a@(HAddr i) s = do
   case cNode c of
     NCont prefix hinfo
       | cRc c == 1 ->
+          -- NCont is abstract-only; cBytes c == 0 (wouldBeCBytes NCont = 0).
           let s' = s { stCells = IM.delete i (stCells s)
                      , stDead  = IS.insert i (stDead s)
-                     , stStats = recordFree (stStats s) }
+                     , stStats = recordFree (cBytes c) (stStats s) }
           in Right (prefix, hinfo, s')
       | otherwise ->
           Left (PrimError (Tx.pack ("internal: resume of a continuation with rc=" <> show (cRc c)
@@ -658,8 +676,13 @@ data CaptureMode = OwnCaptures | BorrowCaptures
 -- ---------------------------------------------------------------------------
 -- Store cells
 
--- | A single heap cell: a reference count and the node payload.
-data Cell = Cell { cRc :: Int, cNode :: Node }
+-- | A single heap cell: a reference count, the node payload, and the byte
+-- count charged to 'stCurBytes' at allocation time. 'cBytes' mirrors the
+-- value passed to 'recordAlloc' so 'dropAddrStepPure' can pass the SAME
+-- delta to 'recordFree' — keeping 'stCurBytes' balanced even when a
+-- descriptor-mismatch or fallback allocation charged 0 instead of
+-- 'wouldBeCBytes'.
+data Cell = Cell { cRc :: Int, cNode :: Node, cBytes :: Int }
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -667,24 +690,40 @@ data Cell = Cell { cRc :: Int, cNode :: Node }
 
 -- | Monotonic counters maintained by 'alloc' and (in later tasks) by drop.
 data Stats = Stats
-  { stAllocs :: Int   -- ^ total allocations since emptyStore
-  , stFrees  :: Int   -- ^ total frees since emptyStore (unused until dup/drop)
-  , stLive   :: Int   -- ^ current live-cell count
-  , stPeak   :: Int   -- ^ high-water mark of live-cell count
+  { stAllocs    :: Int   -- ^ total allocations since emptyStore
+  , stFrees     :: Int   -- ^ total frees since emptyStore (unused until dup/drop)
+  , stLive      :: Int   -- ^ current live-cell count
+  , stPeak      :: Int   -- ^ high-water mark of live-cell count
+  , stCurBytes  :: Int   -- ^ current live bytes (C cells only; abstract-only nodes = 0)
+  , stPeakBytes :: Int   -- ^ high-water mark of live bytes (mirrors C 'peak_bytes')
   }
   deriving (Eq, Show)
 
 -- | Record one allocation: bump total allocs and the live count, raising the
--- high-water peak. The single source of truth for alloc-stat math (shared by
--- the abstract and C heap paths so their totals stay byte-identical).
-recordAlloc :: Stats -> Stats
-recordAlloc g = let live = stLive g + 1
-                in g { stAllocs = stAllocs g + 1, stLive = live, stPeak = max (stPeak g) live }
+-- high-water peak. The 'Int' is the byte delta from 'wouldBeCBytes' for the
+-- node being allocated (0 for abstract-only nodes). The single source of truth
+-- for alloc-stat math (shared by the abstract and C heap paths so their totals
+-- stay byte-identical).
+recordAlloc :: Int -> Stats -> Stats
+recordAlloc bytes g =
+  let live = stLive g + 1
+      cur  = stCurBytes g + bytes
+  in g { stAllocs    = stAllocs g + 1
+       , stLive      = live
+       , stPeak      = max (stPeak g) live
+       , stCurBytes  = cur
+       , stPeakBytes = max (stPeakBytes g) cur
+       }
 
--- | Record one free: bump total frees and drop the live count. Shared by the
--- abstract and C heap free paths.
-recordFree :: Stats -> Stats
-recordFree g = g { stFrees = stFrees g + 1, stLive = stLive g - 1 }
+-- | Record one free: bump total frees and drop the live count. The 'Int' is
+-- the byte delta from 'wouldBeCBytes' for the node being freed (0 for
+-- abstract-only nodes). Shared by the abstract and C heap free paths.
+recordFree :: Int -> Stats -> Stats
+recordFree bytes g =
+  g { stFrees    = stFrees g + 1
+    , stLive     = stLive g - 1
+    , stCurBytes = stCurBytes g - bytes
+    }
 
 -- ---------------------------------------------------------------------------
 -- The owned heap
@@ -777,7 +816,7 @@ emptyStore = Store
   , stNext       = 0
   , stNextStatic = -1
   , stDead       = IS.empty
-  , stStats      = Stats 0 0 0 0
+  , stStats      = Stats 0 0 0 0 0 0
   , stBackend    = AbstractHeap
   , stTagFwd     = Map.empty
   , stTagRev     = IM.empty
@@ -789,11 +828,22 @@ emptyStore = Store
 -- first sight. Returns the id and the (possibly extended) store. The bijection
 -- is monotonic and total over every constructor that has ever been allocated in
 -- the C heap, so 'tagName' can always reverse a live cell's tag.
+--
+-- RESERVATION GUARD: 'wokArrayTag' (0xFFFF) is reserved for the C WokArray
+-- discriminator; it is never assigned to a constructor. When the sequential
+-- counter would land on 0xFFFF the next id is bumped to 0x10000, skipping
+-- the reserved slot. 'allocNCon's @tid >= 65536@ guard then routes any
+-- 0x10000+ constructor to the abstract heap, so no C cell ever carries the
+-- reserved tag. The bijection stays injective (0xFFFF is simply never a
+-- constructor tag).
 internTag :: Text -> Store -> (Word32, Store)
 internTag con s = case Map.lookup con (stTagFwd s) of
   Just w  -> (w, s)
   Nothing ->
-    let w = fromIntegral (Map.size (stTagFwd s))
+    let raw = fromIntegral (Map.size (stTagFwd s))
+        -- Skip the reserved WOK_ARRAY_TAG value so no constructor tag collides
+        -- with the C array discriminator.
+        w   = if raw >= wokArrayTag then raw + 1 else raw
     in ( w
        , s { stTagFwd  = Map.insert con w (stTagFwd s)
            , stTagRev  = IM.insert (fromIntegral w) con (stTagRev s)
@@ -814,9 +864,40 @@ tagName w s = IM.findWithDefault (error "tagName: unknown tag id") (fromIntegral
 -- 'stConDesc' (keyed by the constructor's interned tag-id) when the constructor
 -- is first allocated, and consulted on every decode ('readCCell', 'dropAddr').
 
+-- | The reserved C tag value for array cells. 'internTag' is guarded to never
+-- assign this value to a constructor, so a 'CAddr' cell with this tag is always
+-- a 'WokArray', never an 'NCon'.
+wokArrayTag :: Word32
+wokArrayTag = 0xFFFF
+
 -- | The kind of a single raw slot word in a compact C cell.
 data SlotKind = KLitInt | KLitChar | KLitUnit | KPointer
   deriving (Eq, Show)
+
+-- | Encode a 'SlotKind' as the @elemkind@ byte stored in the C array header.
+-- This is the single source of truth for the mapping; 'elemKindToSlotKind'
+-- is its exact inverse.
+--
+-- Encoding:
+--   0  -> KLitInt    (raw Int64 word, uncounted)
+--   1  -> KLitChar   (raw codepoint word, uncounted)
+--   2  -> KLitUnit   (raw zero word, uncounted)
+--   3  -> KPointer   (2-bit-tagged pointer word, counted)
+slotKindToElemKind :: SlotKind -> Word8
+slotKindToElemKind KLitInt  = 0
+slotKindToElemKind KLitChar = 1
+slotKindToElemKind KLitUnit = 2
+slotKindToElemKind KPointer = 3
+
+-- | Inverse of 'slotKindToElemKind'. An out-of-range byte is a C-heap invariant
+-- violation (only the four values above are ever written by 'allocNArray'); fail
+-- loudly rather than silently decoding as the wrong kind and corrupting the cascade.
+elemKindToSlotKind :: Word32 -> SlotKind
+elemKindToSlotKind 0 = KLitInt
+elemKindToSlotKind 1 = KLitChar
+elemKindToSlotKind 2 = KLitUnit
+elemKindToSlotKind 3 = KPointer
+elemKindToSlotKind w = error ("elemKindToSlotKind: unknown elemkind byte " <> show w)
 
 -- ---------------------------------------------------------------------------
 -- C-heap slot encode/decode (the §5 encoding; the single source of truth that
@@ -909,15 +990,21 @@ isUncounted a = isStaticAddr a || isInline a
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
 --
--- BACKEND DISPATCH. Only an 'NCon' is ever C-eligible: under a 'CHeap' backend,
--- an 'NCon' whose every field is encodable allocates in the C runtime ('CAddr');
--- a non-encodable field, or any other node kind, falls back to the abstract
--- 'IntMap' heap ('HAddr', via 'allocPure'). The abstract path is unchanged from
--- the Task-0 pure core, so store-algebra unit tests that call 'allocPure'
--- directly keep working.
+-- BACKEND DISPATCH. Under the 'CHeap' backend:
+--   * a nullary 'NCon' becomes an inline immediate (no cell on either heap);
+--   * an 'NCon' with encodable fields allocates in the C runtime ('CAddr');
+--   * an 'NArray' allocates a real 'WokArray' C cell via 'allocNArray';
+--   * any other node kind, or a non-encodable 'NCon', falls back to the abstract
+--     'IntMap' heap ('HAddr', via 'allocPure').
+-- Under 'AbstractHeap' the C paths are never taken; all allocation is abstract.
+-- The abstract path is unchanged from the Task-0 pure core, so store-algebra
+-- unit tests that call 'allocPure' directly keep working.
 alloc :: Node -> Store -> RC (Addr, Store)
 alloc (NCon con []) s = pure (allocInline con s)
 alloc (NCon con vs) s = allocNCon con vs s
+alloc (NArray vs)   s = case stBackend s of
+  CHeap hp     -> allocNArray hp vs s
+  AbstractHeap -> pure (allocPure (NArray vs) s)
 alloc n             s = pure (allocPure n s)
 
 -- | A nullary constructor becomes an inline immediate carrying the interned
@@ -933,14 +1020,49 @@ allocInline con s = let (tid, s') = internTag con s in (Inline tid, s')
 -- high-water) so the abstract-vs-C totals match in the differential oracle.
 allocNCon :: Text -> [RCValue] -> Store -> RC (Addr, Store)
 allocNCon con vs s = case stBackend s of
-  AbstractHeap -> pure (allocPure (NCon con vs) s)
+  -- AbstractHeap: all NCons land on the abstract heap (HAddr via 'allocPure').
+  -- To keep 'stPeakBytes' bit-for-bit identical to the C runtime's
+  -- 'wok_stat_peak_bytes', the abstract path mirrors EXACTLY which NCons WOULD
+  -- land on the C heap vs. fall back to abstract (without actually calling the C
+  -- allocator). This requires the SAME eligibility checks as the CHeap path:
+  --   * arity > 255 -> fall back (0 bytes)
+  --   * any field non-encodable -> fall back (0 bytes)
+  --   * tid >= 65536 -> fall back (0 bytes)
+  --   * descriptor mismatch (first-kind-wins, polymorphic Tuple2 etc.) -> fall back
+  --     (0 bytes): the second instantiation NEVER lands on C, so must not be charged
+  -- Only NCons that pass ALL checks charge bytes (8 + 8 * arity), recording the
+  -- same descriptor so later descriptor checks match the CHeap run.
+  AbstractHeap
+    | length vs > 255    -> pure (allocPure (NCon con vs) s)  -- non-C-eligible: wouldBeCBytes=0
+    | otherwise -> case traverse encodeSlotC vs of
+        Nothing      -> pure (allocPure (NCon con vs) s)       -- non-C-eligible: wouldBeCBytes=0
+        Just encoded ->
+          let (tid, s1) = internTag con s
+              newKinds  = map fst encoded
+          in if tid >= 65536
+               then pure (allocPureFallback (NCon con vs) s1)  -- tag overflow: non-C-eligible: 0 bytes
+               else case IM.lookup (fromIntegral tid) (stConDesc s1) of
+                 -- First-kind-wins: record descriptor on first sight. This first
+                 -- instantiation WOULD land on C, so 'allocPure' charges its bytes
+                 -- (8 + 8 * arity) -- only later mismatching kinds fall back to 0.
+                 Nothing   -> pure (allocPure (NCon con vs)
+                                     (s1 { stConDesc = IM.insert (fromIntegral tid) newKinds
+                                                                  (stConDesc s1) }))
+                 -- Descriptor matches: this node WOULD land on C -> charged bytes.
+                 Just existing
+                   | existing == newKinds -> pure (allocPure (NCon con vs) s1)
+                   -- Descriptor mismatch: this node NEVER lands on C -> 0 bytes.
+                   | otherwise            -> pure (allocPureFallback (NCon con vs) s1)
   CHeap hp
     -- The C @arity@ field is a 'uint8' (0..255); a wider constructor cannot be
     -- represented, so route it to the unbounded abstract heap. Checked BEFORE the
     -- encode (which would otherwise be wasted on a cell that must fall back).
-    | length vs > 255 -> pure (allocPure (NCon con vs) s)
+    -- CHeap fallback: use 'allocPureFallback' (0 bytes) -- this node does NOT
+    -- land on the C heap and must not inflate 'stCurBytes'/'stPeakBytes'; the
+    -- oracle only reads 'stPeakBytes' from the abstract run, not the CHeap run.
+    | length vs > 255 -> pure (allocPureFallback (NCon con vs) s)
     | otherwise -> case traverse encodeSlotC vs of
-        Nothing -> pure (allocPure (NCon con vs) s)
+        Nothing -> pure (allocPureFallback (NCon con vs) s)
         Just encoded ->
           let (tid, s1)  = internTag con s
               newKinds   = map fst encoded
@@ -948,11 +1070,12 @@ allocNCon con vs s = case stBackend s of
                 p <- liftIO (H.wokAlloc hp tid (fromIntegral (length vs)))
                 liftIO $ mapM_ (\(i, (_, w)) -> H.wokSlotSet p (fromIntegral i) w)
                                (zip [0 :: Int ..] encoded)
-                pure (CAddr p, st { stStats = recordAlloc (stStats st) })
+                pure (CAddr p, st { stStats = recordAlloc (8 + 8 * length vs) (stStats st) })
           -- The C @tag@ field is a 'uint16'; beyond 65535 distinct interned
           -- constructors a 'CAddr' would truncate the tag and collide. Fall back.
+          -- CHeap fallback: 0 bytes (same reason as above).
           in if tid >= 65536
-               then pure (allocPure (NCon con vs) s1)
+               then pure (allocPureFallback (NCon con vs) s1)
                else case IM.lookup (fromIntegral tid) (stConDesc s1) of
                  -- A nominal/polymorphic constructor (e.g. Tuple2) can appear at
                  -- different instantiations with different slot kinds. The FIRST kind
@@ -960,21 +1083,72 @@ allocNCon con vs s = case stBackend s of
                  -- recorded descriptor stays correct for every C cell of that tag.
                  -- (Here @s1 == s@: a recorded descriptor implies the tag was already
                  -- interned, so 'internTag' left the store unchanged.)
+                 -- Descriptor-mismatch CHeap fallback: 0 bytes.
                  Just existing
-                   | existing == newKinds -> doAlloc s1                        -- known: no re-insert
-                   | otherwise            -> pure (allocPure (NCon con vs) s1)  -- kind mismatch
+                   | existing == newKinds -> doAlloc s1                              -- known: no re-insert
+                   | otherwise            -> pure (allocPureFallback (NCon con vs) s1) -- kind mismatch
                  Nothing -> doAlloc (s1 { stConDesc = IM.insert (fromIntegral tid) newKinds (stConDesc s1) })
 
+-- | Allocate a 'WokArray' C cell for an 'NArray' node. Called only under the
+-- 'CHeap' backend; the 'AbstractHeap' branch in 'alloc' keeps 'NArray' on the
+-- 'IntMap'.
+--
+-- ELEMKIND. All slots of @Array a@ are homogeneous (one element type). The
+-- @elemkind@ byte stored in the cell header is derived from the FIRST encoded
+-- slot's 'SlotKind'. An empty array has no slots to derive from; the default is
+-- 'KLitInt' (raw-lit, uncounted) because:
+--   (a) teardown skips every slot regardless of the stored kind when there are no
+--       slots (len=0), so the value is inert for teardown;
+--   (b) raw-lit is the safer default (no spurious counted-slot drops on a future
+--       reuse of the slot).
+-- A non-encodable element is not representable in a C slot; this cannot happen
+-- today (all non-encodable values return 'Nothing' from 'encodeSlotC', and the
+-- alloc entry point pre-checks). 'traverse encodeSlotC' encodes every element
+-- ONCE; a 'Nothing' is a loud invariant error rather than a silent fallback.
+allocNArray :: Ptr WokHeap -> [RCValue] -> Store -> RC (Addr, Store)
+allocNArray hp vs s =
+  case traverse encodeSlotC vs of
+    Nothing      -> liftRC (Left (PrimError (Tx.pack "allocNArray: non-encodable element in NArray")))
+    Just encoded -> do
+      let len = fromIntegral (length encoded) :: Word64
+          kind = case encoded of
+                   []           -> KLitInt   -- empty array: safe default (raw-lit, uncounted)
+                   ((k, _) : _) -> k
+          ek = slotKindToElemKind kind
+      p <- liftIO (H.wokArrayAlloc hp len ek)
+      liftIO $ mapM_ (\(i, (_, w)) -> H.wokArraySlotSet p (fromIntegral (i :: Int)) w)
+                     (zip [0..] encoded)
+      pure (CAddr p, s { stStats = recordAlloc (16 + 8 * length vs) (stStats s) })
+
 -- | The pure core of 'alloc': always allocates on the abstract 'IntMap' heap,
--- returning an 'HAddr'. The backend-aware 'alloc' wrapper decides whether an
--- 'NCon' goes to C instead.
+-- returning an 'HAddr'. Charges 'wouldBeCBytes n' to 'stCurBytes'/'stPeakBytes'
+-- so the abstract run's byte high-water tracks what would land on the C heap.
+-- On the 'AbstractHeap' backend this is always the right choice; the 'CHeap'
+-- fallback paths use 'allocPureFallback' (charges 0) instead.
 allocPure :: Node -> Store -> (Addr, Store)
 allocPure n s =
+  let a     = stNext s
+      bytes = wouldBeCBytes n
+  in ( HAddr a
+     , s { stCells = IM.insert a (Cell 1 n bytes) (stCells s)
+         , stNext  = a + 1
+         , stStats = recordAlloc bytes (stStats s)
+         }
+     )
+
+-- | Like 'allocPure' but charges 0 bytes. Used for 'CHeap' fallback allocations
+-- (arity overflow, descriptor mismatch, tag overflow) where the node does NOT
+-- land on the C heap. Charging 'wouldBeCBytes' in these cases would inflate the
+-- CHeap run's 'stCurBytes' but the node is never freed via 'bumpFreeStats' --
+-- the mismatch would corrupt 'stCurBytes'. On the AbstractHeap run this path is
+-- never taken (all fallbacks to allocPure go through the public 'allocPure').
+allocPureFallback :: Node -> Store -> (Addr, Store)
+allocPureFallback n s =
   let a = stNext s
   in ( HAddr a
-     , s { stCells = IM.insert a (Cell 1 n) (stCells s)
+     , s { stCells = IM.insert a (Cell 1 n 0) (stCells s)
          , stNext  = a + 1
-         , stStats = recordAlloc (stStats s)
+         , stStats = recordAlloc 0 (stStats s)
          }
      )
 
@@ -1002,6 +1176,23 @@ nodeArity :: Node -> Word32
 nodeArity (NCon _ vs) = fromIntegral (length vs)
 nodeArity _           = 0
 
+-- | The byte size a node occupies AS A C CELL, or 0 if it never becomes one.
+-- This mirrors the C runtime exactly:
+--   * A C-eligible 'NCon': @8 + 8 * arity@ (matches 'wok_alloc' in the C runtime).
+--   * 'NArray': @16 + 8 * len@ (matches 'wok_array_alloc' in the C runtime).
+--   * Every abstract-only node ('NClosure', 'NEnv', 'NCont', 'NContCell',
+--     non-eligible 'NCon'): 0 (never allocated on the C heap).
+--
+-- Used to keep 'stCurBytes'/'stPeakBytes' bit-for-bit identical to the C
+-- runtime's @cur_bytes@/@peak_bytes@ so the differential oracle can assert
+-- 'peak_bytes' equality between both backends.
+wouldBeCBytes :: Node -> Int
+wouldBeCBytes n@(NCon _ vs)
+  | nodeCEligible n = 8 + 8 * length vs
+  | otherwise       = 0
+wouldBeCBytes (NArray vs) = 16 + 8 * length vs
+wouldBeCBytes _           = 0
+
 -- | Allocate a node into the STATIC immortal region. Returns a NEGATIVE 'Addr'
 -- and the updated 'Store'. Unlike 'alloc', this does NOT touch 'stStats': a
 -- static cell is never counted in 'stLive'/'stAllocs', is never increfed or
@@ -1015,7 +1206,7 @@ allocStatic :: Node -> Store -> (Addr, Store)
 allocStatic n s =
   let a = stNextStatic s
   in ( HAddr a
-     , s { stCells       = IM.insert a (Cell 1 n) (stCells s)
+     , s { stCells       = IM.insert a (Cell 1 n 0) (stCells s)
          , stNextStatic  = a - 1
          }
      )
@@ -1027,7 +1218,7 @@ allocStatic n s =
 -- (non-negative) address; doing so silently overwrites a counted cell, so the
 -- caller ('runModuleRC') only ever passes reserved static addresses.
 writeStatic :: Addr -> Node -> Store -> Store
-writeStatic (HAddr i) n s = s { stCells = IM.insert i (Cell 1 n) (stCells s) }
+writeStatic (HAddr i) n s = s { stCells = IM.insert i (Cell 1 n 0) (stCells s) }
 writeStatic (CAddr _) _ _ = error "writeStatic: a C-heap address is never static"
 writeStatic (Inline _) _ _ = error "writeStatic: an inline immediate has no cell to overwrite"
 
@@ -1097,10 +1288,11 @@ closureOwnedBoxed _ = []
 deref :: Addr -> Store -> RC Cell
 deref (CAddr p)    s = liftIO (readCCell p s)
 deref a@(HAddr _)  s = liftRC (derefPure a s)
-deref (Inline tid) s = pure (Cell 0 (NCon (tagName tid s) []))
+deref (Inline tid) s = pure (Cell 0 (NCon (tagName tid s) []) 0)
 
--- | Reconstruct the 'Cell' of a C-heap 'NCon' from its tag/arity/slots. Shared
--- by 'deref' and the C-cell free cascade in 'dropAddr'.
+-- | Reconstruct the 'Cell' of a C-heap cell from its header. Dispatches on the
+-- tag field: 'wokArrayTag' (0xFFFF) produces an 'NArray'; any other tag produces
+-- an 'NCon' via 'readCConValues'.
 --
 -- THE @cRc@ FIELD IS A MEANINGLESS PLACEHOLDER (always 0) for a C cell: the real
 -- reference count lives in the C runtime (the @rc@ word of the @WokObj@). NO
@@ -1111,8 +1303,36 @@ deref (Inline tid) s = pure (Cell 0 (NCon (tagName tid s) []))
 readCCell :: Ptr WokObj -> Store -> IO Cell
 readCCell p s = do
   tid <- H.wokTag p
-  vs  <- readCConValues p s
-  pure (Cell 0 (NCon (tagName tid s) vs))
+  if tid == wokArrayTag
+    then do
+      vs <- readCArrayValues p
+      pure (Cell 0 (NArray vs) 0)
+    else do
+      vs <- readCConValues p s
+      pure (Cell 0 (NCon (tagName tid s) vs) 0)
+
+-- | Decode a C array cell's slots back to @[RCValue]@, reading the header
+-- @elemkind@ once. Delegates to 'readCArraySlots' with the decoded kind. Used by
+-- 'readCCell' (deref), which has no kind in hand.
+readCArrayValues :: Ptr WokObj -> IO [RCValue]
+readCArrayValues p = do
+  ekWord <- H.wokArrayElemKind p
+  readCArraySlots (elemKindToSlotKind ekWord) p
+
+-- | Decode a C array cell's @len@ slots given the ALREADY-DECODED element
+-- 'SlotKind' (no redundant @elemkind@ read). Reads each slot via 'wokArraySlotGet'
+-- and decodes it with 'decodeSlotC'. The single slot-decode path shared by
+-- 'readCArrayValues' (deref) and the 'dropAddr' cascade (which already holds the
+-- kind it read to decide raw-lit-vs-pointer).
+--
+-- NOTE: 'wokArrayLen' returns a 'Word64'; @take (fromIntegral len)@ on the lazy
+-- infinite list @[0..]@ avoids the @len - 1@ underflow that the NCon path guards
+-- against with 'readCWords'.
+readCArraySlots :: SlotKind -> Ptr WokObj -> IO [RCValue]
+readCArraySlots kind p = do
+  len <- H.wokArrayLen p
+  mapM (fmap (decodeSlotC kind) . H.wokArraySlotGet p)
+       (take (fromIntegral len) [0 ..])
 
 -- | Decode a C cell's slots back to @[RCValue]@ via its per-constructor
 -- descriptor --- the single @tag -> kinds -> decode@ path shared by 'readCCell'
@@ -1150,7 +1370,7 @@ readCWords p = do
 -- the identical cell. This is why the renderers need no inline special-case.
 derefPure :: Addr -> Store -> Either RuntimeError Cell
 derefPure (CAddr _)   _ = Left (PrimError (Tx.pack "deref: C-heap address has no pure reconstruction"))
-derefPure (Inline tid) s = Right (Cell 0 (NCon (tagName tid s) []))
+derefPure (Inline tid) s = Right (Cell 0 (NCon (tagName tid s) []) 0)
 derefPure (HAddr i)  s
   | IS.member i (stDead s) =
       Left (PrimError (Tx.pack ("use-after-free: addr " <> show i)))
@@ -1208,24 +1428,48 @@ dropAddr a0 s0 = go [a0] s0
       if newrc /= 0
         then go rest s
         else do
-          -- About to free: decode the children for the cascade BEFORE freeing,
-          -- then return the C cell to the runtime. The children are an ordinary
-          -- 'countedRefs' set (CAddr + non-static HAddr), routed by 'go'.
+          -- About to free: read the tag to dispatch between WokArray and NCon,
+          -- decode children BEFORE freeing, then return the cell to the runtime.
           --
-          -- WHY 'countedRefs' HERE IS THE CORRECT CASCADE (and 'cascadeChildren' is
-          -- not needed). A 'CAddr' is ALWAYS an 'NCon' ('allocNCon' is the only
-          -- 'CAddr' producer), and for an 'NCon',
-          --   cascadeChildren (NCon _ vs) == countedRefs (nodeValues (NCon _ vs))
-          --                               == countedRefs vs,
-          -- so 'countedRefs' over the decoded slots IS the cascade for the only
-          -- C-eligible node. The special routing 'cascadeChildren' adds (the 'NCont'
-          -- owned-set path) never applies to a 'CAddr'. If some OTHER node kind ever
-          -- becomes C-eligible AND needs that special routing, this branch must be
-          -- revisited to call 'cascadeChildren' on a reconstructed node instead.
-          kids <- countedRefs <$> liftIO (readCConValues p s)
+          -- CAddr CELLS: 'allocNCon' and 'allocNArray' are the ONLY 'CAddr'
+          -- producers. For an 'NCon' (tag /= WOK_ARRAY_TAG):
+          --   cascadeChildren (NCon _ vs) == countedRefs vs,
+          -- so 'countedRefs' over the decoded slots is the correct cascade.
+          -- For a 'WokArray' (tag == WOK_ARRAY_TAG), the cascade depends on the
+          -- header's 'elemkind':
+          --   * raw-lit kind (KLitInt/KLitChar/KLitUnit): no counted children;
+          --     no child drops needed, just free the cell.
+          --   * pointer-scheme kind (KPointer): each slot holds a 2-bit-tagged
+          --     pointer; 'countedRefs' over decoded values drops the counted ones.
+          -- 'cascadeChildren' is not consulted for either C-eligible kind: 'NCont'
+          -- owned-set routing never applies to a C cell.
+          tid <- liftIO (H.wokTag p)
+          -- Compute the byte delta BEFORE freeing: the same formula used at
+          -- allocation so stCurBytes stays balanced. Arrays = 16 + 8*len;
+          -- NCons = 8 + 8*arity (both C-eligible, same layout as wok_alloc /
+          -- wok_array_alloc charge).
+          bytes <- if tid == wokArrayTag
+                     then do
+                       len <- liftIO (H.wokArrayLen p)
+                       pure (16 + 8 * fromIntegral (len :: Word64))
+                     else do
+                       ar <- liftIO (H.wokArity p)
+                       pure (8 + 8 * fromIntegral (ar :: Word32))
+          kids <- if tid == wokArrayTag
+                    then do
+                      kind <- elemKindToSlotKind <$> liftIO (H.wokArrayElemKind p)
+                      case kind of
+                        -- raw-lit elemkind: teardown skips every slot (uncounted)
+                        KLitInt  -> pure []
+                        KLitChar -> pure []
+                        KLitUnit -> pure []
+                        -- pointer-scheme: decode slots (reusing the kind already
+                        -- read) and collect counted refs
+                        KPointer -> countedRefs <$> liftIO (readCArraySlots kind p)
+                    else countedRefs <$> liftIO (readCConValues p s)
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
-          go (kids ++ rest) (bumpFreeStats s)
+          go (kids ++ rest) (bumpFreeStats bytes s)
     go (a@(HAddr _) : rest) s = do
       -- ABORT RECLAIM (FBIP effect-safety, spec §3.4). If @a@ is an 'NCont' about
       -- to be freed (rc reaching 0 -- a handler discarding a captured continuation),
@@ -1247,18 +1491,19 @@ dropAddr a0 s0 = go [a0] s0
     reclaimIfNCont :: Addr -> Store -> RC Store
     reclaimIfNCont (HAddr i) s =
       case IM.lookup i (stCells s) of
-        Just (Cell rc (NCont prefix _))
+        Just (Cell rc (NCont prefix _) _)
           | rc <= 1 && not (IS.member i (stDead s)) ->
               foldM (flip freeReservation) s (continuationReservations prefix (stReserved s))
         _ -> pure s
     reclaimIfNCont _ s = pure s
 
 -- | The C-heap free-stats bump, mirroring the abstract path's free accounting in
--- 'dropAddrStepPure' (frees + 1, live - 1). The C runtime keeps its own
--- independent stat counters; this keeps the store-level 'Stats' identical to the
--- abstract path so the differential oracle can diff abstract-vs-C totals.
-bumpFreeStats :: Store -> Store
-bumpFreeStats s = s { stStats = recordFree (stStats s) }
+-- 'dropAddrStepPure' (frees + 1, live - 1, stCurBytes - bytes). The C runtime keeps
+-- its own independent stat counters; this keeps the store-level 'Stats' identical
+-- to the abstract path so the differential oracle can diff abstract-vs-C totals.
+-- The 'Int' is the byte delta from 'wouldBeCBytes' for the node being freed.
+bumpFreeStats :: Int -> Store -> Store
+bumpFreeStats bytes s = s { stStats = recordFree bytes (stStats s) }
 
 -- | Extract the live C heap context from the store, or fail if the backend is
 -- 'AbstractHeap'. A 'CAddr' can only have been produced under a 'CHeap' backend,
@@ -1289,10 +1534,13 @@ dropAddrStepPure a@(HAddr i) s
         Nothing -> Left (PrimError (Tx.pack ("drop of dangling addr " <> show i)))
         Just c
           | cRc c <= 1 ->  -- rc about to reach 0 -> free
-              let kids = cascadeChildren (cNode c)
-                  s'   = s { stCells = IM.delete i (stCells s)
-                           , stDead  = IS.insert i (stDead s)
-                           , stStats = recordFree (stStats s) }
+              let kids  = cascadeChildren (cNode c)
+                  -- Use cBytes c (the delta charged at alloc time) so stCurBytes
+                  -- stays balanced even when a CHeap descriptor-mismatch fallback
+                  -- charged 0 instead of wouldBeCBytes.
+                  s'    = s { stCells = IM.delete i (stCells s)
+                            , stDead  = IS.insert i (stDead s)
+                            , stStats = recordFree (cBytes c) (stStats s) }
               in Right (Just kids, s')
           | otherwise ->
               Right (Nothing, s { stCells = IM.insert i c { cRc = cRc c - 1 } (stCells s) })
@@ -1370,10 +1618,15 @@ cascadeChildren other            = countedRefs (nodeValues other)
 -- A 'CAddr' donor mirrors 'dropAddr's free branch MINUS the 'wokFree' and the
 -- 'bumpFreeStats': @wok_dec@; if the new rc /= 0 the cell is still shared -> NULL
 -- token; if it hits 0 the cell is unique, so decode the children (the same
--- 'countedRefs'-over-decoded-slots cascade 'dropAddr' uses --- a 'CAddr' is always
--- an 'NCon'), retain the shell as the token WITHOUT returning it to the runtime
--- (no free list push, no stat bump), then drop the children via the worklist. A
--- live 'CAddr' was C-eligible by construction, so @rsCEligible = True@.
+-- 'countedRefs'-over-decoded-slots cascade 'dropAddr' uses --- a 'CAddr' is an
+-- 'NCon' or a 'WokArray'), retain the shell as the token WITHOUT returning it to
+-- the runtime (no free list push, no stat bump), then drop the children via the
+-- worklist. A live 'CAddr' was C-eligible by construction, so @rsCEligible = True@.
+--
+-- ARRAYS ARE FBIP-EXCLUDED. 'nodeCEligible (NArray _) = False' and
+-- 'nodeArity (NArray _) = 0' ensure Perceus never emits a @drop_reuse@ for an
+-- array, so the 'CAddr' arm here NEVER sees a 'WokArray' (WOK_ARRAY_TAG).
+-- No WOK_ARRAY_TAG branch is needed; the existing 'readCConValues' path is NCon-only.
 dropReuse :: Addr -> Store -> RC (RCValue, Store)
 dropReuse (Inline _) s = pure (RVReuse Nothing, s)              -- uncounted: never a donor
 dropReuse (CAddr p)  s = do
@@ -1382,12 +1635,21 @@ dropReuse (CAddr p)  s = do
     then pure (RVReuse Nothing, s)                             -- shared: NULL token
     else do
       arity <- liftIO (H.wokArity p)
-      kids  <- countedRefs <$> liftIO (readCConValues p s)     -- decode children BEFORE reserving
+      -- Arrays are FBIP-excluded (nodeCEligible returns False for NArray), so
+      -- Perceus never emits drop_reuse for an array cell. A WOK_ARRAY_TAG CAddr
+      -- here is an internal invariant violation: fail loudly through the RC error
+      -- channel rather than decoding an array via the NCon descriptor path.
+      tid <- liftIO (H.wokTag p)
+      ks  <- if tid == wokArrayTag
+               then liftRC (Left (PrimError (Tx.pack
+                      "dropReuse: WokArray reached CAddr FBIP path (arrays are FBIP-excluded)")))
+               else countedRefs <$> liftIO (readCConValues p s)  -- decode children BEFORE reserving
       -- reserve the shell: do NOT wokFree, do NOT bumpFreeStats. Track it as
       -- in-flight so the abort-reclaim collector can find it (spec §3.1).
-      s'    <- foldM (flip dropAddr) s kids
+      s'    <- foldM (flip dropAddr) s ks
       let s'' = s' { stReserved = Set.insert (CAddr p) (stReserved s') }
-      pure (RVReuse (Just (ReuseSlot (CAddr p) arity True)), s'')
+      let cAddrBytes = 8 + 8 * fromIntegral (arity :: Word32)
+      pure (RVReuse (Just (ReuseSlot (CAddr p) arity True cAddrBytes)), s'')
 dropReuse a@(HAddr i) s
   | isStaticAddr a = pure (RVReuse Nothing, s)                  -- uncounted: never a donor
   | otherwise = do
@@ -1403,7 +1665,7 @@ dropReuse a@(HAddr i) s
           s'' <- foldM (flip dropAddr) s' kids
           -- track the reserved shell as in-flight (spec §3.1).
           let s''' = s'' { stReserved = Set.insert (HAddr i) (stReserved s'') }
-          pure (RVReuse (Just (ReuseSlot (HAddr i) arity elig)), s''')
+          pure (RVReuse (Just (ReuseSlot (HAddr i) arity elig (cBytes c))), s''')
         else
           -- shared: decrement in place, NO recordFree, NULL token.
           let s' = s { stCells = IM.insert i c { cRc = cRc c - 1 } (stCells s) }
@@ -1432,7 +1694,7 @@ dropReuse a@(HAddr i) s
 -- A non-'RVReuse' first argument is an internal error (loud 'Left').
 allocAt :: RCValue -> Node -> Store -> RC (Addr, Store)
 allocAt (RVReuse Nothing)               newNode s = alloc newNode s
-allocAt (RVReuse (Just (ReuseSlot a ar oldElig))) newNode s0 =
+allocAt (RVReuse (Just (ReuseSlot a ar oldElig origBytes))) newNode s0 =
   -- Consuming the token: release its in-flight reservation on EVERY consume path
   -- (reuse re-stamp AND not-eligible free+fresh) so the abort-reclaim collector
   -- no longer sees it (spec §3.1).
@@ -1440,17 +1702,23 @@ allocAt (RVReuse (Just (ReuseSlot a ar oldElig))) newNode s0 =
   in case a of
        HAddr i
          | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
-             pure (HAddr i, s { stCells = IM.insert i (Cell 1 newNode) (stCells s) })
+             -- Reuse: no alloc/free accounting change; preserve the original 'cBytes'
+             -- in the revived cell so its eventual free restores the right delta.
+             pure (HAddr i, s { stCells = IM.insert i (Cell 1 newNode origBytes) (stCells s) })
          | otherwise ->
+             -- Shell doesn't fit the new node: free the shell (using the original
+             -- byte charge so accounting is balanced) then allocate fresh.
              alloc newNode (s { stDead  = IS.insert i (stDead s)
-                              , stStats = recordFree (stStats s) })
+                              , stStats = recordFree origBytes (stStats s) })
        CAddr p
          | nodeArity newNode == ar && nodeCEligible newNode == oldElig ->
              reuseCConAt p newNode s
          | otherwise -> do
+             -- Shell doesn't fit the new node: free the shell (using the original
+             -- byte charge so accounting is balanced) then allocate fresh.
              hp <- heapPtr s
              liftIO (H.wokFree hp p)
-             alloc newNode (bumpFreeStats s)
+             alloc newNode (bumpFreeStats origBytes s)
        Inline _ -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline immediate")))
 allocAt v _ _ =
   liftRC (Left (PrimError (Tx.pack ("alloc_at: expected a reuse token, got " <> show v))))

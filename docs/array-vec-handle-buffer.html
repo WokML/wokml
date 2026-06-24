@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok — Array vs Vec memory layout (pressure-testing the handle+buffer idea)</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --good:#1a7f4b; --warn:#c0392b; --hand:#8e44ad; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.8rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.16rem;margin:46px 0 2px}
+  h3{font-size:.97rem;margin:0 0 6px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  p{margin:.7em 0}
+
+  /* linear memory strip */
+  .addrlab{font-family:ui-monospace,monospace;font-size:.66rem;color:var(--mut);display:flex;justify-content:space-between;margin:14px 0 -2px}
+  .mem{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;font-family:ui-monospace,monospace;font-size:.72rem;margin:2px 0}
+  .seg{padding:8px 7px;border-right:1px solid var(--line);text-align:center;white-space:nowrap;min-width:0}
+  .seg:last-child{border-right:none}
+  .seg small{display:block;color:var(--mut);font-size:.85em;font-weight:400}
+  .seg.hdr{background:#eceff3;color:var(--mut)}
+  .seg.cell{background:var(--soft)}
+  .seg.elem{background:#eef7f0;color:var(--good)}
+  .seg.ptr{background:#fdeef6;color:var(--hand)}
+  .seg.arr{background:#eef4fb;color:var(--accent)}
+  .seg.hand{background:#f4ecfa;color:var(--hand)}
+  .seg.free{flex:1;background:repeating-linear-gradient(45deg,#fbfcfd,#fbfcfd 6px,#f1f3f5 6px,#f1f3f5 12px);color:var(--mut)}
+  .seg.cap{flex:none;background:repeating-linear-gradient(45deg,#fbfdfb,#fbfdfb 6px,#eaf4ee 6px,#eaf4ee 12px);color:var(--good)}
+  .wide{flex:3}
+  .indent{margin-left:40px}
+
+  /* slice ladder */
+  .ladder{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:16px 0;font-family:ui-monospace,monospace;font-size:.74rem}
+  .rung{border:1px solid var(--line);background:var(--soft);border-radius:7px;padding:8px 10px;min-width:96px;text-align:center}
+  .rung small{display:block;color:var(--mut);font-size:.82em;font-weight:400;margin-top:2px}
+  .rung.done{background:#eef7f0;border-color:var(--good);color:var(--good)}
+  .rung.here{background:#f4ecfa;border-color:var(--hand);color:var(--hand);box-shadow:0 0 0 2px #f0e3f9}
+  .rung.next{background:#eef4fb;border-color:var(--accent);color:var(--accent)}
+  .chev{align-self:center;color:var(--mut);padding:0 6px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card .lab{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .card p{font-size:.83rem;margin:6px 0 0}
+  .card.win{border-color:var(--good)} .card.win h3{color:var(--good)}
+  .card.cost{border-color:var(--warn)} .card.cost h3{color:var(--warn)}
+
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.82rem}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  td .mono{font-size:.92em}
+  .ok{color:var(--good);font-weight:600}
+  .bad{color:var(--warn);font-weight:600}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0}
+  .note b{color:var(--accent)}
+  .note.hand{border-left-color:var(--hand)} .note.hand b{color:var(--hand)}
+  .arrowdown{color:var(--hand);font-family:ui-monospace,monospace;font-size:.8rem;margin:1px 0 1px 64px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Array vs Vec: where the bytes actually live</h1>
+  <p class="sub">Pressure-testing the idea: <i>"one slot pointing at the first element, with length + size; elements consecutive — not N pointers."</i> That is the Rust <code>Vec&lt;T&gt;</code> shape. Here is what it buys, what it costs, and where it fits the slice ladder.</p>
+
+  <!-- 1 · SCOPE -->
+  <h2>1 &middot; The scope &mdash; where this sits on the ladder</h2>
+  <p>Each rung is sound on its own; later rungs hang off earlier ones. Your idea is the <b>Vec layer</b>, and it leans on the <b>byte-size-class arena</b> rung to place its buffer.</p>
+  <div class="ladder">
+    <div class="rung done">A<small>boxed Array<br>abstract heap<br>(merged)</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">B<small>C cell<br>single-block</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">C<small>in-place set<br>rc==1</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">D<small>flat / unboxed<br>stride &ne; 8</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung next">size-class<small>arena + capacity<br>(this brainstorm)</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung here">Vec<small>handle+buffer<br>(your idea)</small></div>
+    <span class="chev">&rarr;</span>
+    <div class="rung">regions<small>LoCal,<br>String</small></div>
+  </div>
+  <p class="cap">fig 1 &mdash; the size-class rung gives the buffer a recycled, capacity-rounded home; Vec adds the growable handle on top</p>
+
+  <!-- 2 · THREE LAYOUTS -->
+  <h2>2 &middot; Three ways to lay out <code>Array Vec4</code> (len = 3)</h2>
+  <p>The contrast that matters. <span style="color:var(--hand)">Purple</span> = a pointer; <span style="color:var(--good)">green</span> = inline element bytes; <span style="color:var(--accent)">blue</span> = the array/handle cell.</p>
+
+  <h3 style="margin-top:18px">(a) Boxed single-block &mdash; Koka <code>vector</code>, the planned Slice A/B</h3>
+  <p>One array cell holds <b>N pointer slots</b>; each element is its <i>own</i> heap cell elsewhere. 1 + N allocations; every <code>index</code> is a pointer-chase.</p>
+  <div class="addrlab"><span>the array cell</span><span></span></div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg arr">hdr<small>rc&middot;tag&middot;len=3</small></div>
+    <div class="seg ptr">p0 &darr;</div>
+    <div class="seg ptr">p1 &darr;</div>
+    <div class="seg ptr">p2 &darr;</div>
+  </div>
+  <div class="arrowdown">&darr; three separate dependent loads</div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg elem">Vec4 #0<small>own 40B cell</small></div>
+    <div class="seg elem">Vec4 #1<small>own 40B cell</small></div>
+    <div class="seg elem">Vec4 #2<small>own 40B cell</small></div>
+  </div>
+  <p class="cap">fig 2a &mdash; polymorphic-friendly (every slot is one word) but 4 allocations, 4 headers, pointer-chasing</p>
+
+  <h3 style="margin-top:22px">(b) Flat single-block &mdash; unboxed, Slice D</h3>
+  <p>One cell; elements packed <b>inline</b> at the element stride (Vec4 = 32B). 1 allocation, no per-element header, contiguous &rarr; cache-friendly. <code>index</code> <b>copies</b> the bytes out (value semantics).</p>
+  <div class="addrlab"><span>one contiguous block</span><span></span></div>
+  <div class="mem" style="max-width:620px">
+    <div class="seg arr">hdr<small>rc&middot;tag&middot;len&middot;stride</small></div>
+    <div class="seg elem wide">e0 (32B)</div>
+    <div class="seg elem wide">e1 (32B)</div>
+    <div class="seg elem wide">e2 (32B)</div>
+  </div>
+  <p class="cap">fig 2b &mdash; the win for monomorphic scalar/value elements; needs a known stride, so not for polymorphic <code>a</code></p>
+
+  <h3 style="margin-top:22px">(c) Handle + buffer &mdash; <b>your idea</b>, the Rust <code>Vec&lt;T&gt;</code> shape</h3>
+  <p>A small fixed <b>handle</b> cell <code>{rc, tag, ptr, len, cap}</code> points at a separate <b>buffer</b> holding the elements inline. Two allocations; the handle never moves when the buffer grows.</p>
+  <div class="addrlab"><span>handle cell (tiny, fixed size class)</span><span></span></div>
+  <div class="mem" style="max-width:430px">
+    <div class="seg hand">rc&middot;tag</div>
+    <div class="seg hand">ptr &darr;</div>
+    <div class="seg hand">len=3</div>
+    <div class="seg hand">cap=4</div>
+  </div>
+  <div class="arrowdown">&darr; ptr</div>
+  <div class="addrlab"><span>buffer (the variable-size citizen &mdash; size-class arena / malloc)</span><span></span></div>
+  <div class="mem" style="max-width:620px">
+    <div class="seg elem wide">e0 (32B)</div>
+    <div class="seg elem wide">e1 (32B)</div>
+    <div class="seg elem wide">e2 (32B)</div>
+    <div class="seg cap wide">cap slot<small>reserved, len&lt;cap</small></div>
+  </div>
+  <p class="cap">fig 2c &mdash; <code>len</code> live, <code>cap</code> allocated; the spare slot is the growth headroom that makes push O(1) amortized</p>
+
+  <!-- 3 · BUYS / COSTS -->
+  <h2>3 &middot; What the handle+buffer split actually buys (and costs)</h2>
+  <div class="grid">
+    <div class="card win"><span class="lab">buys</span><h3>Stable identity on grow</h3><p>Grow = realloc the buffer, patch <code>ptr</code>/<code>cap</code> in place. The handle&rsquo;s address never changes, so existing references stay valid. Single-block can&rsquo;t do this &mdash; a bigger cell is a new address.</p></div>
+    <div class="card win"><span class="lab">buys</span><h3>Isolates the hard part</h3><p>The handle is <i>always</i> the same tiny size &rarr; one arena class, recycled constantly. Only the <b>buffer</b> carries byte-size-class + capacity-rounding. The two concerns stop tangling.</p></div>
+    <div class="card win"><span class="lab">buys</span><h3>len vs cap = Vec</h3><p>Capacity slack (<code>cap &ge; len</code>) is the amortized-doubling foundation: push/pop without reallocating every time.</p></div>
+    <div class="card cost"><span class="lab">costs</span><h3>Two allocations</h3><p>Handle + buffer, vs one block. For a <i>fixed</i> array that never grows, the handle is pure overhead.</p></div>
+    <div class="card cost"><span class="lab">costs</span><h3>Extra indirection</h3><p>Every <code>index</code> is handle &rarr; buffer &rarr; element: one more dependent load than single-block&rsquo;s header-then-slot.</p></div>
+    <div class="card cost"><span class="lab">costs</span><h3>Only worth it growable</h3><p>The whole point is mutation/growth. An immutable <code>Array</code> gains nothing and pays both costs.</p></div>
+  </div>
+  <div class="note hand"><b>Resolution:</b> fixed <code>Array</code> = single-block (Slice B as planned); growable <code>Vec</code> = handle+buffer (your idea), built on top. The byte-size-class arena serves the variable block in <i>both</i> &mdash; the single-block cell, or the Vec buffer.</div>
+
+  <!-- 4 · the "unless it's a tuple" caveat, sharpened -->
+  <h2>4 &middot; &ldquo;Unless it&rsquo;s a tuple&rdquo; &mdash; sharpened</h2>
+  <p>The thing that forces per-element pointers is not <i>tuple</i> &mdash; it is whether the element <b>contains a pointer</b>, and whether the stride is <b>known at compile time</b>. Teardown cost follows the embedded pointers, not the boxed/flat choice.</p>
+  <table>
+    <tr><th>element type</th><th>can pack flat?</th><th>embedded pointers?</th><th>teardown</th><th>needs</th></tr>
+    <tr><td class="mono">Array U64 / Char / Bool</td><td class="ok">yes</td><td>none</td><td class="ok">O(1)</td><td>just a stride</td></tr>
+    <tr><td class="mono">Array Vec4 (4&times;f64)</td><td class="ok">yes</td><td>none</td><td class="ok">O(1)</td><td>just a stride</td></tr>
+    <tr><td class="mono">Array (U64, String)</td><td class="ok">yes</td><td>one per element</td><td class="bad">O(N)</td><td>per-stride slot-kind map</td></tr>
+    <tr><td class="mono">Array String</td><td class="ok">yes*</td><td>one per element</td><td class="bad">O(N)</td><td>"all slots are pointers" map</td></tr>
+    <tr><td class="mono">Array a (polymorphic)</td><td class="bad">no</td><td>unknown</td><td class="bad">O(N)</td><td>must stay boxed (no stride)</td></tr>
+  </table>
+  <p class="cap" style="text-align:left">* flat <code>Array String</code> is a buffer of N pointer-words &mdash; identical bytes to boxed, but in one contiguous buffer. The element <i>cells</i> (the string bodies) still live elsewhere.</p>
+
+  <!-- 5 · where size-class fits -->
+  <h2>5 &middot; Where byte-size-class + capacity bites</h2>
+  <p>Granule is <b>8 bytes</b>; the arena already buckets by word-count (<code>freelist[arity]</code> = <code>(8+8&middot;arity)</code>-byte blocks). So for any block whose size is a multiple of 8, the size class is <b>exact</b> &mdash; no rounding, <code>peak_bytes</code> unchanged.</p>
+  <table>
+    <tr><th>block</th><th>byte size</th><th>multiple of 8?</th><th>rounding / capacity slack</th></tr>
+    <tr><td>boxed array / buffer of pointers</td><td class="mono">hdr + 8&middot;N</td><td class="ok">always</td><td class="ok">none &mdash; exact</td></tr>
+    <tr><td>flat <code>Array U64</code></td><td class="mono">hdr + 8&middot;N</td><td class="ok">always</td><td class="ok">none &mdash; exact</td></tr>
+    <tr><td>flat <code>Array Char</code> (stride 1)</td><td class="mono">hdr + N</td><td class="bad">no</td><td class="bad">round up to 8 &rarr; capacity &gt; len</td></tr>
+    <tr><td>flat <code>Array Vec4</code> (stride 32)</td><td class="mono">hdr + 32&middot;N</td><td class="ok">always</td><td class="ok">none &mdash; exact</td></tr>
+    <tr><td>buffer &gt; 512B (large tier)</td><td class="mono">any</td><td>&mdash;</td><td class="bad">geometric class &rarr; up to ~12.5% slack</td></tr>
+  </table>
+  <div class="note"><b>The bite:</b> capacity rounding only changes <code>peak_bytes</code> when the stride is sub-word (Slice D <code>Array Char</code>) or when a coarse large tier rounds. For everything boxed or word-strided, word-count classing is already exact &mdash; which is why this rung earns its keep <i>at Slice D</i>, and why the simple recycling win is cheap before then.</div>
+
+  <!-- 6 · the decision -->
+  <h2>6 &middot; The open decision</h2>
+  <div class="grid">
+    <div class="card"><span class="lab">option A</span><h3>Two representations</h3><p><code>Array</code> single-block + <code>Vec</code> handle+buffer. Each optimal for its use; two layouts to maintain.</p></div>
+    <div class="card"><span class="lab">option B</span><h3>Unify on handle+buffer</h3><p>Everything is a handle. Uniform, but a fixed array pays the double-allocation + indirection tax forever.</p></div>
+    <div class="card"><span class="lab">option C</span><h3>Single-block only</h3><p>Defer Vec entirely. No growable type yet; the handle idea waits.</p></div>
+  </div>
+  <div class="note hand"><b>Lean:</b> Option A &mdash; keep the planned single-block <code>Array</code>, add handle+buffer only for the genuinely-growable <code>Vec</code>. Both share the one byte-size-class arena for their variable block. That is the smallest blast radius that still realizes your idea where it actually pays.</div>
+
+  <!-- 7 · THE NARROWING -->
+  <h2>7 &middot; Narrowing the scope (decided) &mdash; a fixed flat array, not a Vec</h2>
+  <p>Four cuts collapse the design to something much smaller than &ldquo;byte-size-class + capacity + Vec.&rdquo; This <b>supersedes</b> the growable-Vec direction above &mdash; no handle, no capacity slack.</p>
+  <div class="grid">
+    <div class="card"><span class="lab">cut 1</span><h3>No implicit grow</h3><p><code>resize</code> is an explicit op returning a <i>new</i> array (copy-on-write). Removes capacity slack, amortized doubling, and the stable-handle requirement &mdash; the address may change because nobody holds it expecting growth.</p></div>
+    <div class="card"><span class="lab">cut 2</span><h3>Monomorphic</h3><p>Element type is concrete &rarr; stride known at compile time. The precondition for packing inline at all.</p></div>
+    <div class="card"><span class="lab">cut 3</span><h3>Flat / unboxed</h3><p>Elements packed inline at the stride. One allocation, no per-element header. <code>index</code> copies the bytes out (value semantics).</p></div>
+    <div class="card"><span class="lab">cut 4</span><h3>One indirection</h3><p>Drop the handle. Single-block: <code>cell_ptr</code> (one hop) then <code>+ header + i&middot;stride</code> (direct offset). One allocation, one indirection.</p></div>
+  </div>
+  <div class="note hand"><b>The focus moves:</b> the highlighted rung is no longer the handle <code>Vec</code> &mdash; it is a fixed, monomorphic, flat, single-block array. The handle+buffer (section 2c) is now <i>rejected for this scope</i>; it returns only if a genuinely-growable <code>Vec</code> is wanted later.</div>
+
+  <!-- 8 · PRECEDENT -->
+  <h2>8 &middot; Precedent &mdash; this is the standard monomorphic fast path</h2>
+  <p>The narrowed design is what fast languages already do for monomorphic arrays. Low novelty, low risk.</p>
+  <table>
+    <tr><th>language</th><th>monomorphic array</th><th>shape</th><th>allocs</th><th>indirections</th><th>grows?</th></tr>
+    <tr><td>OCaml</td><td class="mono">float array</td><td>single-block flat (special-cased)</td><td class="ok">1</td><td class="ok">1</td><td>no</td></tr>
+    <tr><td>Java / C#</td><td class="mono">int[], value-type T[]</td><td>single-block flat</td><td class="ok">1</td><td class="ok">1</td><td>no</td></tr>
+    <tr><td>Swift</td><td class="mono">Array&lt;T&gt;</td><td>single-block buffer (hdr + inline), COW</td><td class="ok">1</td><td class="ok">1</td><td>yes</td></tr>
+    <tr><td>Rust</td><td class="mono">Box&lt;[T]&gt;</td><td>one buffer, len in fat ptr, no cap</td><td class="ok">1</td><td class="ok">1</td><td>no</td></tr>
+    <tr><td>Go</td><td class="mono">[]T</td><td>handle (ptr,len,cap) + buffer</td><td class="bad">2</td><td class="bad">2</td><td>yes</td></tr>
+    <tr><td>Koka</td><td class="mono">vector&lt;a&gt;</td><td>single-block <b>boxed</b> (N words)</td><td class="bad">1+N</td><td class="bad">2</td><td>no</td></tr>
+  </table>
+  <div class="note"><b>Match:</b> the narrowed wok array = OCaml <code>float array</code> / Java primitive array semantically; structurally Swift&rsquo;s buffer minus growth, or Rust&rsquo;s <code>Box&lt;[T]&gt;</code> with the length folded into the heap header. The two inherent consequences &mdash; <code>index</code> copies out, and no polymorphic <code>a</code> &mdash; are exactly the chosen cuts.</div>
+
+  <!-- 9 · THE NARROWED LAYOUT -->
+  <h2>9 &middot; The narrowed layout in memory (<code>Array U64</code>, len = 3)</h2>
+  <p>The array <i>value</i> is a single <b>counted pointer</b> &mdash; an 8-byte tagged word (a <code>CAddr</code>) that lives in whatever holds the array (a binding, an enclosing cell&rsquo;s slot, the environment), <i>not</i> inside the block. Following it once lands on the block: a wide header (rc, a tag marking it a flat array, the stride, the runtime length) immediately followed by the inline elements. That one pointer <b>is</b> the &ldquo;one indirection.&rdquo;</p>
+  <div class="addrlab"><span>holder &mdash; env slot / enclosing cell field / binding</span><span></span></div>
+  <div class="mem" style="max-width:300px">
+    <div class="seg ptr">*arr &darr;<small>one counted ref; dup/drop touch the block&rsquo;s rc</small></div>
+  </div>
+  <div class="arrowdown">&darr; the single indirection</div>
+  <div class="addrlab"><span>one contiguous block &mdash; the size-class citizen directly (no separate buffer)</span><span></span></div>
+  <div class="mem" style="max-width:600px">
+    <div class="seg arr">rc&middot;tag&middot;stride<small>8B</small></div>
+    <div class="seg arr">len = 3<small>8B</small></div>
+    <div class="seg elem wide">e0<small>8B @ +16</small></div>
+    <div class="seg elem wide">e1<small>8B @ +24</small></div>
+    <div class="seg elem wide">e2<small>8B @ +32</small></div>
+  </div>
+  <p class="cap">fig 9 &mdash; <code>index i = *(base + 16 + i&middot;stride)</code>; total 40B = multiple of 8 &rarr; exact size class, no rounding, <code>peak_bytes</code> exact</p>
+  <p>Freeing routes by <b>total bytes</b>: 40B &rarr; 5 words &rarr; the existing word-count free-list (shared with a same-size <code>NCon</code>); blocks over 512B fall to <code>malloc</code>. No new free-list machinery for the small case &mdash; the byte-size class <i>is</i> the word count.</p>
+  <table>
+    <tr><th>vs the rejected alternatives</th><th>allocations</th><th>indirections to element bytes</th></tr>
+    <tr><td>boxed single-block (planned Slice B)</td><td class="bad">1 + N</td><td class="bad">2 (cell &rarr; element cell)</td></tr>
+    <tr><td>handle + buffer (the Vec idea)</td><td class="bad">2</td><td class="bad">2 (handle &rarr; buffer)</td></tr>
+    <tr><td><b>flat single-block (this scope)</b></td><td class="ok">1</td><td class="ok">1 (cell, then offset)</td></tr>
+  </table>
+
+  <!-- 10 · STILL OPEN -->
+  <h2>10 &middot; What survives the narrowing (the real remaining decisions)</h2>
+  <div class="grid">
+    <div class="card"><span class="lab">decision</span><h3>Where stride lives</h3><p><b>Header field</b> (self-describing, simplest) vs an <b>element-kind id</b> indexing a Haskell descriptor (matches the existing <code>ConDescriptor</code>; <i>required</i> once elements hold pointers). Lean: header field for the POD MVP.</p></div>
+    <div class="card"><span class="lab">decision</span><h3>Sub-word strides?</h3><p><code>Array Char</code>/<code>Bool</code> (stride 1): <code>hdr+N</code> is not a multiple of 8 &rarr; rounds up &rarr; <code>peak_bytes</code> moves &rarr; forces the shared rounded-byte model on both backends. Lean: defer; first cut = word-multiple strides only (exact <code>peak_bytes</code>, no rounding machinery).</p></div>
+    <div class="card"><span class="lab">decision</span><h3>Pointer-bearing elements?</h3><p>POD (<code>Array U64</code>): no embedded pointers &rarr; O(1) teardown, no map. Pointer-bearing (<code>Array (U64,String)</code>): per-stride slot-kind map + O(N) cascade. Lean: POD-first.</p></div>
+    <div class="card"><span class="lab">decision</span><h3>Abstract-first or C-cell direct?</h3><p>Model flat on the abstract heap first (mirrors A&rarr;B, low risk, gives the oracle a reference) vs build the flat C cell directly (delivers the real contiguity). The contiguity <i>is</i> the point &mdash; but abstract-first is the safer oracle path.</p></div>
+  </div>
+  <div class="note hand"><b>Tightest MVP:</b> fixed + monomorphic + flat + single-block, <b>POD word-multiple-stride elements only</b> (<code>Array U64</code>, <code>Array F64</code>, word-sized value structs). Stride in the header. <code>peak_bytes</code> exact, O(1) teardown, no slot-kind map, no rounding. <code>Char</code>/<code>Bool</code> and pointer-bearing elements are clean follow-ons.</div>
+
+  <!-- 11 · LIBRARY vs CORE -->
+  <h2>11 &middot; &ldquo;Array in the library&rdquo; &mdash; where the seam falls</h2>
+  <p>The <code>extern</code> keyword is the seam: the library <i>names</i> the type and ops; the compiler/runtime <i>fills the holes</i>. As much as possible lives in <code>.wok</code>; only the raw-memory floor is built in.</p>
+  <div class="grid">
+    <div class="card win"><span class="lab">prelude/Std/*.wok (real library)</span><h3>Surface + algorithms</h3><p><code>extern type FlatArray a</code> (name + kind); the op <i>signatures</i>; and &mdash; if the type system can state &ldquo;a is sized&rdquo; &mdash; <b>pure-wok</b> derived ops: <code>map</code>, <code>filter</code>, <code>foldl/r</code>, <code>forEach</code>, <code>find</code>, <code>sum</code>, even <code>toList</code>/<code>resize</code>.</p></div>
+    <div class="card cost"><span class="lab">Haskell + C (irreducible core)</span><h3>Bytes + holes</h3><p>The flat cell (<code>wok_rc.c</code>: wide header + inline elements + size-class placement); type registration + the POD restriction (<code>Types/Builtins/Infer</code>); and the memory-touching <b>primitives</b> the <code>extern</code> signatures point at.</p></div>
+  </div>
+
+  <!-- 12 · REDUNDANCY FINDING -->
+  <h2>12 &middot; Finding A &mdash; scalars are <i>already</i> inline (so flat only pays for structs/bytes)</h2>
+  <p>In wok&rsquo;s value model, <code>U64</code>/<code>F64</code>/<code>Bool</code>/<code>Char</code> are inline-uncounted values, <b>not</b> pointers. So a boxed <code>Array U64</code> already stores the integers inline &mdash; a &ldquo;flat&rdquo; <code>Array U64</code> would add nothing.</p>
+  <div class="grid">
+    <div class="card cost"><span class="lab">redundant</span><h3>Array U64</h3><p>Boxed slot already holds the inline integer. boxed == flat. No win.</p></div>
+    <div class="card win"><span class="lab">flat pays</span><h3>Array Vec4 (struct)</h3><p>Boxed = 8B pointer + a separate 40B cell, per element. Flat = 32B inline. 1 alloc vs 1+N; index <i>materializes</i> a cell.</p></div>
+    <div class="card win"><span class="lab">flat pays</span><h3>Array Char (bytes)</h3><p>Boxed = one 8B word per char. Flat = 1B per char (8&times; denser). This is the <code>String</code>/<code>Bytes</code> foundation.</p></div>
+  </div>
+  <p style="margin-top:14px">Boxed vs flat <code>Array Vec4</code> in memory &mdash; the only case (besides bytes) where they differ:</p>
+  <div class="addrlab"><span>boxed: array of 3 pointers &rarr; 3 separate Vec4 cells</span><span></span></div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg arr">hdr&middot;len=3</div>
+    <div class="seg ptr">p0 &darr;</div><div class="seg ptr">p1 &darr;</div><div class="seg ptr">p2 &darr;</div>
+  </div>
+  <div class="arrowdown">&darr; 3 dependent loads, 3 extra cells (1+N allocs)</div>
+  <div class="mem" style="max-width:420px">
+    <div class="seg elem">Vec4#0<small>40B cell</small></div><div class="seg elem">Vec4#1<small>40B cell</small></div><div class="seg elem">Vec4#2<small>40B cell</small></div>
+  </div>
+  <div class="addrlab" style="margin-top:16px"><span>flat: one block, structs inline (1 alloc)</span><span></span></div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg arr">hdr&middot;stride&middot;len=3</div>
+    <div class="seg elem wide">Vec4#0 (32B inline)</div><div class="seg elem wide">Vec4#1 (32B)</div><div class="seg elem wide">Vec4#2 (32B)</div>
+  </div>
+  <p class="cap">fig 12 &mdash; flat trades N element-cells for inline packing; <code>index</code> must rebuild a cell on the way out (copy-out value semantics)</p>
+
+  <!-- 13 · CONSTRAINT FORK -->
+  <h2>13 &middot; Finding B &mdash; library-richness is gated by the &ldquo;sized&rdquo; constraint</h2>
+  <div class="grid">
+    <div class="card"><span class="lab">option (i) literal</span><h3>Hardcoded allowlist</h3><p>No way to say &ldquo;a is sized&rdquo; in a generic signature &rarr; ops stay <b>prims</b>; the library is just <code>extern type</code> + signatures. Smallest. Generic pure-wok ops not expressible.</p></div>
+    <div class="card"><span class="lab">enabler</span><h3>Sized kind</h3><p><code>FlatArray : Sized -&gt; Type</code>, checked at instantiation, <b>no runtime dictionaries</b> (kind-level representation polymorphism). Unlocks generic <b>pure-wok</b> <code>map</code>/<code>fold</code>/<code>toList</code>. More type-system work.</p></div>
+    <div class="card"><span class="lab">heavyweight</span><h3>Sized type class</h3><p><code>Unbox a =&gt;</code> with per-type instances + dictionaries (Haskell-vector style). Most general, but drags in dictionaries the flat array doesn&rsquo;t need.</p></div>
+  </div>
+  <div class="note"><b>Self-describing cells help, but not enough:</b> stride-in-header makes the <i>prims</i> runtime-polymorphic for free; the <i>type checker</i> still needs the kind (or class) to admit generic <i>library</i> functions.</div>
+
+  <!-- 14 · CONCLUSION -->
+  <h2>14 &middot; Conclusion &mdash; <code>Array a</code> on a real C cell (Slice B)</h2>
+  <p>The codebase findings collapsed the flat/<code>Vector</code>/allowlist plan. wok has only <code>U64</code>/<code>U32</code> (no sub-word, no floats), and for those the boxed array is <i>already inline</i> &mdash; so a separate "flat" type buys nothing today. The real, buildable goal is simpler: <b>stop simulating the array in the interpreter; give <code>Array a</code> a real C allocator cell</b> (the C <code>WokArray</code> Slice A deferred = Koka&rsquo;s <code>vector</code>). With 8-byte slots it is flat for scalars and pointer-bearing for boxed elements, automatically &mdash; so it stays <b>one polymorphic <code>Array a</code></b>: no rename, no new type, no allowlist.</p>
+  <div class="addrlab"><span>the WokArray cell (16B header + 8-byte slots, byte size = 16 + 8&middot;len)</span><span></span></div>
+  <div class="mem" style="max-width:640px">
+    <div class="seg arr">rc&middot;tag<small>tag = ARRAY</small></div>
+    <div class="seg arr">len = 3<small>runtime width</small></div>
+    <div class="seg elem">slot0<small>inline or ptr</small></div>
+    <div class="seg elem">slot1</div>
+    <div class="seg elem">slot2</div>
+  </div>
+  <p class="cap">fig 14 &mdash; class = bytes/8 &minus; 1, so a len-L array shares <code>freelist[L+1]</code> with an arity-(L+1) NCon; len &le; 62 recycles in the arena, larger mallocs</p>
+  <div class="grid">
+    <div class="card win"><span class="lab">ships</span><h3>Real C layout</h3><p>The <code>WokArray</code> cell + <code>wok_array_*</code> ABI; byte-size-class placement reusing the word-count free-list; the seven prims backed by C slots; the abstract <code>NArray</code> kept only as the oracle reference.</p></div>
+    <div class="card win"><span class="lab">ships</span><h3>peak_bytes oracle</h3><p>Abstract <code>Stats</code> gains byte tracking + a shared <code>wouldBeCBytes</code>; the differential oracle proves output + alloc/free/peak + <b>peak_bytes</b> bit-for-bit.</p></div>
+    <div class="card"><span class="lab">deferred</span><h3>The unboxed story</h3><p>Sub-word/float types, genuinely-unboxed structs (<code>Vec4</code> + descriptor), capacity rounding, the <code>Sized</code> kind + pure-wok ops, <code>ArrayOf n a</code>, in-place set (Slice C).</p></div>
+  </div>
+  <div class="note hand"><b>Spec:</b> <code>docs/superpowers/specs/2026-06-24-array-slice-b-c-cell-design.md</code>. The runtime <code>len</code> kept here is exactly what a future length-indexed <code>ArrayOf n a</code> would wrap, so this founds that epic without a runtime change.</div>
+
+</div>
+</body>
+</html>

@@ -6,10 +6,11 @@ module Wok.Interp.RC.Heap
   , wokSlotSet, wokSlotGet, wokTag, wokArity
   , wokStatAllocs, wokStatFrees, wokStatLive, wokStatPeak
   , wokStatPeakBytes
+  , wokArrayAlloc, wokArrayLen, wokArrayElemKind, wokArraySlotGet, wokArraySlotSet
   ) where
 
 import Foreign.Ptr (Ptr)
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
 
 data WokObj   -- phantom: pointer to a C cell
@@ -31,3 +32,8 @@ foreign import ccall unsafe "wok_stat_frees"       wokStatFrees       :: Ptr Wok
 foreign import ccall unsafe "wok_stat_live"        wokStatLive        :: Ptr WokHeap -> IO Int64
 foreign import ccall unsafe "wok_stat_peak"        wokStatPeak        :: Ptr WokHeap -> IO Int64
 foreign import ccall unsafe "wok_stat_peak_bytes"  wokStatPeakBytes   :: Ptr WokHeap -> IO Word64
+foreign import ccall unsafe "wok_array_alloc"     wokArrayAlloc    :: Ptr WokHeap -> Word64 -> Word8 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_array_len"        wokArrayLen      :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_array_elemkind"   wokArrayElemKind :: Ptr WokObj -> IO Word32
+foreign import ccall unsafe "wok_array_slot_get"   wokArraySlotGet  :: Ptr WokObj -> Word64 -> IO Word64
+foreign import ccall unsafe "wok_array_slot_set"   wokArraySlotSet  :: Ptr WokObj -> Word64 -> Word64 -> IO ()

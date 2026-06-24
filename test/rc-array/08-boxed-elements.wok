@@ -1,0 +1,38 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Array (Option U64): pointer-scheme (KPointer) elements mixing counted CAddr
+-- slots (Some k) and uncounted Inline slots (None).  Exercises the C-cell
+-- WokArray cascade on a heterogeneous pointer-scheme array:
+--   - Some k is a one-field NCon -> routed to the C heap (CAddr, counted)
+--   - None is a nullary NCon -> encoded as an Inline immediate (uncounted)
+-- The teardown loop must drop the counted CAddr slots exactly once and skip
+-- the Inline slots; the heap must return to baseline with no double-free.
+--
+-- Plan:
+--   arr0 = fromList [Some 10, None, Some 30]  -- [Some 10, None, Some 30]
+--   v0   = index arr0 0                       -- Some 10
+--   n    = length arr0                        -- 3
+--   arr1 = set arr0 1 (Some 20)              -- [Some 10, Some 20, Some 30]
+--   arr2 = resize arr1 2 None                -- [Some 10, Some 20]
+--   xs   = toList arr2                       -- [Some 10, Some 20]
+--   s    = countSomes xs                     -- 2
+--   main = n + s                             -- 3 + 2 = 5
+
+countSomes : [Option U64] -> U64
+countSomes xs = case xs of
+  []    -> 0
+  h :: t -> case h of
+    None   -> countSomes t
+    Some _ -> 1 + countSomes t
+
+main : U64
+main =
+  let arr0 = fromList [Some 10, None, Some 30] in
+  let n    = length arr0 in
+  let arr1 = set arr0 1 (Some 20) in
+  let arr2 = resize arr1 2 None in
+  let xs   = toList arr2 in
+  let s    = countSomes xs in
+  n + s

@@ -23,10 +23,12 @@ Each rung is sound and useful on its own; later rungs hang off earlier ones.
 1. **Slice A — boxed `Array a` on the abstract heap.** `new`/`fromList`/`toList`/`index`/
    `length`/copy-on-write `set`/`resize`. RC-managed, oracle-covered, no C cell. *This is the
    only rung being specced now.* It is the same design as Koka's `vector<a>` (see §4).
-2. **Slice B — the real C `WokArray` cell.** A distinct large-object layout with a runtime-width
-   `uint64 len` (the first wok value whose size is not `8 + 8·uint8`), its own `wok_array_*`
-   ABI, allocated through the existing `WokHeap*` seam (so it is already region-ready). Oracle
-   then proves abstract-vs-C byte+stat identity.
+2. **Slice B — the real C `WokArray` cell** (IMPLEMENTED on `feat/array-slice-b-c-cell`,
+   1396 green, pending final full-branch review + merge). A distinct large-object layout with a
+   runtime-width `uint64 len` (the first wok value whose size is not `8 + 8·uint8`), its own
+   `wok_array_*` ABI, allocated through the existing `WokHeap*` seam (so it is already
+   region-ready). Oracle then proves abstract-vs-C byte+stat identity. See spec:
+   `docs/superpowers/specs/2026-06-24-array-slice-b-c-cell-design.md`.
 3. **Slice C — in-place `set` under `rc == 1`.** The FBIP runtime gate applied to a slot write:
    mutate-if-unique-else-copy. Reuses the `rc == 1` gate, *not* the `drop_reuse`/`alloc_at`
    pairing.

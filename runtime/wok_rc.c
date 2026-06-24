@@ -6,6 +6,10 @@
 
 _Static_assert(sizeof(WokObj)  == 8, "WokObj header must be 8 bytes");
 
+/* WokArray header: 16 bytes (WokObj prefix at offset 0 + uint64_t len at offset 8). */
+_Static_assert(sizeof(WokObj) + sizeof(uint64_t) == 16,
+               "WokArray header must be 16 bytes, keeping 8-alignment");
+
 /* --- tunables (spec section 11) --------------------------------------------- */
 #define WOK_GRANULE     8u
 #define WOK_ARENA_SIZE  (64u * 1024u)   /* slab bytes */
@@ -16,9 +20,48 @@ _Static_assert(WOK_ARENA_SIZE % WOK_GRANULE == 0u,
 _Static_assert((sizeof(WokObj) + (WOK_NUM_CLASSES - 1u) * sizeof(uint64_t)) < WOK_ARENA_SIZE,
                "largest slab-class cell must fit a slab");
 
+/* The largest slab-class array (len = WOK_NUM_CLASSES-2, class WOK_NUM_CLASSES-1) must fit a
+   slab. Tied to WOK_NUM_CLASSES so raising it cannot silently exceed the slab capacity. */
+_Static_assert((16u + 8u * (WOK_NUM_CLASSES - 2u)) < WOK_ARENA_SIZE,
+               "largest slab-class array must fit within a slab");
+
 static size_t wok_cell_bytes(uint32_t arity) {
     return sizeof(WokObj) + (size_t)arity * sizeof(uint64_t);
 }
+
+/* Read the runtime length of an array cell (offset 8 past the WokObj prefix). */
+static uint64_t wok_array_read_len(const WokObj* p) {
+    uint64_t len;
+    memcpy(&len, (const char*)p + 8, sizeof(uint64_t));
+    return len;
+}
+
+/* Byte size of an array cell = 16 + 8*len. Aborts on size_t overflow: `len` is a
+   runtime value (a system boundary), so an adversarial len that would wrap size_t and
+   yield a tiny allocation must fail loudly, not corrupt the heap. Protects BOTH backends
+   (the malloc path's tiny-cell-then-OOB write can never happen: the abort fires first). */
+static size_t wok_array_cell_bytes(uint64_t len) {
+    if (WOK_UNLIKELY(len > (uint64_t)((SIZE_MAX - 16u) / sizeof(uint64_t)))) {
+        fprintf(stderr, "wok_rc: wok_array_alloc len overflows size_t (16 + 8*len)\n");
+        abort();
+    }
+    return 16u + (size_t)len * sizeof(uint64_t);
+}
+
+/* Free-list size class of an array cell, WITHOUT wrapping `len + 1`. The arena holds
+   classes 0..WOK_NUM_CLASSES-1; an array of len L occupies class L+1, so it fits the
+   arena iff L+1 < WOK_NUM_CLASSES, i.e. L < WOK_NUM_CLASSES-1. Any larger L (including
+   the adversarial UINT64_MAX where L+1 would wrap to 0) routes to malloc. wok_array_alloc
+   and wok_free's array branch MUST use this identical guard so they agree on routing.
+   Arena-only: the WOK_RC_MALLOC backend never routes by class. */
+#ifndef WOK_RC_MALLOC
+static size_t wok_array_class(uint64_t len) {
+    if (len < (uint64_t)WOK_NUM_CLASSES - 1u) {
+        return (size_t)(len + 1u);
+    }
+    return (size_t)WOK_NUM_CLASSES;   /* >= WOK_NUM_CLASSES -> malloc path */
+}
+#endif
 
 /* INVARIANT: both `struct WokHeap` definitions below begin with the same four fields
    (allocs, frees, live, peak) in the same order; the shared wok_stat_allocs/frees/live/
@@ -53,9 +96,16 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
 }
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
-    uint32_t arity = (uint32_t)p->arity;
+    /* Tag-first dispatch: array cells carry a runtime len at offset 8, not an arity byte. */
+    size_t bytes;
+    if (WOK_UNLIKELY((uint32_t)p->tag == WOK_ARRAY_TAG)) {
+        uint64_t len = wok_array_read_len(p);
+        bytes = wok_array_cell_bytes(len);
+    } else {
+        bytes = wok_cell_bytes((uint32_t)p->arity);
+    }
     h->frees += 1u; h->live -= 1;
-    h->cur_bytes -= (uint64_t)wok_cell_bytes(arity);
+    h->cur_bytes -= (uint64_t)bytes;
     free(p);
 }
 /* FBIP in-place reuse: re-stamp a just-decremented cell's header without touching
@@ -83,6 +133,20 @@ WokObj* wok_alloc_at(WokHeap* h, uint32_t tag, uint32_t arity, WokObj* p) {
 uint64_t wok_stat_reused(const WokHeap* h)         { (void)h; return 0u; }
 uint64_t wok_stat_reused_inplace(const WokHeap* h) { (void)h; return 0u; }
 uint64_t wok_stat_slabs(const WokHeap* h)          { (void)h; return 0u; }
+
+WokObj* wok_array_alloc(WokHeap* h, uint64_t len, uint8_t elemkind) {
+    size_t sz = wok_array_cell_bytes(len);
+    WokObj* p = (WokObj*)malloc(sz);
+    if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    p->rc = 1u; p->tag = (uint16_t)WOK_ARRAY_TAG; p->arity = elemkind; p->scan = 0u;
+    /* Write len at offset 8 (past the WokObj prefix). */
+    memcpy((char*)p + 8, &len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    return p;
+}
 
 #else
 /* ---- the slab arena (default) ------------------------------------------------------- */
@@ -201,21 +265,66 @@ WokObj* wok_alloc_at(WokHeap* h, uint32_t tag, uint32_t arity, WokObj* p) {
 
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
-    uint32_t arity = (uint32_t)p->arity;
+    /* Tag-first dispatch: array cells carry a runtime len at offset 8, not an arity byte.
+       Size class: bytes/8-1.  NCon arity a -> class=a.  WokArray len L -> class=L+1
+       (via wok_array_class, the no-wrap guard alloc uses so routing agrees). */
+    size_t bytes;
+    size_t cls;
+    if (WOK_UNLIKELY((uint32_t)p->tag == WOK_ARRAY_TAG)) {
+        uint64_t len = wok_array_read_len(p);
+        bytes = wok_array_cell_bytes(len);
+        cls   = wok_array_class(len);
+    } else {
+        uint32_t arity = (uint32_t)p->arity;
+        bytes = wok_cell_bytes(arity);
+        cls   = (size_t)arity;
+    }
     h->frees += 1u; h->live -= 1;
-    h->cur_bytes -= (uint64_t)wok_cell_bytes(arity);
+    h->cur_bytes -= (uint64_t)bytes;
 #ifdef WOK_RC_POISON
     /* Poison is arena-only by design: it forces a reuse-after-free read to see garbage,
        since ASan cannot flag the arena recycling its own live memory. The WOK_RC_MALLOC
        backend needs no poison -- its real free() makes every UAF ASan-visible directly. */
-    memset(p, 0xDE, wok_cell_bytes(arity));       /* poison BEFORE relink so the link survives */
+    memset(p, 0xDE, bytes);       /* poison BEFORE relink so the link survives */
 #endif
-    if (arity < WOK_NUM_CLASSES) {
-        fl_set_next(p, h->freelist[arity]);
-        h->freelist[arity] = p;
+    if (cls < WOK_NUM_CLASSES) {
+        fl_set_next(p, h->freelist[cls]);
+        h->freelist[cls] = p;
     } else {
         free(p);
     }
+}
+
+WokObj* wok_array_alloc(WokHeap* h, uint64_t len, uint8_t elemkind) {
+    size_t   sz  = wok_array_cell_bytes(len);   /* aborts on size_t overflow */
+    /* Size class = bytes/8-1 = len+1 (shared with NCon arity=len+1); no-wrap guard. */
+    size_t   cls = wok_array_class(len);
+    WokObj*  p;
+    if (cls < WOK_NUM_CLASSES) {
+        WokObj* head = h->freelist[cls];
+        if (head != NULL) {                       /* reuse from shared free-list */
+            h->freelist[cls] = fl_next(head);
+            p = head;
+            h->reused += 1u;
+        } else {                                  /* bump */
+            if (h->bump_ptr == NULL || sz > (size_t)(h->bump_end - h->bump_ptr)) {
+                wok_new_slab(h);
+            }
+            p = (WokObj*)h->bump_ptr;
+            h->bump_ptr += sz;
+        }
+    } else {                                      /* large: direct malloc */
+        p = (WokObj*)malloc(sz);
+        if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    }
+    p->rc = 1u; p->tag = (uint16_t)WOK_ARRAY_TAG; p->arity = elemkind; p->scan = 0u;
+    /* Write len at offset 8 (past the WokObj prefix). */
+    memcpy((char*)p + 8, &len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    return p;
 }
 
 uint64_t wok_stat_reused(const WokHeap* h)         { return h->reused; }
@@ -226,6 +335,32 @@ uint64_t wok_stat_slabs(const WokHeap* h)          { return h->nslabs; }
 
 /* ---- shared across both backends ---------------------------------------------------- */
 uint64_t wok_stat_peak_bytes(const WokHeap* h)     { return h->peak_bytes; }
+
+/* ---- WokArray accessors (shared, no allocator involvement) -------------------------- */
+
+uint64_t wok_array_len(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_ARRAY_TAG);
+    uint64_t len;
+    memcpy(&len, (const char*)p + 8, sizeof(uint64_t));
+    return len;
+}
+
+uint32_t wok_array_elemkind(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_ARRAY_TAG);
+    return (uint32_t)p->arity;
+}
+
+void wok_array_slot_set(WokObj* p, uint64_t i, uint64_t word) {
+    assert((uint32_t)p->tag == WOK_ARRAY_TAG);
+    assert(i < wok_array_read_len(p));
+    ((uint64_t*)((char*)p + 16))[i] = word;
+}
+
+uint64_t wok_array_slot_get(const WokObj* p, uint64_t i) {
+    assert((uint32_t)p->tag == WOK_ARRAY_TAG);
+    assert(i < wok_array_read_len(p));
+    return ((const uint64_t*)((const char*)p + 16))[i];
+}
 
 /* ---- shared across both backends (unchanged from slice 1) --------------------------- */
 void wok_dup(WokObj* p) { p->rc += 1u; }

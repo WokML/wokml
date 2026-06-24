@@ -1,4 +1,6 @@
-allocs   = 6
-frees    = 6
-peakLive = 6
-baseline = 0
+allocs    = 6
+frees     = 6
+peakLive  = 6
+curBytes  = 0
+peakBytes = 144
+baseline  = 0
