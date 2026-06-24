@@ -278,6 +278,35 @@ int main(void) {
         wok_heap_free(h);
     }
 
+    /* --- wok_rc: non-destructive refcount peek (Slice C) ----------------------------- */
+    {
+        WokHeap* h = wok_heap_new();
+
+        /* NCon cell: peek tracks rc and never mutates it */
+        WokObj* p = wok_alloc(h, 3u, 2u);
+        assert(wok_rc(p) == 1u);          /* fresh: rc 1 */
+        assert(wok_rc(p) == 1u);          /* idempotent: a peek does not change rc */
+        wok_dup(p);
+        assert(wok_rc(p) == 2u);          /* after dup */
+        assert(wok_dec(p) == 1u);
+        assert(wok_rc(p) == 1u);          /* after dec */
+        assert(wok_dec(p) == 0u);
+        wok_free(h, p);
+
+        /* WokArray cell: same shared-prefix rc field */
+        WokObj* arr = wok_array_alloc(h, 2u, 0u);
+        assert(wok_rc(arr) == 1u);
+        wok_dup(arr);
+        assert(wok_rc(arr) == 2u);
+        assert(wok_dec(arr) == 1u);
+        assert(wok_rc(arr) == 1u);
+        assert(wok_dec(arr) == 0u);
+        wok_free(h, arr);
+
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
     printf("OK\n");
     return 0;
 }

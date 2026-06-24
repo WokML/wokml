@@ -80,6 +80,12 @@ module Wok.Interp.RC.Value
   , wokArrayTag
   , slotKindToElemKind
   , elemKindToSlotKind
+    -- * Array in-place mutation helpers (Slice C)
+  , atIndex
+  , setAt
+  , arrayLenOf
+  , arrayUnique
+  , arraySetSlotInPlace
   ) where
 
 import Control.Monad (foldM)
@@ -1923,3 +1929,95 @@ tupleArity :: Text -> Maybe Int
 tupleArity t = case Tx.stripPrefix (Tx.pack "Tuple") t of
   Just rest | not (Tx.null rest), Tx.all (`elem` ['0' .. '9']) rest -> Just (read (Tx.unpack rest))
   _ -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- Array in-place mutation helpers (Array Slice C)
+
+-- | Total safe list index: @atIndex n xs@ is @Just (xs !! n)@ without the partial
+-- @(!!)@, or @Nothing@ if @n@ is out of range. Lives here (not Prim.hs) so the
+-- array in-place writer can use it without the Prim->Value import cycle; Prim.hs
+-- imports it from here.
+atIndex :: Int -> [a] -> Maybe a
+atIndex n xs = case drop n xs of
+  (x : _) -> Just x
+  []      -> Nothing
+
+-- | Replace the element at index @i@ with @x@ (others unchanged). Shared by the
+-- HAddr in-place writer and the copy-on-write path in 'arraySet'. Out-of-range
+-- @i@ leaves the list unchanged (callers bounds-check first).
+setAt :: Int -> a -> [a] -> [a]
+setAt i x xs = [ if j == i then x else el | (j, el) <- zip [0 :: Int ..] xs ]
+
+-- | Element count of the array at @a@, cheaply: O(1) 'H.wokArrayLen' on the C
+-- backend (no per-slot decode), list length on the abstract backend. Used by
+-- 'arraySet' for the bounds check so the in-place fast path does not decode every
+-- slot just to learn the length.
+arrayLenOf :: Addr -> Store -> RC Int
+arrayLenOf (CAddr p) _ = fromIntegral <$> liftIO (H.wokArrayLen p)
+arrayLenOf a s = do
+  c <- liftRC (derefPure a s)
+  case cNode c of
+    NArray vs -> pure (length vs)
+    _         -> liftRC (Left (PrimError (Tx.pack "Array: not an array")))
+
+-- | True iff the array at @a@ is safe to mutate in place: a dynamic, counted
+-- cell whose refcount is exactly 1 (the caller's owned reference is the only
+-- one).
+--
+-- Uncounted addresses ('isUncounted': static immortal negatives or inline
+-- immediates) are never unique here; 'isUncounted' is checked FIRST, exactly as
+-- 'dropReuse' guards its donor.
+--
+-- The 'CAddr' arm peeks the C cell's rc non-destructively ('H.wokRc');
+-- the 'HAddr' arm reads 'cRc' via 'derefPure' (which rejects 'CAddr', so it is
+-- reached only for a dynamic 'HAddr'). The decision is identical on both
+-- backends because the refcount is maintained in lockstep.
+--
+-- An array handle is never an 'Inline' immediate (the 'Inline' arm is defensive
+-- totality only).
+arrayUnique :: Addr -> Store -> RC Bool
+arrayUnique a _ | isUncounted a = pure False
+arrayUnique (CAddr p) _         = (== 1) <$> liftIO (H.wokRc p)
+arrayUnique a@(HAddr _) s       = (== 1) . cRc <$> liftRC (derefPure a s)
+arrayUnique (Inline _) _        = pure False   -- isUncounted already covers Inline; kept for exhaustiveness
+
+-- | Overwrite slot @i@ of the array at @a@ with @v@, in place, returning the OLD
+-- element for the caller to drop. 0 alloc / 0 free; rc / length / cBytes unchanged.
+-- The first argument is @encodeSlotC v@ (precomputed by the caller's gate, which
+-- guarantees it is 'Just'): the C backend writes that encoded word, the abstract
+-- backend ignores it and stores @v@ directly. ORDER: read old -> write new ->
+-- return old (caller drops it). Precondition: the array is unique ('arrayUnique').
+arraySetSlotInPlace :: (SlotKind, Word64) -> Addr -> Int -> RCValue -> Store -> RC (RCValue, Store)
+arraySetSlotInPlace (newKind, w) (CAddr p) i _v s = do
+  -- Bounds-check BEFORE touching raw memory (the C wokArraySlot* carry only a
+  -- DEBUG assert; an out-of-range index would corrupt the heap in release).
+  len <- liftIO (H.wokArrayLen p)
+  if i < 0 || fromIntegral i >= len
+    then liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: index out of range")))
+    else do
+      kind <- elemKindToSlotKind <$> liftIO (H.wokArrayElemKind p)
+      oldW <- liftIO (H.wokArraySlotGet p (fromIntegral i))
+      let oldEl = decodeSlotC kind oldW
+      -- v : a, so by monomorphism newKind == kind in well-typed code; we still
+      -- check because a mismatch would be a SILENT C-heap corruption (the teardown
+      -- cascade decodes every slot with the header elemkind).
+      if newKind == kind
+        then do
+          liftIO (H.wokArraySlotSet p (fromIntegral i) w)
+          pure (oldEl, s)
+        else liftRC (Left (PrimError (Tx.pack
+               "arraySetSlotInPlace: new element SlotKind does not match the array elemkind")))
+arraySetSlotInPlace _ (HAddr idx) i v s
+  | i < 0     = liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: index out of range")))
+  | otherwise = do
+      c <- liftRC (derefPure (HAddr idx) s)
+      case cNode c of
+        NArray vs -> case atIndex i vs of
+          Just oldEl ->
+            let newVs = setAt i v vs
+                c'    = c { cNode = NArray newVs }
+            in pure (oldEl, s { stCells = IM.insert idx c' (stCells s) })
+          Nothing -> liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: index out of range")))
+        _ -> liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: address is not an array")))
+arraySetSlotInPlace _ (Inline _) _ _ _ =
+  liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: inline handle is not an array")))

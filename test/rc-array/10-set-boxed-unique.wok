@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Unique boxed-element array taking the IN-PLACE set path while replacing a
+-- COUNTED old element (a CAddr `Some` slot). arr0 is consumed straight into `set`
+-- (used nowhere else) so it is uniquely owned (rc==1) -> in-place mutation; the
+-- displaced old `Some 10` (a counted NCon cell) must be dropped EXACTLY once
+-- (cascade), and the new `Some 99` moved into the slot. This pins the C-backend
+-- in-place counted-old-element drop that 08 (which replaces an uncounted `None`)
+-- does not cover.
+--
+-- Plan:
+--   arr0 = fromList [Some 10, Some 20, Some 30]   -- counted CAddr slots
+--   arr1 = set arr0 0 (Some 99)                   -- unique -> in-place; old Some 10 dropped once
+--   xs   = toList arr1                            -- [Some 99, Some 20, Some 30]
+--   s    = sumSomes xs                            -- 99 + 20 + 30 = 149
+--   main = s
+
+sumSomes : [Option U64] -> U64
+sumSomes xs = case xs of
+  []     -> 0
+  h :: t -> case h of
+    None   -> sumSomes t
+    Some k -> k + sumSomes t
+
+main : U64
+main =
+  let arr0 = fromList [Some 10, Some 20, Some 30] in
+  let arr1 = set arr0 0 (Some 99) in
+  let xs   = toList arr1 in
+  let s    = sumSomes xs in
+  s

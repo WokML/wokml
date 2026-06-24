@@ -31,7 +31,7 @@ Each rung is sound and useful on its own; later rungs hang off earlier ones.
    `docs/superpowers/specs/2026-06-24-array-slice-b-c-cell-design.md`.
 3. **Slice C — in-place `set` under `rc == 1`.** The FBIP runtime gate applied to a slot write:
    mutate-if-unique-else-copy. Reuses the `rc == 1` gate, *not* the `drop_reuse`/`alloc_at`
-   pairing.
+   pairing. (IMPLEMENTED on `feat/array-slice-c-inplace-set`, 1406 green, ASan clean; `wok_rc` peek + `arrayUnique`/`arraySetSlotInPlace`; FBIP untouched, `resize` still copy-only; pending full-branch review + merge.)
 4. **Slice D — unboxed / flat arrays.** `Array U64`/`Array Char`/`Array <fixed struct>` packed
    inline with a per-element stride. The first serialization entry point; also the first place
    the boxing/cache win is measurable (alloc-count now, cache later at codegen).

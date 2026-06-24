@@ -185,6 +185,7 @@ void     wok_heap_free(WokHeap* h);               // tear down; warns on residua
 WokObj*  wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity);  // header + slots, rc = 1, slots undef
 void     wok_dup(WokObj* p);                      // rc++
 uint64_t wok_dec(WokObj* p);                      // rc--, returns NEW rc; does NOT free
+uint32_t wok_rc(const WokObj* p);                 // WOK_PURE; non-destructive refcount peek
 void     wok_free(WokHeap* h, WokObj* p);         // free the cell (caller reads slots first)
 
 void     wok_slot_set(WokObj* p, uint32_t i, uint64_t tag, uint64_t payload);

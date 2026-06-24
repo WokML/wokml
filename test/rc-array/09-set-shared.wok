@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.Array
+
+-- Shared-input set: arr0 is used by BOTH `set` and a later `index`, so Perceus dups
+-- it and `set` sees rc > 1 -> copy-on-write fallback (NOT in-place). The original
+-- arr0 must still read its OLD value (proving no in-place mutation of a shared
+-- array); the returned copy carries the new value.
+--
+--   arr0 = new 4 0          -- [0,0,0,0]; shared (used twice below)
+--   arr1 = set arr0 0 100   -- copy path: arr1 = [100,0,0,0]; arr0 untouched
+--   orig = index arr0 0     -- 0   (original unchanged)
+--   upd  = index arr1 0     -- 100 (copy updated)
+--   main = orig + upd        -- 100
+
+main : U64
+main =
+  let arr0 = new 4 0 in
+  let arr1 = set arr0 0 100 in
+  let orig = index arr0 0 in
+  let upd  = index arr1 0 in
+  orig + upd

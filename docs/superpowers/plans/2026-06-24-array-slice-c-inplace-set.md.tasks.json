@@ -1,0 +1,33 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-24-array-slice-c-inplace-set.md",
+  "tasks": [
+    {
+      "id": 6,
+      "subject": "Task 1: wok_rc non-destructive peek (C + FFI)",
+      "status": "completed",
+      "description": "**Goal:** Add a general `wok_rc` returning a cell's refcount without modifying it, with a non-destructive C unit test, plus the Haskell FFI binding.\n\n**Files:** runtime/wok_rc.h, runtime/wok_rc.c, runtime/test/wok_rc_test.c, src/Wok/Interp/RC/Heap.hs\n\n**Verify:** bash scripts/asan-runtime.sh && cabal build\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\", \"runtime/test/wok_rc_test.c\", \"src/Wok/Interp/RC/Heap.hs\"], \"verifyCommand\": \"bash scripts/asan-runtime.sh && cabal build\", \"acceptanceCriteria\": [\"wok_rc returns p->rc non-destructively\", \"works on NCon and WokArray cells\", \"asan-runtime.sh prints OK sanitizer-clean\", \"cabal build succeeds with wokRc exported\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 2: arrayUnique + arraySetSlotInPlace (Value.hs)",
+      "status": "completed",
+      "blockedBy": [6],
+      "description": "**Goal:** Add the shared uniqueness decision and the address-dispatched in-place slot writer to Value.hs, each unit-tested; arraySet unchanged (ships green).\n\n**Files:** src/Wok/Interp/RC/Value.hs, test/Spec.hs\n\n**Verify:** cabal test wok-tests\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests\", \"acceptanceCriteria\": [\"arrayUnique True/False for unique/shared/static\", \"arraySetSlotInPlace overwrites slot, returns old, 0 alloc/0 free\", \"stLive returns to baseline after drop\", \"both exported, full suite still passes\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 3: Gate arraySet on in-place fast path + tests",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "**Goal:** Gate arraySet (in-place when arrayUnique && isJust (encodeSlotC v), else copy verbatim); update set unit test; add shared-input corpus; keep QuickCheck + differential oracle green on both backends.\n\n**Files:** src/Wok/Interp/RC/Prim.hs, test/Spec.hs, test/rc-array/09-set-shared.wok\n\n**Verify:** cabal test wok-tests && bash scripts/asan-runtime.sh\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Prim.hs\", \"test/Spec.hs\", \"test/rc-array/09-set-shared.wok\"], \"verifyCommand\": \"cabal test wok-tests && bash scripts/asan-runtime.sh\", \"acceptanceCriteria\": [\"unique set 0 alloc, shared set +1 alloc original unchanged\", \"QuickCheck set properties hold both backends\", \"differential oracle byte+stat identical incl 09-set-shared, heap baseline\", \"cabal test + asan green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 4: Docs + memory + arc update",
+      "status": "completed",
+      "blockedBy": [8],
+      "description": "**Goal:** Document the wok_rc ABI and mark Slice C done in the arc and the memory note.\n\n**Files:** runtime/README.md, docs/superpowers/2026-06-24-array-region-valuemodel-arc.md, memory note array-slice-b-c-cell.md + MEMORY.md\n\n**Verify:** cabal test wok-tests (docs-only)\n\n```json:metadata\n{\"files\": [\"runtime/README.md\", \"docs/superpowers/2026-06-24-array-region-valuemodel-arc.md\"], \"verifyCommand\": \"cabal test wok-tests\", \"acceptanceCriteria\": [\"runtime/README lists wok_rc\", \"arc rung 3 marked implemented\", \"memory note records Slice C\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-24"
+}

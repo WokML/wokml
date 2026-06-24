@@ -12,7 +12,8 @@ import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.RC.Value
   ( RC, liftRC, RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
   , Node (..), Cell (..), Store, alloc, deref, incref, dropAddr, dropReuse, writeNode
-  , continuationOwned, valueChildren )
+  , continuationOwned, valueChildren
+  , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC )
 import Wok.Interp.Value (RuntimeError (..))
 
 -- | The RC primitive table. Mirrors the reference 'Wok.Interp.Prim.primTable'
@@ -450,13 +451,6 @@ asIndex (RVLit (LInt n))
   | otherwise                       = Right (fromInteger n)
 asIndex _ = Left (PrimError (Tx.pack "Array: expected U64 index"))
 
--- | Total safe list index: returns 'Just' the element at position i, or
--- 'Nothing' if i is out of range. Never uses @(!!)@ or 'head'.
-atIndex :: Int -> [a] -> Maybe a
-atIndex i xs = case drop i xs of
-  (x : _) -> Just x
-  []       -> Nothing
-
 -- | Deref an array handle and return its element list. Fails with 'PrimError'
 -- if the value is not a boxed 'NArray'.
 arrayElems :: RCValue -> Store -> RC [RCValue]
@@ -538,28 +532,47 @@ arrayLength = RCPrim PN.arrayLengthName 1 [] $ \args s -> case args of
     pure (PRDone (RVLit (LInt (toInteger (length vs)))), s1)
   _ -> throwE (ArityError (Tx.pack "Array.length"))
 
--- | @set arr i v@: copy-on-write update. Build a new element list with slot i
--- replaced by v (moved in) and all other slots incref'd. Alloc the new array.
+-- | @set arr i v@: in-place update when the array is uniquely owned and the new
+-- value is C-encodable; copy-on-write otherwise.
+--
+-- Fast path (rc == 1 AND 'encodeSlotC' succeeds): mutate slot i in place, return
+-- the SAME array handle (0 array alloc). The old element is returned by
+-- 'arraySetSlotInPlace' and then dropped by the caller.
+--
+-- Slow path (shared or non-encodable): build a new element list with slot i
+-- replaced by v (moved in) and all other slots incref'd. Alloc a new array.
 -- Drop the input (cascade releases old arr[i]; survivors net 0). RC: +1 alloc.
 arraySet :: RCPrim
 arraySet = RCPrim PN.arraySetName 3 [] $ \args s -> case args of
   [arr@(RVBox a), iv, v] -> do
-    i  <- liftRC (asIndex iv)
-    vs <- arrayElems arr s
-    if i >= length vs
+    i <- liftRC (asIndex iv)
+    n <- arrayLenOf a s
+    if i >= n
       then throwE (PrimError (Tx.pack "Array.set: out of bounds"))
       else do
-        let newVs = [ if j == i then v else el | (j, el) <- zip [0 ..] vs ]
-        -- Incref each survivor (j /= i); slot i is v, already owned.
-        s1 <- foldM
-                (\st (j, el) -> if j == i then pure st else dupValue el st)
-                s
-                (zip [0 :: Int ..] vs)
-        (na, s2) <- alloc (NArray newVs) s1
-        -- Consume input: cascade drops each old arr[j]; old arr[i] is released,
-        -- survivors net to 0 (one incref above, one drop here).
-        s3 <- dropAddr a s2
-        pure (PRDone (RVBox na), s3)
+        unique <- arrayUnique a s
+        -- Shared gate (identical on both backends): in-place only when the array
+        -- is uniquely owned AND v is C-encodable. encodeSlotC is pure and computed
+        -- exactly once here; a non-encodable v (Int >= 2^63) degrades to copy on
+        -- BOTH backends, preserving the oracle invariant.
+        case if unique then encodeSlotC v else Nothing of
+          Just enc -> do
+            -- In-place fast path: 0 array alloc, survivors untouched.
+            (oldEl, s1) <- arraySetSlotInPlace enc a i v s
+            s2          <- dropValue oldEl s1
+            pure (PRDone (RVBox a), s2)
+          Nothing -> do
+            -- Copy-on-write: decode the elements (only needed here), replace slot
+            -- i (v moved in), incref each survivor, alloc the new array, drop input.
+            vs <- arrayElems arr s
+            let newVs = setAt i v vs
+            s1 <- foldM
+                    (\st (j, el) -> if j == i then pure st else dupValue el st)
+                    s
+                    (zip [0 :: Int ..] vs)
+            (na, s2) <- alloc (NArray newVs) s1
+            s3 <- dropAddr a s2
+            pure (PRDone (RVBox na), s3)
   _ -> throwE (ArityError (Tx.pack "Array.set"))
 
 -- | @resize arr m fill@: copy-on-write resize to length m. Kept prefix (length

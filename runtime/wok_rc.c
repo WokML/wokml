@@ -386,6 +386,7 @@ uint64_t wok_slot_get(const WokObj* p, uint32_t i) {
 
 uint32_t wok_tag(const WokObj* p)   { return (uint32_t)p->tag; }
 uint32_t wok_arity(const WokObj* p) { return (uint32_t)p->arity; }
+uint32_t wok_rc(const WokObj* p) { return p->rc; }
 
 uint64_t wok_stat_allocs(const WokHeap* h) { return h->allocs; }
 uint64_t wok_stat_frees(const WokHeap* h)  { return h->frees; }

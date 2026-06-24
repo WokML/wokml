@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok — Array Slice C: in-place set under rc == 1</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --good:#1a7f4b; --warn:#c0392b; --hand:#8e44ad; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.8rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.16rem;margin:46px 0 2px}
+  h3{font-size:.97rem;margin:18px 0 4px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  p{margin:.7em 0}
+
+  .addrlab{font-family:ui-monospace,monospace;font-size:.66rem;color:var(--mut);display:flex;justify-content:space-between;margin:14px 0 -2px}
+  .mem{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;font-family:ui-monospace,monospace;font-size:.72rem;margin:2px 0}
+  .seg{padding:8px 7px;border-right:1px solid var(--line);text-align:center;white-space:nowrap;min-width:0}
+  .seg:last-child{border-right:none}
+  .seg small{display:block;color:var(--mut);font-size:.85em;font-weight:400}
+  .seg.hdr{background:#eceff3;color:var(--mut)}
+  .seg.arr{background:#eef4fb;color:var(--accent)}
+  .seg.elem{background:#eef7f0;color:var(--good)}
+  .seg.ptr{background:#fdeef6;color:var(--hand)}
+  .seg.new{background:#fff4e0;color:#a86412}
+  .seg.dead{background:repeating-linear-gradient(45deg,#fdeeee,#fdeeee 6px,#f6dede 6px,#f6dede 12px);color:var(--warn)}
+  .seg.free{flex:1;background:repeating-linear-gradient(45deg,#fbfcfd,#fbfcfd 6px,#f1f3f5 6px,#f1f3f5 12px);color:var(--mut)}
+  .wide{flex:2}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:16px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:200px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb;color:var(--accent)}
+  .box.good{border-color:var(--good);background:#eef7f0;color:var(--good)}
+  .box.warn{border-color:var(--warn);background:#fdeeee;color:var(--warn)}
+  .arrow{color:var(--mut);margin:3px 0}
+  .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+
+  .ladder{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:16px 0;font-family:ui-monospace,monospace;font-size:.73rem}
+  .rung{border:1px solid var(--line);background:var(--soft);border-radius:7px;padding:8px 10px;min-width:96px;text-align:center}
+  .rung small{display:block;color:var(--mut);font-size:.84em;font-weight:400;margin-top:2px}
+  .rung.done{background:#eef7f0;border-color:var(--good);color:var(--good)}
+  .rung.here{background:#eef4fb;border-color:var(--accent);color:var(--accent);box-shadow:0 0 0 2px #e3eef9}
+  .rung.next{background:#f4ecfa;border-color:var(--hand);color:var(--hand)}
+  .chev{align-self:center;color:var(--mut);padding:0 6px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card .lab{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .card h3{margin:0 0 6px;font-size:.95rem}
+  .card p{font-size:.83rem;margin:6px 0 0}
+  .card.good{border-color:var(--good)} .card.good h3{color:var(--good)}
+  .card.warn{border-color:var(--warn)} .card.warn h3{color:var(--warn)}
+  .pick{font-family:ui-monospace,monospace;font-size:.66rem;font-weight:700;color:var(--good);text-transform:uppercase;letter-spacing:.05em}
+  .rej{font-family:ui-monospace,monospace;font-size:.66rem;font-weight:700;color:var(--warn);text-transform:uppercase;letter-spacing:.05em}
+
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.82rem}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  .ok{color:var(--good);font-weight:600}
+  .bad{color:var(--warn);font-weight:600}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0;font-size:.92rem}
+  .note b{color:var(--accent)}
+  .note.warn{border-left-color:var(--warn)} .note.warn b{color:var(--warn)}
+  .note.good{border-left-color:var(--good)} .note.good b{color:var(--good)}
+
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+  .twocol .pane{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .twocol .pane h3{margin-top:0}
+  .twocol .pane.eq{border-color:var(--good)}
+  .eqbar{text-align:center;color:var(--good);font-weight:700;margin:6px 0}
+  @media(max-width:680px){.twocol{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Array Slice C — in-place <code>set</code> under <code>rc == 1</code></h1>
+  <p class="sub">Teach <code>Array.set</code> a fast path: when nobody else holds the array, poke the new value straight into the existing cell — zero allocation — instead of copying the whole thing. Same meaning, smarter memory. The FBIP <code>rc == 1</code> gate, applied to a slot write.</p>
+
+  <!-- ladder -->
+  <h2>Where this sits in the arc</h2>
+  <div class="ladder">
+    <div class="rung done">A<small>boxed Array a</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung done">B<small>real C cell</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung here">C<small>in-place set<br>rc == 1</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung next">D<small>unboxed/flat</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung next">R<small>regions</small></div>
+  </div>
+  <p class="cap">Slice C reuses the <code>rc == 1</code> <i>gate</i> from FBIP — <b>not</b> the <code>drop_reuse</code>/<code>alloc_at</code> token pairing. Arrays stay FBIP-excluded; this is a single, self-contained slot write.</p>
+
+  <!-- 1 -->
+  <h2>1 &middot; The idea in one line</h2>
+  <p><code>set arr i v</code> must return an array equal to <code>arr</code> but with slot <code>i</code> holding <code>v</code>. <b>How</b> it gets there is invisible to the program. Today it always builds a fresh copy. Slice C asks one question first — <i>am I the only owner?</i> — and if yes, mutates the one array it already has.</p>
+  <div class="flow">
+    <div class="box">set arr i v</div>
+    <div class="arrow">&darr; &nbsp; is <code>arr</code> uniquely owned? (<code>rc == 1</code>)</div>
+    <div class="row">
+      <div class="box good">YES &rarr; mutate in place<small>0 array alloc &middot; 0 array free</small></div>
+      <div class="box hi">NO &rarr; copy-on-write<small>+1 array alloc (today's behaviour)</small></div>
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <h2>2 &middot; Today: copy-on-write (always +1)</h2>
+  <p>The current prim allocates a whole new array, increfs the <code>n&minus;1</code> survivors into it, moves <code>v</code> into slot <code>i</code>, then drops the old array. For a moment <b>both arrays are live</b> — that transient is a real spike in <code>peak_bytes</code>.</p>
+  <div class="addrlab"><span>old array (rc 1)</span><span></span></div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg arr">hdr&middot;len 3</div>
+    <div class="seg elem wide">a</div>
+    <div class="seg ptr wide">b &larr; slot i</div>
+    <div class="seg elem wide">c</div>
+  </div>
+  <div class="addrlab"><span>+ new array allocated alongside it &nbsp;(both live = the spike)</span><span></span></div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg arr">hdr&middot;len 3</div>
+    <div class="seg elem wide">a <small>incref</small></div>
+    <div class="seg new wide">v <small>moved in</small></div>
+    <div class="seg elem wide">c <small>incref</small></div>
+  </div>
+  <p class="cap">fig 2 &mdash; <code>+1 alloc</code>, <code>n&minus;1</code> increfs, then the old array is dropped (its <code>b</code> released). Net live: same; but the high-water rose by one array.</p>
+
+  <!-- 3 -->
+  <h2>3 &middot; The fast path: in-place under <code>rc == 1</code></h2>
+  <p>If the refcount is 1, the prim owns the <i>only</i> reference. Nobody else can observe a change. So: drop the old element at slot <code>i</code> (cascade if it was a counted child), write <code>v</code> into that slot, leave the other <code>n&minus;1</code> slots exactly as they are. Same address, same refcount, <b>no allocation, no spike</b>.</p>
+  <div class="addrlab"><span>the one array (rc 1) &mdash; mutated in place</span><span></span></div>
+  <div class="mem" style="max-width:560px">
+    <div class="seg arr">hdr&middot;len 3<small>unchanged</small></div>
+    <div class="seg elem wide">a<small>untouched</small></div>
+    <div class="seg new wide">v<small>slot i overwritten</small></div>
+    <div class="seg elem wide">c<small>untouched</small></div>
+  </div>
+  <p class="cap">fig 3 &mdash; old <code>b</code> dropped, <code>v</code> moved in. Survivors never touched (no incref/drop churn). <code>0 alloc &middot; 0 free</code>.</p>
+
+  <table>
+    <tr><th>per <code>set</code> on a unique array</th><th>array alloc</th><th>array free</th><th><code>peak_bytes</code></th><th>survivors</th></tr>
+    <tr><td>copy-on-write (today)</td><td class="mono">+1</td><td class="mono">+1</td><td class="bad">spikes +16+8n</td><td class="mono">n&minus;1 incref + n&minus;1 drop</td></tr>
+    <tr><td>in-place (Slice C)</td><td class="mono ok">0</td><td class="mono ok">0</td><td class="ok">no spike</td><td class="mono ok">untouched</td></tr>
+  </table>
+  <p class="cap">fig 3b &mdash; the old element drop and the <code>v</code> move-in are identical in both paths; the <b>only</b> difference is the array cell. That difference is exactly the win.</p>
+
+  <!-- 4 -->
+  <h2>4 &middot; THE CRUX: one decision, two backends, bit-for-bit</h2>
+  <p>wok keeps two runtimes in lockstep: a simple <b>abstract</b> model (the oracle&rsquo;s source of truth) and the real <b>C cell</b>. A differential test runs every array program on both and demands identical memory stats. Because in-place and copy produce <i>different</i> stats, the <code>rc == 1</code> answer must come out <b>the same on both backends</b> — or the oracle diverges.</p>
+  <div class="twocol">
+    <div class="pane eq">
+      <h3>abstract backend</h3>
+      <p style="font-size:.85rem">refcount lives in the <code>Cell</code>; read it directly: <code>cRc c</code>. Non-destructive by nature.</p>
+    </div>
+    <div class="pane eq">
+      <h3>C backend</h3>
+      <p style="font-size:.85rem">refcount lives in the C cell. Today the only reader is <code>wok_dec</code> (which <i>decrements</i>). Add a peek: <code>wok_rc(p)</code>.</p>
+    </div>
+  </div>
+  <div class="eqbar">&rarr; same number, because both backends bump/drop the refcount at the same shared call sites &larr;</div>
+  <p>This isn&rsquo;t a new leap of faith. FBIP already relies on the <code>rc == 1</code> decision agreeing across backends at <code>drop_reuse</code> sites — and the oracle already proves it (a divergent decision would diverge the alloc count). Slice C reads the <i>same</i> lockstep quantity at a <i>new</i> site (<code>set</code>).</p>
+  <div class="note good"><b>What makes it checkable, not just argued:</b> the corpus must include a <i>unique</i> set (takes in-place) and a <i>shared</i> set (takes copy). Their <code>alloc</code>/<code>free</code>/<code>peak_bytes</code> differ, so any cross-backend disagreement on the gate fails the differential immediately.</p>
+
+  <!-- 5 -->
+  <h2>5 &middot; The gate (and the trap inside it)</h2>
+  <p>&ldquo;Unique&rdquo; is not just &ldquo;<code>rc == 1</code>.&rdquo; Two guards ride along, both already familiar from FBIP:</p>
+  <div class="flow">
+    <div class="box warn">static / immortal array?<small>top-level CAF &mdash; negative HAddr, uncounted</small></div>
+    <div class="arrow">&darr; reads &ldquo;rc 1&rdquo; but is shared <b>forever</b></div>
+    <div class="box">force copy-on-write<small>guard <code>isStaticAddr</code> FIRST, exactly like <code>dropReuse</code></small></div>
+  </div>
+  <table>
+    <tr><th>gate condition</th><th>why</th><th>backend-independent?</th></tr>
+    <tr><td>not <code>isStaticAddr</code> / uncounted</td><td>immortal cells read rc 1 but are shared; mutating them is a real bug</td><td class="ok">yes (addr shape)</td></tr>
+    <tr><td><code>rc == 1</code></td><td>sole owner &rArr; mutation unobservable</td><td class="ok">yes (lockstep refcount)</td></tr>
+    <tr><td><code>encodeSlotC v</code> is defined</td><td>C slot needs an encodable word; the only gap is an Int &ge; 2<sup>63</sup> (pre-existing Slice B edge)</td><td class="ok">yes (pure value fn)</td></tr>
+  </table>
+  <p class="cap">fig 5 &mdash; all three are computable identically on both backends, so the path decision is too. The last two are pure; the middle one reads a quantity proven equal across backends.</p>
+
+  <!-- 6 -->
+  <h2>6 &middot; The contested design choices</h2>
+  <div class="grid">
+    <div class="card good">
+      <span class="lab">axis 1 &middot; the uniqueness probe</span>
+      <h3>Non-destructive peek <span class="pick">pick</span></h3>
+      <p>Add <code>wok_rc(p)</code> (a <code>WOK_PURE</code> read of <code>p-&gt;rc</code>) + <code>cRc</code> on the abstract side. One read, no side effect, symmetric with the abstract backend.</p>
+    </div>
+    <div class="card">
+      <span class="lab">axis 1 &middot; alternative</span>
+      <h3>Decrement-then-restore</h3>
+      <p>Reuse <code>wok_dec</code>; re-<code>wok_dup</code> to undo. Writes the header twice, asymmetric with abstract. No upside.</p>
+    </div>
+    <div class="card warn">
+      <span class="lab">axis 1 &middot; rejected</span>
+      <h3>Route through FBIP tokens <span class="rej">no</span></h3>
+      <p>That is the <code>drop_reuse</code>/<code>alloc_at</code> pairing the arc says <i>not</i> to build for arrays. Over-engineering for one slot write.</p>
+    </div>
+    <div class="card good">
+      <span class="lab">axis 2 &middot; where the decision lives</span>
+      <h3>One shared decision fn <span class="pick">pick</span></h3>
+      <p><code>arrayUnique :: Addr -&gt; Store -&gt; RC Bool</code> hides the backend dispatch and returns one Bool. The &ldquo;<code>nodeCEligible</code> discipline&rdquo;: a single chokepoint, identical by construction.</p>
+    </div>
+    <div class="card">
+      <span class="lab">axis 2 &middot; alternative</span>
+      <h3>Inline the rc read</h3>
+      <p>A backend <code>case</code> inside <code>arraySet</code>. Works, but scatters the decision and is harder to unit-test in isolation.</p>
+    </div>
+    <div class="card warn">
+      <span class="lab">axis 2 &middot; impossible</span>
+      <h3>Pure value predicate <span class="rej">n/a</span></h3>
+      <p>Uniqueness <i>is</i> heap state (the refcount), not a value property. Slice C reuses the <i>discipline</i> of <code>nodeCEligible</code>, not its purity.</p>
+    </div>
+    <div class="card good">
+      <span class="lab">axis 3 &middot; what &ldquo;in-place&rdquo; means</span>
+      <h3>One dispatching writer <span class="pick">pick</span></h3>
+      <p><b>C:</b> literal <code>wok_array_slot_set</code>, same pointer. <b>Abstract:</b> replace the node at the <i>same</i> address, same rc/bytes, <b>no</b> recordAlloc/recordFree. Both &rArr; 0 alloc / 0 free.</p>
+    </div>
+  </div>
+
+  <!-- 7 -->
+  <h2>7 &middot; Why it&rsquo;s sound</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Sole owner &rArr; unobservable</h3>
+      <p><code>rc == 1</code> means the prim&rsquo;s owned reference is the only one. No other binding, structure slot, or continuation frame holds the array, so no one can see the mutation. The Perceus/FBIP argument, unchanged.</p>
+    </div>
+    <div class="card">
+      <h3>Bounds before mutation</h3>
+      <p><code>i &ge; n &rArr; PrimError</code>, array untouched — byte-identical to the copy path&rsquo;s error. No partial write, no leak.</p>
+    </div>
+    <div class="card">
+      <h3>Old element + alias order</h3>
+      <p>Read old slot &rarr; write <code>v</code> &rarr; drop old element (cascade if counted). Alias-robust even if <code>v</code> is the old element; <code>v</code> is moved in (no incref).</p>
+    </div>
+  </div>
+
+  <div class="note"><b>Oracle consequence to expect:</b> unique-<code>set</code> programs already in the corpus will now report <i>lower</i> <code>peak_bytes</code> and 0 array alloc/free (no two-array overlap). The differential (backend-vs-backend) check self-adjusts — both take in-place. Any <i>absolute</i>/golden <code>peak_bytes</code> assertions must be updated to the new figures.</p></div>
+
+  <!-- 8 -->
+  <h2>8 &middot; New surface (small, additive)</h2>
+  <table>
+    <tr><th>layer</th><th>addition</th></tr>
+    <tr><td><code>runtime/wok_rc.{c,h}</code></td><td><code>WOK_PURE uint32_t wok_rc(const WokObj* p)</code> — non-destructive refcount peek (works on any cell, incl. <code>WokArray</code>)</td></tr>
+    <tr><td><code>Heap.hs</code></td><td>FFI binding <code>wokRc</code></td></tr>
+    <tr><td><code>Value.hs</code></td><td><code>arrayUnique</code> (shared decision, static-guarded) + an in-place slot writer dispatching on <code>CAddr</code>/<code>HAddr</code></td></tr>
+    <tr><td><code>Prim.hs</code></td><td><code>arraySet</code> splits: gate &rarr; in-place vs the existing copy path</td></tr>
+    <tr><td><code>test/rc-array</code></td><td>unique-set (in-place) + shared-set (copy) corpus; the gap is what proves cross-backend agreement</td></tr>
+  </table>
+  <p class="cap">No new type, no surface change, no FBIP token machinery. The gate is borrowed; only the peek + the in-place writer are new.</p>
+
+</div>
+</body>
+</html>

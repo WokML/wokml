@@ -40,6 +40,10 @@ void     wok_slot_set(WokObj* p, uint32_t i, uint64_t word);
 WOK_PURE uint64_t wok_slot_get(const WokObj* p, uint32_t i);
 WOK_PURE uint32_t wok_tag(const WokObj* p);
 WOK_PURE uint32_t wok_arity(const WokObj* p);
+/* Non-destructive refcount peek. General (the shared WokObj prefix at offset 0,
+   so it works on any cell including WokArray). The read-only sibling of
+   wok_dup/wok_dec. Used by the rc==1 in-place Array.set gate (Slice C). */
+WOK_PURE uint32_t wok_rc(const WokObj* p);
 
 WOK_PURE uint64_t wok_stat_allocs(const WokHeap* h);
 WOK_PURE uint64_t wok_stat_frees(const WokHeap* h);

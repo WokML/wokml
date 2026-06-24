@@ -3,7 +3,7 @@ module Wok.Interp.RC.Heap
   ( WokObj, WokHeap
   , wokHeapNew, wokHeapFree
   , wokAlloc, wokAllocAt, wokDup, wokDec, wokFree
-  , wokSlotSet, wokSlotGet, wokTag, wokArity
+  , wokSlotSet, wokSlotGet, wokTag, wokArity, wokRc
   , wokStatAllocs, wokStatFrees, wokStatLive, wokStatPeak
   , wokStatPeakBytes
   , wokArrayAlloc, wokArrayLen, wokArrayElemKind, wokArraySlotGet, wokArraySlotSet
@@ -22,6 +22,7 @@ foreign import ccall unsafe "wok_alloc"     wokAlloc    :: Ptr WokHeap -> Word32
 foreign import ccall unsafe "wok_alloc_at"  wokAllocAt  :: Ptr WokHeap -> Word32 -> Word32 -> Ptr WokObj -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_dup"       wokDup      :: Ptr WokObj -> IO ()
 foreign import ccall unsafe "wok_dec"       wokDec      :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_rc"        wokRc       :: Ptr WokObj -> IO Word32
 foreign import ccall unsafe "wok_free"      wokFree     :: Ptr WokHeap -> Ptr WokObj -> IO ()
 foreign import ccall unsafe "wok_slot_set"  wokSlotSet  :: Ptr WokObj -> Word32 -> Word64 -> IO ()
 foreign import ccall unsafe "wok_slot_get"  wokSlotGet  :: Ptr WokObj -> Word32 -> IO Word64

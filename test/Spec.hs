@@ -304,6 +304,7 @@ main = do
     , rcM2a1PropertyTests
     , rcM2bPropertyTests
     , rcArrayPropertyTests
+    , rcArraySliceCTests
     -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
     -- hardening; each test group verifies the floor bites when disabled):
     --
@@ -17015,31 +17016,68 @@ rcArrayPrimTests = testGroup "rc array prims"
         "out of bounds"
 
   -- ------------------------------------------------------------------
-  -- set (copy-on-write)
+  -- set (unique input -> in-place; shared input -> copy-on-write)
   -- ------------------------------------------------------------------
-  , testCase "set: replaces slot, +1 alloc, drops old array; drop-to-baseline" $ do
+  , testCase "set: unique input -> 0 alloc (in-place); drop-to-baseline" $ do
+      -- The array is freshly allocated (rc=1, unique). The new value is an
+      -- RVLit (encodable), so the in-place fast path fires: 0 array allocs,
+      -- old element dropped, same array handle returned.
       pSet <- lookupPrim (T.pack "set")
       let s0       = St.emptyStore
           baseline = St.stLive (St.stStats s0)
           (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
           (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
           (e2, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
-          -- v_new: a fresh boxed element to write into slot 1
-          (vn, s4) = St.allocPure (St.NCon (T.pack "Nil") []) s3
-          (arr, s5) = St.allocPure
+          -- v_new: inline literal (C-encodable) to write into slot 1
+          vn       = St.RVLit (Anf.LInt 99)
+          (arr, s4) = St.allocPure
                         (St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2])
+                        s3
+          allocsBefore = St.stAllocs (St.stStats s4)
+      (newArr, s5) <- callPrim pSet
+                        [St.RVBox arr, St.RVLit (Anf.LInt 1), vn]
                         s4
+      -- 0 alloc: in-place fast path (unique array, encodable value)
+      St.stAllocs (St.stStats s5) - allocsBefore @?= 0
+      -- old e1 freed (rc 1->0); arr still live (same handle) + e0 + e2 = 3 cells
+      St.stLive (St.stStats s5) @?= baseline + 3
+      -- value-correctness: slot 1 now holds vn
+      case St.derefPure arr s5 of
+        Left e  -> assertFailure ("deref after in-place set: " <> show e)
+        Right c -> St.cNode c @?= St.NArray [St.RVBox e0, vn, St.RVBox e2]
+      s6 <- dropResult newArr s5
+      St.stLive (St.stStats s6) @?= baseline
+
+  , testCase "set: shared input -> +1 alloc (copy-on-write), original unchanged" $ do
+      -- Incref the array to rc=2 (shared) before calling set. The copy-on-write
+      -- path fires: +1 alloc for a new NArray, original array slot unchanged.
+      pSet <- lookupPrim (T.pack "set")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Nil") []) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Nil") []) s1
+          (e2, s3) = St.allocPure (St.NCon (T.pack "Nil") []) s2
+          vn       = St.RVLit (Anf.LInt 99)
+          (arr, s4) = St.allocPure
+                        (St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2])
+                        s3
+          -- incref arr to rc=2 so arrayUnique returns False -> copy path
+          s5 = either (error . show) id (St.increfPure arr s4)
           allocsBefore = St.stAllocs (St.stStats s5)
       (newArr, s6) <- callPrim pSet
-                        [St.RVBox arr, St.RVLit (Anf.LInt 1), St.RVBox vn]
+                        [St.RVBox arr, St.RVLit (Anf.LInt 1), vn]
                         s5
-      -- +1 alloc for the new NArray
+      -- +1 alloc: copy-on-write path (shared array)
       St.stAllocs (St.stStats s6) - allocsBefore @?= 1
-      -- old arr freed; old e1 freed (rc 1->0); e0 and e2 survive (incref'd)
-      -- new arr live + e0 + e2 + vn = 4 cells
-      St.stLive (St.stStats s6) @?= baseline + 4
+      -- original arr slot 1 must still hold e1 (no in-place mutation)
+      case St.derefPure arr s6 of
+        Left e  -> assertFailure ("deref original after shared set: " <> show e)
+        Right c -> St.cNode c @?= St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2]
+      -- drop the copy result
       s7 <- dropResult newArr s6
-      St.stLive (St.stStats s7) @?= baseline
+      -- arr still at rc=1 (the extra incref we added), drop it to return to baseline
+      s8 <- dropResult (St.RVBox arr) s7
+      St.stLive (St.stStats s8) @?= baseline
 
   , testCase "set: out-of-bounds raises PrimError" $ do
       pSet <- lookupPrim (T.pack "set")
@@ -17812,3 +17850,130 @@ rcArrayPropertyTests =
       , testProperty "P13: fromList with boxed elements: drop-to-baseline (RC accounting)"
           prop_arrayFromListBoxed
       ]
+
+-- ---------------------------------------------------------------------------
+-- Array Slice C: arrayUnique + arraySetSlotInPlace unit tests
+--
+-- These tests pin the two store-layer helpers directly on the ABSTRACT backend
+-- (HAddr / allocPure / increfPure / dropAddrPure), mirroring the harness style
+-- of 'rcArrayNodeTests'. Both helpers ARE now exercised in production: Task 3
+-- wired 'arraySet' (Wok.Interp.RC.Prim) to call 'arrayUnique' then
+-- 'arraySetSlotInPlace' on the unique fast path. The C/CAddr path is covered
+-- end-to-end by the rc-array differential corpus (e.g. 10-set-boxed-unique.wok).
+
+rcArraySliceCTests :: TestTree
+rcArraySliceCTests = testGroup "rc array Slice C helpers"
+  [ -- -----------------------------------------------------------------------
+    -- arrayUnique
+    -- -----------------------------------------------------------------------
+    testCase "arrayUnique: True for freshly-allocated array (rc 1)" $ do
+      -- A freshly allocated NArray has rc=1 (the allocator initialises to 1).
+      -- arrayUnique must return True.
+      let (a, s1) = St.allocPure (St.NArray [St.RVLit (Anf.LInt 1)]) St.emptyStore
+      res <- runExceptT (St.arrayUnique a s1)
+      case res of
+        Left e  -> assertFailure ("arrayUnique raised: " <> show e)
+        Right b -> b @?= True
+
+  , testCase "arrayUnique: False after one incref (rc 2)" $ do
+      -- After incref the array is at rc=2 (shared); arrayUnique must return False.
+      let (a, s1) = St.allocPure (St.NArray [St.RVLit (Anf.LInt 1)]) St.emptyStore
+          s2      = either (error . show) id (St.increfPure a s1)  -- rc 2
+      res <- runExceptT (St.arrayUnique a s2)
+      case res of
+        Left e  -> assertFailure ("arrayUnique raised: " <> show e)
+        Right b -> b @?= False
+
+  , testCase "arrayUnique: False for a static/immortal address" $ do
+      -- A static NArray (negative HAddr, allocated via allocStatic) is immortal /
+      -- uncounted. arrayUnique must return False regardless of its stored rc.
+      -- (Static cells have rc=1 by convention but are never counted.)
+      let (a, s1) = St.allocStatic (St.NArray [St.RVLit (Anf.LInt 42)]) St.emptyStore
+      -- a is a negative HAddr, so isStaticAddr a == True.
+      res <- runExceptT (St.arrayUnique a s1)
+      case res of
+        Left e  -> assertFailure ("arrayUnique raised: " <> show e)
+        Right b -> b @?= False
+
+  -- -----------------------------------------------------------------------
+  -- arraySetSlotInPlace: inline (literal) elements
+  -- -----------------------------------------------------------------------
+  , testCase "arraySetSlotInPlace (inline elems): returns old slot, stores new slot, 0 alloc/free" $ do
+      -- Build NArray [1, 2, 3], call arraySetSlotInPlace a 1 99.
+      -- Old element returned must be RVLit (LInt 2).
+      -- The array cell now holds [1, 99, 3].
+      -- stAllocs and stFrees are UNCHANGED across the call.
+      let s0           = St.emptyStore
+          elems        = map (St.RVLit . Anf.LInt) [1, 2, 3]
+          (a, s1)      = St.allocPure (St.NArray elems) s0
+          allocsBefore = St.stAllocs (St.stStats s1)
+          freesBefore  = St.stFrees  (St.stStats s1)
+          newEl        = St.RVLit (Anf.LInt 99)
+          -- arraySetSlotInPlace now takes encodeSlotC v as its first arg (the C arm
+          -- uses it; the abstract/HAddr arm here ignores it). Fail loudly if the
+          -- test value is ever non-encodable rather than passing a plausible default.
+          enc          = maybe (error "test setup: newEl must be C-encodable") id (St.encodeSlotC newEl)
+      res <- runExceptT (St.arraySetSlotInPlace enc a 1 newEl s1)
+      case res of
+        Left e -> assertFailure ("arraySetSlotInPlace raised: " <> show e)
+        Right (oldEl, s2) -> do
+          -- old element must be slot 1 of the original array
+          oldEl @?= St.RVLit (Anf.LInt 2)
+          -- 0 alloc / 0 free
+          St.stAllocs (St.stStats s2) @?= allocsBefore
+          St.stFrees  (St.stStats s2) @?= freesBefore
+          -- array cell now holds [1, 99, 3]
+          case St.derefPure a s2 of
+            Left e  -> assertFailure ("deref after set raised: " <> show e)
+            Right c -> St.cNode c @?= St.NArray [ St.RVLit (Anf.LInt 1)
+                                                , St.RVLit (Anf.LInt 99)
+                                                , St.RVLit (Anf.LInt 3) ]
+          -- stLive unchanged: inline element never allocates a cell
+          St.stLive (St.stStats s2) @?= St.stLive (St.stStats s1)
+
+  -- -----------------------------------------------------------------------
+  -- arraySetSlotInPlace: boxed (counted) elements
+  -- -----------------------------------------------------------------------
+  , testCase "arraySetSlotInPlace (boxed elems): old slot returned, new slot stored, drop-to-baseline" $ do
+      -- Allocate three boxed cells e0, e1, e2.
+      -- Build NArray [e0, e1, e2].  Allocate a fresh boxed newEl.
+      -- Call arraySetSlotInPlace a 1 newEl s.
+      -- Assert: returned old element == RVBox e1; slot 1 now holds RVBox newEl.
+      -- 0 alloc / 0 free across the call (rc unchanged).
+      -- Drop the old element (e1 at rc 1 -> freed) then drop a;
+      -- heap must return to baseline.
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (e0, s1) = St.allocPure (St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 0)]) s0
+          (e1, s2) = St.allocPure (St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 1)]) s1
+          (e2, s3) = St.allocPure (St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 2)]) s2
+          (a,  s4) = St.allocPure (St.NArray [St.RVBox e0, St.RVBox e1, St.RVBox e2]) s3
+          (newEl, s5) = St.allocPure (St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 99)]) s4
+          allocsBefore = St.stAllocs (St.stStats s5)
+          freesBefore  = St.stFrees  (St.stStats s5)
+          enc2         = maybe (error "test setup: newEl must be C-encodable") id (St.encodeSlotC (St.RVBox newEl))
+      res <- runExceptT (St.arraySetSlotInPlace enc2 a 1 (St.RVBox newEl) s5)
+      case res of
+        Left e -> assertFailure ("arraySetSlotInPlace raised: " <> show e)
+        Right (oldEl, s6) -> do
+          -- old element must be the address of e1
+          oldEl @?= St.RVBox e1
+          -- slot 1 of the array is now newEl
+          case St.derefPure a s6 of
+            Left e  -> assertFailure ("deref after set raised: " <> show e)
+            Right c -> St.cNode c @?= St.NArray [ St.RVBox e0
+                                                , St.RVBox newEl
+                                                , St.RVBox e2 ]
+          -- 0 alloc / 0 free from the set itself
+          St.stAllocs (St.stStats s6) @?= allocsBefore
+          St.stFrees  (St.stStats s6) @?= freesBefore
+          -- Drop the old element (e1, rc 1 -> 0, freed), then drop the array
+          -- (which cascades drops to e0, newEl, e2 each at rc 1).
+          -- After all drops stLive must return to baseline.
+          case St.dropAddrPure e1 s6 of
+            Left e   -> assertFailure ("drop old element failed: " <> show e)
+            Right s7 ->
+              case St.dropAddrPure a s7 of
+                Left e   -> assertFailure ("drop array failed: " <> show e)
+                Right s8 -> St.stLive (St.stStats s8) @?= baseline
+  ]
