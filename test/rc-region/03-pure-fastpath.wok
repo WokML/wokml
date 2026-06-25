@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+
+-- Pure-cohort fast path: the Triple holds ONLY U64 scalars (all Inline / raw
+-- literals, no counted children). The arena_close scan-out is empty (no counted
+-- children to drop); close is truly O(1). Expected: Triple -> Arena; arena_bytes
+-- > 0 during the call and 0 after; scan-out drops zero children; abstract == C.
+
+data Triple = Triple U64 U64 U64
+
+sumTriple : U64 -> U64 -> U64 -> U64
+sumTriple x y z =
+  let t = Triple x y z in
+  case t of
+    Triple a b c -> a + b + c
+
+main = sumTriple 1 2 3

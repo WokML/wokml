@@ -10,6 +10,7 @@ import Test.QuickCheck
   , frequency, conjoin, property, cover, checkCoverage, (.&&.) )
 import qualified Test.QuickCheck as QC
 import Control.Monad.State.Strict (StateT, runStateT, state, lift)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (runExceptT)
 
 import qualified Data.ByteString.Lazy.Char8 as BL
@@ -58,6 +59,8 @@ import qualified Wok.IR.Perceus as Perceus
 import Wok.IR.ReusePairing (reusePairing)
 import qualified Wok.IR.ReusePairing as RP
 import qualified Wok.IR.Escape as Esc
+import qualified Wok.IR.Region as Region
+import Wok.IR.Region (Placement (..))
 import Wok.IR.Reachable
   ( pruneToReachable, exprUniques
   , firstOrderNoHandlerViolations, m2bHandlerViolations
@@ -127,6 +130,14 @@ main = do
   -- programs must NOT go into the stats or C-backend-parity groups, which call
   -- 'assertFailure' on any Left result.
   rcArrayOobFiles <- findByExtension [".wok"] "test/rc-array-oob"
+  -- Region Slice R1 (Task 6): the differential-oracle corpus for the arena
+  -- routing pass.  All four programs are HANDLER-FREE (the module-level fence
+  -- in 'planRegions' is therefore lifted and arena routing fires).  They are
+  -- wired to the same 'rc differential' and 'rc stats' groups as the regular
+  -- corpus, and also to 'rcCBackendParity' (abstract==C on all stats incl.
+  -- 'arena_bytes'/'arena_peak'). A dedicated 'rcRegionCorpusTests' group
+  -- additionally asserts the arena-specific invariants per-file.
+  rcRegionFiles <- findByExtension [".wok"] "test/rc-region"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -219,6 +230,7 @@ main = do
     , rcArrayNodeTests
     , rcArrayCCellTests
     , rcArrayPrimTests
+    , regionRoutingTests
     , wokRcHeapTests
     , wokRcReuseTests
     , wokRcReservedTests
@@ -280,11 +292,11 @@ main = do
         | f <- perceusHandlerFiles ]
     , testGroup "rc differential"
         [ testCase (takeBaseName f) (rcDifferentialHarness f)
-        | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ]
+        | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ++ rcRegionFiles ]
     , testGroup "rc stats"
         [ testGroup "heap accounting"
             [ testCase (takeBaseName f) (rcStatsHarness f)
-            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ]
+            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ]
         , testGroup "golden"
             [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
             | f <- perceusFiles ]
@@ -295,7 +307,7 @@ main = do
     -- through both the abstract heap and the C heap, asserting output + alloc-stat
     -- parity; plus targeted cross-heap/fallback/deep tests and the slot
     -- encode/decode round-trip property.
-    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles)
+    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles ++ rcRegionFiles)
     , rcCBackendTargeted
     , rcFbipTargeted
     , rcFbipFaultInjection
@@ -337,6 +349,9 @@ main = do
     --   and leaving the cell LIVE (a leak). Per-entry free is required.
     , rcM3PropertyTests
     , rcReclaimTests
+    , rcArenaStoreTests
+    , rcRegionCorpusTests
+    , rcRegionNegativeControl
     , rcEffectSafetyTests
     , rcM2bRejectTests
     , rcM3StoreTests rcM3Files
@@ -6935,6 +6950,183 @@ rcReclaimTests = testGroup "rc-reclaim"
   ]
 
 -- ---------------------------------------------------------------------------
+-- Region Slice R1 (Task 4): the abstract-heap arena mirror.
+--
+-- An arena cohort is allocated UNCOUNTED ('arenaAllocPure'): dup/drop are no-ops
+-- with no cascade (exactly like static/'Inline' values), the cohort's cells never
+-- enter 'stLive'/'stPeak'/'stAllocs'/'stFrees', and they bump a SEPARATE
+-- 'stArenaBytes'/'stArenaPeak' pair instead. 'arenaClose' SCANS OUT each arena
+-- cell's COUNTED children (dropping them once, exactly the RC the program would
+-- have done, relocated to scope close) and then BULK-REMOVES the cohort in O(1).
+--
+-- These Store-level tests pin the arena algebra in isolation (no interpreter
+-- wiring yet, that is Task 5), mirroring 'rcStoreTests'/'rcDropTests' for the
+-- counted heap. The crux soundness property (spec §5.1): a counted child of an
+-- arena cell never points back into the arena, so the scan-out's 'dropAddr'
+-- cascade only ever touches counted cells -- it never frees an arena cell.
+rcArenaStoreTests :: TestTree
+rcArenaStoreTests = testGroup "arena store"
+  [ testCase "arena alloc is uncounted; dup/drop on it are no-ops" $ do
+      -- Build a counted child B on the normal heap, then an arena cell A owning B.
+      -- A is uncounted: it does not touch the counted books, and dup/drop of A are
+      -- inert (no cascade) -- so B is NOT freed by a drop of A.
+      let s0          = St.emptyStore
+          sOpen       = St.arenaOpen s0
+          (b, s1)     = St.allocPure (St.NCon (T.pack "B") []) sOpen
+          allocsAfterB = St.stAllocs (St.stStats s1)
+          liveAfterB   = St.stLive   (St.stStats s1)
+          arenaBytesB  = St.stArenaBytes (St.stStats s1)
+          nodeA        = St.NCon (T.pack "A") [St.RVBox b]
+          (a, s2)      = St.arenaAllocPure nodeA s1
+      -- A is recognised as an arena address (the store-aware uncounted check); the
+      -- pure 'isUncounted' covers only static/'Inline', so A is NOT uncounted by it.
+      St.isArenaAddr a s2 @?= True
+      St.isUncounted a    @?= False
+      -- The counted books did NOT count A: allocs/live unchanged from after B.
+      St.stAllocs (St.stStats s2) @?= allocsAfterB
+      St.stLive   (St.stStats s2) @?= liveAfterB
+      -- But the arena footprint DID grow by exactly A's would-be C bytes.
+      St.stArenaBytes (St.stStats s2) @?= arenaBytesB + St.wouldBeCBytes nodeA
+      St.stArenaPeak  (St.stStats s2) @?= arenaBytesB + St.wouldBeCBytes nodeA
+      -- dup A is a no-op: stats and cells unchanged.
+      dupRes <- runExceptT (St.incref a s2)
+      case dupRes of
+        Left e   -> assertFailure ("dup of arena addr failed: " <> show e)
+        Right s3 -> St.stStats s3 @?= St.stStats s2
+      -- drop A is a no-op WITH NO CASCADE: stats unchanged, A still present,
+      -- and crucially B is NOT freed (a naive cascade would have freed it).
+      dropRes <- runExceptT (St.dropAddr a s2)
+      case dropRes of
+        Left e   -> assertFailure ("drop of arena addr failed: " <> show e)
+        Right s3 -> do
+          St.stStats s3 @?= St.stStats s2
+          case St.derefPure a s3 of
+            Left e  -> assertFailure ("arena cell A was wrongly removed by drop: " <> show e)
+            Right _ -> pure ()
+          case St.derefPure b s3 of
+            Left e  -> assertFailure ("counted child B was wrongly freed by an inert arena drop: " <> show e)
+            Right _ -> pure ()
+  , testCase "close scans out counted children once; shared survives; cohort gone" $ do
+      -- The cohort: two arena cells A and A2.
+      --   * A owns a counted child B (rc 1) -> scan-out drops B to 0 (freed once).
+      --   * A and A2 both own a counted child C; C also held once from OUTSIDE
+      --     the cohort, so C starts at rc 3.  Scan-out drops C twice (once per
+      --     arena owner) -> rc 1 (C survives, because the outside holder remains).
+      let s0          = St.emptyStore
+          baseline    = St.stLive (St.stStats s0)
+          sOpen       = St.arenaOpen s0
+          (b, s1)     = St.allocPure (St.NCon (T.pack "B") []) sOpen
+          (c, s2)     = St.allocPure (St.NCon (T.pack "C") []) s1
+          -- C must be referenced by A, A2, AND an outside holder = rc 3.
+          s2'         = case St.increfPure c s2 >>= St.increfPure c of
+                          Right s -> s
+                          Left e  -> error ("incref C setup: " <> show e)
+          (a,  s3)    = St.arenaAllocPure (St.NCon (T.pack "A")  [St.RVBox b, St.RVBox c]) s2'
+          (a2, s4)    = St.arenaAllocPure (St.NCon (T.pack "A2") [St.RVBox c]) s3
+      -- C is at rc 3 (A + A2 + outside) before close.
+      case St.derefPure c s4 of
+        Right cell -> St.cRc cell @?= 3
+        Left e     -> assertFailure ("C deref before close: " <> show e)
+      closeRes <- runExceptT (St.arenaClose s4)
+      case closeRes of
+        Left e   -> assertFailure ("arenaClose failed: " <> show e)
+        Right s5 -> do
+          -- B was freed exactly once (rc 1 -> 0).
+          case St.derefPure b s5 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "B was not freed by the scan-out"
+          -- C survives at rc 1 (the outside holder remains).
+          case St.derefPure c s5 of
+            Right cell -> St.cRc cell @?= 1
+            Left e     -> assertFailure ("C was wrongly freed by the scan-out: " <> show e)
+          -- All arena addresses departed the arena (the frame popped) and the
+          -- cells are gone from the heap (bulk reset).
+          St.isArenaAddr a  s5 @?= False  -- no longer in any arena frame
+          St.isArenaAddr a2 s5 @?= False
+          case St.derefPure a s5 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "arena cell A was not bulk-removed at close"
+          case St.derefPure a2 s5 of
+            Left _  -> pure ()
+            Right _ -> assertFailure "arena cell A2 was not bulk-removed at close"
+          -- Counted live = baseline + 1: only C survives (B freed; A/A2 uncounted,
+          -- never on the counted books).
+          St.stLive (St.stStats s5) @?= baseline + 1
+          -- The arena frame stack popped.
+          St.stArena s5 @?= []
+  , testCase "close returns arena-bytes to baseline; stLive unperturbed" $ do
+      -- Arena cells never enter 'stLive'/'stPeak'; after a full close
+      -- 'stArenaBytes' returns to its pre-open value and 'stLive' equals the
+      -- pre-open counted baseline (B is allocated and freed by the scan-out).
+      let s0           = St.emptyStore
+          arenaBytes0  = St.stArenaBytes (St.stStats s0)
+          live0        = St.stLive (St.stStats s0)
+          sOpen        = St.arenaOpen s0
+          (b, s1)      = St.allocPure (St.NCon (T.pack "B") []) sOpen
+          liveWithB    = St.stLive (St.stStats s1)
+          (_, s2)      = St.arenaAllocPure (St.NCon (T.pack "A") [St.RVBox b]) s1
+      -- The arena footprint grew (A charged its bytes); the counted live grew
+      -- only by B (A is uncounted).
+      St.stArenaBytes (St.stStats s2) @?= arenaBytes0 + St.wouldBeCBytes (St.NCon (T.pack "A") [St.RVBox b])
+      St.stLive (St.stStats s2) @?= liveWithB
+      closeRes <- runExceptT (St.arenaClose s2)
+      case closeRes of
+        Left e   -> assertFailure ("arenaClose failed: " <> show e)
+        Right s3 -> do
+          -- Arena bytes back to the pre-open value.
+          St.stArenaBytes (St.stStats s3) @?= arenaBytes0
+          -- Counted live back to the pre-open baseline: B was freed by the
+          -- scan-out, A never perturbed stLive.
+          St.stLive (St.stStats s3) @?= live0
+  , testCase "stArenaPeak survives close (high-water mark, not reset)" $ do
+      -- 'stArenaBytes' returns to baseline at close, but 'stArenaPeak' is a
+      -- HIGH-WATER MARK: it retains the largest footprint the scope reached and is
+      -- NEVER reduced by close. (The existing close test pins the bytes-reset; this
+      -- pins the peak-retention, the complementary half.)
+      let s0          = St.emptyStore
+          arenaPeak0  = St.stArenaPeak (St.stStats s0)
+          sOpen       = St.arenaOpen s0
+          nodeA       = St.NCon (T.pack "A") [St.RVLit (LInt 1)]
+          highWater   = arenaPeak0 + St.wouldBeCBytes nodeA
+          (_, s1)     = St.arenaAllocPure nodeA sOpen
+      -- The peak rose to the in-scope high-water mark.
+      St.stArenaPeak (St.stStats s1) @?= highWater
+      closeRes <- runExceptT (St.arenaClose s1)
+      case closeRes of
+        Left e   -> assertFailure ("arenaClose failed: " <> show e)
+        Right s2 -> do
+          -- After close: bytes back to baseline, but the peak is RETAINED (>= the
+          -- in-scope high-water it reached, never reset to the pre-open value).
+          St.stArenaBytes (St.stStats s2) @?= St.stArenaBytes (St.stStats s0)
+          St.stArenaPeak  (St.stStats s2) @?= highWater
+  , testCase "close of an empty arena (no open frame) fails loudly" $ do
+      -- 'arenaClose' on a store with no open arena frame is an internal error.
+      closeRes <- runExceptT (St.arenaClose St.emptyStore)
+      case closeRes of
+        Left _  -> pure ()
+        Right _ -> assertFailure "arenaClose with no open frame should fail loudly"
+  , testCase "arena cells are FBIP-excluded (never a reuse donor)" $ do
+      -- An arena cell is uncounted, so 'dropReuse' must treat it like any other
+      -- uncounted donor: it yields a NULL token and never reserves the shell.
+      let s0      = St.emptyStore
+          sOpen   = St.arenaOpen s0
+          (a, s1) = St.arenaAllocPure (St.NCon (T.pack "A") [St.RVLit (LInt 1)]) sOpen
+      reuseRes <- runExceptT (St.dropReuse a s1)
+      case reuseRes of
+        Left e         -> assertFailure ("dropReuse on arena addr failed: " <> show e)
+        Right (tok, s2) -> do
+          -- The token is NULL (the arena cell is not a reuse donor).
+          tok @?= St.RVReuse Nothing
+          -- The arena cell was NOT reserved off-books.
+          St.stReserved s2 @?= St.stReserved s1
+          St.stReserved s2 @?= Set.empty
+          -- And the arena cell is still present (a no-op dropReuse).
+          case St.derefPure a s2 of
+            Left e  -> assertFailure ("arena cell was wrongly removed by dropReuse: " <> show e)
+            Right _ -> pure ()
+  ]
+
+-- ---------------------------------------------------------------------------
 -- FBIP effect-safety (E+ lazy reclaim) Task 3: the END-TO-END differential
 -- oracle. The Task-2 reclaim ('rcReclaimTests' above) is pinned at the Store
 -- level on hand-built 'NCont' prefixes; THIS group proves the same mechanism on
@@ -7436,6 +7628,94 @@ rcArrayCCellTests = testGroup "rc array C-cell store algebra"
           case St.derefPure child s3 of
             Left _  -> pure ()
             Right _ -> assertFailure "cross-heap HAddr child was not freed through the array cascade"
+          Heap.wokHeapFree hp
+  , -- -----------------------------------------------------------------------
+    -- Region Slice R1: a C-eligible NCon born in the C arena is UNCOUNTED, and
+    -- 'incref' on it is INERT (no @wok_dup@). This pins the 'incref' CAddr arena
+    -- guard symmetric with the 'dropAddr' one: arena-alloc a one-field NCon under
+    -- CHeap (-> a real 'wok_arena_alloc' CAddr), read its raw rc, 'incref' it, and
+    -- assert the rc is UNCHANGED and the counted stats are untouched. (The arena
+    -- cell's rc field is unused; 'wok_arena_close' reclaims it, not refcounting.)
+    testCase "C-arena cell: incref is inert (no wok_dup, rc unchanged, counted stats untouched)" $ do
+      hp <- Heap.wokHeapNew
+      let s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+          allocs0 = St.stAllocs (St.stStats s0)
+          live0   = St.stLive (St.stStats s0)
+      r <- runExceptT $ do
+             -- Open an arena and born a C-eligible NCon in it (arity 1, LInt field).
+             s1        <- St.arenaOpenRC s0
+             (a, s2)   <- St.arenaAlloc (St.NCon (T.pack "Some") [St.RVLit (Anf.LInt 7)]) s1
+             rcBefore  <- liftIO $ case a of
+                            St.CAddr p -> Heap.wokRc p
+                            _          -> error "arena NCon under CHeap must be a CAddr"
+             -- incref the arena cell: must be a no-op (no wok_dup).
+             s3        <- St.incref a s2
+             rcAfter   <- liftIO $ case a of
+                            St.CAddr p -> Heap.wokRc p
+                            _          -> error "unreachable"
+             s4        <- St.arenaClose s3
+             pure (a, rcBefore, rcAfter, s2, s4)
+      case r of
+        Left e -> Heap.wokHeapFree hp >> assertFailure ("C-arena incref test failed: " <> show e)
+        Right (a, rcBefore, rcAfter, s2, s4) -> do
+          -- The cell is a real C arena cell.
+          assertBool "arena NCon under CHeap is a CAddr" (case a of St.CAddr _ -> True; _ -> False)
+          -- incref did NOT bump the C runtime refcount.
+          assertEqual "incref of a C-arena cell leaves wok_rc unchanged (inert dup)"
+            rcBefore rcAfter
+          -- The arena cell never touched the COUNTED books (allocs/live unchanged
+          -- by the alloc), and incref/close left them at the pre-open baseline.
+          assertEqual "arena alloc did not bump counted allocs"
+            allocs0 (St.stAllocs (St.stStats s2))
+          assertEqual "counted allocs still at baseline after incref+close"
+            allocs0 (St.stAllocs (St.stStats s4))
+          assertEqual "counted live still at baseline after incref+close"
+            live0 (St.stLive (St.stStats s4))
+          -- Arena bytes returned to the pre-open value (no arena leak).
+          assertEqual "arena_bytes back to 0 after close"
+            0 (St.stArenaBytes (St.stStats s4))
+          Heap.wokHeapFree hp
+  , -- -----------------------------------------------------------------------
+    -- Region Slice R1 (code-review #2): the C-INELIGIBLE arena FALLBACK charges
+    -- 0 arena bytes, matching the C runtime (which never ran 'wok_arena_alloc'
+    -- for it). Forces the DESCRIPTOR first-kind-wins MISMATCH branch of
+    -- 'arenaAlloc' under CHeap: a polymorphic constructor is allocated FIRST with
+    -- a 'KLitInt' field (recording the tag's slot descriptor as [KLitInt]), then
+    -- arena-allocated with a MISMATCHING 'KLitUnit' field. The second node is
+    -- still 'nodeCEligible' (arity 1, both fields encode), so 'wouldBeCBytes' is
+    -- NONZERO (16) -- but no 'wok_arena_alloc' runs (the mismatch falls back to
+    -- the abstract arena), so the C @arena_bytes@ stays 0. The abstract side must
+    -- therefore charge 0 too (via 'arenaAllocPureFallback'), or 'stArenaBytes'
+    -- would diverge from the C @wok_stat_arena_bytes@ and fail the parity oracle.
+    testCase "C-arena descriptor-mismatch fallback charges 0 arena bytes (parity)" $ do
+      hp <- Heap.wokHeapNew
+      let s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+          con = T.pack "Poly"
+      r <- runExceptT $ do
+             -- First alloc (counted C cell) records the tag descriptor as [KLitInt].
+             (_, sA) <- St.alloc (St.NCon con [St.RVLit (Anf.LInt 1)]) s0
+             -- The node WOULD be C-eligible (so 'wouldBeCBytes' is nonzero); confirm.
+             let mismatch = St.NCon con [St.RVLit Anf.LUnit]
+             liftIO $ assertBool "the mismatching arena node is genuinely C-eligible (nonzero would-be bytes)"
+                        (St.wouldBeCBytes mismatch > 0)
+             sOpen        <- St.arenaOpenRC sA
+             let arenaB0   = St.stArenaBytes (St.stStats sOpen)
+             -- Arena-alloc the SAME constructor with a MISMATCHING field kind
+             -- ('KLitUnit' vs the recorded 'KLitInt') -> descriptor-mismatch
+             -- fallback to the abstract arena, which must charge 0 bytes.
+             (a, sMis)    <- St.arenaAlloc mismatch sOpen
+             pure (a, arenaB0, sMis, sOpen)
+      case r of
+        Left e -> Heap.wokHeapFree hp >> assertFailure ("arena descriptor-mismatch test failed: " <> show e)
+        Right (a, arenaB0, sMis, _) -> do
+          -- The fallback landed on the ABSTRACT arena (an HAddr), not a C cell.
+          assertBool "descriptor-mismatch arena alloc falls back to an abstract HAddr"
+            (case a of St.HAddr _ -> True; _ -> False)
+          -- THE PARITY POINT: the abstract side charged 0 arena bytes for the
+          -- fallback (matching the C runtime's @arena_bytes@, which saw nothing),
+          -- even though the node's 'wouldBeCBytes' is nonzero.
+          assertEqual "C-ineligible arena fallback charges 0 arena bytes (matches C)"
+            arenaB0 (St.stArenaBytes (St.stStats sMis))
           Heap.wokHeapFree hp
   ]
 
@@ -17812,6 +18092,218 @@ prop_arrayFromListBoxed =
       pure (St.stLive (St.stStats s3) == baseline)
 
 -- -------------------------------------------------------------------------
+-- Wok.IR.Region  (R+escape routing annotation, Region Slice R1)
+-- -------------------------------------------------------------------------
+--
+-- The routing pass tags each Let-bound allocation Arena | Heap under three
+-- fences (non-escape §5.1, mutation §5.2, continuation §5.3) reusing
+-- Wok.IR.Escape; these unit tests pin the Arena|Heap verdict against a
+-- hand-computed escape verdict on the four shapes from the spec (§9), plus a
+-- fifth shape documenting the §5.1 side-condition (an extracted boxed child that
+-- escapes is independently Heap, so its parent stays Arena-safe).
+
+-- Helpers (high Uniques to avoid collision with any other hand-built module).
+regNm :: T.Text -> Int -> Name
+regNm h u = Name h (Unique u)
+
+regBnd :: T.Text -> Int -> Ty.CType -> Anf.Binder
+regBnd h u t = Anf.Binder (regNm h u) Anf.Unrestricted t
+
+regU64 :: Ty.CType
+regU64 = Ty.CTCon Ty.TcU64 []
+
+-- A boxed user type (so a binder of this type is reference-counted / routable).
+regBoxTy :: Ty.CType
+regBoxTy = Ty.CTCon (Ty.TcUser (T.pack "Box")) []
+
+-- A boxed pair type (TcTuple 2 is boxed per isBoxedType).
+regPairTy :: Ty.CType
+regPairTy = Ty.CTCon (Ty.TcTuple 2) [regU64, regU64]
+
+regArrayTy :: Ty.CType
+regArrayTy = Ty.CTCon Ty.TcArray [regU64]
+
+-- | Placement of a binder Unique in a single-function module, or Nothing if the
+-- binder carries no placement entry (it is not an allocation site).
+regPlacementOf :: Int -> Anf.CoreModule -> Maybe Region.Placement
+regPlacementOf u cm = Map.lookup (Unique u) (Region.rpPlacement (Region.planRegions cm))
+
+regArenaBodies :: Anf.CoreModule -> Set.Set Unique
+regArenaBodies = Region.rpArenaBodies . Region.planRegions
+
+regModule :: Anf.TopBind -> Anf.CoreModule
+regModule tb = Anf.CoreModule [tb]
+
+-- Shape 1: non-escaping scratch.
+--   f x = let p = Pair x x      -- p :: (U64, U64), boxed, never flows out
+--         case p of Pair a b -> let r = a + b in r
+-- p is matched in place and consumed; the Pair binder -> Arena, f in rpArenaBodies.
+regShape1 :: Anf.CoreModule
+regShape1 = regModule $ Anf.TopBind (regNm "f" 7000) [regBnd "x" 7001 regU64]
+  (Anf.Let (regBnd "p" 7002 regPairTy)
+     (Anf.RCon (T.pack "Pair") [Anf.AVar (regNm "x" 7001), Anf.AVar (regNm "x" 7001)])
+  (Anf.Case (Anf.AVar (regNm "p" 7002))
+     [ Anf.AltCon (T.pack "Pair") [regBnd "a" 7003 regU64, regBnd "b" 7004 regU64]
+         (Anf.Let (regBnd "r" 7005 regU64)
+            (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+               [Anf.AVar (regNm "a" 7003), Anf.AVar (regNm "b" 7004)])
+            (Anf.Ret (Anf.AVar (regNm "r" 7005)))) ]))
+
+-- Shape 2: return-escape.
+--   g x = let p = Pair x x
+--         p                    -- p IS the return value -> escapes
+-- The Pair binder -> Heap, g NOT in rpArenaBodies.
+regShape2 :: Anf.CoreModule
+regShape2 = regModule $ Anf.TopBind (regNm "g" 7100) [regBnd "x" 7101 regU64]
+  (Anf.Let (regBnd "p" 7102 regPairTy)
+     (Anf.RCon (T.pack "Pair") [Anf.AVar (regNm "x" 7101), Anf.AVar (regNm "x" 7101)])
+  (Anf.Ret (Anf.AVar (regNm "p" 7102))))
+
+-- Shape 3: array (mutation fence §5.2).
+--   h n v = let arr = Std.Array.new n v   -- arr :: Array U64
+--           let len = Std.Array.length arr
+--           len
+-- Even though arr does not escape, the array binder -> Heap (arrays stay counted).
+regShape3 :: Anf.CoreModule
+regShape3 = regModule $ Anf.TopBind (regNm "h" 7200)
+  [regBnd "n" 7201 regU64, regBnd "v" 7202 regU64]
+  (Anf.Let (regBnd "arr" 7203 regArrayTy)
+     (Anf.RApp (Anf.APrim (PN.stdArrayModule, PN.arrayNewName))
+        [Anf.AVar (regNm "n" 7201), Anf.AVar (regNm "v" 7202)])
+  (Anf.Let (regBnd "len" 7204 regU64)
+     (Anf.RApp (Anf.APrim (PN.stdArrayModule, PN.arrayLengthName))
+        [Anf.AVar (regNm "arr" 7203)])
+  (Anf.Ret (Anf.AVar (regNm "len" 7204)))))
+
+-- Shape 4: continuation-capturing body (§5.3 fence).
+--   k () = with { return v -> v ; E.op(r) -> let kk = r in let q = Pair r r in kk }
+--          (Ret 0)
+-- The op-arm binds resume r and uses it NON-tail (aliased to kk, then returned),
+-- so m2bResumeEscapes fires -> the whole body falls back to Heap. The Pair alloc
+-- q inside the arm is forced Heap by the whole-body gate.
+regShape4 :: Anf.CoreModule
+regShape4 = regModule $ Anf.TopBind (regNm "k" 7300) []
+  (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+     (Anf.Handler
+        (regBnd "v" 7301 regU64, Anf.Ret (Anf.AVar (regNm "v" 7301)))
+        [ Anf.OpArm (T.pack "E") (T.pack "op")
+            [regBnd "arg" 7302 regU64]
+            (regBnd "r" 7303 regU64)         -- the resume binder
+            (Anf.Let (regBnd "kk" 7304 regU64)
+               (Anf.RAtom (Anf.AVar (regNm "r" 7303)))   -- alias-rename of resume = escape
+            (Anf.Let (regBnd "q" 7305 regPairTy)
+               (Anf.RCon (T.pack "Pair")
+                  [Anf.AVar (regNm "arg" 7302), Anf.AVar (regNm "arg" 7302)])
+            (Anf.Ret (Anf.AVar (regNm "kk" 7304))))) ]
+        Nothing Nothing Nothing))
+
+-- Shape 5: extract + return a boxed child (the §5.1 side-condition).
+--   m y = let x = Box ()         -- the child allocation, boxed
+--         let p = Pair x y       -- x is STORED into p (a con field = escaping)
+--         case p of Pair a b -> a   -- p matched in place, child a returned
+-- p -> Arena (only the scrutinee names it, not an escape); x -> Heap (it flowed
+-- into the Pair). This documents that extracting+returning a child is safe with
+-- p in the arena: the child is independently counted.
+regShape5 :: Anf.CoreModule
+regShape5 = regModule $ Anf.TopBind (regNm "m" 7400) [regBnd "y" 7401 regBoxTy]
+  (Anf.Let (regBnd "x" 7402 regBoxTy)
+     (Anf.RCon (T.pack "Box") [])
+  (Anf.Let (regBnd "p" 7403 (Ty.CTCon (Ty.TcTuple 2) [regBoxTy, regBoxTy]))
+     (Anf.RCon (T.pack "Pair") [Anf.AVar (regNm "x" 7402), Anf.AVar (regNm "y" 7401)])
+  (Anf.Case (Anf.AVar (regNm "p" 7403))
+     [ Anf.AltCon (T.pack "Pair") [regBnd "a" 7404 regBoxTy, regBnd "b" 7405 regBoxTy]
+         (Anf.Ret (Anf.AVar (regNm "a" 7404))) ])))
+
+-- Shape 6: alias-then-escape (pins aliasEscapeStep's alias-chain tracking).
+--   n a b = let p = Pair a b    -- p :: (Box, Box), boxed
+--           let q = p           -- pure alias-rename of p (followed, not an escape)
+--           let r = sink(q)     -- q passed as a CONSUMING arg -> escapes
+--           r
+-- The escape flows through the q-alias, so arenaEscapes {p} must catch it via the
+-- followed rename: p -> Heap, n opens no arena.
+regShape6 :: Anf.CoreModule
+regShape6 = regModule $ Anf.TopBind (regNm "n" 7500)
+  [regBnd "a" 7501 regBoxTy, regBnd "b" 7502 regBoxTy]
+  (Anf.Let (regBnd "p" 7503 (Ty.CTCon (Ty.TcTuple 2) [regBoxTy, regBoxTy]))
+     (Anf.RCon (T.pack "Pair") [Anf.AVar (regNm "a" 7501), Anf.AVar (regNm "b" 7502)])
+  (Anf.Let (regBnd "q" 7504 (Ty.CTCon (Ty.TcTuple 2) [regBoxTy, regBoxTy]))
+     (Anf.RAtom (Anf.AVar (regNm "p" 7503)))               -- q = p  (alias)
+  (Anf.Let (regBnd "r" 7505 regBoxTy)
+     (Anf.RApp (Anf.APrim (T.pack "Main", T.pack "sink"))
+        [Anf.AVar (regNm "q" 7504)])                       -- sink(q): q escapes
+  (Anf.Ret (Anf.AVar (regNm "r" 7505))))))
+
+-- Shape 7: LetRec member captures a boxed local PURELY AS A CALL HEAD, and the
+-- member escapes (REGRESSION for the reachable UAF the capstone review found).
+--   run k = let p = \y -> y + k       -- p :: boxed closure, arena candidate
+--           letrec f x = p x          -- f captures p, used ONLY as the call HEAD
+--           f                         -- f is RETURNED -> escapes; its shared NEnv
+--                                     -- still holds p after run returns
+-- The bug: aliasEscapeStep's escapingAtomsRhs (RApp _ as) EXEMPTS the head, so a
+-- head-only capture was invisible and p was mis-tagged Arena -> run's arena close
+-- bulk-freed p while the escaped env still pointed at it (use-after-free). The fix
+-- tests raw freeVarsExpr membership over member bodies, so a head-only capture
+-- escapes too: p -> Heap, run opens no arena.
+regShape7 :: Anf.CoreModule
+regShape7 = regModule $ Anf.TopBind (regNm "run" 7600) [regBnd "k" 7601 regU64]
+  (Anf.Let (regBnd "p" 7602 regBoxTy)
+     (Anf.RLam [regBnd "y" 7603 regU64]
+        (Anf.Let (regBnd "s" 7604 regU64)
+           (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+              [Anf.AVar (regNm "y" 7603), Anf.AVar (regNm "k" 7601)])
+           (Anf.Ret (Anf.AVar (regNm "s" 7604)))))
+  (Anf.LetRec
+     [ (regBnd "f" 7605 regBoxTy, [regBnd "x" 7606 regU64]
+       , Anf.Let (regBnd "fr" 7607 regU64)
+           (Anf.RApp (Anf.AVar (regNm "p" 7602)) [Anf.AVar (regNm "x" 7606)])  -- p as HEAD
+           (Anf.Ret (Anf.AVar (regNm "fr" 7607)))) ]
+     (Anf.Ret (Anf.AVar (regNm "f" 7605)))))                                   -- f escapes
+
+regionRoutingTests :: TestTree
+regionRoutingTests = testGroup "Region routing"
+  [ testCase "shape 1 (non-escaping scratch): Pair -> Arena, f opens an arena" $ do
+      regPlacementOf 7002 regShape1 @?= Just Arena
+      Set.member (Unique 7000) (regArenaBodies regShape1) @?= True
+
+  , testCase "shape 2 (return-escape): Pair -> Heap, g opens no arena" $ do
+      regPlacementOf 7102 regShape2 @?= Just Heap
+      Set.member (Unique 7100) (regArenaBodies regShape2) @?= False
+
+  , testCase "shape 3 (array, mutation fence): array binder -> Heap, h opens no arena" $ do
+      regPlacementOf 7203 regShape3 @?= Just Heap
+      Set.member (Unique 7200) (regArenaBodies regShape3) @?= False
+
+  , testCase "shape 4 (continuation-capturing): every allocation -> Heap, no arena" $ do
+      -- The Pair built inside the capturing arm is forced Heap by the whole-body gate.
+      regPlacementOf 7305 regShape4 @?= Just Heap
+      regArenaBodies regShape4 @?= Set.empty
+
+  , testCase "shape 5 (extract+return boxed child): Pair -> Arena, child -> Heap" $ do
+      -- p is only matched in place (scrutinee, not an escape) -> Arena.
+      regPlacementOf 7403 regShape5 @?= Just Arena
+      -- x flowed INTO the Pair (a con field = escaping) -> independently Heap.
+      regPlacementOf 7402 regShape5 @?= Just Heap
+      Set.member (Unique 7400) (regArenaBodies regShape5) @?= True
+
+  , testCase "shape 6 (alias-then-escape): Pair -> Heap via the alias chain" $ do
+      -- p is aliased to q, then q escapes as a consuming arg: arenaEscapes follows
+      -- the rename and catches the escape -> p is Heap, n opens no arena.
+      regPlacementOf 7503 regShape6 @?= Just Heap
+      Set.member (Unique 7500) (regArenaBodies regShape6) @?= False
+
+  , testCase "shape 7 (LetRec head-capture-escape): closure -> Heap, run opens no arena" $ do
+      -- REGRESSION (capstone review UAF): p is captured by member f purely as a
+      -- CALL HEAD and f escapes (returned), so p's shared NEnv outlives run. The
+      -- arenaEscapes LetRec fence must catch a head-only capture -> p is Heap and
+      -- run opens no arena (else run's arena close frees p under the escaped env).
+      regPlacementOf 7602 regShape7 @?= Just Heap
+      Set.member (Unique 7600) (regArenaBodies regShape7) @?= False
+
+  , testCase "planRegions is idempotent (pure, heap-independent)" $
+      Region.planRegions regShape1 @?= Region.planRegions regShape1
+  ]
+
+-- -------------------------------------------------------------------------
 -- Registration
 -- -------------------------------------------------------------------------
 
@@ -17976,4 +18468,399 @@ rcArraySliceCTests = testGroup "rc array Slice C helpers"
               case St.dropAddrPure a s7 of
                 Left e   -> assertFailure ("drop array failed: " <> show e)
                 Right s8 -> St.stLive (St.stStats s8) @?= baseline
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Region Slice R1 oracle extension (Task 6):
+--
+--   * 'rcRegionCorpusTests' --- targeted per-file assertions for the four
+--     corpus programs under 'test/rc-region/': arena_bytes > 0 for the three
+--     arena-routing programs (01/03/04) and == 0 for the heap-only program
+--     (02), plus full abstract==C parity on all six stats (allocs/frees/peak/
+--     peak_bytes/arena_bytes/arena_peak) and the arena-leak invariant
+--     (arena_bytes back to 0 at program end on both backends).
+--
+--   * 'rcRegionNegativeControl' --- store-level proof the oracle has TEETH:
+--     manually misuse 'arenaAllocPure' for a node whose sole reference flows
+--     out of the activation (escaping value), skip the scan-out, and assert
+--     that the arena-leak invariant fires (stArenaBytes != 0 after close OR
+--     stLive > baseline after drop -- proving a routing bug would be caught).
+--
+-- The four corpus programs are also fed to 'rc differential' / 'rc stats' /
+-- 'rcCBackendParity' in 'main' (where they exercise the standard output +
+-- heap-accounting + parity harnesses).  The targeted group here adds the
+-- ARENA-SPECIFIC assertions that those generic harnesses do not include.
+--
+-- ABSTRACT == C PARITY ON ARENA STATS:
+-- 'withBothBackendsArena' extends 'withBothBackends' with two additional C
+-- reads: 'wokStatArenaBytes' and 'wokStatArenaPeak'.  These are the C
+-- runtime's own arena counters (distinct from the counted 'wok_stat_allocs'
+-- etc.) and must bit-for-bit equal the abstract 'stArenaBytes'/'stArenaPeak'
+-- because both backends charge the SAME 'wouldBeCBytes' per arena cell (spec
+-- §6).  A divergence here means the routing decision was not identical on
+-- both backends -- the headline oracle signal.
+
+-- | Run one region corpus file through BOTH backends; return
+-- @(absResult, cResult, cHeapAllocs, cPeakBytes, cArenaBytes, cArenaPeak)@.
+-- The C heap is created fresh per program and freed via 'finally' so a
+-- thrown exception cannot leak the native pointer.  Both arena counters are
+-- read BEFORE the free (they are zeroed by 'wok_heap_free' -- spec §3.1).
+withBothBackendsArena
+  :: FilePath
+  -> IO ( Either IV.RuntimeError RCM.RCRun
+        , Either IV.RuntimeError RCM.RCRun
+        , Word64   -- ^ cHeapAllocs (the C heap's own alloc counter)
+        , Word64   -- ^ cPeakBytes  (C wok_stat_peak_bytes)
+        , Word64   -- ^ cArenaBytes (C wok_stat_arena_bytes at program end)
+        , Word64   -- ^ cArenaPeak  (C wok_stat_arena_peak)
+        )
+withBothBackendsArena path = do
+  cm   <- rcParityPrepare path
+  absR <- RCM.runModuleRCWith St.AbstractHeap cm
+  hp   <- Heap.wokHeapNew
+  (cR, cAllocs, cPeakBytes, cArenaBytes, cArenaPeak) <-
+    (do c  <- RCM.runModuleRCWith (St.CHeap hp) cm
+        a  <- Heap.wokStatAllocs hp
+        pb <- Heap.wokStatPeakBytes hp
+        ab <- Heap.wokStatArenaBytes hp
+        ap <- Heap.wokStatArenaPeak hp
+        pure (c, a, pb, ab, ap))
+    `Control.Exception.finally` Heap.wokHeapFree hp
+  pure (absR, cR, cAllocs, cPeakBytes, cArenaBytes, cArenaPeak)
+
+-- | Full arena-parity assertion for one region corpus program.
+-- Checks all six stat pairs (allocs/frees/peak/peak_bytes/arena_bytes/
+-- arena_peak) abstract==C, plus:
+--   * counted-heap leak freedom: stLive == baseline, allocs - frees == baseline
+--   * arena-leak invariant: arena_bytes == 0 at program end (every open was closed)
+rcRegionParityHarness :: FilePath -> Assertion
+rcRegionParityHarness path = do
+  (absR, cR, _cAllocs, cPeakBytes, cArenaBytes, cArenaPeak) <-
+    withBothBackendsArena path
+  case (absR, cR) of
+    (Right a, Right c) -> do
+      let aSt = RCM.rcStats a
+          cSt = RCM.rcStats c
+          bl  = RCM.rcBaseline c
+      assertEqual (path <> ": output parity")
+        (RCM.rcOutput a) (RCM.rcOutput c)
+      -- Counted heap: abstract == C
+      assertEqual (path <> ": allocs parity")
+        (St.stAllocs aSt) (St.stAllocs cSt)
+      assertEqual (path <> ": frees parity")
+        (St.stFrees aSt) (St.stFrees cSt)
+      assertEqual (path <> ": peak parity")
+        (St.stPeak aSt) (St.stPeak cSt)
+      assertEqual (path <> ": peak_bytes parity")
+        (fromIntegral (St.stPeakBytes aSt) :: Word64) cPeakBytes
+      -- Arena: abstract == C (both are 0 after program end; peak may be > 0)
+      assertEqual (path <> ": arena_bytes parity (abstract == C at end)")
+        (fromIntegral (St.stArenaBytes aSt) :: Word64) cArenaBytes
+      assertEqual (path <> ": arena_peak parity (abstract == C high-water)")
+        (fromIntegral (St.stArenaPeak aSt) :: Word64) cArenaPeak
+      -- Arena-leak invariant: every open was closed; arena back to 0 at end
+      assertEqual (path <> ": arena-leak invariant (abstract): arena_bytes == 0 at end")
+        (0 :: Int) (St.stArenaBytes aSt)
+      assertEqual (path <> ": arena-leak invariant (C): arena_bytes == 0 at end")
+        (0 :: Word64) cArenaBytes
+      -- Counted-heap leak freedom
+      assertEqual (path <> ": baseline parity")
+        (RCM.rcBaseline a) (RCM.rcBaseline c)
+      assertEqual (path <> ": no counted leak (C) -- stLive returns to baseline")
+        bl (St.stLive cSt)
+      assertEqual (path <> ": no counted leak (C) -- allocs - frees == baseline")
+        bl (St.stAllocs cSt - St.stFrees cSt)
+    (Left e, _) ->
+      assertFailure (path <> ": abstract backend FAILED: " <> show e)
+    (_, Left e) ->
+      assertFailure (path <> ": C backend FAILED: " <> show e)
+
+-- | Targeted arena-stats assertions for the four Region Slice R1 corpus
+-- programs.  The standard 'rc differential' / 'rc stats' / 'rcCBackendParity'
+-- groups (in 'main') cover output parity + the standard heap-accounting
+-- invariants.  This group adds:
+--
+--   * arena_bytes > 0 at peak for the three arena-routing programs (01/03/04):
+--     proves the C-arena path ('wok_arena_alloc') was actually reached, not
+--     just asserted by the analysis.  'cArenaPeak' is the C heap's high-water
+--     mark (not reset at program end) -- it is > 0 iff at least one arena
+--     cell was allocated during the run.
+--
+--   * arena_bytes == 0 throughout for the heap-only program (02): proves the
+--     routing correctly kept the escaping Pair on the counted heap.
+--
+--   * Full six-stat parity + arena-leak invariant via 'rcRegionParityHarness'.
+rcRegionCorpusTests :: TestTree
+rcRegionCorpusTests = testGroup "rc-region-corpus"
+  [ -- -----------------------------------------------------------------------
+    -- 01-scratch-struct: Pair U64 U64, non-escaping, C-eligible NCon.
+    -- THE C-ARENA PATH: wok_arena_alloc fires for the Pair on CHeap; the
+    -- abstract arenaAllocPure fires on AbstractHeap.  Both charge
+    -- 'wouldBeCBytes' = 8 + 8*2 = 24 bytes to their respective arena counters.
+    -- At program end arena_bytes returns to 0 (the arena is closed); arena_peak
+    -- == 24 (one Pair cell was live at peak).  Counted allocs == 0 extra (the
+    -- Pair is uncounted).
+    testCase "01-scratch-struct: Pair routed to C-arena (arena_peak > 0)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes, _cArenaBytes, cArenaPeak) <-
+        withBothBackendsArena "test/rc-region/01-scratch-struct.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "output is 7" (T.pack "7") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          -- The abstract backend must have seen arena activity too.
+          assertBool "abstract arena_peak > 0 (Pair was arena-routed)"
+            (St.stArenaPeak (RCM.rcStats a) > 0)
+          -- The C backend must have seen arena activity (proves C path fired).
+          assertBool "C arena_peak > 0 (wok_arena_alloc was reached)"
+            (cArenaPeak > 0)
+          -- Arena-leak invariant: back to 0 at end.
+          assertEqual "abstract arena_bytes == 0 at end"
+            (0 :: Int) (St.stArenaBytes (RCM.rcStats a))
+          assertEqual "C arena_bytes == 0 at end"
+            (0 :: Word64) _cArenaBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , testCase "01-scratch-struct: full six-stat parity + arena-leak invariant" $
+      rcRegionParityHarness "test/rc-region/01-scratch-struct.wok"
+
+  , -- -----------------------------------------------------------------------
+    -- 02-escape-heap: Pair returned from makePair -> escapes -> Heap.
+    -- NEGATIVE ROUTING CONTROL (at the routing level, not oracle level): the
+    -- Pair must NOT be arena-routed.  arena_peak must be 0 on both backends.
+    testCase "02-escape-heap: escaping Pair is NOT arena-routed (arena_peak == 0)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes, _cArenaBytes, cArenaPeak) <-
+        withBothBackendsArena "test/rc-region/02-escape-heap.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "output is 10" (T.pack "10") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "abstract arena_peak == 0 (no arena routing fired)"
+            (0 :: Int) (St.stArenaPeak (RCM.rcStats a))
+          assertEqual "C arena_peak == 0 (no arena routing fired)"
+            (0 :: Word64) cArenaPeak
+          -- The Pair went to the counted heap: at least one counted alloc.
+          assertBool "counted allocs > 0 (Pair is on the counted heap)"
+            (St.stAllocs (RCM.rcStats c) > 0)
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , testCase "02-escape-heap: full six-stat parity + arena-leak invariant" $
+      rcRegionParityHarness "test/rc-region/02-escape-heap.wok"
+
+  , -- -----------------------------------------------------------------------
+    -- 03-pure-fastpath: Triple U64 U64 U64, non-escaping, all-scalar children.
+    -- No counted children -> arena_close scan-out is EMPTY (fast path).
+    -- arena_peak > 0 proves the arena cell was allocated; counted allocs are
+    -- the same as if the Triple were never allocated at all (0 extra).
+    testCase "03-pure-fastpath: Triple routed to arena, scan-out is empty (arena_peak > 0)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes, _cArenaBytes, cArenaPeak) <-
+        withBothBackendsArena "test/rc-region/03-pure-fastpath.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "output is 6" (T.pack "6") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertBool "abstract arena_peak > 0 (Triple was arena-routed)"
+            (St.stArenaPeak (RCM.rcStats a) > 0)
+          assertBool "C arena_peak > 0 (wok_arena_alloc was reached)"
+            (cArenaPeak > 0)
+          assertEqual "abstract arena_bytes == 0 at end (scan-out: empty, fast path)"
+            (0 :: Int) (St.stArenaBytes (RCM.rcStats a))
+          assertEqual "C arena_bytes == 0 at end"
+            (0 :: Word64) _cArenaBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , testCase "03-pure-fastpath: full six-stat parity + arena-leak invariant" $
+      rcRegionParityHarness "test/rc-region/03-pure-fastpath.wok"
+
+  , -- -----------------------------------------------------------------------
+    -- 04-counted-scanout: Wrap holds a counted Box child.
+    -- THE SCAN-OUT PATH: at arena_close the Wrap's counted Box child is dropped
+    -- exactly once (on both backends).  arena_peak > 0 proves the Wrap was
+    -- arena-routed; counted allocs >= 1 (the Box is Heap); heap returns to
+    -- baseline (the scan-out freed the Box correctly).
+    testCase "04-counted-scanout: Wrap arena-routed, Box counted, scan-out fires (arena_peak > 0)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes, _cArenaBytes, cArenaPeak) <-
+        withBothBackendsArena "test/rc-region/04-counted-scanout.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "output is 42" (T.pack "42") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertBool "abstract arena_peak > 0 (Wrap was arena-routed)"
+            (St.stArenaPeak (RCM.rcStats a) > 0)
+          assertBool "C arena_peak > 0 (wok_arena_alloc was reached)"
+            (cArenaPeak > 0)
+          -- The Box is a counted child: at least one counted alloc fired.
+          assertBool "counted allocs > 0 (Box is on the counted heap)"
+            (St.stAllocs (RCM.rcStats c) > 0)
+          -- Arena-leak: Wrap's arena scope was properly closed.
+          assertEqual "abstract arena_bytes == 0 at end (scan-out dropped Box)"
+            (0 :: Int) (St.stArenaBytes (RCM.rcStats a))
+          assertEqual "C arena_bytes == 0 at end"
+            (0 :: Word64) _cArenaBytes
+          -- Counted heap returns to baseline (scan-out dropped Box exactly once).
+          assertEqual "no counted leak: stLive returns to baseline"
+            (RCM.rcBaseline c) (St.stLive (RCM.rcStats c))
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , testCase "04-counted-scanout: full six-stat parity + arena-leak invariant" $
+      rcRegionParityHarness "test/rc-region/04-counted-scanout.wok"
+
+  , -- -----------------------------------------------------------------------
+    -- 05-letrec-head-capture-escape: REGRESSION for the capstone-review UAF.
+    -- A boxed closure 'p' is captured by a LetRec member 'f' PURELY AS A CALL
+    -- HEAD ('p x'), and 'f' is RETURNED, so the group's shared NEnv (holding 'p')
+    -- outlives 'run'.  The bug mis-tagged 'p' -> Arena (aliasEscapeStep exempts the
+    -- call head), so 'run's arena close bulk-freed 'p' while the escaped env still
+    -- pointed at it ("use-after-free: addr 0" instead of 15).  THE FIX: 'p' must be
+    -- Heap, 'run' opens no arena (arena_peak == 0), output is 15, heap balanced.
+    testCase "05-letrec-head-capture-escape: head-only LetRec capture -> Heap (no UAF)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes, _cArenaBytes, cArenaPeak) <-
+        withBothBackendsArena "test/rc-region/05-letrec-head-capture-escape.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "output is 15" (T.pack "15") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          -- The captured-and-escaping closure went to the counted heap: NO arena.
+          assertEqual "abstract arena_peak == 0 (head-only capture is NOT arena-routed)"
+            (0 :: Int) (St.stArenaPeak (RCM.rcStats a))
+          assertEqual "C arena_peak == 0 (no arena routing fired)"
+            (0 :: Word64) cArenaPeak
+          -- Heap balanced on both backends (no UAF, no leak): stLive == baseline.
+          assertEqual "no counted leak: stLive returns to baseline (C)"
+            (RCM.rcBaseline c) (St.stLive (RCM.rcStats c))
+          assertEqual "no counted leak: stLive returns to baseline (abstract)"
+            (RCM.rcBaseline a) (St.stLive (RCM.rcStats a))
+        (Left e, _) -> assertFailure ("abstract FAILED (the UAF regression): " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (the UAF regression): " <> show e)
+
+  , testCase "05-letrec-head-capture-escape: full six-stat parity + arena-leak invariant" $
+      rcRegionParityHarness "test/rc-region/05-letrec-head-capture-escape.wok"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Region Slice R1 negative control: the oracle has TEETH.
+--
+-- This group proves the oracle has TEETH by running a deliberately BROKEN
+-- close (one that SKIPS the scan-out) and asserting the oracle's OWN
+-- invariant fails on its output, contrasted with the correct close which
+-- passes.  The pair (broken leaks / correct does not) is the genuine teeth:
+-- it shows the scan-out is LOAD-BEARING and that the differential oracle's
+-- @stLive == baseline@ assertion catches its absence.
+--
+-- THE SHAPE (the 04-counted-scanout cohort, at the store level):
+--   * an arena 'Wrap' cell that OWNS a counted 'Box' child (the scan-out
+--     target).
+--   * 'closeSkippingScanOut' = the BROKEN close: pop the arena frame and zero
+--     'stArenaBytes' (so the close "ran" -- arena_bytes back to 0), but DO NOT
+--     drop the counted children.  This is exactly the bug a mis-implemented
+--     'arenaClose' (or a missing scan-out step) would produce.
+--   * Assert: the broken close LEAKS the Box ('stLive' stays ABOVE baseline)
+--     even though 'stArenaBytes == 0', so the oracle's @stLive == baseline@
+--     check FAILS on its output.
+--   * Contrast: the real 'arenaClose' drops the Box (scan-out fires), so
+--     'stLive == baseline' -- the oracle PASSES.
+--
+-- This is the store-level analogue of 'rcTeethTests' (Perceus teeth via
+-- 'insertRCMutated') and 'rcFbipFaultInjection' (FBIP teeth): a real broken
+-- operation, and proof the oracle rejects it.
+
+-- | A BROKEN arena close that SKIPS the scan-out (the deliberate bug). Pops the
+-- innermost 'stArena' frame and zeroes 'stArenaBytes' (so the close appears to
+-- have run -- arena_bytes returns to baseline), but does NOT drop the arena
+-- cells' counted children.  A correct close ('St.arenaClose') drops those
+-- children first; omitting that step leaks every counted child of an arena cell.
+-- Built purely from the public 'Store'/'Stats' record fields so it does not
+-- depend on the abstract heap's internal address layout.
+closeSkippingScanOut :: St.Store -> St.Store
+closeSkippingScanOut s = case St.stArena s of
+  []         -> s  -- no open frame: nothing to (mis-)close
+  (_ : rest) ->
+    s { St.stArena = rest                          -- pop the frame (close "ran")
+      , St.stStats = (St.stStats s)
+          { St.stArenaBytes = 0 }                  -- zero arena bytes (looks closed)
+      }                                            -- but the counted child is NEVER dropped
+
+rcRegionNegativeControl :: TestTree
+rcRegionNegativeControl = testGroup "rc-region-negative-control"
+  [ testCase "skipped scan-out LEAKS the counted child; the correct close does not (oracle teeth)" $ do
+      -- Build the 04-style state: an arena 'Wrap' owning a counted 'Box'.
+      let s0   = St.emptyStore
+          base = St.stLive (St.stStats s0)
+          s1   = St.arenaOpen s0
+          -- The counted child: a Box on the COUNTED heap (rc 1, live).
+          (box, s2) = St.allocPure (St.NCon (T.pack "Box") [St.RVLit (Anf.LInt 7)]) s1
+          -- The arena cell: a Wrap OWNING the counted Box (its only reference).
+          (_wrap, s3) = St.arenaAllocPure (St.NCon (T.pack "Wrap") [St.RVBox box]) s2
+
+      -- Sanity: before either close, the Box is live and the arena is non-empty.
+      assertEqual "the counted Box is live before close" (base + 1) (St.stLive (St.stStats s3))
+      assertBool  "arena_bytes > 0 before close" (St.stArenaBytes (St.stStats s3) > 0)
+
+      -- (A) THE BROKEN CLOSE: skip the scan-out. arena_bytes returns to 0 (the
+      -- close "ran"), but the Box's only reference (in the Wrap's slot) is never
+      -- dropped, so it LEAKS: stLive stays ABOVE baseline.
+      let sBroken = closeSkippingScanOut s3
+      assertEqual "broken close zeroes arena_bytes (it appears to have run)"
+        0 (St.stArenaBytes (St.stStats sBroken))
+      -- THE TOOTH: the oracle's own @stLive == baseline@ assertion FAILS on the
+      -- broken close's output -- the skipped scan-out genuinely leaked the Box.
+      assertBool
+        ("ORACLE TOOTH: broken scan-out leaks the counted child -> the oracle's "
+           <> "stLive==baseline assertion FAILS on it (stLive="
+           <> show (St.stLive (St.stStats sBroken)) <> ", baseline=" <> show base <> ")")
+        (St.stLive (St.stStats sBroken) /= base)
+
+      -- (B) THE CORRECT CLOSE: 'St.arenaClose' runs the scan-out, dropping the
+      -- Box exactly once. stLive returns to baseline -- the oracle PASSES.
+      eGood <- runExceptT (St.arenaClose s3)
+      case eGood of
+        Left err -> assertFailure ("arenaClose failed: " <> show err)
+        Right sGood -> do
+          assertEqual "correct close returns arena_bytes to baseline"
+            0 (St.stArenaBytes (St.stStats sGood))
+          assertEqual "correct close: scan-out dropped the Box, stLive == baseline"
+            base (St.stLive (St.stStats sGood))
+          -- The contrast is the teeth: the SAME oracle invariant
+          -- (stLive == baseline) PASSES on the correct close and FAILS on the
+          -- broken one, so a missing scan-out would be caught by the corpus
+          -- harness, never silently green.
+          assertBool "the broken and correct closes DIFFER on stLive (scan-out is load-bearing)"
+            (St.stLive (St.stStats sBroken) /= St.stLive (St.stStats sGood))
+
+  , testCase "pure-cohort close needs no scan-out; the broken close agrees there (no false alarm)" $ do
+      -- A pure-data arena cohort (no counted children) is the fast path: both
+      -- the correct and the (scan-out-skipping) broken close must agree, because
+      -- there is nothing to scan out. This guards against the teeth firing
+      -- spuriously on a fast-path cohort.
+      let s0   = St.emptyStore
+          base = St.stLive (St.stStats s0)
+          s1   = St.arenaOpen s0
+          -- A Pair of two inline literals: NO counted children.
+          (_pair, s2) = St.arenaAllocPure
+                          (St.NCon (T.pack "Pair") [St.RVLit (Anf.LInt 3), St.RVLit (Anf.LInt 4)]) s1
+      assertBool "arena_bytes > 0 before close" (St.stArenaBytes (St.stStats s2) > 0)
+
+      -- The broken close (skipped scan-out) here leaks NOTHING -- the cohort has
+      -- no counted children -- so stLive stays at baseline, same as the correct
+      -- close. (The teeth fire only when there is a counted child to leak.)
+      let sBroken = closeSkippingScanOut s2
+      assertEqual "broken close zeroes arena_bytes" 0 (St.stArenaBytes (St.stStats sBroken))
+      assertEqual "pure cohort: broken close leaks nothing (stLive == baseline)"
+        base (St.stLive (St.stStats sBroken))
+
+      eGood <- runExceptT (St.arenaClose s2)
+      case eGood of
+        Left err -> assertFailure ("arenaClose failed: " <> show err)
+        Right sGood -> do
+          assertEqual "correct close returns arena_bytes to baseline"
+            0 (St.stArenaBytes (St.stStats sGood))
+          assertEqual "correct close leaves stLive at baseline"
+            base (St.stLive (St.stStats sGood))
+          -- On the pure cohort, broken == correct: the teeth correctly stay
+          -- silent (no scan-out to skip).
+          assertEqual "pure cohort: broken and correct closes AGREE on stLive"
+            (St.stLive (St.stStats sBroken)) (St.stLive (St.stStats sGood))
   ]

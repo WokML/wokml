@@ -96,6 +96,7 @@ library
         Wok.IR.PrimNames
         Wok.IR.Anf
         Wok.IR.Escape
+        Wok.IR.Region
         Wok.IR.Elaborate
         Wok.IR.Match
         Wok.IR.Multiplicity

@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+
+-- REGRESSION (capstone full-branch review): a reachable use-after-free in the
+-- arena LetRec-capture fence. 'p' is a boxed closure captured by the local
+-- function 'f' (which elaborates to a LetRec member) PURELY AS A CALL HEAD
+-- ('p x'), and 'f' is RETURNED, so the group's shared env (holding 'p') outlives
+-- 'run'. The buggy arenaEscapes exempted the call head, mis-tagging 'p' -> Arena;
+-- 'run's arena close then bulk-freed 'p' while 'g's env still pointed at it
+-- (faulted "use-after-free: addr 0" instead of 15). The fix tests raw
+-- freeVarsExpr membership over LetRec member bodies, so a head-only capture
+-- escapes too: 'p' -> Heap (counted), arena_bytes == 0 throughout, heap balanced
+-- on BOTH backends, output 15.
+
+run : U64 -> (U64 -> U64)
+run k =
+  let p = \y -> y + k in
+  let f x = p x in
+  f
+
+main : U64
+main =
+  let g = run 5 in
+  g 10

@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+
+-- Counted-child scan-out: the arena-routed Wrap cell OWNS a counted Box child.
+-- At arena_close the scan-out must drop the Box reference exactly once (on BOTH
+-- backends, with the C scan-out exercised on CHeap). The Box itself is Heap
+-- (it flows into the Wrap field = an escaping position), the Wrap is Arena.
+
+data Box  = Box U64
+data Wrap = Wrap Box
+
+extractBox : U64 -> U64
+extractBox n =
+  let b = Box n in
+  let w = Wrap b in
+  case w of
+    Wrap inner ->
+      case inner of
+        Box v -> v
+
+main = extractBox 42

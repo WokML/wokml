@@ -25,9 +25,11 @@ import Wok.IR.Anf
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import qualified Wok.IR.PrimNames as PN
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
+import Wok.IR.Region (Placement (..), RegionPlan (..), planRegions)
 import Wok.Interp.RC.Prim (rcPrimTable)
 import Wok.Interp.RC.Value
 import Wok.Interp.Value (RuntimeError (..))
+import Data.Map.Strict (Map)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -43,33 +45,55 @@ data RCConfig
 -- | One small-step result.
 data RCStep = RMore RCConfig | RDone RCValue Store
 
--- | A single small-step. Halts on a return into the empty continuation.
-stepRC :: RCPrimTable -> RCConfig -> RC RCStep
-stepRC _     (RReturn v KDoneRC s) = pure (RDone v s)
-stepRC prims cfg                   = RMore <$> transition prims cfg
+-- | The read-only interpreter context threaded through every step: the primitive
+-- table and the region-routing placement map (Region Slice R1). 'rcePlacement'
+-- maps each allocation-binder 'Unique' to its 'Placement' ('Arena' | 'Heap'); the
+-- 'evalRhsRC' alloc sites route by it, and the function-body bracket
+-- ('enterBodyRC') opens an arena for any body that routes >= 1 'Arena' allocation.
+-- An EMPTY placement map disables arena routing entirely (every alloc is 'Heap',
+-- no body opens an arena) -- the behaviour of the public 'runExprRC' test seam.
+data RCEnv = RCEnv
+  { rcePrims     :: RCPrimTable
+  , rcePlacement :: Map Unique Placement
+  }
 
-transition :: RCPrimTable -> RCConfig -> RC RCConfig
-transition prims (RReturn v k s)    = returnToRC prims v k s
-transition prims (REval expr sc k s) = evalExprRC prims expr sc k s
+-- | A single small-step. Halts on a return into the empty continuation.
+stepRC :: RCEnv -> RCConfig -> RC RCStep
+stepRC _   (RReturn v KDoneRC s) = pure (RDone v s)
+stepRC env cfg                   = RMore <$> transition env cfg
+
+transition :: RCEnv -> RCConfig -> RC RCConfig
+transition env (RReturn v k s)    = returnToRC env v k s
+transition env (REval expr sc k s) = evalExprRC env expr sc k s
 
 -- ---------------------------------------------------------------------------
 -- Return: deliver a value to a continuation frame.
 
-returnToRC :: RCPrimTable -> RCValue -> RCKont -> Store -> RC RCConfig
-returnToRC _     _ KDoneRC                _ = throwE (PrimError (Tx.pack "internal: returnToRC KDoneRC"))
-returnToRC _     v (KLetRC b body sc k)   s =
+returnToRC :: RCEnv -> RCValue -> RCKont -> Store -> RC RCConfig
+returnToRC _   _ KDoneRC                _ = throwE (PrimError (Tx.pack "internal: returnToRC KDoneRC"))
+returnToRC _   v (KLetRC b body sc k)   s =
   pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s)
 -- OWNED: a 'KAppRC' over-application continuation holds an ANONYMOUS intermediate
 -- function value (the result of saturating the previous application) with no IR
 -- binder. The application is its sole owner, so it CONSUMES it (no Perceus drop
 -- can reach an unnamed intermediate). See 'enterRC'.
-returnToRC prims v (KAppRC args k)        s = enterRC False prims v args k s
+returnToRC env v (KAppRC args k)        s = enterRC False env v args k s
 -- DEFERRED CONSUME (M2a-2): the unnamed-intermediate closure cell whose body just
 -- produced @v@ is now dropped --- its captures are no longer borrowed by the
 -- (completed) body, so the cascade is safe. Thread @v@ onward to the saved
 -- continuation. (See 'KDropCellRC' and the deferred-consume note in 'enterRC'.)
-returnToRC _     v (KDropCellRC addr k)   s = do
+returnToRC _   v (KDropCellRC addr k)   s = do
   s' <- dropAddr addr s
+  pure (RReturn v k s')
+-- ARENA BRACKET CLOSE (Region Slice R1, spec §4.2). The body that opened this
+-- arena has produced its final value @v@ (a normal return, a tail-call result, or
+-- a body-local 'Jump' result -- every exit threads through this frame). Run
+-- 'arenaClose' (scan out the arena cells' counted children, then O(1) bulk reset)
+-- and deliver @v@ onward. @v@ is born 'Heap' (it escaped via the return, §5.1), so
+-- by the R+escape invariant it never points into the closing arena -- the close is
+-- sound.
+returnToRC _   v (KArenaCloseRC k)      s = do
+  s' <- arenaClose s
   pure (RReturn v k s')
 -- Normal completion of a handled computation (M2b-1 Task 3): run the return arm,
 -- binding the produced value to the return binder in the frame's captured scope.
@@ -77,21 +101,21 @@ returnToRC _     v (KDropCellRC addr k)   s = do
 -- captured 'hsc' by reference (no incref on install), so there is nothing to drop
 -- here: the value 'v' is delivered into the return-arm body, which the Perceus
 -- pass instruments for its own last-use drops.
-returnToRC _     v (KHandleRC h _ hsc k)  s =
+returnToRC _   v (KHandleRC h _ hsc k)  s =
   let (rb, rbody) = hReturn h
   in pure (REval rbody hsc { rscEnv = bindRCBinder rb v (rscEnv hsc) } k s)
 
 -- ---------------------------------------------------------------------------
 -- Eval
 
-evalExprRC :: RCPrimTable -> Expr -> RCScope -> RCKont -> Store
+evalExprRC :: RCEnv -> Expr -> RCScope -> RCKont -> Store
            -> RC RCConfig
-evalExprRC prims expr sc k s = case expr of
+evalExprRC env expr sc k s = case expr of
   Ret a -> do
     v <- liftRC (resolveRCAtom sc a)
     pure (RReturn v k s)
 
-  Let b rhs body -> evalRhsRC prims b rhs body sc k s
+  Let b rhs body -> evalRhsRC env b rhs body sc k s
 
   Case a alts -> do
     v <- liftRC (resolveRCAtom sc a)
@@ -194,22 +218,26 @@ evalExprRC prims expr sc k s = case expr of
                 Nothing -> sc
     in pure (REval e sc' (KHandleRC h tag sc' k) s)
 
-evalRhsRC :: RCPrimTable -> Binder -> Rhs -> Expr -> RCScope -> RCKont -> Store
+evalRhsRC :: RCEnv -> Binder -> Rhs -> Expr -> RCScope -> RCKont -> Store
           -> RC RCConfig
-evalRhsRC prims b rhs body sc k s = case rhs of
+evalRhsRC env b rhs body sc k s = case rhs of
   RAtom a -> do
     v <- liftRC (resolveRCAtom sc a)
     cont v s
 
   RCon c as -> do
     vs <- liftRC (mapM (resolveRCAtom sc) as)
-    (a, s') <- alloc (NCon c vs) s
+    (a, s') <- allocRouted b (NCon c vs) s
     cont (RVBox a) s'
 
   -- The FBIP @alloc_at@ form (spec §9): an 'RCon' that consumes a reuse token.
   -- Mirrors the 'RCon' arm but resolves the token atom too and routes through
   -- 'allocAt', which writes the new node into the reserved shell when placement
   -- matches (0 alloc / 0 free), else frees-and-allocates fresh.
+  --
+  -- NOT arena-routed: 'RReuseCon' is the post-Perceus FBIP form, and arena cells
+  -- are FBIP-excluded (§5.5), so a reuse target is always 'Heap'. (The region pass
+  -- never even sees 'RReuseCon' -- it runs before reuse-pairing.)
   RReuseCon tok c as -> do
     tokVal <- liftRC (resolveRCAtom sc tok)
     vs     <- liftRC (mapM (resolveRCAtom sc) as)
@@ -218,14 +246,14 @@ evalRhsRC prims b rhs body sc k s = case rhs of
 
   RRecord t flds -> do
     vs <- liftRC (mapM (\(l, a) -> (,) l <$> resolveRCAtom sc a) flds)
-    (a, s') <- alloc (NRecord t (Map.fromList vs)) s
+    (a, s') <- allocRouted b (NRecord t (Map.fromList vs)) s
     cont (RVBox a) s'
 
   RLam ps e -> do
     let fvs  = freeVarsExpr e `Set.difference`
                  Set.fromList (map binderUnique ps)
         cenv = Map.restrictKeys (rscEnv sc) fvs
-    (a, s') <- alloc (mkClosure cenv ps e) s
+    (a, s') <- allocRouted b (mkClosure cenv ps e) s
     cont (RVBox a) s'
 
   RProj l a -> do
@@ -243,7 +271,7 @@ evalRhsRC prims b rhs body sc k s = case rhs of
 
   RApp f as -> do
     vs <- liftRC (mapM (resolveRCAtom sc) as)
-    callFn prims sc f vs (KLetRC b body sc k) s
+    callFn env sc f vs (KLetRC b body sc k) s
 
   -- An effect OPERATION (M2b-1 Task 4): the RC analogue of the reference
   -- 'Wok.Interp.Machine' 'ROp' arm. Resolve the args and the optional named-
@@ -256,6 +284,14 @@ evalRhsRC prims b rhs body sc k s = case rhs of
     rcDispatchOp mTarget lbl op vs (KLetRC b body sc k) s
   where
     cont v s' = pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
+    -- Route this allocation by the region plan (Region Slice R1, spec §4.2): an
+    -- 'Arena'-tagged binder is born in the activation's UNCOUNTED arena
+    -- ('arenaAlloc'); a 'Heap'-tagged (or unplanned) binder takes the counted path
+    -- ('alloc'). The arena is guaranteed open: the binder's enclosing body opened
+    -- one ('enterBodyRC' fired on entry because this very binder routes 'Arena').
+    allocRouted bd node st = case Map.lookup (binderUnique bd) (rcePlacement env) of
+      Just Arena -> arenaAlloc node st
+      _          -> alloc node st
 
 -- | Resolve the optional named-instance handle of an 'ROp' to its @(Unique, tag)@
 -- routing pair. 'Nothing' is ambient dispatch (route to the nearest covering
@@ -278,19 +314,19 @@ resolveInstRC sc (Just a) = do
 -- NAMES are resolved here, at the application head, by consulting the table.
 
 -- | Apply the function named by an atom to already-resolved argument values.
-callFn :: RCPrimTable -> RCScope -> Atom -> [RCValue] -> RCKont -> Store
+callFn :: RCEnv -> RCScope -> Atom -> [RCValue] -> RCKont -> Store
        -> RC RCConfig
-callFn prims sc f args k s = case f of
+callFn env sc f args k s = case f of
   ALit _ -> throwE (NotAFunction (Tx.pack "literal"))
   APrim (_, name) ->
-    case Map.lookup name prims of
-      Just p  -> enterPrim prims p args k s
+    case Map.lookup name (rcePrims env) of
+      Just p  -> enterPrim env p args k s
       Nothing -> throwE (UnboundPrim name)
   AVar n ->
     case Map.lookup (nameUniq n) (rscEnv sc) of
       -- BORROW: the function value sits at a NAMED call head, owned by its binder;
       -- the application reads it and Perceus drops it at its last use.
-      Just fv -> enterRC True prims fv args k s
+      Just fv -> enterRC True env fv args k s
       -- The general by-hint prim fallback is GONE (#12): a missing 'AVar' is a
       -- loud 'UnboundVar', not a same-named builtin (which now reaches us only as
       -- an 'APrim'). The ONE exception is the three Perceus-SYNTHESIZED RC
@@ -306,8 +342,8 @@ callFn prims sc f args k s = case f of
             -- @__rc_drop_reuse@ joins @__rc_dup@/@__rc_drop@ as a
             -- compiler-SYNTHESIZED RC intrinsic (emitted by the FBIP post-pass as
             -- an 'AVar'-with-hint, never an extern), resolved here by HINT.
-            case Map.lookup (nameHint n) prims of
-              Just p  -> enterPrim prims p args k s
+            case Map.lookup (nameHint n) (rcePrims env) of
+              Just p  -> enterPrim env p args k s
               Nothing -> throwE (UnboundVar (nameHint n))
         | otherwise -> throwE (UnboundVar (nameHint n))
 
@@ -321,9 +357,9 @@ callFn prims sc f args k s = case f of
 -- over-application continuation, a prim's over-application result, or a 'PRApply'
 -- function value) that the application OWNS and must consume, since no IR binder
 -- (and therefore no Perceus drop) can reach it.
-enterRC :: Bool -> RCPrimTable -> RCValue -> [RCValue] -> RCKont -> Store
+enterRC :: Bool -> RCEnv -> RCValue -> [RCValue] -> RCKont -> Store
         -> RC RCConfig
-enterRC borrowHead _ fv args k s = case fv of
+enterRC borrowHead env fv args k s = case fv of
   RVBox addr -> do
     c <- deref addr s
     case cNode c of
@@ -385,7 +421,7 @@ enterRC borrowHead _ fv args k s = case fv of
         case compare na np of
           EQ -> do
             s'  <- increfOwned s
-            pure (REval body (RCScope (bindRCBinders ps args cenv) Map.empty) (deferConsume k) s')
+            enterBodyRC env body (RCScope (bindRCBinders ps args cenv) Map.empty) (deferConsume k) s'
           LT -> do
             -- Partial application: allocate a fresh closure that SHARES the original's
             -- captures plus the supplied args (moved in from the caller). It keeps the
@@ -416,8 +452,8 @@ enterRC borrowHead _ fv args k s = case fv of
           GT -> do
             let (use, over) = splitAt np args
             s'  <- increfOwned s
-            pure (REval body (RCScope (bindRCBinders ps use cenv) Map.empty)
-                     (KAppRC over (deferConsume k)) s')
+            enterBodyRC env body (RCScope (bindRCBinders ps use cenv) Map.empty)
+                     (KAppRC over (deferConsume k)) s'
       -- RESUME of a reified continuation (M2b-1 Task 5; spec §4.3 RESUME). Applying
       -- the boxed 'NCont' handle (the op-arm @resume@ binder) MOVES the captured
       -- frames back onto the live 'Kont': 'spliceKont' re-prepends the prefix and
@@ -504,9 +540,9 @@ enterRC borrowHead _ fv args k s = case fv of
             -- left untouched here.
             deferEnv kont = if borrowHead then kont else KDropCellRC envAddr kont
         case compare na np of
-          EQ -> pure (REval body (RCScope (callEnv args) Map.empty) (deferEnv k) s)
+          EQ -> enterBodyRC env body (RCScope (callEnv args) Map.empty) (deferEnv k) s
           GT -> let (use, over) = splitAt np args
-                in pure (REval body (RCScope (callEnv use) Map.empty) (KAppRC over (deferEnv k)) s)
+                in enterBodyRC env body (RCScope (callEnv use) Map.empty) (KAppRC over (deferEnv k)) s
           LT -> do
             -- Partial application: allocate an ordinary closure that captures the
             -- already-supplied args (bound to the consumed params), the siblings,
@@ -557,9 +593,9 @@ enterRC borrowHead _ fv args k s = case fv of
 -- | Apply a primitive to args, accumulating for currying and threading the
 -- store. Mirrors the reference 'enter' prim branch, sans the 'PRDrive'
 -- scheduler seam (absent in the no-handler fragment).
-enterPrim :: RCPrimTable -> RCPrim -> [RCValue] -> RCKont -> Store
+enterPrim :: RCEnv -> RCPrim -> [RCValue] -> RCKont -> Store
           -> RC RCConfig
-enterPrim prims p args k s =
+enterPrim env p args k s =
   let combined = rpArgs p ++ args in
   if length combined < rpArity p
     then
@@ -576,12 +612,12 @@ enterPrim prims p args k s =
           | null over -> pure (RReturn v k s')
           -- OWNED: the prim returned a function value we now over-apply; it is an
           -- anonymous intermediate the application consumes (no Perceus drop).
-          | otherwise -> enterRC False prims v over k s'
+          | otherwise -> enterRC False env v over k s'
         PRApply g gargs ->
           -- The function being applied (e.g. ($)'s first arg) is a value handle,
           -- not a prim name, so dispatch via 'enterRC'. It is an OWNED intermediate
           -- delivered by the prim, consumed by the application.
-          enterRC False prims g (gargs ++ over) k s'
+          enterRC False env g (gargs ++ over) k s'
 
 -- ---------------------------------------------------------------------------
 -- Case matching (deref the scrutinee handle, match over the NCon node)
@@ -698,6 +734,10 @@ rcFindHandler mTarget lbl op = go id
     go acc (KLetRC b e sc k)     = go (acc . KLetRC b e sc) k
     go acc (KAppRC vs k)         = go (acc . KAppRC vs) k
     go acc (KDropCellRC a k)     = go (acc . KDropCellRC a) k
+    -- Totality only: an arena bracket frame never co-occurs with a handler search
+    -- (arena-opening bodies are in the handler-free fragment), so this is never
+    -- exercised; accumulate it into the prefix for completeness.
+    go acc (KArenaCloseRC k)     = go (acc . KArenaCloseRC) k
     go acc (KHandleRC h tag sc k)
       | matches h                = Just (acc, h, tag, sc, k)
       | otherwise                = go (acc . KHandleRC h tag sc) k
@@ -749,14 +789,66 @@ rcDispatchOp mTarget lbl op vs kCur s =
           pure (REval (oaBody oa) (RCScope env2 (rscJoins hsc)) kBelow s')
 
 -- ---------------------------------------------------------------------------
+-- Region Slice R1: the function-body arena bracket (spec §4.2)
+
+-- | True iff this body OPENS an arena: it routes at least one 'Arena'-tagged
+-- allocation OF ITS OWN (Region Slice R1). Walks the body's allocation 'Let's but
+-- does NOT descend into a nested 'RLam' body -- a nested lambda is a SEPARATE
+-- activation that brackets ITS OWN arena on its own 'enterRC'. So the predicate
+-- attributes each 'Arena' binder to the NEAREST enclosing body, matching the
+-- placement's per-activation escape verdict. An empty plan ('rcePlacement') never
+-- finds an 'Arena' tag, so no body opens an arena -- the test-seam default.
+bodyOpensArena :: Map Unique Placement -> Expr -> Bool
+bodyOpensArena plc = go
+  where
+    isArenaBinder bd = Map.lookup (binderUnique bd) plc == Just Arena
+    go (Ret _)            = False
+    -- A 'Let'-bound allocation is this body's iff its binder is tagged 'Arena'.
+    -- 'goRhs' deliberately STOPS at an 'RLam' (a nested activation, not this one).
+    go (Let bd r e)       = isArenaBinder bd || goRhs r || go e
+    go (LetRec _ e)       = go e   -- LetRec members are FUNCTION bodies (own frames)
+    go (Case _ alts)      = any goAlt alts
+    go (LetJoin _ _ jb e) = go jb || go e
+    go (Jump _ _)         = False
+    go (Handle e h)       = go e || go (snd (hReturn h))
+                              || any (go . oaBody) (hOps h)
+    goAlt (AltCon _ _ e)  = go e
+    goAlt (AltLit _ e)    = go e
+    goAlt (AltDefault e)  = go e
+    -- An 'RLam' RHS is a DIFFERENT activation: do not look inside it.
+    goRhs RLam{}          = False
+    goRhs _               = False
+
+-- | Enter a function/CAF/lambda body, applying the arena bracket (Region Slice R1,
+-- spec §4.2). If the body opens an arena ('bodyOpensArena'), 'arenaOpenRC' the
+-- store and push a 'KArenaCloseRC' frame ABOVE the body's continuation @k@, so the
+-- arena closes structurally on EVERY exit path (normal return, tail call, body-
+-- local 'Jump'). Otherwise it is exactly @pure (REval body sc k s)@ -- no bracket,
+-- no behaviour change.
+--
+-- JUMP INVARIANT (why a 'Jump' can never skip the close): a 'Jump' inside this
+-- body always targets a join defined WITHIN this body (wok's ANF property -- a
+-- closure/function body is evaluated with a FRESH 'RCScope ... Map.empty', so its
+-- 'rscJoins' holds only its own 'LetJoin's; no outer-activation join is in scope).
+-- That join's saved continuation was captured AFTER the bracket was pushed, so it
+-- still threads through this 'KArenaCloseRC'. So jumping cannot route the body's
+-- result past the bracket to an outer-activation continuation.
+enterBodyRC :: RCEnv -> Expr -> RCScope -> RCKont -> Store -> RC RCConfig
+enterBodyRC env body sc k s
+  | bodyOpensArena (rcePlacement env) body = do
+      s' <- arenaOpenRC s
+      pure (REval body sc (KArenaCloseRC k) s')
+  | otherwise = pure (REval body sc k s)
+
+-- ---------------------------------------------------------------------------
 -- Drivers
 
 -- | Run a configuration to a final value, threading the store.
-runRC :: RCPrimTable -> RCConfig -> RC (RCValue, Store)
-runRC prims = loop
+runRC :: RCEnv -> RCConfig -> RC (RCValue, Store)
+runRC env = loop
   where
     loop cfg = do
-      st <- stepRC prims cfg
+      st <- stepRC env cfg
       case st of
         RDone v s -> pure (v, s)
         RMore c   -> loop c
@@ -766,9 +858,27 @@ runRC prims = loop
 -- supplied by the caller (typically 'emptyStore' or a store pre-loaded with a
 -- static globals region). Runs the RC loop and discharges the 'ExceptT'/'IO' at
 -- this public boundary.
+--
+-- ARENA ROUTING IS OFF here: this seam uses an EMPTY region plan, so every alloc
+-- is 'Heap' and no body opens an arena. (The store-algebra and machine unit tests
+-- that call it expect the counted-only behaviour.) The whole-module runner uses
+-- 'runExprRCBracketed', which threads the real plan and brackets the top-level
+-- body.
 runExprRC :: RCPrimTable -> REnv -> Store -> Expr -> IO (Either RuntimeError (RCValue, Store))
 runExprRC prims env s e =
-  runExceptT (runRC prims (REval e (RCScope env Map.empty) KDoneRC s))
+  let renv = RCEnv prims Map.empty
+  in runExceptT (runRC renv (REval e (RCScope env Map.empty) KDoneRC s))
+
+-- | The whole-module run seam (Region Slice R1): like 'runExprRC' but threads the
+-- supplied 'RCEnv' (carrying the region plan) AND applies the arena bracket to the
+-- TOP-LEVEL body via 'enterBodyRC'. Used for 'main' and each forced CAF body, so a
+-- top-level function whose own body routes an 'Arena' alloc opens/closes its arena
+-- exactly like a called closure body.
+runExprRCBracketed :: RCEnv -> REnv -> Store -> Expr -> IO (Either RuntimeError (RCValue, Store))
+runExprRCBracketed renv env s e =
+  runExceptT $ do
+    cfg <- enterBodyRC renv e (RCScope env Map.empty) KDoneRC s
+    runRC renv cfg
 
 -- ---------------------------------------------------------------------------
 -- Whole-module entry
@@ -858,7 +968,22 @@ runModuleRCUnchecked = runModuleRCUncheckedWith AbstractHeap
 -- | 'runModuleRCUnchecked' parameterized by the heap backend (see
 -- 'runModuleRCWith'). 'runModuleRCUnchecked' is the 'AbstractHeap' specialization.
 runModuleRCUncheckedWith :: HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
-runModuleRCUncheckedWith backend (CoreModule binds) = runExceptT $ do
+runModuleRCUncheckedWith backend cm@(CoreModule binds) = runExceptT $ do
+  -- 0. REGION ROUTING PLAN (Region Slice R1, spec §4.1-§4.2). The plan tags each
+  --    allocation 'Arena' | 'Heap' and is the single artifact the alloc sites and
+  --    the body bracket read. The plan is only INSTALLED when the boundary guard
+  --    'firstOrderNoHandlerViolations' admits the module: 'arenaEscapes' (§5.1)
+  --    omits handler-arm bodies, sound ONLY because that guard rejects a handler
+  --    arm capturing an enclosing boxed local (Region.hs BOUNDARY-GUARD
+  --    DEPENDENCY). 'runModuleRCWith' runs the guard before reaching here, so the
+  --    plan is always live on the production path; this UNCHECKED entry (a test
+  --    seam for already-instrumented modules) re-checks it directly and falls back
+  --    to an EMPTY plan (all-'Heap', no arena) for a module the guard would reject,
+  --    so no arena ever opens for a program whose escape verdict is unsound.
+  let plan
+        | null (firstOrderNoHandlerViolations cm) = rpPlacement (planRegions cm)
+        | otherwise                               = Map.empty
+      renv = RCEnv rcPrimTable plan
   -- 1. Reserve a static address for every top-level bind, building the knotted
   --    static env (every global maps to its handle before any body runs) and a
   --    store pre-loaded with placeholder static cells. The store carries the
@@ -867,7 +992,7 @@ runModuleRCUncheckedWith backend (CoreModule binds) = runExceptT $ do
       s0b                  = s0 { stBackend = backend }
   -- 2. Install function closures and force constant (CAF) bodies into the store,
   --    threading it left-to-right; the env is refined with CAF result values.
-  (staticEnv, s1) <- installBinds rcPrimTable knotEnv binds s0b knotEnv addrs
+  (staticEnv, s1) <- installBinds renv knotEnv binds s0b knotEnv addrs
   -- 3. Snapshot the live-cell count AFTER all top-level binds are installed.
   --    Any cells already live at this point are immortal value-CAF results.
   --    This is the baseline: main's dynamic work should return stLive to exactly
@@ -876,7 +1001,7 @@ runModuleRCUncheckedWith backend (CoreModule binds) = runExceptT $ do
   -- 4. Locate and run 'main' (must be 0-arity), starting from the loaded store.
   case [ tb | tb@(TopBind n _ _) <- binds, nameHint n == Tx.pack "main" ] of
     (TopBind _ [] body : _) -> do
-      (v, s2) <- ExceptT (runExprRC rcPrimTable staticEnv s1 body)
+      (v, s2) <- ExceptT (runExprRCBracketed renv staticEnv s1 body)
       txt <- renderRCValueRC s2 v
       -- 5. Drop the result via its COUNTED children ('valueChildren'): an 'RVBox'
       --    releases its node, an 'RVRecMember' releases its shared 'NEnv', and a
@@ -912,14 +1037,14 @@ placeholderNode = NCon (Tx.pack "<uninstalled-global>") []
 -- into the env (eager, in bind order). 'main' keeps its placeholder cell (it is
 -- run explicitly by 'runModuleRC').
 installBinds
-  :: RCPrimTable
+  :: RCEnv         -- ^ the read-only interpreter context (prims + region plan)
   -> REnv          -- ^ the full knotted static env (closures capture this)
   -> [TopBind]     -- ^ binds, in order
   -> Store         -- ^ store carrying the reserved placeholder cells
   -> REnv          -- ^ accumulator env (refined with CAF results)
   -> [Addr]        -- ^ static address reserved for each bind, in order
   -> RC (REnv, Store)
-installBinds prims knotEnv = go
+installBinds renv knotEnv = go
   where
     go (TopBind n ps body : bs) s env (a : as)
       | not (null ps) =
@@ -928,7 +1053,10 @@ installBinds prims knotEnv = go
       | nameHint n == Tx.pack "main" =
           go bs s env as
       | otherwise = do
-          (v, s') <- ExceptT (runExprRC prims env s body)
+          -- The CAF body is bracketed too: a 0-arity top-level bind whose body
+          -- routes an 'Arena' alloc opens/closes its arena exactly like 'main' or a
+          -- called closure (Region Slice R1).
+          (v, s') <- ExceptT (runExprRCBracketed renv env s body)
           -- F2: write the forced CAF result back into its RESERVED static cell.
           -- Function binds are installed as 'NClosure' capturing the UNREFINED
           -- 'knotEnv', which maps this CAF's 'Unique' to its static handle

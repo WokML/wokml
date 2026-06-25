@@ -35,6 +35,7 @@ module Wok.IR.Escape
   , dropTargets
     -- * LetRec / closure escape + consume predicate family
   , escapesFrom
+  , arenaEscapes
   , rlamSiblingCaptureEscapes
   , letRecCapturesEnclosing
   , letRecEnclosingCaptures
@@ -386,9 +387,28 @@ data RhsStep = StepEscape | StepTrack | StepContinue
 -- and 'Jump' (terminal escapes), 'LetRec', 'Case' alts, 'LetJoin', 'Handle' --- is
 -- identical for both callers and lives here.
 escapeWalk :: Bool -> (Set Unique -> Binder -> Rhs -> RhsStep) -> Set Unique -> Expr -> Bool
-escapeWalk scrutEscapes step = goE
+escapeWalk scrutEscapes = escapeWalkLetRec scrutEscapes False
+
+-- | The shared escape traversal, generalised with a SECOND flag
+-- @letRecCaptureEscapes@ that controls how a 'LetRec' MEMBER BODY is treated:
+--
+--   * 'False' (the default --- 'escapesFrom', 'captureEscapesBody'): a member body
+--     is walked exactly like any other sub-expression with the caller's
+--     @scrutEscapes@, preserving the historical/frozen behaviour those two walkers
+--     were validated against.
+--   * 'True' (only 'arenaEscapes', Region Slice R1): a member body is a SEPARATE
+--     activation that CAPTURES enclosing locals into the shared env (an implicit
+--     store-into-cell = an escaping position, spec §5.1). So a tracked value
+--     occurring ANYWHERE in a member body escapes the current activation --- the
+--     member descent forces @scrutEscapes@ True. This TIGHTENS 'arenaEscapes' so a
+--     boxed local captured by a 'LetRec' is never arena-routed (it would dangle if
+--     the group's env outlived the activation), WITHOUT losing 'arenaEscapes's
+--     in-place-match relaxation for the CURRENT body.
+escapeWalkLetRec
+  :: Bool -> Bool -> (Set Unique -> Binder -> Rhs -> RhsStep) -> Set Unique -> Expr -> Bool
+escapeWalkLetRec scrutEscapes0 letRecCaptureEscapes step = goE scrutEscapes0
   where
-    goE tracked e =
+    goE scrutEscapes tracked e =
       let hit a = case a of
             AVar n -> nameUniq n `Set.member` tracked
             ALit _ -> False
@@ -398,15 +418,70 @@ escapeWalk scrutEscapes step = goE
         Jump _ as           -> any hit as                -- terminal escape
         Let bd r body       -> case step tracked bd r of
           StepEscape   -> True
-          StepTrack    -> goE (Set.insert (binderUnique bd) tracked) body
-          StepContinue -> goE tracked body
-        LetRec ds body      -> any (\(_, _, d) -> goE tracked d) ds || goE tracked body
-        Case a alts         -> (scrutEscapes && hit a) || any (goAlt tracked) alts
-        LetJoin _ _ jb body -> goE tracked jb || goE tracked body
-        Handle e' _         -> goE tracked e'
-    goAlt tracked (AltCon _ _ e) = goE tracked e
-    goAlt tracked (AltLit _ e)   = goE tracked e
-    goAlt tracked (AltDefault e) = goE tracked e
+          StepTrack    -> goE scrutEscapes (Set.insert (binderUnique bd) tracked) body
+          StepContinue -> goE scrutEscapes tracked body
+        LetRec ds body
+          -- ARENA LETREC-CAPTURE FENCE (Region Slice R1, spec §5.1, §5.3; guarded
+          -- by @letRecCaptureEscapes@ so 'escapesFrom'/'captureEscapesBody' --- which
+          -- pass False --- never reach this branch and stay byte-identical). ANY free
+          -- occurrence of a tracked value in a member body is a CAPTURE into the
+          -- group's shared 'NEnv', which can outlive the activation (the group, or a
+          -- member, may escape). That includes a capture used purely as a CALL HEAD
+          -- (@let f x = p x@): @aliasEscapeStep@'s @escapingAtomsRhs (RApp _ as)@
+          -- EXEMPTS the head, so a head-only capture is invisible to the per-'Let'
+          -- walk below and the @memberScrut@ flag (which only governs the 'Case'
+          -- SCRUTINEE rule) does not catch it either. We therefore test raw
+          -- 'freeVarsExpr' membership over the member bodies --- the same union
+          -- 'letRecEnclosingCaptures' uses --- so a head-only capture escapes too.
+          -- LOAD-BEARING: this 'freeVarsExpr'-intersection guard is the SOLE trap for
+          -- a head-only 'LetRec' capture (the use-after-free fix). It MUST NOT be
+          -- removed: 'aliasEscapeStep' exempts a call HEAD, so a tracked value used
+          -- only as @let f x = p x@ is invisible to the per-'Let' walk in the
+          -- @otherwise@ branch below. Removing this guard silently reintroduces the
+          -- LetRec head-capture UAF (corpus 05-letrec-head-capture-escape.wok).
+          | letRecCaptureEscapes
+          , any (\(_, _, d) -> not (Set.null (tracked `Set.intersection` freeVarsExpr d))) ds
+          -> True
+          | otherwise ->
+              -- Use the caller's @scrutEscapes@ unchanged. When @letRecCaptureEscapes@
+              -- is True the guard above already returned True for any tracked var free
+              -- in a member body, so this branch runs ONLY when no tracked var occurs
+              -- in any member -- a @scrutEscapes || letRecCaptureEscapes@ widening here
+              -- would be a NO-OP (nothing to find) and could mislead a reader into
+              -- mistaking it, not the @freeVarsExpr@ guard, for the load-bearing trap.
+              any (\(_, _, d) -> goE scrutEscapes tracked d) ds
+                   || goE scrutEscapes tracked body
+        Case a alts         -> (scrutEscapes && hit a) || any (goAlt scrutEscapes tracked) alts
+        LetJoin _ _ jb body -> goE scrutEscapes tracked jb || goE scrutEscapes tracked body
+        Handle e' _         -> goE scrutEscapes tracked e'
+    goAlt scrutEscapes tracked (AltCon _ _ e) = goE scrutEscapes tracked e
+    goAlt scrutEscapes tracked (AltLit _ e)   = goE scrutEscapes tracked e
+    goAlt scrutEscapes tracked (AltDefault e) = goE scrutEscapes tracked e
+
+-- | The SHARED per-'Let'-'Rhs' policy for the two general escape walkers
+-- 'escapesFrom' and 'arenaEscapes'. They differ ONLY in the @scrutEscapes@ flag
+-- handed to 'escapeWalk' (whether a 'Case' scrutinee counts as an escape); the
+-- per-'Rhs' decision is identical, so it lives here once. A tracked value occurs
+-- in an escaping position iff one of the RHS's escaping atoms ('escapingAtomsRhs',
+-- the single source of truth) names it; the alias-rename special case (a
+-- tracked-to-tracked 'RAtom' rename) is FOLLOWED, not counted, and is matched
+-- FIRST so it never double-counts. Intentionally MODULE-INTERNAL (not exported):
+-- it is a private detail of how the two walkers share their policy.
+aliasEscapeStep :: Set Unique -> Binder -> Rhs -> RhsStep
+aliasEscapeStep tracked _ r = case r of
+  -- Pure alias rename of a tracked value: follow it, do not count the
+  -- occurrence as an escape. The new binder joins the tracked set.
+  RAtom (AVar n)
+    | nameUniq n `Set.member` tracked -> StepTrack
+  -- A tracked value occurs in an escaping position iff one of the RHS's escaping
+  -- atoms (single source of truth) names it. The alias-rename case is matched
+  -- FIRST, so it never double-counts.
+  _ | any hit (escapingAtomsRhs r) -> StepEscape
+    | otherwise                    -> StepContinue
+  where
+    hit (AVar n) = nameUniq n `Set.member` tracked
+    hit (ALit _) = False
+    hit (APrim _) = False
 
 -- | The alias-following escape walker. @tracked@ is the set of binders that ALIAS
 -- the value (an original binder plus every @let x = AVar u@ rename of a tracked
@@ -414,27 +489,45 @@ escapeWalk scrutEscapes step = goE
 -- that is not itself a pure alias-rename. An alias-rename is NOT an escape: it
 -- just extends @tracked@ and the question recurses on the new name.
 --
--- Expressed as the shared 'escapeWalk' (a 'Case' scrutinee DOES escape here). The
--- per-'Rhs' escape step uses the SAME 'escapingAtomsRhs' (the single source of
--- truth) as 'nonHeadOccsRhs', keeping only this walker's alias-rename special case
--- (a tracked-to-tracked 'RAtom' rename is FOLLOWED, not counted).
+-- Expressed as the shared 'escapeWalk' (a 'Case' scrutinee DOES escape here),
+-- with the shared 'aliasEscapeStep' policy.
 escapesFrom :: Set Unique -> Expr -> Bool
-escapesFrom = escapeWalk True step
-  where
-    hit tracked a = case a of
-      AVar n -> nameUniq n `Set.member` tracked
-      ALit _ -> False
-      APrim _ -> False
-    step tracked _ r = case r of
-      -- Pure alias rename of a tracked value: follow it, do not count the
-      -- occurrence as an escape. The new binder joins the tracked set.
-      RAtom (AVar n)
-        | nameUniq n `Set.member` tracked -> StepTrack
-      -- A tracked value occurs in an escaping position iff one of the RHS's
-      -- escaping atoms (single source of truth) names it. The alias-rename case is
-      -- matched FIRST, so it never double-counts.
-      _ | any (hit tracked) (escapingAtomsRhs r) -> StepEscape
-        | otherwise                              -> StepContinue
+escapesFrom = escapeWalk True aliasEscapeStep
+
+-- | The REGION-ROUTING non-escape walker (Region Slice R1 fence #3, spec §5.1).
+-- Identical to 'escapesFrom' EXCEPT a 'Case' scrutinee that names a tracked value
+-- does NOT count as an escape: matching @p@ in place CONSUMES @p@ within the
+-- activation rather than flowing it OUT, so it does not bar @p@ from the arena.
+-- Every position that IS a real escape --- the return value, a 'Jump', a
+-- CONSUMING call argument, a constructor/record/closure field, a captured
+-- continuation --- is still caught, because the per-'Rhs' policy is the SAME
+-- 'aliasEscapeStep' (the full 'escapingAtomsRhs' set) that 'escapesFrom' uses.
+--
+-- WHY NO CHILD-TRACKING IS NEEDED (the §5.1 side-condition holds without it). A
+-- boxed value extracted from a matched scrutinee and then escaped (e.g.
+-- @case p of Pair a b -> Ret a@) is sound with @p@ in the arena: that value was
+-- stored INTO @p@ via a constructor field, which is itself an escaping position,
+-- so the value's OWN allocation is independently 'Heap' (counted). Nothing
+-- reachable from an arena cell is itself an arena cell, so bulk-freeing @p@ at
+-- scope close dangles nothing --- the close scan-out (§4.3) drops @p@'s counted
+-- reference to the child, which survives on its own count.
+--
+-- HANDLER-ARM OMISSION (deliberate; relies on the boundary guard). Like every
+-- 'escapeWalk' walker, this does NOT descend into handler-arm bodies
+-- (@Handle e' _ -> goE tracked e'@). For region routing that is sound ONLY
+-- because the boundary guard 'Wok.IR.Reachable.firstOrderNoHandlerViolations'
+-- rejects any admitted program whose handler arm references an enclosing BOXED
+-- local --- so no arena-candidate boxed local can occur in a handler arm of its
+-- own body, leaving no escape-through-an-arm to miss. The region pass's consumer
+-- (Task 5) must run that guard before opening any arena. See the matching note in
+-- 'Wok.IR.Region.placeLet'.
+arenaEscapes :: Set Unique -> Expr -> Bool
+-- @scrutEscapes = False@ (the in-place-match relaxation), but
+-- @letRecCaptureEscapes = True@: a tracked value used inside a 'LetRec' member
+-- body is a CAPTURE into the shared env (which can outlive the activation), so it
+-- escapes the arena even though a direct in-place 'Case' match in the CURRENT body
+-- does not. See 'escapeWalkLetRec'.
+arenaEscapes = escapeWalkLetRec False True aliasEscapeStep
 
 -- ---------------------------------------------------------------------------
 -- FINDING 1 (consuming captures, DEFERRED)

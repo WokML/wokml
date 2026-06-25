@@ -172,6 +172,183 @@ unsound. That is an abstract-interpreter detail, not part of the C ABI.)
 The differential oracle validates that abstract-interpreter `stPeakBytes` matches the C
 runtime's `wok_stat_peak_bytes` on all test-suite runs.
 
+## Self-policing PHYSICAL-memory invariant
+
+The oracle above checks **logical** accounting (live bytes via `cur_bytes`/`peak_bytes`,
+`allocs`/`frees`). It is structurally **blind to physical memory** — the slabs the runtime
+holds from the OS. A bug can grow slabs **without bound** (O(number of cycles)) while the byte
+accounting stays perfectly balanced; LeakSanitizer misses it too (the slabs are freed at heap
+teardown, just accumulated during the run). This is a whole *class* of bug, not one site.
+
+Rather than chase it with one ad-hoc bounded-ness test per allocator, the allocator
+**self-polices**: it tracks its own physical high-water and asserts a bound against the logical
+high-water, so **every test that runs the runtime checks the class for free** (the whole suite,
+under sanitizers).
+
+### `wok_stat_peak_physical_bytes`
+
+```c
+uint64_t wok_stat_peak_physical_bytes(const WokHeap* h);  // WOK_PURE
+```
+
+The high-water **physical** bytes the heap held from the OS — every slab `malloc`
+(`WOK_ARENA_SIZE` each, counted and arena regions) plus every large-object/array `malloc`
+(arity ≥ 64 / len ≥ 63). On the `WOK_RC_MALLOC` backend (one `malloc` per cell) physical tracks
+logical closely. Distinct from `peak_bytes` (logical live bytes): `peak_physical` is the
+structural memory the process retained at its worst, regardless of how densely the logical bytes
+packed into the slabs. **Additive**, mirroring `wok_stat_peak_bytes`; bound Haskell-side as
+`wokStatPeakPhysicalBytes`. The **tracking is always-on** (two adds at the malloc boundary —
+cheap), present in both the interpreter build and the sanitizer build.
+
+### The bound (heuristic, debug/sanitizer-build only)
+
+A bump+free-list allocator packs densely, so physical high-water stays within a bounded factor
+of logical high-water, plus an additive slab-granularity headroom for small programs (a tiny
+program holds whole slabs against a few bytes of logical data — that ratio is unbounded, which
+is why the additive term, not a pure ratio, is needed):
+
+```
+peak_physical_bytes  <=  K * peak_logical_bytes  +  C * WOK_ARENA_SIZE
+```
+
+`peak_logical_bytes` is the high-water of total live logical bytes (counted `cur_bytes` + arena
+`arena_bytes`, the peak of the **sum**). **K = 4, C = 8** (8 slabs = 512 KiB). K covers the
+trailing half-empty slab of each region plus free-list slack (~2x measured) with headroom; C is
+the slab-granularity floor for small programs and arena nesting depth. Measured per-heap margins:
+the heaviest workloads (T10 grow-heavy 200-cycle arena, 9000-cell deep lists, large arrays,
+counted+arena concurrent) all sit at ≥ 4.2x slack under the bound, while a seeded slab-orphaning
+leak blows straight past it.
+
+The bound is checked where it is cheap and catches early — at each slab `malloc` (after the
+physical high-water updates) and at `wok_heap_free`. On violation it prints
+`peak_physical=… peak_logical=… bound=…` and `abort()`s.
+
+**Gating.** Only the `abort()` assertion is gated, behind `WOK_RC_CHECK_PHYSICAL` — a *release*
+build must never abort on a memory heuristic. `scripts/asan-runtime.sh` defines it (plus
+`WOK_RC_PHYSICAL_TEST_HOOK`) so the assertion is active across all of T1–T10 + the deep tests —
+the "checked everywhere for free" payoff. The cabal/interpreter build (`wok.cabal`, `-O3`) does
+**not** define it, so the interpreter gets the cheap tracking without the heuristic abort.
+
+### Negative + positive controls
+
+`runtime/test/wok_arena_test.c` carries the permanent controls:
+
+- **T11 (negative control, death test):** a test-only hook `wok_test_orphan_slabs(h, n)`
+  (compiled only under `WOK_RC_PHYSICAL_TEST_HOOK`) mallocs `n` slabs and folds them into the
+  physical high-water with **no** logical allocation — exactly the slab-orphaning shape. Under
+  `WOK_TEST_DEATH=physical` the invariant `abort()` **must** fire (SIGABRT / exit 134). The asan
+  script runs this and fails if it does *not* abort (a regression that left the assertion inert).
+- **T12 (positive control):** a grow-heavy-then-free workload (T10-shaped) where the invariant
+  holds — `peak_physical` stays bounded (~2 slabs, recycled, not O(cycles)) and never trips.
+
+> **Interpreter-era / codegen-transitional.** This entire physical-memory concern —
+> slabs, free-lists, the bump arena, and this invariant — is **replaced when codegen lands**
+> (the arena becomes a stack frame, etc.). It is deliberately a **cheap runtime self-check**, not
+> long-lived test infrastructure: it exists to police the interpreter-era allocator, and it goes
+> away with the model it polices.
+
+## Per-activation arena tier (uncounted, Region Slice R1)
+
+An **uncounted arena** is a separate bump region within the `WokHeap`, dedicated to storing
+**provably non-escaping function-local allocations**. Region cells live for the duration of
+their activation and are reclaimed wholesale in O(1) when the activation ends, with no
+reference-counting overhead.
+
+### Motivation
+
+Function-local allocations (scratch cohorts created and consumed within a function body)
+need not pay the full RC tax — per-cell `dup`/`drop` writes + the cascade walk on drop.
+An arena routes these to a *separate, uncounted tier* (identical cell layout, inert RC),
+reclaimed in bulk at scope close via a fast frontier reset. The win is measurable in the
+differential oracle: reduced counted `allocs`/`frees` for any module that routes locally-
+bound values to the arena, and a new `arena_bytes`/`arena_peak` stat tracking the arena's
+high-water usage.
+
+### ABI
+
+An arena is opened at the start of a function body and closed at every exit (normal return
+and all tail-call jumps):
+
+```c
+uint32_t wok_arena_open(WokHeap* h);                                /* push checkpoint; returns depth handle */
+WokObj*  wok_arena_alloc(WokHeap* h, uint32_t tag, uint32_t arity); /* uncounted bump alloc in innermost arena */
+void     wok_arena_close(WokHeap* h, uint32_t handle);              /* assert handle == top of stack; reset frontier */
+
+uint64_t wok_stat_arena_bytes(const WokHeap* h);   /* WOK_PURE; current arena usage (sum of live cells) */
+uint64_t wok_stat_arena_peak(const WokHeap* h);    /* WOK_PURE; high-water arena bytes */
+```
+
+- `wok_arena_open` pushes the current arena frontier and returns a depth handle.
+- `wok_arena_alloc` bump-allocates an **uncounted cell** in the innermost open arena (RC field
+  unused; cell layout identical to a counted `NCon`). The cell consumes 8 + 8*arity bytes.
+- `wok_arena_close` asserts the handle matches the checkpoint stack's top and **resets the
+  arena frontier** to the saved checkpoint, reclaiming all arena cells in O(1). A mismatched
+  handle aborts loudly (a fence against LIFO violations).
+
+### The separate arena region
+
+The arena is a **distinct bump allocator** within `WokHeap` — its own slabs and frontier
+pointer, never interleaved with the **counted RC slab allocator**. This is essential:
+- During an open scope, the interpreter may allocate both `Arena` cells (non-escaping) and
+  `Heap` cells (escaping values) in program order.
+- If both bumped one shared frontier, resetting it at close would retroactively reclaim
+  counted cells allocated *after* the checkpoint — a use-after-free. Separate regions make
+  close reset *only* arena cells.
+- A counted cell is freed individually via `wok_free` (unchanged) when its RC reaches zero.
+  Arena cells have no refcount lifecycle; they are freed only by `wok_arena_close`.
+
+### Uncounted cells: inert dup/drop
+
+A cell allocated via `wok_arena_alloc` has its RC field **unused**. The interpreter's
+`wok_dup`/`wok_dec` functions recognize arena addresses via a private `isUncountedAddr`
+predicate and **do nothing** (making the Perceus pass's drop-on-last-use safe, even if
+Perceus emits a drop on an arena binder — the drop is a runtime no-op). The cell is never
+freed individually; it is reclaimed only by `wok_arena_close`.
+
+### Close: scan-out then O(1) reset (the core win)
+
+An arena cell may hold **counted children** (e.g., a constructor `Box` with a field holding
+a counted RC-heap value). Before closing:
+
+1. **Scan-out:** for each arena cell at this depth, extract its counted children (via the
+   cell's descriptor), call `wok_dec` on each, and if any RC reaches zero, cascade the
+   normal recursive free (exactly as the program would if the cell were being dropped).
+   Arena cells of the same depth that are children are **skipped** (uncounted; they die in
+   the bulk reset).
+2. **Bulk reset:** reset the arena's frontier to the checkpoint, reclaiming all arena cells
+   at this depth in one operation.
+
+The **fast path** (pure-data cohort: all `Inline` or arena children) has an empty scan-out
+and is O(1). The **general path** pays only for the counted children that must cascade
+anyway.
+
+### Arena statistics
+
+Arena bytes are tracked separately from the counted RC heap:
+- `wok_stat_arena_bytes` — current usage (sum of 8 + 8*arity for each live arena cell).
+- `wok_stat_arena_peak` — high-water bytes during the run.
+- The counted heap's `wok_stat_allocs` / `wok_stat_frees` / `wok_stat_peak_bytes` are
+  **unaffected** by arena cells (they use separate counters), so the differential oracle can
+  compare reduced counted stats between backends.
+
+### Nesting and LIFO discipline
+
+Opens and closes are **LIFO** (a checkpoint stack), mirroring the runtime call stack. Each
+open returns a depth handle; `close` asserts the handle matches the stack's top. A mismatched
+close (e.g., closing a parent scope before a child) aborts the runtime. Nested arenas reuse
+the same region; the frontier is restored per-checkpoint.
+
+### Cross-backend equivalence
+
+Both the C runtime (`wok_arena_*` calls) and the abstract-heap interpreter (a mirrored
+`stArena` address set with scan-out logic) implement the same uncounted semantics, so the
+differential oracle validates:
+- Output byte-identical for both backends.
+- Reduced counted `allocs`/`frees` match between backends (the headline win).
+- `arena_bytes` and `arena_peak` match between backends.
+- **Arena-leak invariant:** `arena_bytes` returns to its pre-open value after each close;
+  every open is matched by a close.
+
 ## Function ABI
 
 All state lives in a per-run, opaque `WokHeap` context — there is **no global runtime
@@ -199,6 +376,8 @@ uint64_t wok_stat_allocs(const WokHeap* h);       // WOK_PURE
 uint64_t wok_stat_frees(const WokHeap* h);        // WOK_PURE
 int64_t  wok_stat_live(const WokHeap* h);         // WOK_PURE
 int64_t  wok_stat_peak(const WokHeap* h);         // WOK_PURE
+uint64_t wok_stat_peak_bytes(const WokHeap* h);          // WOK_PURE; logical live-byte high-water
+uint64_t wok_stat_peak_physical_bytes(const WokHeap* h); // WOK_PURE; physical (OS-held) high-water
 ```
 
 Notes on the contract:

@@ -1,0 +1,56 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-25-region-slice-r1.md",
+  "branch": "feat/region-slice-r1",
+  "spec": "docs/superpowers/specs/2026-06-25-region-slice-r1-design.md",
+  "tasks": [
+    {
+      "id": 9,
+      "subject": "Task 1: C uncounted-arena ABI + checkpoint stack + sanitizer tests",
+      "status": "completed",
+      "description": "**Goal:** Per-activation arena = LIFO checkpoint stack over the bump allocator, uncounted alloc, O(1) bulk reset; counted path untouched (design §3.1).\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.c\", \"runtime/wok_rc.h\", \"runtime/test\", \"scripts/asan-runtime.sh\"], \"verifyCommand\": \"bash scripts/asan-runtime.sh && cabal test wok-tests\", \"acceptanceCriteria\": [\"arena open/alloc/close round-trip with pointer-identity reuse\", \"LIFO nesting + mismatched-handle abort\", \"arena stats isolated; arena_bytes back to baseline after close\", \"ASan/UBSan/LSan clean; counted path unchanged\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 2: FFI bindings for the arena ABI",
+      "status": "completed",
+      "blockedBy": [9],
+      "description": "**Goal:** Bind wok_arena_open/alloc/close + wok_stat_arena_bytes/peak into Haskell.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Heap.hs\"], \"verifyCommand\": \"cabal build wok\", \"acceptanceCriteria\": [\"five wok_arena_* / arena-stat FFI imports added + exported\", \"module builds clean\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 3: Wok.IR.Region — the R+escape routing annotation",
+      "status": "completed",
+      "blockedBy": [10],
+      "description": "**Goal:** Pure pass tagging each function-body alloc Arena|Heap from Wok.IR.Escape under the three fences; mark arena-opening bodies (design §4.1, §5.1-5.4, §7).\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Region.hs\", \"src/Wok/IR/Escape.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-show-details=direct -k \\\"Region routing\\\"\", \"acceptanceCriteria\": [\"non-escaping boxed local -> Arena; return-escape -> Heap\", \"NArray -> Heap; continuation-capturing body -> all Heap\", \"planRegions pure/idempotent; reuses Escape.hs\", \"arena-opening function set computed\"], \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "Task 4: Abstract-heap arena mirror + uncounted semantics + scan-out",
+      "status": "completed",
+      "blockedBy": [11],
+      "description": "**Goal:** Abstract Store arena tier (oracle reference): uncounted arena addresses, arenaOpen/arenaClose mirror, scan-out counted children before bulk-reset (design §3.2, §4.3, §5.1, §5.5).\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-show-details=direct -k \\\"arena store\\\"\", \"acceptanceCriteria\": [\"stArena stack + arena stats; isUncounted arena case (dup/drop inert)\", \"arena alloc bypasses counted stats; arenaClose scans out counted children once then bulk-resets\", \"arena bytes + stLive return to baseline\", \"arena addresses FBIP-excluded\"], \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "Task 5: Interpreter routing + function-body arena bracket",
+      "status": "completed",
+      "blockedBy": [12],
+      "description": "**Goal:** Route alloc by tag; bracket arena-opening bodies with open … scan-out+close on every exit path (incl tail-call), both backends (design §4.2, §5.1, §5.3). If bracket placement intractable, narrow to leaf bodies + capture blocker.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Machine.hs\", \"src/Wok/Interp/RC/Value.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-show-details=direct -k \\\"rc\\\"\", \"acceptanceCriteria\": [\"alloc routed by Placement on both backends\", \"arena-opening body open/scan-out+close on every exit path incl tail-call; continuation body opens no arena\", \"no double/missed close; nothing live is arena-resident at close\", \"existing RC suite green\"], \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "Task 6: Differential-oracle extension + region corpus",
+      "status": "completed",
+      "blockedBy": [13],
+      "description": "**Goal:** Arena-stat parity + arena-leak invariant + four-shape test/rc-region corpus + negative-control teeth (design §6, §8, §9).\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\", \"test/rc-region/01-scratch-cohort.wok\", \"test/rc-region/02-escape-heap.wok\", \"test/rc-region/03-pure-fastpath.wok\", \"test/rc-region/04-counted-scanout.wok\"], \"verifyCommand\": \"cabal test wok-tests --test-show-details=direct -k \\\"rc\\\"\", \"acceptanceCriteria\": [\"arena_bytes/arena_peak parity abstract==C + arena-leak invariant\", \"four-shape corpus: scratch (counts drop), escape (heap), pure fastpath, counted scan-out\", \"byte-identical output + leak-freedom both backends\", \"negative-control teeth: mis-tag diverges the oracle\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "Task 7: Docs + memory + cleanup",
+      "status": "completed",
+      "blockedBy": [14],
+      "description": "**Goal:** Document the arena tier + routing; memory note region-slice-r1; cleanup.\n\n```json:metadata\n{\"files\": [\"runtime/README.md\", \"docs/superpowers/2026-06-24-array-region-valuemodel-arc.md\"], \"verifyCommand\": \"cabal test wok-tests\", \"acceptanceCriteria\": [\"runtime/README arena ABI documented\", \"arc doc R1 status updated\", \"memory note written\", \"no leftover scaffolding\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-25"
+}

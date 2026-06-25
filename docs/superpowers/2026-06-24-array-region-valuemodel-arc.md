@@ -186,6 +186,20 @@ the `Future` template), the multiplicity/one-shot analysis (`Multiplicity.hs`), 
 handler abort/resume hooks (`KHandleRC`, `cascadeChildren`, `moveOutCont`). Missing: runtime
 arena scoping (`wok_heap_checkpoint`/`reset` or a sub-`WokHeap`) and IR-level alloc routing.
 
+### Region Slice R1 — IMPLEMENTED (2026-06)
+
+**R + escape-routing** is now live on branch `feat/region-slice-r1` (not yet merged to main).
+The implementation is complete and differential-oracle green: inferred function-local arenas
+via Go-style escape analysis (`Wok.IR.Region`'s `Arena|Heap` routing annotation), routing
+non-escaping mutation-free locals → uncounted arena, escapees → RC heap. Both C runtime and
+abstract-heap backends ship the uncounted-arena tier (`wok_arena_open`/`alloc`/`close` + arena
+stats), with bit-for-bit parity validated by the differential oracle (reduced counted
+`allocs`/`frees`, new `arena_bytes`/`arena_peak` tracking, and the arena-leak invariant).
+The routing is a backend-agnostic IR annotation (codegen-transferable per design), and
+function-local arenas become **stack frames at codegen**. Honest limitation: arena routing
+is currently disabled module-wide when any handler is present (the deferred arena↔continuations
+interaction), so the win materialises only in handler-free modules.
+
 ---
 
 ## 7 · LoCal-in-region (the serialization endgame)

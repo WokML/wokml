@@ -5,8 +5,9 @@ module Wok.Interp.RC.Heap
   , wokAlloc, wokAllocAt, wokDup, wokDec, wokFree
   , wokSlotSet, wokSlotGet, wokTag, wokArity, wokRc
   , wokStatAllocs, wokStatFrees, wokStatLive, wokStatPeak
-  , wokStatPeakBytes
+  , wokStatPeakBytes, wokStatPeakPhysicalBytes
   , wokArrayAlloc, wokArrayLen, wokArrayElemKind, wokArraySlotGet, wokArraySlotSet
+  , wokArenaOpen, wokArenaAlloc, wokArenaClose, wokStatArenaBytes, wokStatArenaPeak
   ) where
 
 import Foreign.Ptr (Ptr)
@@ -33,8 +34,14 @@ foreign import ccall unsafe "wok_stat_frees"       wokStatFrees       :: Ptr Wok
 foreign import ccall unsafe "wok_stat_live"        wokStatLive        :: Ptr WokHeap -> IO Int64
 foreign import ccall unsafe "wok_stat_peak"        wokStatPeak        :: Ptr WokHeap -> IO Int64
 foreign import ccall unsafe "wok_stat_peak_bytes"  wokStatPeakBytes   :: Ptr WokHeap -> IO Word64
+foreign import ccall unsafe "wok_stat_peak_physical_bytes" wokStatPeakPhysicalBytes :: Ptr WokHeap -> IO Word64
 foreign import ccall unsafe "wok_array_alloc"     wokArrayAlloc    :: Ptr WokHeap -> Word64 -> Word8 -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_array_len"        wokArrayLen      :: Ptr WokObj -> IO Word64
 foreign import ccall unsafe "wok_array_elemkind"   wokArrayElemKind :: Ptr WokObj -> IO Word32
 foreign import ccall unsafe "wok_array_slot_get"   wokArraySlotGet  :: Ptr WokObj -> Word64 -> IO Word64
 foreign import ccall unsafe "wok_array_slot_set"   wokArraySlotSet  :: Ptr WokObj -> Word64 -> Word64 -> IO ()
+foreign import ccall unsafe "wok_arena_open"       wokArenaOpen     :: Ptr WokHeap -> IO Word32
+foreign import ccall unsafe "wok_arena_alloc"      wokArenaAlloc    :: Ptr WokHeap -> Word32 -> Word32 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_arena_close"      wokArenaClose    :: Ptr WokHeap -> Word32 -> IO ()
+foreign import ccall unsafe "wok_stat_arena_bytes" wokStatArenaBytes :: Ptr WokHeap -> IO Word64
+foreign import ccall unsafe "wok_stat_arena_peak"  wokStatArenaPeak  :: Ptr WokHeap -> IO Word64

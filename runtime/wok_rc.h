@@ -59,6 +59,17 @@ WOK_PURE uint64_t wok_stat_slabs(const WokHeap* h);
    real figure under WOK_RC_MALLOC; bound in Haskell as wokStatPeakBytes for benchmarking. */
 WOK_PURE uint64_t wok_stat_peak_bytes(const WokHeap* h);
 
+/* High-water PHYSICAL bytes held from the OS (slabs + large-object mallocs; the malloc
+   backend counts every per-cell malloc). Distinct from peak_bytes (LOGICAL live bytes):
+   peak_physical is the structural memory the process retained at its worst, regardless of
+   how densely the logical bytes packed into it. A self-policing invariant (debug/sanitizer
+   build) asserts peak_physical stays within a bounded factor of the logical high-water --
+   catching unbounded physical growth (the slab-orphaning bug class) that balanced byte
+   accounting and LeakSanitizer are both blind to. Additive, mirroring wok_stat_peak_bytes.
+   Interpreter-era infrastructure: the slab model is replaced at codegen, so this is a cheap
+   runtime self-check, not long-lived test infrastructure. */
+WOK_PURE uint64_t wok_stat_peak_physical_bytes(const WokHeap* h);
+
 /* ---- WokArray: a real C array cell (Slice B) ----------------------------------------
    Layout (always 8-aligned):
      offset  0  uint32 rc       \
@@ -80,5 +91,33 @@ WOK_PURE uint64_t wok_array_len(const WokObj* p);
 WOK_PURE uint32_t wok_array_elemkind(const WokObj* p);
 void     wok_array_slot_set(WokObj* p, uint64_t i, uint64_t word);
 WOK_PURE uint64_t wok_array_slot_get(const WokObj* p, uint64_t i);
+
+/* ---- Uncounted per-activation arena (Region Slice R1) -----------------------------
+   A LIFO checkpoint over the bump allocator. wok_arena_alloc returns an UNCOUNTED cell
+   (rc field unused). The whole arena is reclaimed in O(1) by wok_arena_close (reset the
+   bump frontier). The caller drops any counted children BEFORE close (a later Haskell
+   task). Arena bytes are tracked separately from allocs/frees/live/peak. */
+uint32_t wok_arena_open(WokHeap* h);                                /* push frontier; returns depth handle */
+WokObj*  wok_arena_alloc(WokHeap* h, uint32_t tag, uint32_t arity); /* uncounted bump alloc in innermost arena */
+void     wok_arena_close(WokHeap* h, uint32_t handle);              /* assert top==handle; reset frontier */
+WOK_PURE uint64_t wok_stat_arena_bytes(const WokHeap* h);
+WOK_PURE uint64_t wok_stat_arena_peak(const WokHeap* h);
+/* High-water count of distinct arena slabs ever malloc'd (slab backend; the malloc backend
+   has no slabs and reports 0). Counts mallocs, not live slabs -- a close recycles grown slabs
+   onto an internal free-list rather than freeing them, so repeated grow/close cycles reuse
+   slabs and this stays ~the peak concurrent need, NOT O(number of cycles). Symmetric with
+   wok_stat_slabs; consumed C-side by the standalone bounded-slab regression test. */
+WOK_PURE uint64_t wok_stat_arena_slabs(const WokHeap* h);
+
+/* ---- test-only physical-invariant hook (negative control) --------------------------
+   Compiled in only under WOK_RC_PHYSICAL_TEST_HOOK. Mallocs `n` slabs and folds their
+   bytes into the heap's PHYSICAL high-water WITHOUT any corresponding logical allocation,
+   simulating the slab-orphaning bug. With WOK_RC_CHECK_PHYSICAL active, a large `n` drives
+   peak_physical past the K*logical + C*slab bound and the self-policing assertion aborts.
+   The slabs are tracked so wok_heap_free reclaims them (no real leak under LSan when the
+   assertion is NOT firing). Never reachable from the codegen/interpreter path. */
+#ifdef WOK_RC_PHYSICAL_TEST_HOOK
+void wok_test_orphan_slabs(WokHeap* h, int n);
+#endif
 
 #endif /* WOK_RC_H */

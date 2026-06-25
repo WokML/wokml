@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- Arena routing: the NCon Pair (two U64 scalars) is C-eligible and does NOT
+-- escape the body of 'sumPair' -- it is only matched in place as the scrutinee.
+-- Expected: Pair -> Arena on both backends; arena_bytes > 0 during the run and
+-- back to 0 at scope close; counted allocs/frees are LOWER than they would be
+-- without arena routing (the Pair cell is not counted).
+
+data Pair = Pair U64 U64
+
+sumPair : U64 -> U64 -> U64
+sumPair x y =
+  let p = Pair x y in
+  case p of
+    Pair a b -> a + b
+
+main = sumPair 3 4

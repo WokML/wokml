@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok — Borrowership: coarsest to finest granularity</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --good:#1a7f4b; --warn:#c0392b; --hand:#8e44ad; --amber:#a86412; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:920px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.8rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.16rem;margin:48px 0 2px}
+  h3{font-size:.97rem;margin:18px 0 4px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  p{margin:.7em 0}
+
+  .slogan{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+  .slogan div{flex:1;min-width:240px;border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:11px 14px;font-size:.9rem}
+  .slogan b{color:var(--accent)}
+
+  /* spectrum ladder */
+  .spectrum{border:1px solid var(--line);border-radius:10px;padding:14px 14px 6px;margin:18px 0}
+  .axis{display:flex;justify-content:space-between;font-family:ui-monospace,monospace;font-size:.68rem;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+  .rung{display:grid;grid-template-columns:30px 1fr 150px;gap:10px;align-items:center;padding:7px 0;border-top:1px solid var(--line)}
+  .rung:first-of-type{border-top:none}
+  .lv{font-family:ui-monospace,monospace;font-size:.8rem;font-weight:700;color:var(--mut);text-align:center}
+  .barwrap{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .barlab{font-size:.82rem}
+  .barlab b{font-size:.9rem}
+  .bar{height:9px;border-radius:5px;background:linear-gradient(90deg,#cdddef,#eaf1f8)}
+  .bar.b1{background:linear-gradient(90deg,#bcd2ea,#e7eff7)}
+  .bar.b2{background:linear-gradient(90deg,#c7b9e3,#efeaf8)}
+  .bar.b3{background:linear-gradient(90deg,#f0d3a6,#fbf0dd)}
+  .bar.b4{background:repeating-linear-gradient(45deg,#eee,#eee 5px,#e3e3e3 5px,#e3e3e3 10px)}
+  .badge{font-family:ui-monospace,monospace;font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;text-align:center;border-radius:5px;padding:4px 6px;border:1px solid var(--line)}
+  .badge.built{background:#eef7f0;border-color:var(--good);color:var(--good)}
+  .badge.baby{background:#eef4fb;border-color:var(--accent);color:var(--accent)}
+  .badge.plan{background:#f4ecfa;border-color:var(--hand);color:var(--hand)}
+  .badge.defer{background:#fdf2e3;border-color:var(--amber);color:var(--amber)}
+  .badge.rej{background:#f3f4f6;border-color:var(--mut);color:var(--mut)}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:12px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:9px;padding:13px;position:relative}
+  .card .lv2{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .card h3{margin:2px 0 6px;font-size:.98rem}
+  .card p{font-size:.83rem;margin:6px 0 0}
+  .card .mech{font-size:.76rem;color:var(--mut);margin-top:8px;border-top:1px dashed var(--line);padding-top:6px}
+  .card.built{border-color:var(--good)} .card.built h3{color:var(--good)}
+  .card.baby{border-color:var(--accent)} .card.baby h3{color:var(--accent)}
+  .card.plan{border-color:var(--hand)} .card.plan h3{color:var(--hand)}
+  .card.defer{border-color:var(--amber)} .card.defer h3{color:var(--amber)}
+  .card.rej{border-color:var(--line);background:var(--soft)} .card.rej h3{color:var(--mut)}
+  .tagb{position:absolute;top:11px;right:11px;font-family:ui-monospace,monospace;font-size:.58rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border-radius:4px;padding:2px 5px;border:1px solid var(--line);color:var(--mut)}
+
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.8rem}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  td.c{text-align:center}
+  .ok{color:var(--good);font-weight:600}
+  .bad{color:var(--warn);font-weight:600}
+  .meh{color:var(--accent);font-weight:600}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0;font-size:.92rem}
+  .note b{color:var(--accent)}
+  .note.warn{border-left-color:var(--warn)} .note.warn b{color:var(--warn)}
+  .note.good{border-left-color:var(--good)} .note.good b{color:var(--good)}
+  .note.plan{border-left-color:var(--hand)} .note.plan b{color:var(--hand)}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:16px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:210px;font-size:.86rem}
+  .box small{display:block;color:var(--mut);font-size:.82em}
+  .box.good{border-color:var(--good);background:#eef7f0;color:var(--good)}
+  .box.hand{border-color:var(--hand);background:#f4ecfa;color:var(--hand)}
+  .arrow{color:var(--mut);margin:3px 0;font-size:.85rem}
+  .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+
+  .ladder{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:14px 0;font-family:ui-monospace,monospace;font-size:.72rem}
+  .lr{border:1px solid var(--line);background:var(--soft);border-radius:7px;padding:8px 10px;min-width:104px;text-align:center}
+  .lr small{display:block;color:var(--mut);font-size:.84em;font-weight:400;margin-top:2px}
+  .lr.done{background:#eef7f0;border-color:var(--good);color:var(--good)}
+  .lr.here{background:#fdf2e3;border-color:var(--amber);color:var(--amber);box-shadow:0 0 0 2px #f7e8cf}
+  .lr.next{background:#f4ecfa;border-color:var(--hand);color:var(--hand)}
+  .chev{align-self:center;color:var(--mut);padding:0 6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Borrowership in wok — coarsest to finest granularity</h1>
+  <p class="sub">A data value is always in one of two states: <b>owned</b> (someone is on the hook to free it) or <b>borrowed</b> (it rides inside someone else's lifetime, so nobody here must free it). "Borrowership granularity" = <b>how finely the system tracks a value's real lifetime to decide which.</b> Finer tracking means less reference-counting traffic and more escapes handled cheaply — paid for with more analysis. wok climbs this ladder; it stops, on purpose, one rung short of Rust.</p>
+
+  <div class="slogan">
+    <div><b>Effects decide WHERE a value lives; RC decides WHEN it dies.</b> Borrowership is the seam between them — it says whose lifetime a value rides on.</div>
+    <div><b>Coarse = cheap analysis, more RC traffic + leak-till-scope-exit. Fine = less traffic, more analysis.</b> Each rung trades one for the other.</div>
+  </div>
+
+  <!-- spectrum -->
+  <h2>The spectrum at a glance</h2>
+  <p>Each bar shows how much of a value's lifetime <i>one borrow decision</i> spans. Coarse rungs make one decision for everything; fine rungs make a fresh, precise decision per value / per use / per reference.</p>
+  <div class="spectrum">
+    <div class="axis"><span>&larr; coarsest (one fixed verdict, no tracking)</span><span>finest (per-reference, fully tracked) &rarr;</span></div>
+
+    <div class="rung">
+      <div class="lv">L0</div>
+      <div class="barwrap"><div class="barlab"><b>Own everything</b> &mdash; no borrowing; every share dups, every owner drops</div><div class="bar b1" style="width:100%"></div></div>
+      <div class="badge rej">baseline</div>
+    </div>
+    <div class="rung">
+      <div class="lv">L1</div>
+      <div class="barwrap"><div class="barlab"><b>Immortal / static</b> &mdash; borrowed by all, forever, uncounted</div><div class="bar b1" style="width:100%"></div></div>
+      <div class="badge built">built</div>
+    </div>
+    <div class="rung">
+      <div class="lv">L2</div>
+      <div class="barwrap"><div class="barlab"><b>Uniform borrow-on-call</b> &mdash; one syntactic rule, every call</div><div class="bar" style="width:80%"></div></div>
+      <div class="badge built">built</div>
+    </div>
+    <div class="rung">
+      <div class="lv">L3</div>
+      <div class="barwrap"><div class="barlab"><b>Region / arena cohort</b> &mdash; a scope-worth of values share one lifetime</div><div class="bar" style="width:58%"></div></div>
+      <div class="badge baby">baby&nbsp;built&nbsp;&middot;&nbsp;epic</div>
+    </div>
+    <div class="rung">
+      <div class="lv">L4</div>
+      <div class="barwrap"><div class="barlab"><b>Escape-driven promotion</b> &mdash; per value, at the scope boundary</div><div class="bar b2" style="width:38%"></div></div>
+      <div class="badge plan">analysis&nbsp;built</div>
+    </div>
+    <div class="rung">
+      <div class="lv">L5</div>
+      <div class="barwrap"><div class="barlab"><b>Borrow-passing</b> &mdash; per use, threaded through call boundaries</div><div class="bar b3" style="width:22%"></div></div>
+      <div class="badge defer">deferred</div>
+    </div>
+    <div class="rung">
+      <div class="lv">L6</div>
+      <div class="barwrap"><div class="barlab"><b>Lifetime-in-types</b> &mdash; per reference, named &amp; type-checked (Rust)</div><div class="bar b4" style="width:10%"></div></div>
+      <div class="badge rej">rejected</div>
+    </div>
+  </div>
+  <p class="cap">wok is solid through L2, has a <b>baby L3</b> (the <code>LetRec</code> group) and the <b>L4 analysis</b> already shipped. The region epic is the climb L3&rarr;L4. L5 is a later epic; L6 is the deliberate ceiling.</p>
+
+  <!-- the value's-eye view -->
+  <h2>The same value, walking down the ladder</h2>
+  <p>Picture one boxed value <code>b = Box 6</code>. At each finer rung, the question "<i>who frees <code>b</code>?</i>" is answered by a smaller, more precise scope:</p>
+  <table>
+    <tr><th>granularity</th><th>who decides <code>b</code> is borrowed</th><th>the verdict for <code>b</code></th></tr>
+    <tr><td>L1 whole program</td><td>allocation site (is it top-level?)</td><td>if a CAF: borrowed by everyone, never freed</td></tr>
+    <tr><td>L2 the call</td><td>syntactic position (call head vs argument)</td><td>borrowed when it's the function head; moved when it's an argument</td></tr>
+    <tr><td>L3 the region</td><td>the enclosing scope/group it was born in</td><td>borrowed for the region; freed wholesale at scope close</td></tr>
+    <tr><td>L4 this value vs the scope</td><td>does <code>b</code> escape the scope?</td><td>local &rarr; borrowed; escapes &rarr; promoted to its own counted life</td></tr>
+    <tr><td>L5 each use of <code>b</code></td><td>this occurrence: borrow or consume?</td><td>callee borrows it here, consumes it there &mdash; per use</td></tr>
+    <tr><td>L6 each reference</td><td>the type checker, per <code>&amp;'a b</code></td><td>every borrow carries a checked lifetime</td></tr>
+  </table>
+
+  <!-- per-level cards -->
+  <h2>Each rung, concretely</h2>
+  <div class="grid">
+    <div class="card rej">
+      <span class="tagb">baseline</span>
+      <span class="lv2">L0 &middot; coarsest</span>
+      <h3>Own everything</h3>
+      <p>No borrow concept. Every shared use inserts a <code>dup</code>; every owner a <code>drop</code>. Correct but maximal RC traffic. This is what borrowing <i>removes</i> — the "before" picture.</p>
+      <p class="mech">wok never sits here: it has at least L2 by default.</p>
+    </div>
+    <div class="card built">
+      <span class="tagb">built</span>
+      <span class="lv2">L1 &middot; whole program</span>
+      <h3>Immortal / static</h3>
+      <p>A top-level CAF lives the whole run. It is <b>borrowed by all, owned by none</b>, never counted — the coarsest verdict, fixed once at its allocation site.</p>
+      <p class="mech">Static immortal region; negative <code>Addr</code>; <code>isUncounted</code> makes <code>dup</code>/<code>drop</code> no-ops (arc &sect;3).</p>
+    </div>
+    <div class="card built">
+      <span class="tagb">built &middot; default</span>
+      <span class="lv2">L2 &middot; per call, uniform</span>
+      <h3>Uniform borrow-on-call</h3>
+      <p>One fixed syntactic rule, applied at every call: the value in the <b>head</b> of a saturated call is borrowed (calling it doesn't consume the closure); arguments are owned/moved. No per-value reasoning — the rule is the same everywhere.</p>
+      <p class="mech"><code>escapingAtomsRhs</code> (head exempt), <code>consumingOccs</code> (head exempt). The standard Perceus borrowed-head heuristic.</p>
+    </div>
+    <div class="card baby">
+      <span class="tagb">baby built &middot; epic</span>
+      <span class="lv2">L3 &middot; per scope cohort</span>
+      <h3>Region / arena</h3>
+      <p>A <b>cohort</b> of values shares one lifetime: born together, freed <b>wholesale</b> at scope close, with intra-region back-pointers <b>uncounted</b> (borrowed within the region). No per-cell counting; O(1) bulk free instead of O(N) drops. Costs: leak-till-scope-exit for churn; escape breaks it.</p>
+      <p class="mech">TODAY: the <code>LetRec</code> group is "already a baby arena" (<code>stRegionOf</code>; <code>countedChildren</code> skips siblings) + the static region. PLANNED: a user-facing <code>region { }</code> / <code>with mem in</code> arena — "the same idea generalized" (M2 spec &sect;7.2).</p>
+    </div>
+    <div class="card plan">
+      <span class="tagb">analysis built &middot; routing planned</span>
+      <span class="lv2">L4 &middot; per value @ scope boundary</span>
+      <h3>Escape-driven promotion</h3>
+      <p>Now <b>each value</b> in a scope is judged individually: if it does <b>not escape</b>, it stays borrowed at region-lifetime (cheap); if it <b>escapes</b>, it is <b>promoted</b> to its own counted lifetime, driven by its refcount instead of the scope. Recovers skip-RC speed for locals <i>and</i> lets values escape — no copy-out, no compile error. <b>This is "finer borrowership via scope."</b></p>
+      <p class="mech">BUILT: the escape analysis (<code>Escape.hs</code>: <code>escapesFrom</code>, <code>letRecEnclosingCaptureEscapes</code>). PLANNED: the promotion / R+escape allocation-site routing (M2a-2 &sect;4.2; arc &sect;5 "R + escape").</p>
+    </div>
+    <div class="card defer">
+      <span class="tagb">deferred</span>
+      <span class="lv2">L5 &middot; per use, inter-procedural</span>
+      <h3>Borrow-passing</h3>
+      <p>The finest <i>sound</i> borrowing without types: <b>each occurrence</b> is borrow-or-consume, and a borrow can be <b>passed through a call</b> — the callee borrows a parameter (doesn't consume it) and hands the borrow back. Minimal dup/drop. This is the "proper" fix the consuming-capture class is waiting on.</p>
+      <p class="mech">NOT BUILT. <code>Escape.hs</code> FINDING 1: "the properly-sound mechanism is borrow-passing (the callee borrows)" — a later slice. Would clear the deferred #1 consuming-capture rejections.</p>
+    </div>
+    <div class="card rej">
+      <span class="tagb">rejected ceiling</span>
+      <span class="lv2">L6 &middot; per reference, typed</span>
+      <h3>Lifetime-in-types</h3>
+      <p>The finest possible: <b>every reference carries a named lifetime</b> the type checker verifies (<code>&amp;'a T</code>, region polymorphism <code>Array r a</code>, the rank-N <code>ST</code> trick). Zero runtime cost — but a heavy type-system + ergonomic burden.</p>
+      <p class="mech">DELIBERATELY REJECTED. The region deep-research verdict (arc &sect;6): wok wants <b>second-class + escape analysis</b>, NOT lifetime-in-types. This rung defines where wok stops.</p>
+    </div>
+  </div>
+
+  <!-- comparison table -->
+  <h2>The trade, rung by rung</h2>
+  <table>
+    <tr><th>level</th><th>granularity unit</th><th>who/what decides</th><th>RC traffic</th><th>escape handling</th><th>status</th></tr>
+    <tr><td>L1 immortal</td><td>whole program</td><td>alloc site (top-level)</td><td class="c ok">none</td><td class="c">n/a (never dies)</td><td class="c ok">built</td></tr>
+    <tr><td>L2 borrow-on-call</td><td>a call position</td><td>fixed syntactic rule</td><td class="c meh">low on heads</td><td class="c">args always owned</td><td class="c ok">built</td></tr>
+    <tr><td>L3 region</td><td>a scope cohort</td><td>the enclosing scope</td><td class="c ok">none within</td><td class="c bad">breaks it (reject / leak)</td><td class="c meh">baby + epic</td></tr>
+    <tr><td>L4 promotion</td><td>one value</td><td>escape analysis</td><td class="c ok">none for locals</td><td class="c ok">promote on escape</td><td class="c meh">analysis built</td></tr>
+    <tr><td>L5 borrow-passing</td><td>one use</td><td>inter-proc borrow inference</td><td class="c ok">minimal</td><td class="c ok">borrow crosses calls</td><td class="c bad">deferred</td></tr>
+    <tr><td>L6 lifetime types</td><td>one reference</td><td>the type checker</td><td class="c ok">none (static)</td><td class="c ok">checked statically</td><td class="c bad">rejected</td></tr>
+  </table>
+
+  <!-- the L4 mechanism -->
+  <h2>The crux mechanism (L3 &rarr; L4): escape decides borrow vs own</h2>
+  <p>This single fork is what "finer granularity via scope" means in practice. A value born in a region reaches the scope boundary, and the escape analysis routes it:</p>
+  <div class="flow">
+    <div class="box">value born in a <code>region { }</code> scope</div>
+    <div class="arrow">&darr; &nbsp; at scope close, does it escape? (<code>Escape.hs</code>)</div>
+    <div class="row">
+      <div class="box good">NO &rarr; stays BORROWED<small>region-lifetime &middot; uncounted &middot; freed wholesale (0 RC traffic)</small></div>
+      <div class="box hand">YES &rarr; PROMOTED to OWNED<small>its own counted lifetime &middot; born in the RC heap &middot; no copy-out</small></div>
+    </div>
+  </div>
+  <div class="note"><b>Why this is wok-native.</b> The escapee is <i>born</i> in the RC heap (routed there up front), so there is no copy-out walker and no soundness proof to invent; the local stays in the cheap arena. wok already ships the escape analysis (<code>Escape.hs</code>) and the region runtime (<code>stRegionOf</code> + the M2a-2 promotion shape) — the missing pieces are the runtime arena primitive and the IR-level alloc routing. The three coarser models are special cases of this one: <b>F</b> = "escape is a compile error" (never promote); <b>R</b> = "always counted" (never borrow into the arena); <b>R+escape</b> = this fork.</p></div>
+
+  <!-- surface impact -->
+  <h2>Does any of this change the surface language?</h2>
+  <div class="note good"><b>No new grammar is required &mdash; the core is pure compiler analysis.</b> Borrowership is "lifetime as analysis": the programmer writes ordinary wok, and the compiler decides owned-vs-borrowed and where each value lives, invisibly &mdash; exactly like Go's stack/heap split or ML&nbsp;Kit's inferred regions. The <i>only</i> rung that would <i>force</i> new surface syntax is the one we reject.</p></div>
+  <table>
+    <tr><th>level</th><th>surface impact</th></tr>
+    <tr><td>L1 immortal</td><td class="ok">none &mdash; compiler-internal (static allocation site)</td></tr>
+    <tr><td>L2 borrow-on-call</td><td class="ok">none &mdash; pure Perceus analysis</td></tr>
+    <tr><td>L3 region / arena</td><td class="meh"><b>none required.</b> Attaches to scopes that <i>already exist</i> (function bodies, <code>let</code> blocks, handler extents). An <i>optional</i> programmer-visible arena rides the <b>existing <code>with&hellip;in</code> effect-handler grammar</b> (a provider effect, like <code>State</code>) &mdash; not a new keyword. A brand-new <code>region&nbsp;{&nbsp;}</code> block is possible but <b>unnecessary</b>.</td></tr>
+    <tr><td>L4 promotion / R+escape</td><td class="ok">none &mdash; allocation-site routing is invisible (the Go / Tofte&ndash;Talpin "lifetime as analysis" model)</td></tr>
+    <tr><td>L5 borrow-passing</td><td class="meh">none if <b>inferred</b> (Koka infers borrowed parameters with no annotation). A <code>^</code>/<code>&amp;</code> marker only if we chose explicit &mdash; we would not.</td></tr>
+    <tr><td>L6 lifetime-in-types</td><td class="bad"><b>requires</b> new surface (lifetime params <code>'a</code>, region variables). This surface + ergonomic burden is a core reason it is the <b>rejected</b> ceiling.</td></tr>
+  </table>
+  <p class="cap">The whole design is built to keep the surface clean: even resource cleanup is <b>RAII-via-type + a library <code>close</code></b> (M2 spec &sect;7.4/7.5), never a new <code>try</code>/<code>finally</code> keyword. "Reject lifetime-in-types" (arc &sect;6) is, in part, a decision to <b>never push lifetimes into the syntax</b>.</p>
+
+  <!-- proposal -->
+  <h2>What I propose</h2>
+  <div class="note plan"><b>Treat the regions epic as <i>climbing this ladder</i> — one shippable rung at a time, never skipping to L6.</b> We are solid through L2 and already own a baby L3 and the L4 analysis, so the epic is short and each rung is independently sound and measurable (the differential oracle counts the dropped <code>frees</code> + lower <code>peak</code>).</p></div>
+  <div class="ladder">
+    <div class="lr done">L1&ndash;L2<small>immortal +<br>borrow-on-call</small></div><div class="chev">&rsaquo;</div>
+    <div class="lr here">R1<small>L3 user arena<br><code>region { }</code></small></div><div class="chev">&rsaquo;</div>
+    <div class="lr next">R2<small>L4 escape<br>promotion</small></div><div class="chev">&rsaquo;</div>
+    <div class="lr next">later<small>L5 borrow-<br>passing</small></div><div class="chev">&rsaquo;</div>
+    <div class="lr" style="opacity:.5">L6<small>never<br>(typed lifetimes)</small></div>
+  </div>
+  <table>
+    <tr><th>slice</th><th>delivers</th><th>built on</th></tr>
+    <tr><td><b>R1</b> — arena runtime + a region scope (F model)</td><td>L3: the runtime arena primitive (<code>wok_heap_checkpoint</code>/<code>reset</code> or sub-<code>WokHeap</code>) + a region boundary; escape is a <b>compile error</b>. Bulk-free win, oracle-visible. The boundary is an <b>existing scope</b> (or the <code>with&hellip;in</code> effect form) — <b>no new keyword</b>.</td><td>reuses <code>Carrier.hs</code> + <code>Escape.hs</code> as-is (no new analysis)</td></tr>
+    <tr><td><b>R2</b> — flip reject &rarr; route (R+escape)</td><td>L4: the escape fork above. Local allocations &rarr; arena; escapees &rarr; promoted to counted. <b>The finer granularity via scope.</b></td><td>the escape analysis already ships; adds IR alloc routing + the promotion rewrite (M2a-2 shape)</td></tr>
+    <tr><td><i>later epic</i> — borrow-passing</td><td>L5: per-use borrows that cross call boundaries; clears the deferred consuming-capture class.</td><td>a real inter-procedural borrow inference (new)</td></tr>
+  </table>
+
+  <div class="note warn"><b>Two forks still open for you — neither needs new grammar.</b><br>
+  <b>1 · Visibility.</b> Regions can be <b>fully invisible</b> (compiler-inferred, Go-style — the programmer marks nothing) or <b>opt-in via the existing <code>with&hellip;in</code> effect syntax</b> (a provider effect — visible, but still no new keyword). A brand-new <code>region&nbsp;{&nbsp;}</code> block is the one option I'd avoid, since it adds surface for no gain.<br>
+  <b>2 · Escape.</b> <b>F</b> (escape = compile error — simplest to build, but the harsh error really wants an opt-in marker to justify it) vs <b>R+escape</b> (escapees silently routed to the RC heap — graceful, no errors, no need for any marker, and the most "lifetime-as-analysis"). Note the pull: <b>no-surface favours R+escape</b>, because invisible regions that throw unannotated escape errors are bad UX, whereas invisible R+escape just works.<br>
+  Either way R1 builds the arena runtime first (shared plumbing). My refined lean: <b>invisible/inferred + R+escape</b> as the north star, reached either in one slice or via an F stepping-stone — your call on visibility decides which.</p></div>
+
+</div>
+</body>
+</html>

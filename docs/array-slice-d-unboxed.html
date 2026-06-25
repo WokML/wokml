@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok — Array Slice D: unboxed / flat arrays (brainstorm)</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --good:#1a7f4b; --warn:#c0392b; --hand:#8e44ad; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.8rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.16rem;margin:46px 0 2px}
+  h3{font-size:.97rem;margin:18px 0 4px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  p{margin:.7em 0}
+
+  .addrlab{font-family:ui-monospace,monospace;font-size:.66rem;color:var(--mut);display:flex;justify-content:space-between;margin:14px 0 -2px}
+  .mem{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;font-family:ui-monospace,monospace;font-size:.72rem;margin:2px 0}
+  .seg{padding:8px 7px;border-right:1px solid var(--line);text-align:center;white-space:nowrap;min-width:0}
+  .seg:last-child{border-right:none}
+  .seg small{display:block;color:var(--mut);font-size:.85em;font-weight:400}
+  .seg.hdr{background:#eceff3;color:var(--mut)}
+  .seg.arr{background:#eef4fb;color:var(--accent)}
+  .seg.elem{background:#eef7f0;color:var(--good)}
+  .seg.ptr{background:#fdeef6;color:var(--hand)}
+  .seg.new{background:#fff4e0;color:#a86412}
+  .seg.dead{background:repeating-linear-gradient(45deg,#fdeeee,#fdeeee 6px,#f6dede 6px,#f6dede 12px);color:var(--warn)}
+  .seg.free{flex:1;background:repeating-linear-gradient(45deg,#fbfcfd,#fbfcfd 6px,#f1f3f5 6px,#f1f3f5 12px);color:var(--mut)}
+  .wide{flex:2}
+  .x3{flex:3}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:16px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:200px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb;color:var(--accent)}
+  .box.good{border-color:var(--good);background:#eef7f0;color:var(--good)}
+  .box.warn{border-color:var(--warn);background:#fdeeee;color:var(--warn)}
+  .arrow{color:var(--mut);margin:3px 0}
+  .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+
+  .ladder{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:16px 0;font-family:ui-monospace,monospace;font-size:.73rem}
+  .rung{border:1px solid var(--line);background:var(--soft);border-radius:7px;padding:8px 10px;min-width:96px;text-align:center}
+  .rung small{display:block;color:var(--mut);font-size:.84em;font-weight:400;margin-top:2px}
+  .rung.done{background:#eef7f0;border-color:var(--good);color:var(--good)}
+  .rung.here{background:#fff4e0;border-color:#a86412;color:#a86412;box-shadow:0 0 0 2px #fbeaccc}
+  .rung.next{background:#f4ecfa;border-color:var(--hand);color:var(--hand)}
+  .chev{align-self:center;color:var(--mut);padding:0 6px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card .lab{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .card h3{margin:0 0 6px;font-size:.95rem}
+  .card p{font-size:.83rem;margin:6px 0 0}
+  .card.good{border-color:var(--good)} .card.good h3{color:var(--good)}
+  .card.warn{border-color:var(--warn)} .card.warn h3{color:var(--warn)}
+  .card.hi{border-color:var(--accent)} .card.hi h3{color:var(--accent)}
+  .pick{font-family:ui-monospace,monospace;font-size:.66rem;font-weight:700;color:var(--good);text-transform:uppercase;letter-spacing:.05em}
+  .rej{font-family:ui-monospace,monospace;font-size:.66rem;font-weight:700;color:var(--warn);text-transform:uppercase;letter-spacing:.05em}
+  .maybe{font-family:ui-monospace,monospace;font-size:.66rem;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.05em}
+
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.82rem}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  .ok{color:var(--good);font-weight:600}
+  .bad{color:var(--warn);font-weight:600}
+  .meh{color:var(--accent);font-weight:600}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0;font-size:.92rem}
+  .note b{color:var(--accent)}
+  .note.warn{border-left-color:var(--warn)} .note.warn b{color:var(--warn)}
+  .note.good{border-left-color:var(--good)} .note.good b{color:var(--good)}
+
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+  .twocol .pane{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .twocol .pane h3{margin-top:0}
+  .twocol .pane.eq{border-color:var(--good)}
+  .eqbar{text-align:center;color:var(--mut);font-weight:700;margin:6px 0}
+  @media(max-width:680px){.twocol{grid-template-columns:1fr}}
+  .tag{display:inline-block;font-family:ui-monospace,monospace;font-size:.66rem;padding:1px 6px;border-radius:4px;border:1px solid var(--line);color:var(--mut);margin-left:6px;vertical-align:middle}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Array Slice D — unboxed / flat arrays <span class="tag">brainstorm</span></h1>
+  <p class="sub">The question is not "<i>how</i> do we pack elements flat?" It is "<i>is there anything to pack</i>, and does it <i>pay</i> now?" This page lays out the central tension, the evidence, and the contested axes — so we can decide together whether to build, re-order, or defer.</p>
+
+  <!-- ladder -->
+  <h2>Where this sits in the arc</h2>
+  <div class="ladder">
+    <div class="rung done">A<small>boxed Array a</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung done">B<small>real C cell</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung done">C<small>in-place set</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung here">D<small>unboxed / flat<br>&mdash; on trial &mdash;</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung next">R<small>regions</small></div><div class="chev">&rsaquo;</div>
+    <div class="rung next">E<small>String = flat bytes</small></div>
+  </div>
+  <p class="cap">A, B, C are all merged (C at <code>9597c7d</code>, 1409 green, ASan clean). D is highlighted in <b>amber</b>, not blue, on purpose: unlike A&ndash;C it has <b>no justifying consumer yet</b>. This brainstorm tests whether D should ship, be re-ordered, or wait for codegen.</p>
+
+  <!-- 0 -->
+  <h2>0 &middot; The punchline, up front</h2>
+  <div class="note warn"><b>For the types wok has today, the boxed array IS the flat array.</b> Every scalar wok owns is word-sized (<code>U64</code>, <code>U32</code> — same rep — <code>Char</code>, <code>Unit</code>, <code>Bool</code>). A scalar element already sits <i>inline</i> in an 8-byte slot — no per-element cell, no pointer. There is literally <b>nothing to unbox</b>. Genuine flat-packing only pays for things wok cannot yet express.</p></div>
+
+  <!-- 1 -->
+  <h2>1 &middot; Why scalars are already flat</h2>
+  <p>Slice B gave <code>Array a</code> a real C cell: a 16-byte header then <code>len</code> 8-byte slots. For <code>Array U64</code>, each slot holds the integer <b>directly</b> (a raw <code>KLitInt</code> word, uncounted). That is bit-for-bit what a "flat <code>Array U64</code>" would be. Drawing the two gives the same picture:</p>
+  <div class="addrlab"><span><code>Array U64</code> &mdash; "boxed" (Slice B) <b>and</b> "flat" are identical</span><span>16 + 8&middot;len bytes</span></div>
+  <div class="mem" style="max-width:620px">
+    <div class="seg arr">hdr&middot;len 3<small>rc&middot;tag&middot;elemkind</small></div>
+    <div class="seg elem wide">10<small>raw word</small></div>
+    <div class="seg elem wide">20<small>raw word</small></div>
+    <div class="seg elem wide">30<small>raw word</small></div>
+  </div>
+  <p class="cap">fig 1 &mdash; one cell, no pointers, no per-element RC. Teardown is O(1): nothing counted to cascade. "Unboxing" this changes nothing.</p>
+  <div class="note"><b>Slice B Finding 1&ndash;2 (locked):</b> wok has only <code>U64</code>/<code>U32</code> (identical) + <code>Char</code>/<code>Unit</code>. No sub-word ints, no signed, no floats. So a "packed numeric scalar" array has no element type denser than a word. The flat-vs-boxed split <i>dissolved</i> in Slice B precisely because there was no second representation to choose.</p></div>
+
+  <!-- 2 -->
+  <h2>2 &middot; What flat packing WOULD buy — the two real targets</h2>
+  <p>Flat packing pays in exactly two situations, <b>both needing language features wok lacks today</b>:</p>
+
+  <h3>(a) Multi-word value structs &mdash; <span class="meh">alloc-count win, measurable in the interpreter</span></h3>
+  <p>Take <code>Array (U64, U64)</code> — three pairs. Today a tuple is a boxed <code>NCon</code>, so the array is three <i>pointers</i> to three separate 2-word cells:</p>
+  <div class="addrlab"><span>boxed today &mdash; 1 array cell + 3 tuple cells = <b>4 allocations</b>, 3 pointers to chase</span></div>
+  <div class="mem" style="max-width:620px">
+    <div class="seg arr">hdr&middot;len 3</div>
+    <div class="seg ptr wide">ptr &rarr;</div>
+    <div class="seg ptr wide">ptr &rarr;</div>
+    <div class="seg ptr wide">ptr &rarr;</div>
+  </div>
+  <div class="row" style="justify-content:flex-start;gap:8px;margin-top:6px">
+    <div class="mem" style="width:150px"><div class="seg hdr">hdr</div><div class="seg elem">a0</div><div class="seg elem">a1</div></div>
+    <div class="mem" style="width:150px"><div class="seg hdr">hdr</div><div class="seg elem">b0</div><div class="seg elem">b1</div></div>
+    <div class="mem" style="width:150px"><div class="seg hdr">hdr</div><div class="seg elem">c0</div><div class="seg elem">c1</div></div>
+  </div>
+  <div class="addrlab" style="margin-top:14px"><span>flat (Slice D) &mdash; one cell, stride 2, contiguous = <b>1 allocation</b>, no pointer chase</span></div>
+  <div class="mem" style="max-width:620px">
+    <div class="seg arr">hdr&middot;len 3&middot;stride 2</div>
+    <div class="seg elem">a0</div><div class="seg elem">a1</div>
+    <div class="seg elem">b0</div><div class="seg elem">b1</div>
+    <div class="seg elem">c0</div><div class="seg elem">c1</div>
+  </div>
+  <p class="cap">fig 2 &mdash; 4 cells &rarr; 1 cell. The alloc-count drop is real and the oracle can <b>see it today</b>, even in the interpreter (no codegen needed). This is the only flat-packing win that is measurable now.</p>
+
+  <h3>(b) Sub-word / byte elements &mdash; <span class="meh">density, mostly codegen-era; really the road to String</span></h3>
+  <p>Pack N <code>U8</code>/bytes per machine word. The win is cache density + SIMD, which is <b>invisible until there is a native backend</b> (arc &sect;8). The true consumer of flat bytes is not a numeric array — it is <code>String = kk_bytes_t</code> (Slice E). Koka's evidence (&sect;6 below) says strings get their <i>own</i> flat type, not a boxed <code>Array Char</code>.</p>
+
+  <!-- 3 -->
+  <h2>3 &middot; The YAGNI verdict &mdash; does D have a consumer at all?</h2>
+  <p>Anti-over-engineering rule: build only what a real consumer needs. So we swept every <code>.wok</code> program in the repo (430 files). Every single array is either a scalar array (already flat) or a genuinely-boxed array (not flattenable). <b>Zero</b> use a value-struct element.</p>
+  <table>
+    <tr><th>element category</th><th>arrays in corpus</th><th>benefit from Slice D?</th></tr>
+    <tr><td><code>Array U64</code> &mdash; scalar</td><td class="mono">7 (01&ndash;05, 09, oob)</td><td class="ok">none &mdash; already flat inline</td></tr>
+    <tr><td><code>Array [U64]</code> / <code>Array (Option U64)</code> &mdash; boxed</td><td class="mono">3 (07, 08, 10)</td><td class="bad">none &mdash; genuinely needs pointers</td></tr>
+    <tr><td><code>Array (U64,U64)</code> / <code>Array Point</code> &mdash; <b>flattenable struct</b></td><td class="mono bad">0</td><td class="meh">would benefit &mdash; but absent</td></tr>
+    <tr><td>sub-word / byte element</td><td class="mono bad">0 (not expressible)</td><td class="meh">n/a &mdash; no such type</td></tr>
+  </table>
+  <p class="cap">fig 3 &mdash; records (<code>Point {x,y}</code>) exist in 6 typecheck tests and tuples appear in signatures, but <b>neither is ever stored in an array</b>. Slice D today is foundation with no building on top of it.</p>
+  <div class="note warn"><b>So the honest framing:</b> Slice D is not "the next optimization" — it is a <i>capability</i> with no caller. That is exactly the situation the arc warned about: D "has no justifying consumer until a value-struct or byte type exists." The brainstorm's real job is choosing among <b>build-foundation-only</b>, <b>re-order the arc</b>, or <b>defer</b>.</p></div>
+
+  <!-- 4 -->
+  <h2>4 &middot; The contested axes (directions + a recommendation each)</h2>
+
+  <h3>Axis 1 &middot; What, if anything, justifies flat packing NOW?</h3>
+  <div class="grid">
+    <div class="card hi">
+      <span class="lab">direction A</span>
+      <h3>Value-structs <span class="maybe">measurable</span></h3>
+      <p>Pack <code>Array (U64,U64)</code> inline. The one win the interpreter can measure today (alloc-count). But needs a struct element type used in an array — which no program has.</p>
+    </div>
+    <div class="card">
+      <span class="lab">direction B</span>
+      <h3>Sub-word / bytes</h3>
+      <p>Density win, but invisible pre-codegen. Its real payoff is <code>String</code> (Slice E), which wants its own flat type, not <code>Array U8</code>.</p>
+    </div>
+    <div class="card good">
+      <span class="lab">direction C</span>
+      <h3>Defer / foundation-only <span class="pick">lean</span></h3>
+      <p>No consumer &rArr; don't build representation. At most lay type-system groundwork (a way to <i>say</i> "this element is sized"). Let a real consumer pull the feature.</p>
+    </div>
+  </div>
+
+  <h3>Axis 2 &middot; Re-order the arc? (D vs String vs regions)</h3>
+  <div class="grid">
+    <div class="card good">
+      <span class="lab">direction A</span>
+      <h3>String (E) is the real flat-bytes consumer <span class="maybe">argue it</span></h3>
+      <p>D's sub-word road leads to <code>String</code>. Strings are used <i>everywhere</i>; a flat byte buffer has an immediate, large consumer. Bringing E forward gives flat-bytes a caller D lacks.</p>
+    </div>
+    <div class="card hi">
+      <span class="lab">direction B</span>
+      <h3>Regions next</h3>
+      <p>Regions are arc-ordered after D but don't depend on it; they pay off on the boxed data we already have (bulk-free, locality). A consumer-rich rung.</p>
+    </div>
+    <div class="card">
+      <span class="lab">direction C</span>
+      <h3>Keep arc order, D as foundation</h3>
+      <p>Build D minimally so later rungs (LoCal serialization needs fixed-size flat elements) have the cell shape ready. Risk: building ahead of need.</p>
+    </div>
+  </div>
+
+  <h3>Axis 3 &middot; One <code>Array a</code> vs a Sized/unboxed KIND</h3>
+  <div class="grid">
+    <div class="card good">
+      <span class="lab">direction A</span>
+      <h3>Monomorphic-only MVP &mdash; no kind <span class="pick">lean</span></h3>
+      <p>Pick a concrete element layout per array; no generic flat-array code, so no need to <i>state</i> "element is sized" in a signature. Sidesteps the kind entirely (the MLton monomorphization precedent — see &sect;6).</p>
+    </div>
+    <div class="card hi">
+      <span class="lab">direction B</span>
+      <h3>A <code>Sized</code> kind up front</h3>
+      <p>Add <code>KSized</code> to <code>data Kind</code>; constrain <code>Array : Sized -&gt; *</code>. Needed only to write <i>generic</i> flat code (<code>map</code>/<code>fold</code> over any sized element). Real type-system work; the row-kind machinery (<code>KEffect</code>) is the precedent it would follow.</p>
+    </div>
+    <div class="card">
+      <span class="lab">direction C</span>
+      <h3>Per-element typeclass dictionary</h3>
+      <p>A <code>Prim</code>/<code>Unbox</code>-style class carrying the layout, à la Haskell's <code>vector</code>. Avoids a new kind but adds dictionary passing; heavier than wok needs for an MVP.</p>
+    </div>
+  </div>
+
+  <h3>Axis 4 &middot; Value vs reference semantics of <code>index</code></h3>
+  <p>This is the one <b>surface-observable</b> difference, and it is subtle.</p>
+  <div class="twocol">
+    <div class="pane">
+      <h3>Boxed <code>index</code> &mdash; reference</h3>
+      <p style="font-size:.85rem"><code>index</code> returns the element's <b>shared pointer</b> + a <code>dup</code>. Two handles to the <i>same</i> cell. Zero copy.</p>
+    </div>
+    <div class="pane">
+      <h3>Flat <code>index</code> &mdash; value (materialize)</h3>
+      <p style="font-size:.85rem">The bytes live <i>inside</i> the array — there is no cell to point at. <code>index</code> must <b>copy the element out</b> into a fresh value. For a struct element that is a <i>new allocation on every index</i>.</p>
+    </div>
+  </div>
+  <div class="note"><b>The twist that flips the ledger:</b> flat packing saves allocations at <i>construction</i> but spends one at every <i>materialize-on-index</i> of a struct element. For pure scalars there is no materialize cost (the word IS the value). So flat's net win depends on the access pattern — and the cleanest version (<i>project</i> a single field <code>arr[i].x</code> without materializing the whole struct) is a codegen optimization, not an interpreter one. Worth seeing clearly before committing.</p></div>
+
+  <h3>Axis 5 &middot; The C cell + RC + the element layout descriptor</h3>
+  <div class="grid">
+    <div class="card">
+      <span class="lab">today (Slice B/C)</span>
+      <h3>Stride 1, one <code>elemkind</code> byte</h3>
+      <p>16B header, uniform 8B slots, a single <code>elemkind</code> (the element's <code>SlotKind</code>). Teardown reads that one byte: raw-lit &rArr; O(1); pointer &rArr; cascade.</p>
+    </div>
+    <div class="card hi">
+      <span class="lab">Slice D needs</span>
+      <h3>Stride &gt; 1 + a slot-kind <i>vector</i></h3>
+      <p>A struct element spans <code>k</code> slots; a struct with pointer fields (<code>[]Point</code> vs <code>[]*Point</code>) needs a per-<i>sub-slot</i> kind map so teardown cascades only the counted fields. The <code>sizeClass</code> rounding Slice B deferred reactivates here.</p>
+    </div>
+    <div class="card good">
+      <span class="lab">the saving grace</span>
+      <h3>Teardown cost = element bucket <span class="pick">arc &sect;3</span></h3>
+      <p>All-scalar struct (<code>U64,U64</code>) &rArr; still O(1) teardown, just wider. Only pointer-containing structs cascade. The descriptor is the layout-compaction per-tag-descriptor pattern, generalized to a stride.</p>
+    </div>
+  </div>
+
+  <h3>Axis 6 &middot; The serialization connection (LoCal endgame)</h3>
+  <div class="note"><b>Flat fixed-size-element arrays ARE the flat unboxed array of LoCal/Gibbon</b> (arc &sect;7) — the first serialization entry point. But the full serialization win is compiled-traversal, <b>codegen-era</b>. Recommendation: pull in <b>none</b> of LoCal now; just note that a stride-based flat cell is the shape a future region/LoCal slice would reuse. Building serialization ahead of a backend would be the textbook over-engineering the arc &sect;8 warns against.</p></div>
+
+  <!-- 5 -->
+  <h2>5 &middot; Interpreter vs codegen &mdash; the judgment that cuts across everything</h2>
+  <table>
+    <tr><th>win</th><th>visible in the interpreter today?</th><th>needs codegen?</th></tr>
+    <tr><td>alloc-count drop (value-struct: 4 cells &rarr; 1)</td><td class="ok">yes &mdash; oracle counts it</td><td class="meh">no</td></tr>
+    <tr><td>cache density / prefetch / SIMD</td><td class="bad">no &mdash; interp overhead dominates</td><td class="bad">yes</td></tr>
+    <tr><td>sub-word packing payoff</td><td class="bad">no</td><td class="bad">yes</td></tr>
+    <tr><td>LoCal serialized traversal</td><td class="bad">no</td><td class="bad">yes</td></tr>
+  </table>
+  <p class="cap">fig 5 &mdash; only the value-struct alloc-count win lands in the interpreter. Everything else waits for a backend. So if D ships now, value-structs are the <i>only</i> defensible reason — and even that needs a program that puts a struct in an array.</p>
+
+  <!-- 6 -->
+  <h2>6 &middot; Prior art <span class="tag">deep-research &middot; 24/25 claims confirmed</span></h2>
+  <p>Every value-model / RC / region language that ships flat value arrays tells the same story. The headline: <b>a "Sized"/levity kind is only needed to write <i>generic</i> flat-array code</b>; restricting to concrete element layouts sidesteps it entirely (the MLton existence proof). And the strongest flat-data precedent is not a numeric array at all &mdash; it is a <b>dedicated flat byte/String type</b> (Koka).</p>
+  <div class="grid">
+    <div class="card">
+      <span class="lab">Koka &middot; the direct precedent</span>
+      <h3>Boxed vector + a SEPARATE flat bytes type</h3>
+      <p><code>kk_vector_t</code> is strictly an array of boxed words; Koka <b>never</b> generalized it to unboxed elements. Strings are a dedicated flat <code>kk_bytes_t</code> (uint8 buffer + 7-byte small-string optimization), <i>not</i> <code>vector&lt;char&gt;</code>. WHY: bytes have a fixed 1-byte size that doesn't need the runtime's boxed-word uniformity. &rarr; <b>flat String, not flat Array.</b></p>
+    </div>
+    <div class="card">
+      <span class="lab">MLton &middot; the existence proof</span>
+      <h3>Whole-program mono &rarr; flat, no kind</h3>
+      <p>Monomorphization yields a simply-typed IL; a Data-Representation/Flatten stage then packs array elements &mdash; <code>(int*int) array</code> stores pairs <i>inline</i>, not pointers-to-pairs. <b>No source-level representation kind exists</b> (SML has none). &rarr; a monomorphic-only slice sidesteps the Sized/levity kind.</p>
+    </div>
+    <div class="card">
+      <span class="lab">Roc &middot; value-semantics RC</span>
+      <h3>Inline-by-value default</h3>
+      <p>Values are unboxed/inline by default; <code>Box</code> is the expensive opt-in. Because fields are inline (not uniform pointers), reuse analysis must track each variable's <b>specific layout</b>, not just constructor arity. Gated by monomorphization. (The stronger "mono is a <i>prerequisite</i> for reuse" claim was <b>refuted</b>.)</p>
+    </div>
+    <div class="card warn">
+      <span class="lab">OCaml &middot; the cautionary tale</span>
+      <h3>flat-float-array vs array polymorphism</h3>
+      <p>Uniform one-word rep forces <code>float</code> to be heap-boxed; the flat <code>float array</code> special-case conflicts with <code>'a array</code> polymorphism (can't statically know if <code>'a</code> is float) &mdash; OCaml 5 changed its default. Reading an unboxed field <b>copies out</b> (materialize-on-read). &rarr; don't bolt flat onto the uniform <code>Array a</code>; flat index is value-semantic.</p>
+    </div>
+    <div class="card">
+      <span class="lab">GHC &middot; the kind machinery</span>
+      <h3>Representation lives in the KIND</h3>
+      <p><code>TYPE :: RuntimeRep -&gt; Type</code>; <code>BoxedRep Lifted</code> vs <code>IntRep</code>&hellip; A variable/argument may <b>not</b> be representation-polymorphic (codegen must fix width/pointer/register). Generic flat code uses per-element <code>Prim</code>/<code>Unbox</code> <i>dictionaries</i> instead. &rarr; the kind is a <i>generic-code</i> tool, not an MVP need.</p>
+    </div>
+    <div class="card">
+      <span class="lab">Rust/Swift &middot; Gibbon</span>
+      <h3>Sized bound; serialized flat</h3>
+      <p>Rust <code>Vec&lt;T: Sized&gt;</code> stores <code>T</code> inline; Swift value-arrays + copy-on-write. The minimal type-machinery analog is a <b>representable-layout (Sized) bound</b> &mdash; unnecessary if you never write generic flat code. Gibbon/LoCal's serialized headerless layout is a <b>compiled-traversal</b> (codegen) win.</p>
+    </div>
+  </div>
+  <table>
+    <tr><th>the four sub-questions</th><th>prior-art answer</th></tr>
+    <tr><td>(a) Is a Sized/levity <b>kind</b> required?</td><td class="ok">No for an MVP. Needed only for generic separately-compiled flat code. Monomorphic-only sidesteps it (MLton). Minimal analog = a representable-layout bound, and even that is optional.</td></tr>
+    <tr><td>(b) Value vs reference <code>index</code>?</td><td class="meh">Flat <code>index</code> <b>must copy bytes out</b> (value semantics / materialize-on-read) &mdash; OCaml PR&nbsp;#794, confirmed. Boxed returns a shared pointer.</td></tr>
+    <tr><td>(c) RC teardown of pointer-bearing flat elements?</td><td class="meh">A per-element slot-kind descriptor / scan map (wok's layout-compaction per-tag descriptor, generalized to a stride). <b>No prior-art source specifies it</b> &mdash; it would be wok's own contribution.</td></tr>
+    <tr><td>(d) Worth it in an <b>interpreter</b>?</td><td class="bad">Mostly an alloc-count win that is <b>modest until codegen</b> (where cache/SIMD is the real payoff). <b>No benchmark settles this</b> &mdash; design judgment, not a measured datum.</td></tr>
+  </table>
+
+  <!-- 7 -->
+  <h2>7 &middot; Where this points <span class="tag">recommendation</span></h2>
+  <div class="note warn"><b>Defer Slice D as a flat value-struct array.</b> It has no consumer in any wok program, its only interpreter-visible win (value-struct alloc-count) is the <i>weakest</i> in the prior art and is unmeasured, and its real payoff (cache/SIMD/serialization) is codegen-era. Building it now is foundation ahead of need &mdash; the textbook over-engineering arc &sect;8 warns against.</p></div>
+  <div class="note good"><b>Re-order: make String = flat bytes (Slice E) the next slice.</b> It is the one flat-data move with (1) a massive real consumer &mdash; every string &mdash; (2) the strongest precedent (Koka's <code>kk_bytes_t</code>, exactly this shape), (3) an <i>interpreter-visible</i> improvement today (strings are currently non-C abstract-heap values; a flat byte buffer is a real gain now, not just at codegen), and (4) it is a <b>dedicated flat type</b>, which dodges OCaml's polymorphic-array tension entirely. It delivers the "flat" win D promised, on the type that actually needs it.</p></div>
+  <table>
+    <tr><th>axis</th><th>resolved by the evidence</th></tr>
+    <tr><td>3 &middot; one Array vs a Sized kind</td><td class="ok"><b>Monomorphic, no kind.</b> MLton proves it; the kind is only for generic flat code wok isn't writing.</td></tr>
+    <tr><td>4 &middot; index semantics</td><td class="meh"><b>Copy-out / value semantics</b> is forced for any flat element (OCaml-confirmed).</td></tr>
+    <tr><td>5 &middot; representation home</td><td class="meh"><b>A dedicated flat type</b> (Koka's split), not a flat mode bolted onto the polymorphic <code>Array a</code> (OCaml's tension).</td></tr>
+  </table>
+  <div class="note"><b>The decision for you:</b> three live directions &mdash; <b>(A)</b> bring <b>String = flat bytes (E)</b> forward as the next slice <span class="tag">recommended</span>; <b>(B)</b> pivot to the <b>regions</b> epic (the other consumer-rich rung, on existing boxed data); or <b>(C)</b> a minimal <b>foundation-only D</b> (cell-shape / a representable-layout gate) if you want the groundwork laid before a consumer exists. The evidence leans hard toward (A): a real consumer, the strongest precedent, and a win you can measure now.</p></div>
+
+</div>
+</body>
+</html>

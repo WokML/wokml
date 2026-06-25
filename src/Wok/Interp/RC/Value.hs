@@ -49,6 +49,13 @@ module Wok.Interp.RC.Value
   , isStaticAddr
   , isInline
   , isUncounted
+  , isArenaAddr
+    -- * Uncounted arena tier (Region Slice R1)
+  , arenaOpen
+  , arenaOpenRC
+  , arenaAllocPure
+  , arenaAlloc
+  , arenaClose
   , deref
   , derefPure
   , mkClosure
@@ -277,6 +284,27 @@ data RCKont
     -- (cascading the cell's OWN owned captures, now that the body is done borrowing
     -- them) and threads the value onward. The cell is alive throughout its own call,
     -- exactly as the named-head borrow case keeps it alive via its binder.
+  | KArenaCloseRC RCKont
+    -- ^ The PER-ACTIVATION ARENA BRACKET (Region Slice R1, spec §4.2). Pushed ABOVE
+    -- a function/CAF/lambda body's continuation when that body opens an arena
+    -- ('arenaOpen' fired on entry, see 'Wok.Interp.RC.Machine'). When the body's
+    -- final value returns into this frame, it runs 'arenaClose' (the scan-out +
+    -- O(1) bulk reset) and threads the value onward to the saved continuation. The
+    -- frame fires on EVERY exit path of the body STRUCTURALLY --- normal return, a
+    -- tail call (the close runs after the callee returns, which is sound because an
+    -- arena-local is never a CONSUMING call argument, only borrowed), and a 'Jump'
+    -- out of a body-local join (whose saved continuation includes this frame). It
+    -- is DEPTH-INVISIBLE ('kontDepth' does not count it) so it never perturbs a
+    -- named handler's activation tag.
+    --
+    -- SOUNDNESS / CAPTURE-FREEDOM. This frame can NEVER appear inside a captured
+    -- continuation prefix (an 'NCont'): arena-opening bodies are continuation-free
+    -- (the §5.3 fence), and the only fragment that reaches 'runModuleRC' is
+    -- handler-/effect-op-free ('firstOrderNoHandlerViolations'), so no
+    -- continuation is ever reified in a run that opens an arena. The pass-through
+    -- cases in 'continuationOwned'/'continuationReservations'/'spliceKont'/
+    -- 'rcFindHandler' are therefore TOTALITY cases, never exercised by an
+    -- arena-opening run.
   deriving (Eq, Show)
 
 -- | Number of frames in a continuation (the RC analogue of
@@ -292,6 +320,9 @@ kontDepth = go 0
     go n (KAppRC _ k)        = go (n + 1) k
     go n (KHandleRC _ _ _ k) = go (n + 1) k
     go n (KDropCellRC _ k)   = go (n + 1) k
+    -- The arena bracket is DEPTH-INVISIBLE: it is bookkeeping, not a real
+    -- continuation frame, so it must not shift a named handler's activation tag.
+    go n (KArenaCloseRC k)   = go n k
 
 -- | The OWNED SET of a captured continuation prefix (M2b-1, the crux; spec §4.2):
 -- the addresses the continuation's own pending drop/move instructions would free
@@ -330,6 +361,9 @@ continuationOwned = dedup . go
     go (KLetRC r body sc k)   = frameOwned r body sc ++ go k
     go (KAppRC vs k)          = [ (Nothing, a) | a <- countedRefs vs ] ++ go k
     go (KDropCellRC a k)      = [ (Nothing, a) | not (isUncounted a) ] ++ go k
+    -- The arena bracket owns no continuation values (totality only; an
+    -- arena-opening body is never reified into a captured prefix).
+    go (KArenaCloseRC k)      = go k
     -- A nested handler frame in the captured prefix owns its PARAMETER value (if
     -- any).  Only the parameter slot is owned by the frame itself; the rest of
     -- hsc is the captured enclosing scope, whose binders are owned by their own
@@ -467,6 +501,7 @@ continuationReservations k0 reserved = dedup (go k0)
     go KDoneRC               = []
     go (KLetRC _ _ sc k)     = fromValues (Map.elems (rscEnv sc)) ++ go k
     go (KAppRC vs k)         = fromValues vs ++ go k
+    go (KArenaCloseRC k)     = go k  -- totality only (never reified, see KArenaCloseRC)
     -- PARAM-ONLY, mirroring 'continuationOwned's KHandleRC arm: a nested handler
     -- frame in the captured prefix OWNS only its parameter slot; the rest of its
     -- 'hsc' is the captured ENCLOSING scope (a DIFFERENT continuation's bindings).
@@ -586,6 +621,7 @@ spliceKont prefix tl = go prefix
     go (KAppRC vs k)          = KAppRC vs (go k)
     go (KHandleRC h tag sc k) = KHandleRC h tag sc (go k)
     go (KDropCellRC a k)      = KDropCellRC a (go k)
+    go (KArenaCloseRC k)      = KArenaCloseRC (go k)  -- totality only (never reified)
 
 -- ---------------------------------------------------------------------------
 -- Heap nodes
@@ -702,6 +738,14 @@ data Stats = Stats
   , stPeak      :: Int   -- ^ high-water mark of live-cell count
   , stCurBytes  :: Int   -- ^ current live bytes (C cells only; abstract-only nodes = 0)
   , stPeakBytes :: Int   -- ^ high-water mark of live bytes (mirrors C 'peak_bytes')
+  , stArenaBytes :: Int  -- ^ current uncounted ARENA bytes (Region Slice R1): a
+                         --   SEPARATE set of books from the counted 'stCurBytes'.
+                         --   Bumped by 'arenaAllocPure' (by 'wouldBeCBytes'), reduced
+                         --   by 'arenaClose'. Arena cells never enter 'stCurBytes'/
+                         --   'stLive'/'stPeak', mirroring the C runtime's distinct
+                         --   @arena_bytes@ region (spec §3.1, §6).
+  , stArenaPeak :: Int   -- ^ high-water mark of 'stArenaBytes' (mirrors C
+                         --   @arena_peak@). Never reset by 'arenaClose'.
   }
   deriving (Eq, Show)
 
@@ -775,6 +819,38 @@ data Store = Store
     -- token's value may linger in an env, but its address is no longer here ---
     -- which is what keeps the abort-reclaim collector from freeing a revived or
     -- already-freed cell.
+  , stArena      :: [IntSet]
+    -- ^ the per-activation UNCOUNTED ARENA stack (Region Slice R1, spec §3.2): a
+    -- STACK of arena-address sets, head = the innermost open scope. 'arenaOpen'
+    -- pushes an empty frame; 'arenaAllocPure' records a fresh 'HAddr' index in the
+    -- innermost frame; 'arenaClose' scans out the top frame's counted children then
+    -- bulk-removes the frame. An 'HAddr' index present in ANY frame is UNCOUNTED
+    -- ('isUncounted'), so dup/drop of it are inert (no cascade) -- bit-for-bit
+    -- mirroring the C runtime's distinct arena region.
+    --
+    -- On the 'CHeap' backend this frame stack still records the NON-C-eligible
+    -- arena cells (an arity > 255 or non-encodable arena 'NCon', which falls back
+    -- to the abstract arena exactly as 'allocNCon' falls a non-eligible counted
+    -- 'NCon' back to the abstract heap). C-eligible arena cells live as 'CAddr's
+    -- in 'stArenaC' (below). The two frame stacks are pushed/popped in lockstep by
+    -- 'arenaOpen'/'arenaClose' so the depths never diverge.
+  , stArenaC     :: [Set.Set (Ptr WokObj)]
+    -- ^ the C-arena frame stack (Region Slice R1): the per-scope set of C-eligible
+    -- arena cells ('CAddr's allocated by 'wok_arena_alloc'), head = the innermost
+    -- open scope. Populated ONLY under the 'CHeap' backend; always empty frames
+    -- under 'AbstractHeap'. A 'CAddr' present in ANY frame is an UNCOUNTED arena
+    -- cell ('isArenaAddr'), so 'incref'/'dropAddr' on it are inert (no @wok_dup@/
+    -- @wok_dec@), exactly mirroring the abstract 'stArena' membership test. The
+    -- cell is reclaimed by 'wok_arena_close' (a bulk free of the scope's chain),
+    -- not by an rc reaching zero. 'arenaClose' scans out each cell's counted
+    -- children (read from its C slots) before the bulk reset, the C analogue of
+    -- the abstract scan-out.
+  , stArenaHandles :: [Word32]
+    -- ^ the stack of handles returned by 'wok_arena_open' (CHeap backend only),
+    -- head = the innermost open scope, so 'arenaClose' can pass the matching
+    -- handle to 'wok_arena_close' (which asserts @handle == arena_depth - 1@).
+    -- Empty under 'AbstractHeap'. Pushed/popped in lockstep with 'stArena'/
+    -- 'stArenaC'.
   }
 
 -- | Which heap an 'NCon' is allocated into. 'AbstractHeap' is the default and is
@@ -822,12 +898,15 @@ emptyStore = Store
   , stNext       = 0
   , stNextStatic = -1
   , stDead       = IS.empty
-  , stStats      = Stats 0 0 0 0 0 0
+  , stStats      = Stats 0 0 0 0 0 0 0 0
   , stBackend    = AbstractHeap
   , stTagFwd     = Map.empty
   , stTagRev     = IM.empty
   , stConDesc    = IM.empty
   , stReserved   = Set.empty
+  , stArena      = []
+  , stArenaC     = []
+  , stArenaHandles = []
   }
 
 -- | Intern a constructor name to its stable tag-id, allocating a fresh id on
@@ -990,8 +1069,315 @@ isInline _          = False
 -- | True for an address that owns no counted cell: a static (immortal) address
 -- OR an inline immediate. The single filter the counted-ref / owned-set / CAF
 -- paths use, so dup/drop and the free cascade skip both uniformly.
+--
+-- ARENA CELLS ARE ALSO UNCOUNTED, but NOT recognised here (this predicate is pure
+-- 'Addr -> Bool', and arena membership lives in the 'Store'). The store-aware
+-- 'isArenaAddr' is the arena half; 'incref'/'dropAddr'/'dropReuse' (which all hold
+-- the store) short-circuit on it BEFORE dispatching to the pure helpers, so dup/
+-- drop of an arena cell are inert and an arena cell is never an FBIP donor. The
+-- pure-context callers of 'isUncounted' ('countedRefs', 'closureOwnedBoxed',
+-- 'continuationOwned', 'arrayUnique') never need the arena case: by the R+escape
+-- invariant (spec §5.1) a counted child of an arena cell is itself counted, never
+-- an arena address, so no arena address ever flows through those value-children
+-- filters during counted operation.
 isUncounted :: Addr -> Bool
 isUncounted a = isStaticAddr a || isInline a
+
+-- | True for an 'HAddr' currently recorded in ANY open arena frame (Region Slice
+-- R1, spec §3.2). The store-aware half of "uncounted": an arena cell, like a
+-- static cell or an inline immediate, owns no counted books, so 'incref'/
+-- 'dropAddr'/'dropReuse' treat it as inert. A 'CAddr'/'Inline' is never an arena
+-- cell (the abstract mirror records only 'HAddr' indices). A FLATTENED membership
+-- check across the whole frame stack is correct (an address lives in exactly one
+-- frame; closing pops that frame, after which the address is no longer arena).
+isArenaAddr :: Addr -> Store -> Bool
+isArenaAddr (HAddr i) s = any (IS.member i) (stArena s)
+-- A 'CAddr' is an arena cell iff it lives in a C-arena frame ('stArenaC', CHeap
+-- backend only). Recognising it here is what makes 'incref'/'dropAddr' inert on a
+-- C-eligible arena cell -- the C analogue of the 'stArena' HAddr membership test.
+isArenaAddr (CAddr p) s = any (Set.member p) (stArenaC s)
+isArenaAddr (Inline _) _ = False
+
+-- ---------------------------------------------------------------------------
+-- Uncounted arena tier (Region Slice R1): the abstract-heap mirror of the C
+-- runtime's per-activation arena (spec §3.2, §4.3). An arena cohort is allocated
+-- UNCOUNTED ('arenaAllocPure'), dup/drop on it are inert (no cascade), and
+-- 'arenaClose' SCANS OUT the cohort's counted children then bulk-removes the
+-- cohort in O(1). It feeds a SEPARATE 'stArenaBytes'/'stArenaPeak' pair, never
+-- the counted 'stLive'/'stPeak'/'stAllocs'/'stFrees'.
+
+-- | Open an arena scope (the ABSTRACT half): push an empty frame onto both the
+-- abstract 'stArena' stack and the C-cell 'stArenaC' stack. LIFO; matched by
+-- exactly one 'arenaClose'. (Region Slice R1, spec §4.2.) Does NOT touch
+-- 'stArenaHandles' (a CHeap-only concern handled by 'arenaOpenRC'). This is the
+-- PURE abstract open used directly by the store-algebra tests and, via
+-- 'arenaOpenRC', on the 'AbstractHeap' backend.
+arenaOpen :: Store -> Store
+arenaOpen s = s { stArena  = IS.empty  : stArena s
+                , stArenaC = Set.empty : stArenaC s }
+
+-- | Open an arena scope, dispatching on the backend (Region Slice R1, spec §4.2).
+-- On 'AbstractHeap' it is exactly the pure 'arenaOpen'. On 'CHeap' it ALSO calls
+-- 'wok_arena_open' (so the C runtime checkpoints its arena region) and records the
+-- returned handle on 'stArenaHandles' for the matching 'wok_arena_close'.
+arenaOpenRC :: Store -> RC Store
+arenaOpenRC s = case stBackend s of
+  AbstractHeap -> pure (arenaOpen s)
+  CHeap hp     -> do
+    handle <- liftIO (H.wokArenaOpen hp)
+    pure (arenaOpen s) { stArenaHandles = handle : stArenaHandles s }
+
+-- | Allocate an UNCOUNTED arena cell (Region Slice R1, spec §3.2). Hands out a
+-- fresh positive 'HAddr' from 'stNext' (exactly as 'allocPure' does), inserts the
+-- node into 'stCells' (the @rc@ value is irrelevant -- the cell is uncounted and
+-- reclaimed only by 'arenaClose'), records the index in the INNERMOST 'stArena'
+-- frame, and bumps 'stArenaBytes'/'stArenaPeak' by 'wouldBeCBytes' of the node.
+--
+-- It does NOT call 'recordAlloc': it never touches 'stAllocs'/'stFrees'/'stLive'/
+-- 'stPeak'/'stCurBytes'. So the counted accounting is untouched -- the arena lives
+-- entirely on its own books.
+--
+-- PRECONDITION: an arena frame is open. With no open frame ('stArena' empty) the
+-- index could not be recorded anywhere and dup/drop would not be inert -- an
+-- internal routing error. The RC-layer caller ('arenaAlloc') enforces this
+-- precondition and surfaces a catchable 'PrimError' on violation (consistent with
+-- 'arenaClose'); reaching the no-frame case HERE is therefore a programmer error
+-- in a direct (test-only) call, caught loudly as a pure-function precondition.
+arenaAllocPure :: Node -> Store -> (Addr, Store)
+arenaAllocPure n = arenaAllocPureBytes (wouldBeCBytes n) n
+
+-- | Like 'arenaAllocPure' but charges 0 arena bytes. Used for 'CHeap' fallback
+-- arena allocations (tag overflow, descriptor first-kind-wins mismatch) where the
+-- node IS C-eligible ('nodeCEligible': arity + encodable pass, so 'wouldBeCBytes'
+-- is nonzero) but NO 'wok_arena_alloc' actually ran -- so the C runtime's
+-- @arena_bytes@ charges 0. Charging 'wouldBeCBytes' on the abstract side here would
+-- diverge the arena-stat parity oracle (abstract 'stArenaBytes' != C
+-- @wok_stat_arena_bytes@). Mirrors 'allocPureFallback's zero-charge of the counted
+-- 'allocNCon' fallback, keeping both sides at 0. (Region Slice R1, code-review #2.)
+arenaAllocPureFallback :: Node -> Store -> (Addr, Store)
+arenaAllocPureFallback = arenaAllocPureBytes 0
+
+-- | The shared core of 'arenaAllocPure'/'arenaAllocPureFallback': record an
+-- UNCOUNTED arena cell charging an explicit byte amount (the genuinely-C-eligible
+-- path charges 'wouldBeCBytes'; the C-ineligible fallback charges 0). Hands out a
+-- fresh positive 'HAddr' from 'stNext', inserts the node into 'stCells' (the @rc@
+-- value is irrelevant -- uncounted, reclaimed only by 'arenaClose'), records the
+-- index in the INNERMOST 'stArena' frame, and bumps 'stArenaBytes'/'stArenaPeak'.
+-- Does NOT call 'recordAlloc': it never touches 'stAllocs'/'stFrees'/'stLive'/
+-- 'stPeak'/'stCurBytes', so the counted accounting is untouched.
+arenaAllocPureBytes :: Int -> Node -> Store -> (Addr, Store)
+arenaAllocPureBytes bytes n s = case stArena s of
+  [] -> error "arenaAllocPure: no open arena frame"
+  (top : rest) ->
+    let i        = stNext s
+        g        = stStats s
+        cur      = stArenaBytes g + bytes
+        g'       = g { stArenaBytes = cur
+                     , stArenaPeak  = max (stArenaPeak g) cur }
+    in ( HAddr i
+         -- The cell's rc is set to 1 as a CONVENTIONAL PLACEHOLDER only (a
+         -- well-formed 'Cell' for 'derefPure'); an arena cell is uncounted, so its
+         -- rc is never incref'd/decref'd -- 'incref'/'dropAddr' short-circuit on
+         -- 'isArenaAddr' before touching it, and 'arenaClose' bulk-removes it
+         -- without consulting the rc.
+       , s { stCells  = IM.insert i (Cell 1 n bytes) (stCells s)
+           , stNext   = i + 1
+           , stArena  = IS.insert i top : rest
+           , stStats  = g'
+           } )
+
+-- | Allocate an UNCOUNTED arena cell, dispatching on the backend (Region Slice R1,
+-- spec §3.2). This is the arena analogue of 'alloc'/'allocNCon':
+--
+--   * 'AbstractHeap' -> 'arenaAllocPure' (an 'HAddr' recorded in 'stArena').
+--   * 'CHeap' with a C-ELIGIBLE 'NCon' ('nodeCEligible': arity <= 255, every field
+--     encodable) AND a tag < 65536 with a matching descriptor -> a real C arena
+--     cell ('CAddr') via 'wok_arena_alloc', recorded in 'stArenaC'.
+--   * 'CHeap' with any NON-eligible node (a wide/non-encodable 'NCon', or any other
+--     node kind) -> falls back to the abstract arena ('arenaAllocPure', 'HAddr'),
+--     exactly as 'allocNCon' falls a non-eligible counted 'NCon' back to the
+--     abstract heap. Such a node has 'wouldBeCBytes' = 0, so the arena-byte books
+--     stay identical to the C runtime's (which never saw it).
+--
+-- The same descriptor first-kind-wins / tag-bound checks as 'allocNCon' gate the C
+-- path so the recorded 'stConDesc' descriptor stays correct for every C cell of a
+-- tag (the scan-out at close decodes slots through that descriptor). 'stArenaBytes'/
+-- 'stArenaPeak' are bumped by 'wouldBeCBytes' on the C-eligible arena path (matching
+-- the C runtime's @arena_bytes@), and by ZERO on the C-INELIGIBLE fallback paths
+-- (tag-overflow / descriptor-mismatch), where no @wok_arena_alloc@ runs so the C
+-- runtime charges 0 too — mirroring 'allocNCon's zero-charge 'allocPureFallback' so
+-- the differential oracle matches on both branches.
+arenaAlloc :: Node -> Store -> RC (Addr, Store)
+-- PRECONDITION (enforced here, surfaced as a catchable 'PrimError' consistent with
+-- 'arenaClose'): an arena frame is open. The interpreter only routes 'Arena'-tagged
+-- binders here, whose enclosing body opened a frame on entry, so this never trips in
+-- a well-formed run; surfacing it through the RC error channel (rather than the
+-- pure 'arenaAllocPure' 'error') keeps the no-frame failure catchable and matches
+-- 'arenaClose'. (Region Slice R1, code-review #5.)
+arenaAlloc _ s
+  | null (stArena s) =
+      liftRC (Left (PrimError (Tx.pack "arenaAlloc: no open arena frame")))
+arenaAlloc n s = case stBackend s of
+  AbstractHeap -> pure (arenaAllocPure n s)
+  CHeap hp     -> case n of
+    NCon con vs
+      | length vs <= 255
+      , Just encoded <- traverse encodeSlotC vs ->
+          let (tid, s1) = internTag con s
+              newKinds  = map fst encoded
+          in if tid >= 65536
+               -- Tag overflow: the node is C-eligible (wouldBeCBytes nonzero) but no
+               -- 'wok_arena_alloc' runs, so charge 0 to match the C arena_bytes.
+               then pure (arenaAllocPureFallback n s1)
+               else case IM.lookup (fromIntegral tid) (stConDesc s1) of
+                 Nothing ->
+                   arenaAllocCEligible hp tid encoded (NCon con vs)
+                     (s1 { stConDesc = IM.insert (fromIntegral tid) newKinds (stConDesc s1) })
+                 Just existing
+                   | existing == newKinds -> arenaAllocCEligible hp tid encoded (NCon con vs) s1
+                   -- Descriptor first-kind-wins mismatch: C-eligible node, but no
+                   -- 'wok_arena_alloc' runs, so charge 0 to match the C arena_bytes.
+                   | otherwise            -> pure (arenaAllocPureFallback (NCon con vs) s1)
+    -- Non-eligible NCon (wide/non-encodable) or any other node kind: abstract arena.
+    -- 'wouldBeCBytes' is already 0 for these, so 'arenaAllocPure' charges 0.
+    _ -> pure (arenaAllocPure n s)
+
+-- | Allocate a C-ELIGIBLE arena 'NCon' as a real C arena cell ('CAddr') via
+-- 'wok_arena_alloc', writing its encoded slots, recording it in the innermost
+-- 'stArenaC' frame, and bumping 'stArenaBytes'/'stArenaPeak' by 'wouldBeCBytes'
+-- (the SAME @8 + 8*arity@ the C runtime's @wok_arena_alloc@ charges to its own
+-- @arena_bytes@). The cell is UNCOUNTED: it never touches 'recordAlloc'/'stLive',
+-- and 'wok_arena_alloc' allocates with @rc@ unused -- it is reclaimed by
+-- 'wok_arena_close' at scope close, never by an rc reaching zero.
+arenaAllocCEligible :: Ptr WokHeap -> Word32 -> [(SlotKind, Word64)] -> Node -> Store
+                    -> RC (Addr, Store)
+arenaAllocCEligible hp tid encoded n s = case stArenaC s of
+  []          -> liftRC (Left (PrimError (Tx.pack "arenaAlloc: no open C-arena frame")))
+  (top : rest) -> do
+    p <- liftIO (H.wokArenaAlloc hp tid (fromIntegral (length encoded)))
+    liftIO $ mapM_ (\(i, (_, w)) -> H.wokSlotSet p (fromIntegral i) w)
+                   (zip [0 :: Int ..] encoded)
+    let bytes = wouldBeCBytes n  -- 8 + 8*arity for a C-eligible NCon
+        g     = stStats s
+        cur   = stArenaBytes g + bytes
+        g'    = g { stArenaBytes = cur
+                  , stArenaPeak  = max (stArenaPeak g) cur }
+    pure ( CAddr p
+         , s { stArenaC = Set.insert p top : rest
+             , stStats  = g' } )
+
+-- | Close the innermost arena scope: the SCAN-OUT then the O(1) bulk reset (spec
+-- §4.3). Fails loudly ('Left') if no arena frame is open.
+--
+-- THE SCAN-OUT (step 1). For each address in the TOP frame, read its node and
+-- compute its COUNTED children ('countedRefs' over 'nodeValues' -- the SAME
+-- routine the free cascade uses), and 'dropAddr' each counted child that is NOT
+-- itself an address in this top frame. (An arena sibling is skipped: it dies in
+-- the bulk reset; dropping it would be wrong since it is uncounted.) Per the
+-- R+escape invariant (spec §5.1, already proven) a counted child of an arena cell
+-- never points back into the arena, so this cascade only ever touches counted
+-- cells -- it NEVER frees an arena cell. The drops run while the arena cells are
+-- still readable (BEFORE the bulk reset).
+--
+-- THE BULK RESET (step 2). Delete every top-frame address from 'stCells' (marking
+-- it dead, the normal free path), subtract its 'cBytes' from 'stArenaBytes', and
+-- pop the frame. No 'recordFree': arena cells were never on the counted books.
+-- 'stArenaPeak' is NOT reset (it is a high-water mark).
+arenaClose :: Store -> RC Store
+arenaClose s = case stArena s of
+  [] -> liftRC (Left (PrimError (Tx.pack "arenaClose: no open arena frame")))
+  (top : rest) -> do
+    -- Step 1: scan out the counted children of every arena cell in this frame,
+    -- while the arena cells are still readable. Skip children that are arena
+    -- siblings of this frame (they die in the bulk reset).
+    --
+    -- DELIBERATELY DEREFS THE ORIGINAL PRE-DROP STORE @s@: collect every arena
+    -- cell's counted children from the pre-drop store so EVERY arena cell is still
+    -- readable. Do NOT switch this deref to the post-drop store (the @s1@ the fold
+    -- below builds) or to a per-child running store -- a child freed by an earlier
+    -- sibling's drop would then be unreadable. Collect first (read-only over @s@),
+    -- then fold the drops.
+    let scanOne acc i = case derefPure (HAddr i) s of
+          -- An arena cell is always on the abstract heap (arenaAllocPure inserts
+          -- into stCells), so derefPure resolves it; a failure here is an internal
+          -- corruption.
+          Left e  -> Left e
+          Right c ->
+            let kids = [ a | a <- countedRefs (nodeValues (cNode c))
+                           , not (inFrame a) ]
+            in Right (acc ++ kids)
+        -- The sibling-skip filters ONLY this TOP frame. The cross-frame case (an
+        -- inner arena cell referencing an OUTER frame's arena cell) is impossible
+        -- by the R+escape invariant (spec §5.1: a counted child of an arena cell is
+        -- never an arena address) AND, were it ever to arise, would ALSO be caught
+        -- by 'dropAddr's own 'isArenaAddr' guard (defense-in-depth: a drop of any
+        -- arena cell, this frame's or an outer frame's, is inert). So a stale read
+        -- of 'inFrame' alone cannot mislead: it is the same-frame fast skip, never
+        -- the sole net.
+        inFrame (HAddr j) = IS.member j top
+        inFrame _         = False
+    childAddrs <- liftRC (foldM scanOne [] (IS.toList top))
+    s1 <- foldM (flip dropAddr) s childAddrs
+    -- Step 2: bulk-remove every (abstract, HAddr) arena cell of this frame. Mark
+    -- dead (the normal free path), subtract its bytes from stArenaBytes, and pop the
+    -- frame.
+    let removeOne st i = case IM.lookup i (stCells st) of
+          Nothing -> st  -- already gone (cannot happen: arena cells are not dropped)
+          Just c  -> st { stCells      = IM.delete i (stCells st)
+                        , stDead       = IS.insert i (stDead st)
+                        , stStats      = (stStats st)
+                                           { stArenaBytes = stArenaBytes (stStats st) - cBytes c }
+                        }
+        s2 = (foldl removeOne s1 (IS.toList top)) { stArena = rest }
+    -- Step 3 (CHeap only): scan out + bulk-free the C-arena cells of this frame,
+    -- popping the C-cell frame and its handle. On AbstractHeap the C stacks carry
+    -- only empty frames, so this pops an empty frame and is a no-op past the pop.
+    closeCArenaFrame s2
+
+-- | The C-arena half of 'arenaClose' (Region Slice R1): scan out the counted
+-- children of every C-arena cell in the innermost 'stArenaC' frame, then call
+-- 'wok_arena_close' to bulk-reclaim the frame's chain, popping 'stArenaC' and
+-- 'stArenaHandles'.
+--
+--   * On 'AbstractHeap' (or an empty C frame) this just pops the (empty) C frame:
+--     no C cells exist, nothing to scan, no 'wok_arena_close' to call.
+--   * On 'CHeap' it mirrors the abstract scan-out: read each C cell's counted
+--     children from its slots ('readCConValues' -> 'countedRefs'), skip C siblings
+--     of this frame (they die in the bulk reset), and 'dropAddr' the rest -- the
+--     SAME relocated-to-close RC the program would have done. The 'dropAddr' inert
+--     guards ('isArenaAddr' on both 'CAddr' and 'HAddr') make any sibling reached
+--     through a cross-kind edge a no-op too, so the sibling-skip is an optimization,
+--     not the sole net. 'stArenaBytes' is reduced by each cell's @8 + 8*arity@,
+--     mirroring the C runtime's @arena_bytes@ restoration; 'wok_arena_close' frees
+--     the chain in O(slabs).
+closeCArenaFrame :: Store -> RC Store
+closeCArenaFrame s = case stArenaC s of
+  []            -> liftRC (Left (PrimError (Tx.pack "arenaClose: no open C-arena frame")))
+  (top : restC) -> case stBackend s of
+    AbstractHeap ->
+      -- top is empty under AbstractHeap; just pop the C-cell frame.
+      pure s { stArenaC = restC }
+    CHeap hp -> do
+      let cells = Set.toList top
+      -- Collect each C cell's counted children from the PRE-DROP store (all cells
+      -- still readable), skipping C siblings of this frame.
+      childLists <- liftIO $ mapM (`readCConValues` s) cells
+      let kids = [ a | vs <- childLists, a <- countedRefs vs, not (inFrameC a) ]
+          inFrameC (CAddr q) = Set.member q top
+          inFrameC _         = False
+      s1 <- foldM (flip dropAddr) s kids
+      -- Reduce stArenaBytes by each cell's 8 + 8*arity (mirroring the C runtime's
+      -- arena_bytes restoration). Read the arity from each cell while still live.
+      bytesEach <- liftIO $ mapM (\p -> (\ar -> 8 + 8 * fromIntegral (ar :: Word32))
+                                          <$> H.wokArity p) cells
+      let s2 = s1 { stStats = (stStats s1)
+                      { stArenaBytes = stArenaBytes (stStats s1) - sum bytesEach } }
+      -- Bulk-reclaim the C arena frame and pop its handle.
+      case stArenaHandles s2 of
+        (handle : restH) -> do
+          liftIO (H.wokArenaClose hp handle)
+          pure s2 { stArenaC = restC, stArenaHandles = restH }
+        [] -> liftRC (Left (PrimError (Tx.pack "arenaClose: C-arena handle stack underflow")))
 
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
@@ -1395,8 +1781,22 @@ derefPure (HAddr i)  s
 -- store unchanged. The interpreter monad form; 'increfPure' is the abstract-heap
 -- pure core.
 incref :: Addr -> Store -> RC Store
-incref (CAddr p)   s = liftIO (H.wokDup p) >> pure s
-incref a@(HAddr _) s = liftRC (increfPure a s)
+-- A C-arena cell ('CAddr' in 'stArenaC') is UNCOUNTED (Region Slice R1): a dup is
+-- inert -- NO @wok_dup@ -- mirroring the 'HAddr' arena arm below and 'dropAddr's
+-- 'CAddr' arena guard. Checked BEFORE the unconditional @wok_dup@ so a Perceus dup
+-- on a C-eligible arena binder never touches the arena cell's (unused) rc. (Today
+-- unreachable -- the pass never dups a non-escaping arena cell -- but kept
+-- symmetric with the drop path, and live once Task 6 routes C-eligible NCons to
+-- the arena.)
+incref a@(CAddr p) s
+  | isArenaAddr a s = pure s
+  | otherwise       = liftIO (H.wokDup p) >> pure s
+-- Arena cells are uncounted (Region Slice R1): a dup is inert, exactly like a
+-- static/'Inline' address. Checked before the abstract dispatch since arena
+-- membership lives in the store, not in the address.
+incref a@(HAddr _) s
+  | isArenaAddr a s = pure s
+  | otherwise       = liftRC (increfPure a s)
 incref (Inline _)  s = pure s
 
 -- | The pure core of 'incref' over the ABSTRACT heap. A 'CAddr' is increfed by
@@ -1429,6 +1829,14 @@ dropAddr a0 s0 = go [a0] s0
   where
     go [] s = pure s
     go (Inline _ : rest) s = go rest s
+    -- A C-arena cell ('CAddr' in 'stArenaC') is UNCOUNTED (Region Slice R1): a drop
+    -- is an inert no-op WITH NO CASCADE, mirroring the HAddr arena case below and
+    -- the C runtime's reclamation by 'wok_arena_close' (not by an rc reaching zero).
+    -- Checked BEFORE the @wok_dec@ so a Perceus-emitted drop on an arena binder, or
+    -- an arena sibling reached via a scan-out cascade, never decrements a cell the
+    -- arena owns.
+    go (a@(CAddr _) : rest) s
+      | isArenaAddr a s = go rest s
     go (CAddr p : rest) s = do
       newrc <- liftIO (H.wokDec p)
       if newrc /= 0
@@ -1476,6 +1884,13 @@ dropAddr a0 s0 = go [a0] s0
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats bytes s)
+    go (a@(HAddr _) : rest) s
+      -- Arena cells are uncounted (Region Slice R1, spec §3.2): a drop is an inert
+      -- no-op WITH NO CASCADE -- exactly like the static case in 'dropAddrStepPure'.
+      -- The cell is reclaimed only by 'arenaClose'; its counted children are
+      -- released by the close scan-out, not by this inert drop. Checked here (the
+      -- monad form holds the store) before the abort-reclaim/'dropAddrStepPure' path.
+      | isArenaAddr a s = go rest s
     go (a@(HAddr _) : rest) s = do
       -- ABORT RECLAIM (FBIP effect-safety, spec §3.4). If @a@ is an 'NCont' about
       -- to be freed (rc reaching 0 -- a handler discarding a captured continuation),
@@ -1635,6 +2050,11 @@ cascadeChildren other            = countedRefs (nodeValues other)
 -- No WOK_ARRAY_TAG branch is needed; the existing 'readCConValues' path is NCon-only.
 dropReuse :: Addr -> Store -> RC (RCValue, Store)
 dropReuse (Inline _) s = pure (RVReuse Nothing, s)              -- uncounted: never a donor
+-- A C-arena cell is FBIP-excluded (Region Slice R1, spec §5.5): uncounted, never a
+-- donor, never reserved -- the NULL-token path, mirroring the HAddr arena guard
+-- below and the static/Inline cases. Checked before the @wok_dec@.
+dropReuse a@(CAddr _) s
+  | isArenaAddr a s = pure (RVReuse Nothing, s)
 dropReuse (CAddr p)  s = do
   newrc <- liftIO (H.wokDec p)
   if newrc /= 0
@@ -1657,7 +2077,12 @@ dropReuse (CAddr p)  s = do
       let cAddrBytes = 8 + 8 * fromIntegral (arity :: Word32)
       pure (RVReuse (Just (ReuseSlot (CAddr p) arity True cAddrBytes)), s'')
 dropReuse a@(HAddr i) s
-  | isStaticAddr a = pure (RVReuse Nothing, s)                  -- uncounted: never a donor
+  | isStaticAddr a    = pure (RVReuse Nothing, s)              -- uncounted: never a donor
+  -- Arena cells are FBIP-excluded (Region Slice R1, spec §5.5): an arena cell is
+  -- uncounted, so it is never a reuse donor and never enters 'stReserved' -- the
+  -- NULL-token path, exactly like a static address. (Arrays are already excluded;
+  -- arena cells join them.)
+  | isArenaAddr a s   = pure (RVReuse Nothing, s)
   | otherwise = do
       c <- liftRC (derefPure a s)
       if cRc c <= 1
