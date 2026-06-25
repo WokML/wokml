@@ -1,1 +1,1 @@
-typecheck: typecheck in Fail.NoInstance: NoInstance "Eq" "String"
+typecheck: typecheck in Fail.NoInstance: NoInstance "Eq" "Foo"

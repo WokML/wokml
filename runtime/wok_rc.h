@@ -82,7 +82,8 @@ WOK_PURE uint64_t wok_stat_peak_physical_bytes(const WokHeap* h);
    len <= 62 (class < WOK_NUM_CLASSES 64) -> arena free-list; len >= 63 -> malloc.
    The arena free-list[len+1] is SHARED with NCon arity (len+1): identical byte size,
    shape-agnostic recycling.
-   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFF. */
+   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFF or 0xFFFE
+   (0xFFFE is the WOK_STRING_TAG, also reserved). */
 
 #define WOK_ARRAY_TAG 0xFFFFu
 
@@ -91,6 +92,28 @@ WOK_PURE uint64_t wok_array_len(const WokObj* p);
 WOK_PURE uint32_t wok_array_elemkind(const WokObj* p);
 void     wok_array_slot_set(WokObj* p, uint64_t i, uint64_t word);
 WOK_PURE uint64_t wok_array_slot_get(const WokObj* p, uint64_t i);
+
+/* ---- WokString: a flat UTF-8 byte buffer C cell (Slice E1) -------------------------
+   Layout (always 8-aligned):
+     offset  0  uint32 rc       \
+     offset  4  uint16 tag       |  8-byte WokObj-compatible prefix: wok_dup/wok_dec/wok_rc
+     offset  6  uint8  reserved  |  read offsets 0-7 unchanged; tag == WOK_STRING_TAG marks
+     offset  7  uint8  scan      /  a string; reserved=0 (no elemkind); scan=0 (no cascade).
+     offset  8  uint64 byte_len  <- runtime BYTE count (not codepoints, not words)
+     offset 16  uint8  bytes[byte_len]   <- packed UTF-8, 1-byte stride, opaque
+   Cell byte size = 16 + 8*ceil(byte_len/8)  (body rounds UP to an 8-byte granule so the
+   next bumped cell stays 8-aligned; contrast WokArray whose body is already word-aligned).
+   Size class = (cell_bytes/8) - 1 = 1 + ceil(byte_len/8)  (shares the free-list with an
+   NCon of that arity / a WokArray of that word-len -- identical byte size, shape-agnostic
+   recycling).  class < WOK_NUM_CLASSES (64) -> arena free-list; else -> malloc.
+   WOK_STRING_TAG is reserved Haskell-side: internTag never returns 0xFFFE or 0xFFFF. */
+
+#define WOK_STRING_TAG 0xFFFEu
+
+WokObj*          wok_string_alloc(WokHeap* h, uint64_t byte_len); /* rc=1, tag=WOK_STRING_TAG, body undef */
+WOK_PURE uint64_t wok_string_len(const WokObj* p);                /* byte_len */
+         uint8_t* wok_string_data(WokObj* p);                     /* pointer to body (bulk fill + FFI) */
+WOK_PURE uint64_t wok_string_byte_get(const WokObj* p, uint64_t i); /* one byte, zero-extended */
 
 /* ---- Uncounted per-activation arena (Region Slice R1) -----------------------------
    A LIFO checkpoint over the bump allocator. wok_arena_alloc returns an UNCOUNTED cell

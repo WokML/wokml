@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Smoke test: exercise the String ops that return U64/Bool and return a U64 result
+-- so that both the reference interpreter and the RC interpreter produce identical
+-- scalar output.
+--
+-- "hello" is a 5-codepoint, 5-byte ASCII string.
+--   length "hello"       -> 5
+--   byteLength "hello"   -> 5
+--   byteAt "hello" 0     -> 104 (ASCII 'h')
+--   append "ab" "cd"     -> "abcd" (then byteLength -> 4)
+--   eqString "x" "x"    -> True  -> 1
+--   eqString "a" "b"    -> False -> 0
+--
+-- Result: byteLength "hello" + byteAt "hello" 0 + 4 + 1 + 0 = 5 + 104 + 4 + 1 + 0 = 114
+
+main : U64
+main =
+  let bl   = byteLength "hello" in
+  let b0   = byteAt "hello" 0 in
+  let ab   = byteLength (append "ab" "cd") in
+  let r1   = if eqString "x" "x" then 1 else 0 in
+  let r2   = if eqString "a" "b" then 1 else 0 in
+  bl + b0 + ab + r1 + r2

@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Out-of-bounds index: both the reference interpreter and the RC interpreter
+-- must raise a PrimError. "hi" has length 2 (codepoints); index 5 is out of
+-- bounds.
+main : Char
+main = index "hi" 5

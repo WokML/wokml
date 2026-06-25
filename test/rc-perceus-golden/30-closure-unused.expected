@@ -1,13 +1,13 @@
 main =
   let t.3 = Box(99)
   let b = t.3
-  let t.2 = \n -> join j81(r) =
+  let t.2 = \n -> join j90(r) =
     let t.1 = +(n, r)
     t.1
   case b of
     Box v ->
       let _drop.1 = __rc_drop(b)
-      jump j81(v)
+      jump j90(v)
   let f = t.2
   let _drop.2 = __rc_drop(f)
   123
@@ -101,6 +101,18 @@ dict$Eq$Option d$Eq$0 =
   let t.2 = dict$Eq$Option$m1(d$Eq$0)
   let t.3 = Eq$Dict(t.1, t.2)
   t.3
+
+dict$Eq$String$m0 =
+  eqString
+
+dict$Eq$String$m1 x y =
+  let t.1 = dict$Eq$String$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$String =
+  let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
 
 reader e c =
   let t = c(self)

@@ -62,3 +62,8 @@ instance (Eq a) => Eq (Option a) where
       Some a -> case y of
         None   -> False
         Some b -> a == b
+
+extern eqString : String -> String -> Bool
+
+instance Eq String where
+  (==) = eqString

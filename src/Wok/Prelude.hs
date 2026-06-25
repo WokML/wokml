@@ -14,6 +14,8 @@ module Wok.Prelude
   , stdControlSource
   , stdArrayName
   , stdArraySource
+  , stdStringName
+  , stdStringSource
   ) where
 
 import Data.Text (Text)
@@ -53,4 +55,16 @@ stdArrayName = Tx.pack "Std.Array"
 stdArraySource :: IO Text
 stdArraySource = do
   path <- Paths_wok.getDataFileName "prelude/Std/Array.wok"
+  TIO.readFile path
+
+stdStringName :: Text
+stdStringName = Tx.pack "Std.String"
+
+-- | Read the Std.String embedded prelude source from the installed
+-- data-files location. Like Std.Base and Std.Array, the .wok file is the
+-- editable source of truth and is located at runtime via
+-- Paths_wok.getDataFileName.
+stdStringSource :: IO Text
+stdStringSource = do
+  path <- Paths_wok.getDataFileName "prelude/Std/String.wok"
   TIO.readFile path

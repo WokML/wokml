@@ -3,15 +3,20 @@ module Wok.Interp.RC.Prim
   ) where
 
 import Control.Monad (foldM)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (throwE)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
+import qualified Data.Text.Encoding as TxEnc
 import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
+import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.RC.Value
   ( RC, liftRC, RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
-  , Node (..), Cell (..), Store, alloc, deref, incref, dropAddr, dropReuse, writeNode
+  , Addr (..), HeapBackend (..)
+  , Node (..), Cell (..), Store (..), alloc, deref, incref, dropAddr, dropReuse, writeNode
   , continuationOwned, valueChildren
   , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC )
 import Wok.Interp.Value (RuntimeError (..))
@@ -27,11 +32,24 @@ import Wok.Interp.Value (RuntimeError (..))
 -- boolean RESULT must be allocated on the heap. The comparison/boolean prims are
 -- therefore store-threading (not pure), unlike the reference where 'Value'
 -- carries the constructor inline.
+-- | The RC primitive table, keyed by @(module, name)@. The compiler-SYNTHESIZED
+-- RC intrinsics @__rc_dup@/@__rc_drop@/@__rc_drop_reuse@ are dispatched via
+-- 'AVar'-with-hint (never 'APrim'), so they are registered under the empty-module
+-- sentinel @("", name)@ and looked up via the hint path in the machine.
 rcPrimTable :: RCPrimTable
-rcPrimTable = Map.fromList [ (rpName p, p) | p <- prims ]
+rcPrimTable = Map.fromList [ ((mn, rpName p), p) | (mn, p) <- taggedRcPrims ]
 
-prims :: [RCPrim]
-prims =
+-- | All RC primitives tagged with their defining module.
+taggedRcPrims :: [(Text, RCPrim)]
+taggedRcPrims =
+  map (PN.stdBaseModule,)    rcBasePrims
+  ++ map (Tx.pack "",)          rcIntrinsics   -- hint-dispatched; empty module sentinel
+  ++ map (PN.stdControlModule,) rcControlPrims
+  ++ map (PN.stdArrayModule,)   rcArrayPrims
+  ++ map (PN.stdStringModule,)  rcStringPrims
+
+rcBasePrims :: [RCPrim]
+rcBasePrims =
   [ arith   (Tx.pack "+")   (+)
   , arith   (Tx.pack "-")   (-)
   , arith   (Tx.pack "*")   (*)
@@ -44,19 +62,43 @@ prims =
   , boolOp  (Tx.pack "&&") (&&)
   , boolOp  (Tx.pack "||") (||)
   , dollarP
-  , rcDup
+  , eqString
+  ]
+
+-- | Compiler-SYNTHESIZED RC intrinsics. These reach the machine via 'AVar'-with-hint
+-- (not 'APrim'), so the dispatch uses an empty-module sentinel as the table key.
+rcIntrinsics :: [RCPrim]
+rcIntrinsics =
+  [ rcDup
   , rcDrop
   , rcDropReuse
-  , contCellNew
+  ]
+
+rcControlPrims :: [RCPrim]
+rcControlPrims =
+  [ contCellNew
   , contStore
   , contTake
-  , arrayNew
+  ]
+
+rcArrayPrims :: [RCPrim]
+rcArrayPrims =
+  [ arrayNew
   , arrayFromList
   , arrayToList
   , arrayIndex
   , arrayLength
   , arraySet
   , arrayResize
+  ]
+
+rcStringPrims :: [RCPrim]
+rcStringPrims =
+  [ stringLength
+  , stringIndex
+  , stringByteLength
+  , stringByteAt
+  , stringAppend
   ]
 
 -- ---------------------------------------------------------------------------
@@ -640,3 +682,142 @@ buildList vs0 s0 = do
       st2 <- dupValue x st1
       (cell, st3) <- alloc (NCon (Tx.pack "Cons") [x, rest]) st2
       pure (RVBox cell, st3)
+
+-- ---------------------------------------------------------------------------
+-- String primitives (Slice E1, spec §5.3)
+--
+-- Strings are represented as 'NString ByteString' cells on the RC heap.
+-- All prims CONSUME their 'RVBox' arguments (ownership moves in) and drop
+-- the consumed cell with 'dropAddr' after reading, following the Array
+-- convention. RC deltas per op:
+--   append   : +1 alloc (new NString cell; both inputs dropped)
+--   the rest : 0 alloc  (inputs dropped; no output cell)
+--
+-- Codepoint ops ('length', 'index') decode the UTF-8 bytes via
+-- 'Data.Text.Encoding.decodeUtf8' then use 'Data.Text' operations.
+-- Byte ops ('byteLength', 'byteAt') operate directly on the raw bytes.
+-- 'eqString' is a byte-equality comparison.
+
+-- | Extract the 'ByteString' from an 'NString' boxed handle. Fails if the
+-- value is not a boxed 'NString'.
+stringBytes :: RCValue -> Store -> RC BS.ByteString
+stringBytes (RVBox a) s = do
+  c <- deref a s
+  case cNode c of
+    NString bs -> pure bs
+    _          -> throwE (PrimError (Tx.pack "String: not a string"))
+stringBytes _ _ = throwE (PrimError (Tx.pack "String: not a string"))
+
+-- | Extract a non-negative string index from a U64 literal argument.
+-- Mirrors 'asIndex' for Array; message uses the String domain name.
+asStringIndex :: RCValue -> RC Int
+asStringIndex (RVLit (LInt n))
+  | n < 0                           = throwE (PrimError (Tx.pack "String: negative index"))
+  | n > toInteger (maxBound :: Int) = throwE (PrimError (Tx.pack "String: index out of range"))
+  | otherwise                       = pure (fromInteger n)
+asStringIndex _ = throwE (PrimError (Tx.pack "String: expected U64 index"))
+
+-- | @length s@: codepoint count. Decodes UTF-8 bytes to codepoints, counts them.
+-- Consumes 's'. RC: 0 alloc.
+stringLength :: RCPrim
+stringLength = RCPrim PN.stringLengthName 1 [] $ \args s -> case args of
+  [sv@(RVBox a)] -> do
+    bs <- stringBytes sv s
+    let n = Tx.length (TxEnc.decodeUtf8 bs)
+    s1 <- dropAddr a s
+    pure (PRDone (RVLit (LInt (toInteger n))), s1)
+  _ -> throwE (ArityError (Tx.pack "String.length"))
+
+-- | @index s i@: the i-th codepoint as a Char (0-based, bounds-checked).
+-- Decodes UTF-8 bytes to codepoints. OOB raises 'PrimError'.
+-- Consumes 's'; returns an unboxed 'RVLit (LChar c)'. RC: 0 alloc.
+stringIndex :: RCPrim
+stringIndex = RCPrim PN.stringIndexName 2 [] $ \args s -> case args of
+  [sv@(RVBox a), iv] -> do
+    bs <- stringBytes sv s
+    i  <- asStringIndex iv
+    let t = TxEnc.decodeUtf8 bs
+        n = Tx.length t
+    if i >= n
+      then throwE (PrimError (Tx.pack "String.index: out of bounds"))
+      else do
+        let c = Tx.index t i
+        s1 <- dropAddr a s
+        pure (PRDone (RVLit (LChar c)), s1)
+  _ -> throwE (ArityError (Tx.pack "String.index"))
+
+-- | @byteLength s@: byte count of the UTF-8 encoding. O(1): just reads
+-- 'BS.length' from the 'NString' cell. Consumes 's'. RC: 0 alloc.
+stringByteLength :: RCPrim
+stringByteLength = RCPrim PN.stringByteLengthName 1 [] $ \args s -> case args of
+  [sv@(RVBox a)] -> do
+    bs <- stringBytes sv s
+    let n = BS.length bs
+    s1 <- dropAddr a s
+    pure (PRDone (RVLit (LInt (toInteger n))), s1)
+  _ -> throwE (ArityError (Tx.pack "String.byteLength"))
+
+-- | @byteAt s i@: the i-th UTF-8 byte as a U64 (0-based, bounds-checked).
+-- OOB raises 'PrimError'. Consumes 's'. RC: 0 alloc.
+-- On 'CHeap' with a 'CAddr', bounds-checks O(1) via 'wokStringLen' and reads
+-- the single byte via 'wokStringByteGet' (no full-body copy). On 'AbstractHeap'
+-- (or any 'HAddr') the stored 'ByteString' already lives in Haskell memory so
+-- 'BS.index' is O(1) after the 'IntMap' lookup.
+stringByteAt :: RCPrim
+stringByteAt = RCPrim PN.stringByteAtName 2 [] $ \args s -> case args of
+  [RVBox a@(CAddr p), iv] -> case stBackend s of
+    CHeap _ -> do
+      i    <- asStringIndex iv
+      blen <- liftIO (H.wokStringLen p)
+      if i >= fromIntegral blen
+        then throwE (PrimError (Tx.pack "String.byteAt: out of bounds"))
+        else do
+          byte <- liftIO (H.wokStringByteGet p (fromIntegral i))
+          s1   <- dropAddr a s
+          pure (PRDone (RVLit (LInt (toInteger byte))), s1)
+    AbstractHeap -> stringByteAtViaBytes a (RVBox a) iv s
+  [RVBox a, iv] -> stringByteAtViaBytes a (RVBox a) iv s
+  _ -> throwE (ArityError (Tx.pack "String.byteAt"))
+
+-- | O(1)-after-deref fallback: deref the 'NString' cell (an 'IntMap' lookup on
+-- 'AbstractHeap'), then index the already-in-memory 'ByteString'. Used for
+-- 'AbstractHeap' addresses and any address shape not handled by the 'CHeap'
+-- O(1) fast path.
+stringByteAtViaBytes :: Addr -> RCValue -> RCValue -> Store -> RC (RCPrimResult, Store)
+stringByteAtViaBytes a sv iv s = do
+  bs <- stringBytes sv s
+  i  <- asStringIndex iv
+  if i >= BS.length bs
+    then throwE (PrimError (Tx.pack "String.byteAt: out of bounds"))
+    else do
+      let byte = BS.index bs i
+      s1 <- dropAddr a s
+      pure (PRDone (RVLit (LInt (toInteger byte))), s1)
+
+-- | @append a b@: concatenate two strings. Allocates a new 'NString' cell of
+-- byte length = len(a) + len(b); drops both inputs. RC: +1 alloc.
+stringAppend :: RCPrim
+stringAppend = RCPrim PN.stringAppendName 2 [] $ \args s -> case args of
+  [av@(RVBox aa), bv@(RVBox ba)] -> do
+    bsa <- stringBytes av s
+    bsb <- stringBytes bv s
+    let cat = bsa <> bsb
+    s1        <- dropAddr aa s
+    s2        <- dropAddr ba s1
+    (na, s3)  <- alloc (NString cat) s2
+    pure (PRDone (RVBox na), s3)
+  _ -> throwE (ArityError (Tx.pack "String.append"))
+
+-- | @eqString a b@: byte-equality of two strings. Consumes both. RC: 0 alloc.
+-- (For valid UTF-8, codepoint equality = byte equality, so this is correct.)
+eqString :: RCPrim
+eqString = RCPrim PN.eqStringName 2 [] $ \args s -> case args of
+  [av@(RVBox aa), bv@(RVBox ba)] -> do
+    bsa <- stringBytes av s
+    bsb <- stringBytes bv s
+    let eq = bsa == bsb
+    s1        <- dropAddr aa s
+    s2        <- dropAddr ba s1
+    (boolV, s3) <- allocBool eq s2
+    pure (PRDone boolV, s3)
+  _ -> throwE (ArityError (Tx.pack "eqString"))

@@ -18,6 +18,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
+import qualified Data.Text.Encoding as TxEnc
 import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
   , Lit (..), OpArm (..), Rhs (..), TopBind (..), binderUnique, bndName
@@ -112,12 +113,19 @@ evalExprRC :: RCEnv -> Expr -> RCScope -> RCKont -> Store
            -> RC RCConfig
 evalExprRC env expr sc k s = case expr of
   Ret a -> do
-    v <- liftRC (resolveRCAtom sc a)
-    pure (RReturn v k s)
+    -- OWNING position: a returned string literal allocates a fresh counted
+    -- 'NString' cell (E1 Task 3); the caller's continuation owns and drops it.
+    (v, s') <- resolveRCAtomAlloc sc a s
+    pure (RReturn v k s')
 
   Let b rhs body -> evalRhsRC env b rhs body sc k s
 
   Case a alts -> do
+    -- NON-owning position: the scrutinee is matched in place, not owned (Perceus's
+    -- 'scrutineeParent' returns 'Nothing' for a literal, so nothing drops it). A
+    -- VARIABLE String scrutinee is already an 'RVBox' in the env; a literal
+    -- scrutinee stays the inline 'RVLit (LStr s)' (no alloc, no leak). So the PURE
+    -- resolver is correct here.
     v <- liftRC (resolveRCAtom sc a)
     matchAltsRC v alts sc k s
 
@@ -126,7 +134,9 @@ evalExprRC env expr sc k s = case expr of
     in pure (REval body sc { rscJoins = Map.insert j jp (rscJoins sc) } k s)
 
   Jump j args -> do
-    vs <- liftRC (mapM (resolveRCAtom sc) args)
+    -- OWNING position: a string literal jumped as a join argument allocates a
+    -- fresh counted cell; the join's boxed param owns and drops it.
+    (vs, s2) <- resolveRCAtomsAlloc sc args s
     case Map.lookup j (rscJoins sc) of
       Nothing -> throwE (UnboundVar (renderJoin j))
       Just (RCJoin jsc ps jbody jk)
@@ -139,7 +149,7 @@ evalExprRC env expr sc k s = case expr of
                 <> Tx.pack (show (length ps)) <> Tx.pack " argument(s), got "
                 <> Tx.pack (show (length vs))))
         | otherwise ->
-            pure (REval jbody jsc { rscEnv = bindRCBinders ps vs (rscEnv jsc) } jk s)
+            pure (REval jbody jsc { rscEnv = bindRCBinders ps vs (rscEnv jsc) } jk s2)
 
   LetRec defs body ->
     -- SHARED-ENV + CODE-POINTER representation (M2a-2 Task 3). A local group of
@@ -222,12 +232,19 @@ evalRhsRC :: RCEnv -> Binder -> Rhs -> Expr -> RCScope -> RCKont -> Store
           -> RC RCConfig
 evalRhsRC env b rhs body sc k s = case rhs of
   RAtom a -> do
-    v <- liftRC (resolveRCAtom sc a)
-    cont v s
+    -- OWNING position: a 'Let'-bound string literal allocates a fresh counted
+    -- 'NString' cell (E1 Task 3). The boxed binder @b@ owns it; Perceus inserts the
+    -- @__rc_drop@ that frees it at last use (a dup at each extra use). String is
+    -- never an allocating RHS the region pass routes, so this always takes the
+    -- counted 'Heap' path (never arena).
+    (v, s') <- resolveRCAtomAlloc sc a s
+    cont v s'
 
   RCon c as -> do
-    vs <- liftRC (mapM (resolveRCAtom sc) as)
-    (a, s') <- allocRouted b (NCon c vs) s
+    -- Field atoms are OWNED by the cell: a string-literal field allocates a fresh
+    -- counted cell moved into the constructor; the cell's drop cascade frees it.
+    (vs, s1) <- resolveRCAtomsAlloc sc as s
+    (a, s') <- allocRouted b (NCon c vs) s1
     cont (RVBox a) s'
 
   -- The FBIP @alloc_at@ form (spec §9): an 'RCon' that consumes a reuse token.
@@ -239,14 +256,18 @@ evalRhsRC env b rhs body sc k s = case rhs of
   -- are FBIP-excluded (§5.5), so a reuse target is always 'Heap'. (The region pass
   -- never even sees 'RReuseCon' -- it runs before reuse-pairing.)
   RReuseCon tok c as -> do
-    tokVal <- liftRC (resolveRCAtom sc tok)
-    vs     <- liftRC (mapM (resolveRCAtom sc) as)
-    (a, s') <- allocAt tokVal (NCon c vs) s
+    -- The token is a non-owning affine ticket (never a string); the FIELD atoms are
+    -- OWNED by the reused cell, so a string-literal field allocates a counted cell
+    -- the cascade frees. Resolve the token (pure) then the owning fields (alloc).
+    tokVal   <- liftRC (resolveRCAtom sc tok)
+    (vs, s1) <- resolveRCAtomsAlloc sc as s
+    (a, s') <- allocAt tokVal (NCon c vs) s1
     cont (RVBox a) s'
 
   RRecord t flds -> do
-    vs <- liftRC (mapM (\(l, a) -> (,) l <$> resolveRCAtom sc a) flds)
-    (a, s') <- allocRouted b (NRecord t (Map.fromList vs)) s
+    -- Record-field atoms are OWNED by the cell (as for 'RCon').
+    (vs, s1) <- resolveRCFieldsAlloc sc flds s
+    (a, s') <- allocRouted b (NRecord t (Map.fromList vs)) s1
     cont (RVBox a) s'
 
   RLam ps e -> do
@@ -270,8 +291,12 @@ evalRhsRC env b rhs body sc k s = case rhs of
       RVReuse _     -> throwE (BadProjection l)
 
   RApp f as -> do
-    vs <- liftRC (mapM (resolveRCAtom sc) as)
-    callFn env sc f vs (KLetRC b body sc k) s
+    -- Call arguments are OWNED by the callee (a boxed param is owned-on-entry and
+    -- dropped at last use by the callee body / a prim consuming its args), so a
+    -- string-literal argument allocates a fresh counted cell. The call HEAD @f@ is
+    -- resolved separately in 'callFn' (a borrow, never allocated here).
+    (vs, s1) <- resolveRCAtomsAlloc sc as s
+    callFn env sc f vs (KLetRC b body sc k) s1
 
   -- An effect OPERATION (M2b-1 Task 4): the RC analogue of the reference
   -- 'Wok.Interp.Machine' 'ROp' arm. Resolve the args and the optional named-
@@ -279,9 +304,12 @@ evalRhsRC env b rhs body sc k s = case rhs of
   -- continuation 'KLetRC b body sc k' (so the captured @above@ prefix includes
   -- this 'Let' frame).
   ROp minst lbl op as -> do
-    vs      <- liftRC (mapM (resolveRCAtom sc) as)
-    mTarget <- liftRC (resolveInstRC sc minst)
-    rcDispatchOp mTarget lbl op vs (KLetRC b body sc k) s
+    -- Op arguments are OWNED (delivered to the handler arm / resume, consumed like
+    -- call args), so a string-literal op argument allocates a fresh counted cell.
+    -- The instance handle is a non-owning 'RVInst' (never a string).
+    (vs, s1) <- resolveRCAtomsAlloc sc as s
+    mTarget  <- liftRC (resolveInstRC sc minst)
+    rcDispatchOp mTarget lbl op vs (KLetRC b body sc k) s1
   where
     cont v s' = pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
     -- Route this allocation by the region plan (Region Slice R1, spec §4.2): an
@@ -292,6 +320,31 @@ evalRhsRC env b rhs body sc k s = case rhs of
     allocRouted bd node st = case Map.lookup (binderUnique bd) (rcePlacement env) of
       Just Arena -> arenaAlloc node st
       _          -> alloc node st
+
+-- | Resolve a list of atoms in OWNING positions, threading the store left-to-right
+-- (a string literal among them allocates a fresh counted 'NString' cell; every
+-- other atom is resolved purely with the store unchanged). The order matters only
+-- for the allocation counters, which are deterministic across both backends. Used
+-- for constructor/record fields and call/op/jump arguments.
+resolveRCAtomsAlloc :: RCScope -> [Atom] -> Store -> RC ([RCValue], Store)
+resolveRCAtomsAlloc sc as s0 = do
+  (vsRev, s') <- foldM step ([], s0) as
+  pure (reverse vsRev, s')
+  where
+    step (acc, st) a = do
+      (v, st') <- resolveRCAtomAlloc sc a st
+      pure (v : acc, st')
+
+-- | As 'resolveRCAtomsAlloc' but for labelled record fields, preserving the
+-- label of each resolved value.
+resolveRCFieldsAlloc :: RCScope -> [(Text, Atom)] -> Store -> RC ([(Text, RCValue)], Store)
+resolveRCFieldsAlloc sc flds s0 = do
+  (vsRev, s') <- foldM step ([], s0) flds
+  pure (reverse vsRev, s')
+  where
+    step (acc, st) (l, a) = do
+      (v, st') <- resolveRCAtomAlloc sc a st
+      pure ((l, v) : acc, st')
 
 -- | Resolve the optional named-instance handle of an 'ROp' to its @(Unique, tag)@
 -- routing pair. 'Nothing' is ambient dispatch (route to the nearest covering
@@ -318,8 +371,8 @@ callFn :: RCEnv -> RCScope -> Atom -> [RCValue] -> RCKont -> Store
        -> RC RCConfig
 callFn env sc f args k s = case f of
   ALit _ -> throwE (NotAFunction (Tx.pack "literal"))
-  APrim (_, name) ->
-    case Map.lookup name (rcePrims env) of
+  APrim (mn, name) ->
+    case Map.lookup (mn, name) (rcePrims env) of
       Just p  -> enterPrim env p args k s
       Nothing -> throwE (UnboundPrim name)
   AVar n ->
@@ -342,7 +395,9 @@ callFn env sc f args k s = case f of
             -- @__rc_drop_reuse@ joins @__rc_dup@/@__rc_drop@ as a
             -- compiler-SYNTHESIZED RC intrinsic (emitted by the FBIP post-pass as
             -- an 'AVar'-with-hint, never an extern), resolved here by HINT.
-            case Map.lookup (nameHint n) (rcePrims env) of
+            -- The table key for hint-dispatched intrinsics uses @("", name)@ (empty
+            -- module sentinel) to distinguish them from qualified prelude externs.
+            case Map.lookup (Tx.pack "", nameHint n) (rcePrims env) of
               Just p  -> enterPrim env p args k s
               Nothing -> throwE (UnboundVar (nameHint n))
         | otherwise -> throwE (UnboundVar (nameHint n))
@@ -642,7 +697,9 @@ matchAltsRC v alts sc k s = case v of
           NCon c' vs | c' == c && length bs == length vs ->
             pure (REval e sc { rscEnv = bindRCBinders bs vs (rscEnv sc) } k s)
           _ -> go rest
-        go (AltLit _ _ : rest) = go rest   -- a boxed node never equals a literal
+        go (AltLit l e : rest) = case node of
+          NString bs | l == LStr (TxEnc.decodeUtf8 bs) -> pure (REval e sc k s)
+          _ -> go rest
         go (AltDefault e : _)  = pure (REval e sc k s)
 
     -- Literal scrutinee: only literal alts and default apply.
@@ -658,6 +715,7 @@ matchAltsRC v alts sc k s = case v of
 nodeTag :: Node -> Text
 nodeTag (NCon t _)    = t
 nodeTag (NArray _)    = Tx.pack "<array>"
+nodeTag (NString _)   = Tx.pack "<string>"
 nodeTag (NRecord t _) = t
 nodeTag NClosure{}    = Tx.pack "<closure>"
 nodeTag (NGroupCode _) = Tx.pack "<closure>"

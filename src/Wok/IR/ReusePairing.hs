@@ -81,7 +81,10 @@ data SlotClass = KLitInt | KLitChar | KLitUnit | KPointer | NonEncodable
 --   * @Int@ / @U64@ / @U32@        -> 'KLitInt'
 --   * @Char@                       -> 'KLitChar'
 --   * @()@                         -> 'KLitUnit'
---   * @String@                     -> 'NonEncodable' (abstract-heap-only literal)
+--   * @String@                     -> 'KPointer' (Slice E1, Task 3: a String value
+--                                      is now a counted 'NString' cell stored as a
+--                                      pointer word, exactly like any other boxed
+--                                      field; it is no longer an inline literal)
 --   * any boxed / encodable-pointer -> 'KPointer' (Bool, lists, tuples, ADTs,
 --                                      records, functions, type variables)
 slotClassOf :: CType -> SlotClass
@@ -89,7 +92,7 @@ slotClassOf (CTCon TcU64    []) = KLitInt
 slotClassOf (CTCon TcU32    []) = KLitInt
 slotClassOf (CTCon TcChar   []) = KLitChar
 slotClassOf (CTCon TcUnit   []) = KLitUnit
-slotClassOf (CTCon TcString []) = NonEncodable
+slotClassOf (CTCon TcString []) = KPointer
 slotClassOf _                   = KPointer
 
 -- | The per-field slot-kind signature of a constructor, given the 'CType' of each
@@ -98,10 +101,13 @@ slotClassOf _                   = KPointer
 conSlotSig :: [CType] -> [SlotClass]
 conSlotSig = map slotClassOf
 
--- | The slot class of a literal atom (its obvious type).
+-- | The slot class of a literal atom (its obvious type). A string literal now
+-- allocates a counted 'NString' cell stored as a pointer ('KPointer'), so its
+-- slot class agrees with @slotClassOf String@ (Slice E1, Task 3) and a
+-- constructor with a String field stays reuse-compatible with itself.
 litSlotClass :: Lit -> SlotClass
 litSlotClass (LInt _)  = KLitInt
-litSlotClass (LStr _)  = NonEncodable
+litSlotClass (LStr _)  = KPointer
 litSlotClass (LChar _) = KLitChar
 litSlotClass LUnit     = KLitUnit
 

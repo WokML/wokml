@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Out-of-bounds byteAt: both the reference interpreter and the RC interpreter
+-- must raise a PrimError. "hi" has byteLength 2; index 5 is out of bounds.
+main : U64
+main = byteAt "hi" 5

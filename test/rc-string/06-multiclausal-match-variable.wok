@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Regression test (B1, multi-clause form): matching a String VARIABLE against
+-- a string-literal pattern via top-level multi-clause / decision-tree form.
+-- Uses append so the scrutinee is not a trivially-inlinable literal constant.
+-- Before the fix the RC interpreter silently returned 0 instead of 1.
+
+classify : String -> U64
+classify "hi" = 1
+classify _ = 0
+
+main : U64
+main =
+  let s = append "h" "i" in
+  classify s

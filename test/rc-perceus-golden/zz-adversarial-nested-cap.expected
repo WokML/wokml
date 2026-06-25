@@ -1,27 +1,27 @@
 build a b xs =
-  join j84(r.1) =
+  join j93(r.1) =
     let h = r.1
     let t.1 = Cell(h, a, b)
     t.1
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      join j87(r.2) =
+      join j96(r.2) =
         let g.1 = r.2
-        jump j84(g.1)
+        jump j93(g.1)
       case b of
-        Nil -> jump j87(0)
-        Cons p _.1 -> jump j87(p)
+        Nil -> jump j96(0)
+        Cons p _.1 -> jump j96(p)
     Cons y _.2 ->
       let _drop.2 = __rc_drop(xs)
-      join j94(r.3) =
+      join j103(r.3) =
         let g.2 = r.3
-        jump j84(g.2)
+        jump j93(g.2)
       case a of
-        Nil -> jump j94(y)
+        Nil -> jump j103(y)
         Cons q _.3 ->
           let t.2 = +(y, q)
-          jump j94(t.2)
+          jump j103(t.2)
 
 main =
   let t.1 = Nil
@@ -123,6 +123,18 @@ dict$Eq$Option d$Eq$0 =
   let t.2 = dict$Eq$Option$m1(d$Eq$0)
   let t.3 = Eq$Dict(t.1, t.2)
   t.3
+
+dict$Eq$String$m0 =
+  eqString
+
+dict$Eq$String$m1 x y =
+  let t.1 = dict$Eq$String$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$String =
+  let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
 
 reader e c =
   let t = c(self)

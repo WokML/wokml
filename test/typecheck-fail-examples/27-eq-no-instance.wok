@@ -1,4 +1,6 @@
 module Fail.NoInstance
 import Std.Base
 
-bad = "a" == "b"
+data Foo = Foo U64
+
+bad = Foo 1 == Foo 2

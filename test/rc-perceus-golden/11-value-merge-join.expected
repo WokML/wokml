@@ -1,15 +1,15 @@
 firstOr xs d =
-  join j83(r) =
+  join j92(r) =
     let h = r
     let t = +(h, 1)
     t
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      jump j83(d)
+      jump j92(d)
     Cons y _ ->
       let _drop.2 = __rc_drop(xs)
-      jump j83(y)
+      jump j92(y)
 
 main =
   let t.2 = Nil
@@ -107,6 +107,18 @@ dict$Eq$Option d$Eq$0 =
   let t.2 = dict$Eq$Option$m1(d$Eq$0)
   let t.3 = Eq$Dict(t.1, t.2)
   t.3
+
+dict$Eq$String$m0 =
+  eqString
+
+dict$Eq$String$m1 x y =
+  let t.1 = dict$Eq$String$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$String =
+  let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
 
 reader e c =
   let t = c(self)

@@ -37,8 +37,11 @@ type Env = Map Unique Value
 -- | Join points in scope (local labelled continuations).
 type JoinEnv = Map JoinId JoinPoint
 
--- | Primitive lookup table, keyed by the bodyless global's hint text.
-type PrimTable = Map Text Prim
+-- | Primitive lookup table, keyed by the qualified @(module, name)@ of the
+-- prelude @extern@. Using the full pair prevents name collisions between
+-- distinct modules that export identically-named operations (e.g. @length@
+-- in both @Std.Array@ and @Std.String@).
+type PrimTable = Map (Text, Text) Prim
 
 -- | A lexical scope: term bindings plus join points.
 data Scope = Scope { scEnv :: Env, scJoins :: JoinEnv }
@@ -183,8 +186,8 @@ instance Exception CafFailure
 -- by-hint fallback (#12).
 resolveAtom :: PrimTable -> Scope -> Atom -> Either RuntimeError Value
 resolveAtom _     _  (ALit l) = Right (VLit l)
-resolveAtom prims _  (APrim (_, name)) =
-  case Map.lookup name prims of
+resolveAtom prims _  (APrim (m, name)) =
+  case Map.lookup (m, name) prims of
     Just p  -> Right (VPrim p)
     Nothing -> Left (UnboundPrim name)
 resolveAtom _     sc (AVar n) =

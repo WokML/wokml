@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Append chain: verify byteLength of concatenated strings.
+--   append "abc" "def" -> "abcdef" -> byteLength 6
+--   append "" "hi"     -> "hi"     -> byteLength 2
+--   eqString "abc" "abc" -> True -> 1
+-- Result: 6 + 2 + 1 = 9
+
+main : U64
+main =
+  let s1  = append "abc" "def" in
+  let bl1 = byteLength s1 in
+  let s2  = append "" "hi" in
+  let bl2 = byteLength s2 in
+  let r   = if eqString "abc" "abc" then 1 else 0 in
+  bl1 + bl2 + r

@@ -67,6 +67,44 @@ static size_t wok_array_class(uint64_t len) {
 }
 #endif
 
+/* Read the runtime byte_len of a string cell (offset 8 past the WokObj prefix). */
+static uint64_t wok_string_read_byte_len(const WokObj* p) {
+    uint64_t byte_len;
+    memcpy(&byte_len, (const char*)p + 8, sizeof(uint64_t));
+    return byte_len;
+}
+
+/* Byte size of a string cell = 16 + 8*ceil(byte_len/8). Aborts on size_t overflow: the
+   body is rounded UP to an 8-byte granule so the next bumped cell stays 8-aligned (unlike
+   WokArray whose word-slots are already aligned). `byte_len` is a runtime/boundary value;
+   an adversarial value that would wrap size_t must abort loudly, not under-allocate. */
+static size_t wok_string_cell_bytes(uint64_t byte_len) {
+    /* ceil(byte_len/8) = (byte_len + 7) / 8 (integer division).
+       Overflow check: 8 * ceil(byte_len/8) <= byte_len + 7 <= SIZE_MAX - 16 requires
+       byte_len <= SIZE_MAX - 23. (No divisor here, unlike wok_array_cell_bytes: the string
+       rounding factor is the +7 in the numerator, not an 8 in the denominator.) */
+    if (WOK_UNLIKELY(byte_len > (uint64_t)(SIZE_MAX - 16u - 7u))) {
+        fprintf(stderr, "wok_rc: wok_string_alloc byte_len overflows size_t (16 + 8*ceil(byte_len/8))\n");
+        abort();
+    }
+    return 16u + 8u * ((size_t)(byte_len + 7u) / 8u);
+}
+
+/* Free-list size class of a string cell = cell_bytes/8 - 1 = 1 + ceil(byte_len/8).
+   Guards against wrap exactly as wok_array_class: if the class would be >= WOK_NUM_CLASSES
+   (i.e. ceil(byte_len/8) >= WOK_NUM_CLASSES-1, i.e. byte_len >= 8*(WOK_NUM_CLASSES-2)+1 = 497),
+   route to malloc. wok_string_alloc and wok_free's string branch MUST use this identical
+   guard. Arena-only: the WOK_RC_MALLOC backend never routes by class. */
+#ifndef WOK_RC_MALLOC
+static size_t wok_string_class(uint64_t byte_len) {
+    uint64_t granules = (byte_len + 7u) / 8u;   /* ceil(byte_len/8), no overflow (checked by caller) */
+    if (granules < (uint64_t)WOK_NUM_CLASSES - 1u) {
+        return (size_t)(granules + 1u);
+    }
+    return (size_t)WOK_NUM_CLASSES;   /* >= WOK_NUM_CLASSES -> malloc path */
+}
+#endif
+
 /* ---- self-policing PHYSICAL-memory invariant (debug/sanitizer build only) -------------
    The oracle checks LOGICAL accounting (cur_bytes/peak_bytes, allocs/frees) but is blind to
    PHYSICAL memory -- the slabs the runtime holds from the OS. A bug can grow slabs without
@@ -232,11 +270,16 @@ WokObj* wok_alloc(WokHeap* h, uint32_t tag, uint32_t arity) {
 }
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
-    /* Tag-first dispatch: array cells carry a runtime len at offset 8, not an arity byte. */
+    /* Tag-first dispatch: array and string cells carry a runtime len at offset 8, not an
+       arity byte. Check reserved tags BEFORE falling back to arity (their arity bytes have
+       different semantics: array stores elemkind, string stores 0). */
     size_t bytes;
     if (WOK_UNLIKELY((uint32_t)p->tag == WOK_ARRAY_TAG)) {
         uint64_t len = wok_array_read_len(p);
         bytes = wok_array_cell_bytes(len);
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_TAG)) {
+        uint64_t byte_len = wok_string_read_byte_len(p);
+        bytes = wok_string_cell_bytes(byte_len);
     } else {
         bytes = wok_cell_bytes((uint32_t)p->arity);
     }
@@ -367,6 +410,22 @@ WokObj* wok_array_alloc(WokHeap* h, uint64_t len, uint8_t elemkind) {
     h->cur_bytes += (uint64_t)sz;
     if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
     WOK_PHYS_ADD(h, sz);   /* large/array per-cell malloc grows physical */
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_string_alloc(WokHeap* h, uint64_t byte_len) {
+    size_t sz = wok_string_cell_bytes(byte_len);   /* aborts on size_t overflow */
+    WokObj* p = (WokObj*)malloc(sz);
+    if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    p->rc = 1u; p->tag = (uint16_t)WOK_STRING_TAG; p->arity = 0u; p->scan = 0u;
+    /* Write byte_len at offset 8 (past the WokObj prefix). */
+    memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_PHYS_ADD(h, sz);   /* per-cell malloc grows physical */
     WOK_LOGICAL_MARK(h);
     return p;
 }
@@ -578,15 +637,22 @@ WokObj* wok_alloc_at(WokHeap* h, uint32_t tag, uint32_t arity, WokObj* p) {
 
 void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
-    /* Tag-first dispatch: array cells carry a runtime len at offset 8, not an arity byte.
-       Size class: bytes/8-1.  NCon arity a -> class=a.  WokArray len L -> class=L+1
-       (via wok_array_class, the no-wrap guard alloc uses so routing agrees). */
+    /* Tag-first dispatch: array and string cells carry a runtime len at offset 8, not an
+       arity byte.  Check reserved tags BEFORE falling back to arity (their arity bytes have
+       different semantics: array stores elemkind, string stores 0).
+       Size class: bytes/8-1.  NCon arity a -> class=a.  WokArray len L -> class=L+1.
+       WokString byte_len B -> class = 1+ceil(B/8) (via wok_string_class, the no-wrap guard
+       alloc uses so routing agrees). */
     size_t bytes;
     size_t cls;
     if (WOK_UNLIKELY((uint32_t)p->tag == WOK_ARRAY_TAG)) {
         uint64_t len = wok_array_read_len(p);
         bytes = wok_array_cell_bytes(len);
         cls   = wok_array_class(len);
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_TAG)) {
+        uint64_t byte_len = wok_string_read_byte_len(p);
+        bytes = wok_string_cell_bytes(byte_len);
+        cls   = wok_string_class(byte_len);
     } else {
         uint32_t arity = (uint32_t)p->arity;
         bytes = wok_cell_bytes(arity);
@@ -635,6 +701,40 @@ WokObj* wok_array_alloc(WokHeap* h, uint64_t len, uint8_t elemkind) {
     p->rc = 1u; p->tag = (uint16_t)WOK_ARRAY_TAG; p->arity = elemkind; p->scan = 0u;
     /* Write len at offset 8 (past the WokObj prefix). */
     memcpy((char*)p + 8, &len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_string_alloc(WokHeap* h, uint64_t byte_len) {
+    size_t   sz  = wok_string_cell_bytes(byte_len);   /* aborts on size_t overflow */
+    /* Size class = 1+ceil(byte_len/8) (shared with NCon/WokArray of the same byte size). */
+    size_t   cls = wok_string_class(byte_len);
+    WokObj*  p;
+    if (cls < WOK_NUM_CLASSES) {
+        WokObj* head = h->freelist[cls];
+        if (head != NULL) {                       /* reuse from shared free-list */
+            h->freelist[cls] = fl_next(head);
+            p = head;
+            h->reused += 1u;
+        } else {                                  /* bump */
+            if (h->bump_ptr == NULL || sz > (size_t)(h->bump_end - h->bump_ptr)) {
+                wok_new_slab(h);
+            }
+            p = (WokObj*)h->bump_ptr;
+            h->bump_ptr += sz;
+        }
+    } else {                                      /* large: direct malloc */
+        p = (WokObj*)malloc(sz);
+        if (WOK_UNLIKELY(p == NULL)) { abort(); }
+        WOK_PHYS_ADD(h, sz);   /* large string (byte_len >= 8*63) malloc grows physical */
+    }
+    p->rc = 1u; p->tag = (uint16_t)WOK_STRING_TAG; p->arity = 0u; p->scan = 0u;
+    /* Write byte_len at offset 8 (past the WokObj prefix). */
+    memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -796,6 +896,25 @@ void wok_test_orphan_slabs(WokHeap* h, int n) {
     }
 }
 #endif
+
+/* ---- WokString accessors (shared, no allocator involvement) ------------------------- */
+
+uint64_t wok_string_len(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_STRING_TAG);
+    return wok_string_read_byte_len(p);
+}
+
+uint8_t* wok_string_data(WokObj* p) {
+    assert((uint32_t)p->tag == WOK_STRING_TAG);
+    /* Body starts at offset 16 (8-byte WokObj prefix + 8-byte byte_len field). */
+    return (uint8_t*)((char*)p + 16);
+}
+
+uint64_t wok_string_byte_get(const WokObj* p, uint64_t i) {
+    assert((uint32_t)p->tag == WOK_STRING_TAG);
+    assert(i < wok_string_read_byte_len(p));
+    return (uint64_t)(((const uint8_t*)((const char*)p + 16))[i]);
+}
 
 /* ---- WokArray accessors (shared, no allocator involvement) -------------------------- */
 

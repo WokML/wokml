@@ -46,6 +46,9 @@ module Wok.IR.PrimNames
   , contStoreKey
   , contTakeKey
   , coroSuspKey
+    -- * Canonical prelude module names
+  , stdBaseModule
+  , stdControlModule
     -- * Std.Array prim names
   , stdArrayModule
   , arrayNewName
@@ -55,6 +58,14 @@ module Wok.IR.PrimNames
   , arrayLengthName
   , arraySetName
   , arrayResizeName
+    -- * Std.String prim names
+  , stdStringModule
+  , stringLengthName
+  , stringIndexName
+  , stringByteLengthName
+  , stringByteAtName
+  , stringAppendName
+  , eqStringName
   ) where
 
 import Data.Set (Set)
@@ -129,6 +140,20 @@ coroSuspKey :: (Text, Text)
 coroSuspKey = (contStoreModule, coroSuspName)
 
 -- ---------------------------------------------------------------------------
+-- Canonical prelude module names
+
+-- | The defining module of the core/base prelude prims (arithmetic, comparison,
+-- @++@, @eqString@, ...).
+stdBaseModule :: Text
+stdBaseModule = Tx.pack "Std.Base"
+
+-- | The defining module of the control/effect prims (coroutine and
+-- stored-continuation sinks). Same string as 'contStoreModule', which keeps the
+-- narrower once-sink trust-anchor name for the Multiplicity/Escape recognizers.
+stdControlModule :: Text
+stdControlModule = Tx.pack "Std.Control"
+
+-- ---------------------------------------------------------------------------
 -- Std.Array prim names
 
 -- | The defining module of the Array prelude externs.
@@ -162,3 +187,34 @@ arraySetName = Tx.pack "set"
 -- | @resize arr m fill@: copy-on-write resize to length m with fill for new slots.
 arrayResizeName :: Text
 arrayResizeName = Tx.pack "resize"
+
+-- ---------------------------------------------------------------------------
+-- Std.String prim names
+
+-- | The defining module of the String prelude externs.
+stdStringModule :: Text
+stdStringModule = Tx.pack "Std.String"
+
+-- | @length s@: codepoint count (O(n), UTF-8 decode).
+stringLengthName :: Text
+stringLengthName = Tx.pack "length"
+
+-- | @index s i@: the i-th codepoint as a Char (O(n), OOB -> PrimError).
+stringIndexName :: Text
+stringIndexName = Tx.pack "index"
+
+-- | @byteLength s@: byte count (O(1)).
+stringByteLengthName :: Text
+stringByteLengthName = Tx.pack "byteLength"
+
+-- | @byteAt s i@: the i-th UTF-8 byte as U64 (O(1), OOB -> PrimError).
+stringByteAtName :: Text
+stringByteAtName = Tx.pack "byteAt"
+
+-- | @append a b@: concatenate two strings; allocates a new cell.
+stringAppendName :: Text
+stringAppendName = Tx.pack "append"
+
+-- | @eqString a b@: byte-equality comparison; defining module is 'Std.Base'.
+eqStringName :: Text
+eqStringName = Tx.pack "eqString"

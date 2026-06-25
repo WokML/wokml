@@ -13,7 +13,9 @@ import Control.Monad.State.Strict (StateT, runStateT, state, lift)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (runExceptT)
 
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
+import qualified Data.Text.Encoding as TxEnc
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -138,6 +140,14 @@ main = do
   -- 'arena_bytes'/'arena_peak'). A dedicated 'rcRegionCorpusTests' group
   -- additionally asserts the arena-specific invariants per-file.
   rcRegionFiles <- findByExtension [".wok"] "test/rc-region"
+  -- String Slice E1 (Task 4): the differential-oracle corpus for the six String
+  -- ops. Programs are handler-free and string-only (no Std.Array import, to avoid
+  -- the known length/index name conflict). Wired to the rc differential + rc stats
+  -- + rcCBackendParity groups, matching the Array corpus pattern.
+  rcStringFiles    <- findByExtension [".wok"] "test/rc-string"
+  -- String OOB error corpus: programs that intentionally trigger a PrimError.
+  -- Wired to rcDifferential only (both-fail = agreement).
+  rcStringOobFiles <- findByExtension [".wok"] "test/rc-string-oob"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -229,7 +239,10 @@ main = do
     , rcM3NodeTests
     , rcArrayNodeTests
     , rcArrayCCellTests
+    , rcStringNodeTests
+    , rcStringCCellTests
     , rcArrayPrimTests
+    , rcStringPrimTests
     , regionRoutingTests
     , wokRcHeapTests
     , wokRcReuseTests
@@ -292,11 +305,12 @@ main = do
         | f <- perceusHandlerFiles ]
     , testGroup "rc differential"
         [ testCase (takeBaseName f) (rcDifferentialHarness f)
-        | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ++ rcRegionFiles ]
+        | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ++ rcRegionFiles
+            ++ rcStringFiles ++ rcStringOobFiles ]
     , testGroup "rc stats"
         [ testGroup "heap accounting"
             [ testCase (takeBaseName f) (rcStatsHarness f)
-            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ]
+            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ++ rcStringFiles ]
         , testGroup "golden"
             [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
             | f <- perceusFiles ]
@@ -307,7 +321,8 @@ main = do
     -- through both the abstract heap and the C heap, asserting output + alloc-stat
     -- parity; plus targeted cross-heap/fallback/deep tests and the slot
     -- encode/decode round-trip property.
-    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles ++ rcRegionFiles)
+    , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles ++ rcRegionFiles
+        ++ rcStringFiles)
     , rcCBackendTargeted
     , rcFbipTargeted
     , rcFbipFaultInjection
@@ -316,6 +331,7 @@ main = do
     , rcM2a1PropertyTests
     , rcM2bPropertyTests
     , rcArrayPropertyTests
+    , rcStringPropertyTests
     , rcArraySliceCTests
     -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
     -- hardening; each test group verifies the floor bites when disabled):
@@ -3218,7 +3234,7 @@ loaderTests = testGroup "loader"
           Data.List.sort names @?=
             Data.List.sort
               [ T.pack "Std.Base", T.pack "Std.Control"
-              , T.pack "Std.Array", T.pack "Main" ]
+              , T.pack "Std.Array", T.pack "Std.String", T.pack "Main" ]
         Left err -> assertFailure ("unexpected error: " ++ show err)
 
   , testCase "rejects file missing a module header" $ do
@@ -4661,11 +4677,11 @@ interpValueTests = testGroup "InterpValue"
 -- ---------------------------------------------------------------------------
 -- Interp prim tests
 
--- Invoke a prim from the table by name with fully-applied args (test helper).
-runPrim :: Text -> [IV.Value] -> Either IV.RuntimeError IV.PrimResult
-runPrim name args =
-  case Map.lookup name IP.primTable of
-    Nothing -> Left (IV.UnboundVar name)
+-- | Invoke a reference interpreter prim by @(module, name)@ with fully-applied args.
+runPrim :: (Text, Text) -> [IV.Value] -> Either IV.RuntimeError IV.PrimResult
+runPrim key args =
+  case Map.lookup key IP.primTable of
+    Nothing -> Left (IV.UnboundVar (snd key))
     Just p  -> IV.primFn p args
 
 li :: Integer -> IV.Value
@@ -4675,53 +4691,57 @@ interpPrimTests :: TestTree
 interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
-        @?= Data.List.sort (map T.pack
-              [ "+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$"
-              , "__coro_susp","__coro_unwrap","__coro_resume","__coro_done"
-              , "__coro_cancel","__coerce","__drive_conc"
-              , "__cont_cell_new","__cont_store","__cont_take"
-              -- Std.Array prims (Slice A)
-              , "new","fromList","toList","index","length","set","resize"
-              ])
+        @?= Data.List.sort
+              ( map (T.pack "Std.Base",)
+                  ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","eqString"]
+              ++ map (T.pack "Std.Control",)
+                  ["__coro_susp","__coro_unwrap","__coro_resume","__coro_done"
+                  ,"__coro_cancel","__coerce","__drive_conc"
+                  ,"__cont_cell_new","__cont_store","__cont_take"]
+              ++ map (T.pack "Std.Array",)
+                  ["new","fromList","toList","index","length","set","resize"]
+              ++ map (T.pack "Std.String",)
+                  ["length","index","byteLength","byteAt","append"]
+              )
   , testCase "addition" $
-      case runPrim (T.pack "+") [li 2, li 3] of
+      case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
         other -> assertFailure (show2 other)
   , testCase "equality true" $
-      case runPrim (T.pack "eqU64") [li 4, li 4] of
+      case runPrim (T.pack "Std.Base", T.pack "eqU64") [li 4, li 4] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
         other -> assertFailure (show2 other)
   , testCase "equality false" $
-      case runPrim (T.pack "eqU64") [li 4, li 5] of
+      case runPrim (T.pack "Std.Base", T.pack "eqU64") [li 4, li 5] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
         other -> assertFailure (show2 other)
   , testCase "u32 equality" $
-      case runPrim (T.pack "eqU32") [li 4, li 4] of
+      case runPrim (T.pack "Std.Base", T.pack "eqU32") [li 4, li 4] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
         other -> assertFailure (show2 other)
   , testCase "u32 conversion is identity on the value" $
-      case runPrim (T.pack "u32") [li 7] of
+      case runPrim (T.pack "Std.Base", T.pack "u32") [li 7] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "7"
         other -> assertFailure (show2 other)
   , testCase "boolean and" $
-      case runPrim (T.pack "&&") [IV.VCon (T.pack "True") [], IV.VCon (T.pack "False") []] of
+      case runPrim (T.pack "Std.Base", T.pack "&&") [IV.VCon (T.pack "True") [], IV.VCon (T.pack "False") []] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
         other -> assertFailure (show2 other)
   , testCase "division (non-negative)" $
-      case runPrim (T.pack "/") [li 7, li 2] of
+      case runPrim (T.pack "Std.Base", T.pack "/") [li 7, li 2] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "3"
         other -> assertFailure (show2 other)
   , testCase "division by zero is a PrimError" $
-      case runPrim (T.pack "div") [li 1, li 0] of
+      case runPrim (T.pack "Std.Base", T.pack "div") [li 1, li 0] of
         Left (IV.PrimError _) -> pure ()
         other -> assertFailure (show2 other)
   , testCase "list append" $
       let mkList = foldr (\x acc -> IV.VCon (T.pack "Cons") [li x, acc]) (IV.VCon (T.pack "Nil") [])
-      in case runPrim (T.pack "++") [mkList [1,2], mkList [3]] of
+      in case runPrim (T.pack "Std.Base", T.pack "++") [mkList [1,2], mkList [3]] of
            Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "[1, 2, 3]"
            other -> assertFailure (show2 other)
   , testCase "dollar requests an application" $
-      case runPrim (T.pack "$") [IV.VCon (T.pack "K") [], li 1] of
+      case runPrim (T.pack "Std.Base", T.pack "$") [IV.VCon (T.pack "K") [], li 1] of
         Right (IV.PRApply (IV.VCon t []) [arg]) -> do
           t @?= T.pack "K"
           IV.renderValue arg @?= T.pack "1"
@@ -4735,14 +4755,14 @@ interpPrimTests = testGroup "InterpPrim"
   , testCase "Ref overflow: index 2^63 raises PrimError (out of range)" $
       let arr = IV.VCon (T.pack "Array") [li 0, li 1, li 2]
           idx = li (2^(63 :: Int))
-      in case runPrim (T.pack "index") [arr, idx] of
+      in case runPrim (T.pack "Std.Array", T.pack "index") [arr, idx] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow index: expected PrimError out-of-range, got: " <> show e)
            Right _ -> assertFailure "Ref overflow index: prim succeeded unexpectedly with 2^63"
   , testCase "Ref overflow: new size 2^63 raises PrimError (out of range)" $
       let kv = li (2^(63 :: Int))
-      in case runPrim (T.pack "new") [kv, li 0] of
+      in case runPrim (T.pack "Std.Array", T.pack "new") [kv, li 0] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow new: expected PrimError out-of-range, got: " <> show e)
@@ -4750,7 +4770,7 @@ interpPrimTests = testGroup "InterpPrim"
   , testCase "Ref overflow: set index 2^63 raises PrimError (out of range)" $
       let arr = IV.VCon (T.pack "Array") [li 0, li 1, li 2]
           idx = li (2^(63 :: Int))
-      in case runPrim (T.pack "set") [arr, idx, li 99] of
+      in case runPrim (T.pack "Std.Array", T.pack "set") [arr, idx, li 99] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow set: expected PrimError out-of-range, got: " <> show e)
@@ -4758,7 +4778,7 @@ interpPrimTests = testGroup "InterpPrim"
   , testCase "Ref overflow: resize size 2^63 raises PrimError (out of range)" $
       let arr = IV.VCon (T.pack "Array") [li 0, li 1]
           mv  = li (2^(63 :: Int))
-      in case runPrim (T.pack "resize") [arr, mv, li 0] of
+      in case runPrim (T.pack "Std.Array", T.pack "resize") [arr, mv, li 0] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow resize: expected PrimError out-of-range, got: " <> show e)
@@ -7399,6 +7419,277 @@ rcArrayNodeTests = testGroup "rc array node"
   ]
 
 -- ---------------------------------------------------------------------------
+-- RC String node tests (String Slice E1, Task 2: the NString heap node)
+--
+-- 'NString ByteString' is a flat UTF-8 byte buffer. Bytes are opaque (no child
+-- refs), so the drop cascade is empty: freeing an 'NString' frees only the
+-- cell itself. 'wouldBeCBytes' charges 16 + 8*ceil(byte_len/8) (8-rounded
+-- body), exactly as 'wok_string_alloc' does in C, so both backends agree on
+-- 'peak_bytes'. These store-layer tests exercise:
+--   1. Abstract heap: 'allocPure' path, correct byte accounting, empty cascade.
+--   2. C heap: real 'WokString' cell via 'wokStringAlloc', round-trip byte
+--      read-back via 'wokStringLen', balanced allocs/frees, live == 0.
+-- The test string "h\xc3\xa9llo" is UTF-8 for "héllo" (5 codepoints, 6 bytes),
+-- so byte_len=6, ceil(6/8)=1, wouldBeCBytes=16+8=24.
+
+rcStringNodeTests :: TestTree
+rcStringNodeTests = testGroup "rc string node"
+  [ testCase "nodeValues returns empty list (no child refs)" $ do
+      let bs = TxEnc.encodeUtf8 (T.pack "hello")
+      St.nodeValues (St.NString bs) @?= []
+
+  , testCase "wouldBeCBytes: ASCII 5-byte string = 24 (ceil(5/8)=1)" $ do
+      let bs = TxEnc.encodeUtf8 (T.pack "hello")  -- 5 bytes
+      St.wouldBeCBytes (St.NString bs) @?= (24 :: Int)  -- 16 + 8*1
+
+  , testCase "wouldBeCBytes: 8-byte string = 24 (ceil(8/8)=1)" $ do
+      let bs = TxEnc.encodeUtf8 (T.pack "12345678")  -- 8 bytes
+      St.wouldBeCBytes (St.NString bs) @?= (24 :: Int)  -- 16 + 8*1
+
+  , testCase "wouldBeCBytes: 9-byte string = 32 (ceil(9/8)=2)" $ do
+      let bs = TxEnc.encodeUtf8 (T.pack "123456789")  -- 9 bytes
+      St.wouldBeCBytes (St.NString bs) @?= (32 :: Int)  -- 16 + 8*2
+
+  , testCase "wouldBeCBytes: empty string = 16 (ceil(0/8)=0)" $ do
+      let bs = BS.empty
+      St.wouldBeCBytes (St.NString bs) @?= (16 :: Int)  -- 16 + 8*0
+
+  , testCase "wouldBeCBytes: multi-byte UTF-8 'helo' = 24 (6 bytes, ceil(6/8)=1)" $ do
+      -- "h\xc3\xa9llo" = UTF-8 for "h\233llo" = 6 bytes
+      let bs = TxEnc.encodeUtf8 (T.pack "h\233llo")  -- 6 bytes
+      St.wouldBeCBytes (St.NString bs) @?= (24 :: Int)  -- 16 + 8*1
+
+  , testCase "nodeCEligible NString is False (own alloc path)" $ do
+      let bs = TxEnc.encodeUtf8 (T.pack "hello")
+      St.nodeCEligible (St.NString bs) @?= False
+
+  , testCase "abstract alloc: allocPure, byte accounting, empty cascade, balanced drop" $ do
+      -- Allocate an NString on the abstract heap; verify wouldBeCBytes is charged
+      -- to stCurBytes/stPeakBytes; drop it; verify the heap returns to baseline.
+      let bs       = TxEnc.encodeUtf8 (T.pack "h\233llo")  -- 6 bytes, 24 charged
+          expected = St.wouldBeCBytes (St.NString bs)       -- 24
+          s0       = St.emptyStore
+          (a, s1)  = St.allocPure (St.NString bs) s0
+      -- Byte accounting.
+      St.stCurBytes  (St.stStats s1) @?= expected
+      St.stPeakBytes (St.stStats s1) @?= expected
+      -- Live count bumped.
+      St.stLive (St.stStats s1) @?= St.stLive (St.stStats s0) + 1
+      -- Empty cascade: cascadeChildren returns nothing.
+      St.cascadeChildren (St.NString bs) @?= []
+      -- Drop: heap returns to baseline.
+      case St.dropAddrPure a s1 of
+        Left e   -> assertFailure ("dropAddrPure NString failed: " <> show e)
+        Right s2 -> do
+          St.stLive     (St.stStats s2) @?= St.stLive (St.stStats s0)
+          St.stCurBytes (St.stStats s2) @?= 0
+          St.stFrees    (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
+
+  , testCase "renderRCValue NString prints show-quoted text (reference-identical)" $ do
+      -- "h\xc3\xa9llo" should render as "\"h\233llo\"" (Haskell show of Text).
+      let bs  = TxEnc.encodeUtf8 (T.pack "h\233llo")
+          s0  = St.emptyStore
+          (a, s1) = St.allocPure (St.NString bs) s0
+      case St.renderRCValue s1 (St.RVBox a) of
+        Left e  -> assertFailure ("renderRCValue NString failed: " <> show e)
+        Right t -> t @?= T.pack (show (T.pack "h\233llo"))
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC String C-cell store-algebra tests (String Slice E1, Task 2)
+--
+-- Complement 'rcStringNodeTests' (abstract heap) by testing the REAL C cell
+-- path.  Allocates a 'WokHeap', builds a CHeap-backend 'Store', calls
+-- 'St.alloc (NString bs)', then asserts:
+--   * 'wokStringLen' reads back the correct byte count;
+--   * 'stLive' == baseline + 1 after alloc; C 'wok_stat_live' == 1;
+--   * 'dropAddr' balances: stLive == baseline, wok_stat_live == 0,
+--     allocs == frees (no C-heap leak);
+--   * 'peak_bytes' charged = 'wouldBeCBytes (NString bs)' (the SAME rounded
+--     formula on both backends, so the differential oracle would agree).
+
+rcStringCCellTests :: TestTree
+rcStringCCellTests = testGroup "rc string C-cell store algebra"
+  [ -- Multi-byte UTF-8: "h\xc3\xa9llo" = 6 bytes.
+    -- ceil(6/8) = 1 -> cell_bytes = 16 + 8*1 = 24.
+    testCase "multi-byte UTF-8 string: alloc/len-readback/drop balanced" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = TxEnc.encodeUtf8 (T.pack "h\233llo")  -- 6 bytes
+          charged  = St.wouldBeCBytes (St.NString bs)       -- 24
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      -- The string cell is live on both backends.
+      St.stLive (St.stStats s1) @?= baseline + 1
+      cLive0 <- Heap.wokStatLive hp
+      assertEqual "wok_stat_live == 1 after NString alloc" (1 :: Int64) cLive0
+      -- Byte accounting matches the rounded formula on both backends.
+      St.stPeakBytes (St.stStats s1) @?= charged
+      -- The cell is on the C heap (CAddr, not HAddr).
+      assertBool "NString allocated as CAddr on CHeap"
+        (case a of St.CAddr _ -> True; _ -> False)
+      -- Read back byte_len via FFI to confirm the cell was written correctly.
+      blen <- case a of
+        St.CAddr p -> Heap.wokStringLen p
+        _          -> assertFailure "expected CAddr" >> error "unreachable"
+      assertEqual "wokStringLen reads back correct byte count"
+        (fromIntegral (BS.length bs) :: Word64) blen
+      -- Drop: both counters return to baseline.
+      r2 <- runExceptT (St.dropAddr a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr NString failed: " <> show e) }
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          St.stFrees (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop (no leak)" (0 :: Int64) cLive1
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "C heap: allocs == frees (fully balanced)" cAllocs cFrees
+          Heap.wokHeapFree hp
+
+  , -- Empty string: byte_len = 0, ceil(0/8) = 0, cell_bytes = 16.
+    testCase "empty string: alloc/drop balanced, wouldBeCBytes = 16" $ do
+      hp <- Heap.wokHeapNew
+      let bs      = BS.empty
+          charged = St.wouldBeCBytes (St.NString bs)  -- 16
+          s0      = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      St.stPeakBytes (St.stStats s1) @?= charged
+      blen <- case a of
+        St.CAddr p -> Heap.wokStringLen p
+        _          -> assertFailure "expected CAddr" >> error "unreachable"
+      assertEqual "wokStringLen reads 0 for empty string" (0 :: Word64) blen
+      r2 <- runExceptT (St.dropAddr a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr empty NString failed: " <> show e) }
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop" (0 :: Int64) cLive1
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "C heap: allocs == frees" cAllocs cFrees
+          Heap.wokHeapFree hp
+
+  , -- 9-byte string: ceil(9/8) = 2 -> cell_bytes = 16 + 8*2 = 32.
+    testCase "9-byte string: cell_bytes = 32, alloc/drop balanced" $ do
+      hp <- Heap.wokHeapNew
+      let bs      = TxEnc.encodeUtf8 (T.pack "123456789")  -- 9 bytes
+          charged = St.wouldBeCBytes (St.NString bs)         -- 32
+          s0      = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      St.stPeakBytes (St.stStats s1) @?= charged
+      blen <- case a of
+        St.CAddr p -> Heap.wokStringLen p
+        _          -> assertFailure "expected CAddr" >> error "unreachable"
+      assertEqual "wokStringLen reads 9" (9 :: Word64) blen
+      r2 <- runExceptT (St.dropAddr a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr 9-byte NString failed: " <> show e) }
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop" (0 :: Int64) cLive1
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "C heap: allocs == frees" cAllocs cFrees
+          Heap.wokHeapFree hp
+
+  , -- Byte-content roundtrip: the highest-risk line in this task is the
+    -- 'allocNString' 'copyBytes' into the cell body at offset 16. A wrong offset
+    -- or wrong length would pass the len/peak/balance assertions above yet corrupt
+    -- the content, undetected until Task 5. This test reads EVERY byte back via
+    -- 'wokStringByteGet' (also the prim path Task 4 builds on) and asserts the
+    -- read-back equals the original ByteString exactly. Multi-byte UTF-8 so the
+    -- continuation-byte values (>= 0x80) are exercised, not just ASCII.
+    testCase "byte-content roundtrip: every byte read back equals the original" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = TxEnc.encodeUtf8 (T.pack "h\233llo w\246rld")  -- "héllo wörld", 13 bytes
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      p <- case a of
+        St.CAddr p -> pure p
+        _          -> assertFailure "expected CAddr" >> error "unreachable"
+      -- byte_len matches the original length.
+      blen <- Heap.wokStringLen p
+      assertEqual "wokStringLen matches original byte count"
+        (fromIntegral (BS.length bs) :: Word64) blen
+      -- Read back every byte (index 0 .. byte_len-1) and rebuild the read list.
+      readBack <- mapM (Heap.wokStringByteGet p)
+                       (take (fromIntegral blen) [0 ..])
+      -- Each cell byte (zero-extended to Word64) equals the original byte.
+      let expected = map fromIntegral (BS.unpack bs) :: [Word64]
+      assertEqual "every byte read back equals the original (correct offset + length copied)"
+        expected readBack
+      -- Drop: balanced, no leak.
+      r2 <- runExceptT (St.dropAddr a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr roundtrip NString failed: " <> show e) }
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop" (0 :: Int64) cLive1
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "C heap: allocs == frees" cAllocs cFrees
+          Heap.wokHeapFree hp
+
+  , -- Empty-string roundtrip: byte_len 0, 'wokStringLen' is 0, no bytes to read.
+    -- Confirms the copy of a zero-length body neither over-reads nor corrupts.
+    testCase "byte-content roundtrip: empty string has byte_len 0 and no bytes" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = BS.empty
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc empty NString failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      p <- case a of
+        St.CAddr p -> pure p
+        _          -> assertFailure "expected CAddr" >> error "unreachable"
+      blen <- Heap.wokStringLen p
+      assertEqual "wokStringLen reads 0 for empty string" (0 :: Word64) blen
+      readBack <- mapM (Heap.wokStringByteGet p)
+                       (take (fromIntegral blen) [0 ..])
+      assertEqual "no bytes read back for empty string" ([] :: [Word64]) readBack
+      r2 <- runExceptT (St.dropAddr a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr empty roundtrip NString failed: " <> show e) }
+        Right s2 -> do
+          St.stLive (St.stStats s2) @?= baseline
+          cLive1 <- Heap.wokStatLive hp
+          assertEqual "wok_stat_live == 0 after drop" (0 :: Int64) cLive1
+          Heap.wokHeapFree hp
+  ]
+
+-- ---------------------------------------------------------------------------
 -- RC Array C-cell store-algebra tests (Array Slice B, Task 6)
 --
 -- These complement 'rcArrayNodeTests' (which operates on the abstract heap) by
@@ -7879,7 +8170,7 @@ rcM3CarrierWallTests = testGroup "m3 cycle red-check (carrier-wall is load-beari
       -- runtime check ('cellAddr `notElem` continuationOwned prefix') must reject it
       -- loudly with the carrier-wall message --- BEFORE it can write the cyclic edge.
       let (s2, contAddr, _h, _prefix, cellAddr) = buildCycleStore
-      case Map.lookup (T.pack "__cont_store") RCP.rcPrimTable of
+      case Map.lookup (T.pack "Std.Control", T.pack "__cont_store") RCP.rcPrimTable of
         Nothing -> assertFailure "rcPrimTable is missing __cont_store"
         Just p  -> do
           res <- runExceptT (St.rpFn p [St.RVBox cellAddr, St.RVBox contAddr] s2)
@@ -8169,7 +8460,7 @@ rcM3TwoCellCycleSubsumedTests =
       -- legs and the cycle goes live; dropping cellA then double-frees. This is the
       -- gap the single-level runtime check has by itself.
       let (s2, cellA, cellB, contA, contB) = buildTwoCellCycle
-      case Map.lookup (T.pack "__cont_store") RCP.rcPrimTable of
+      case Map.lookup (T.pack "Std.Control", T.pack "__cont_store") RCP.rcPrimTable of
         Nothing -> assertFailure "rcPrimTable is missing __cont_store"
         Just storeP -> do
           -- leg 1: store contA into cellA. single-level: cellA `elem` owned(contA)?
@@ -8897,7 +9188,9 @@ rcReusePairingTests = testGroup "rc-reuse-pairing"
       RP.slotClassOf (Ty.CTCon Ty.TcU32 [])    @?= RP.KLitInt
       RP.slotClassOf (Ty.CTCon Ty.TcChar [])   @?= RP.KLitChar
       RP.slotClassOf (Ty.CTCon Ty.TcUnit [])   @?= RP.KLitUnit
-      RP.slotClassOf (Ty.CTCon Ty.TcString []) @?= RP.NonEncodable
+      -- Slice E1, Task 3: a String is a counted 'NString' cell stored as a pointer,
+      -- so its slot class is 'KPointer' (was 'NonEncodable' when String was inline).
+      RP.slotClassOf (Ty.CTCon Ty.TcString []) @?= RP.KPointer
       RP.slotClassOf (Ty.CTCon Ty.TcBool [])   @?= RP.KPointer
       RP.slotClassOf (Ty.CTCon Ty.TcList [Ty.CTCon Ty.TcU64 []]) @?= RP.KPointer
       RP.slotClassOf (Ty.CTCon (Ty.TcTuple 2) [Ty.CTCon Ty.TcU64 [], Ty.CTCon Ty.TcU64 []])
@@ -11590,6 +11883,7 @@ rcFbipFiles =
   , "test/rc-c-backend/fbip-cons-nil.wok"
   , "test/rc-c-backend/fbip-intwidth-flip.wok"
   , "test/rc-c-backend/fbip-kindchange.wok"
+  , "test/rc-c-backend/fbip-string-field.wok"
   ]
 
 -- | Load + elaborate + M1-guard + prune a corpus file to the pruned, elaborated
@@ -11715,14 +12009,16 @@ rcFbipTargeted = testGroup "rc-fbip"
       assertEqual "not-eligible branch nets the same free count as non-FBIP"
         (St.stFrees nfSt) (St.stFrees fSt)
 
-  , -- AC3: a slot-kind-changing map (KLitInt head -> NonEncodable String head).
-    -- The §6.3 guard REFUSES to pair ([KLitInt,KPointer] /= [NonEncodable,
+  , -- AC3: a slot-kind-changing map (KLitInt head -> KPointer String head).
+    -- The §6.3 guard REFUSES to pair ([KLitInt,KPointer] /= [KPointer,
     -- KPointer]), so the output spine allocates FRESH (no token, no reuse). This
-    -- is the regression guard against the C descriptor mis-decode. Output correct;
-    -- abstract == C. (Int->Char is not expressible in current wok -- no Char
-    -- literal/conversion -- so this uses the closest expressible kind-change,
-    -- KLitInt -> NonEncodable via String; the unit-level Int->Char kindchange
-    -- golden in 'rc-reuse-pairing' covers that case directly.)
+    -- is the regression guard against the C descriptor mis-decode (re-stamping an
+    -- Int cell as a pointer cell would decode the Int payload as a heap handle).
+    -- Output correct; abstract == C. (Int->Char is not expressible in current wok
+    -- -- no Char literal/conversion -- so this uses the closest expressible
+    -- kind-change, KLitInt -> KPointer via String, which since Slice E1 is a
+    -- counted pointer; the unit-level Int->Char kindchange golden in
+    -- 'rc-reuse-pairing' covers that case directly.)
     testCase "fbip-kindchange: §6.3 guard refuses the pair (fresh alloc, no reuse), output 3" $ do
       (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-kindchange.wok"
       (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-kindchange.wok"
@@ -11733,6 +12029,25 @@ rcFbipTargeted = testGroup "rc-fbip"
         (St.stAllocs nfSt) (St.stAllocs fSt)
       assertEqual "kind-change refused: fused frees identical to non-FBIP"
         (St.stFrees nfSt) (St.stFrees fSt)
+
+  , -- AC6 (String Slice E1): String-field reuse. 'slotClassOf TcString = KPointer'
+    -- (Slice E1 Task 3), so a constructor with a String field gets slot-kind
+    -- signature [KPointer, KLitInt] for Box String U64. When 'relabel' rebuilds
+    -- 'Box "x" n' from a matched 'Box _ n', the slot-kind signatures agree and
+    -- the reuse pairing fires for the Box cells (3 reuses). 'mapRelabel' also
+    -- rebuilds 'BCons' with identical slot-kind signature [KPointer, KPointer],
+    -- so the BCons spine cells also reuse (3 more). Total: 6 reuses; the fused
+    -- run saves exactly 6 allocs vs the non-FBIP run. Output 6 (sum 1+2+3).
+    testCase "fbip-string-field: String-field KPointer reuse fires, allocs drop by 6, output 6" $ do
+      (nfOut, nfSt) <- rcFbipNonFused "test/rc-c-backend/fbip-string-field.wok"
+      (fOut,  fSt)  <- rcFbipFused    "test/rc-c-backend/fbip-string-field.wok"
+      assertEqual "output is 6" (T.pack "6") fOut
+      assertEqual "fused output == non-fused output" nfOut fOut
+      assertBool "FBIP win: fused allocs strictly below non-fused"
+        (St.stAllocs fSt < St.stAllocs nfSt)
+      -- 3 Box shells + 3 BCons spine shells reuse in place = 6 saved allocs.
+      assertEqual "allocs reduced by exactly 6 (3 Box + 3 BCons shells reuse in place)"
+        6 (St.stAllocs nfSt - St.stAllocs fSt)
   ]
 
 -- ---------------------------------------------------------------------------
@@ -11864,21 +12179,25 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
       -- silently all-falls-back to the abstract store.
       assertBool "C heap genuinely exercised (NCon routed to CAddr)" (cAllocs > 0)
 
-  , -- Fallback: a 'Tagged' NCon with an 'LStr' field. 'encodeSlotC' rejects the
-    -- 'LStr', so this NCon falls back to the ABSTRACT heap under the C backend;
-    -- the result and the heap accounting must still match the abstract reference.
-    testCase "LStr fallback (constructor with a string field stays abstract)" $ do
+  , -- String field is a POINTER cell (Slice E1, Task 3): a 'Tagged' NCon with a
+    -- 'String' field. The string literal now allocates a counted 'NString' cell,
+    -- and the field stores its POINTER ('encodeSlotC' returns 'KPointer' for the
+    -- 'RVBox'), so the 'Tagged' cell is C-eligible. BOTH cells (the 'NString' and
+    -- the 'Tagged' NCon) route to the C heap; the result and heap accounting still
+    -- match the abstract reference. (Before Task 3 the inline 'LStr' field forced
+    -- the whole NCon onto the abstract heap; that fallback is now gone by design.)
+    testCase "String field is a pointer cell (constructor with a String field is C-eligible)" $ do
       (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/fallback-lstr.wok"
       assertEqual "result is the U64 field (1)" (T.pack "1") txt
       assertEqual "no value-CAF baseline for this program" 0 bl
-      assertParityBalanced "LStr fallback" 1 absSt cSt bl
-      -- Non-vacuity (fallback proof): the ONLY constructor this program builds is
-      -- 'Tagged "hi" 1', whose 'LStr' field is non-encodable, so the whole NCon
-      -- falls back to the ABSTRACT heap. Nothing is C-eligible, so the C heap's
-      -- OWN allocation counter must be exactly zero -- direct proof the fallback
-      -- fired (the cell lives on the abstract store, not the C runtime).
-      assertEqual "LStr-bearing NCon fell back to abstract heap; nothing on C"
-        (0 :: Word64) cAllocs
+      assertParityBalanced "String field pointer" 2 absSt cSt bl
+      -- Non-vacuity (C-eligibility proof): the program builds 'Tagged "hi" 1' ---
+      -- the 'NString "hi"' cell AND the 'Tagged' NCon (whose String field is now an
+      -- encodable pointer). BOTH route to the C heap, so the C heap's OWN allocation
+      -- counter is exactly 2 -- direct proof the String field no longer forces an
+      -- abstract-heap fallback.
+      assertEqual "String-bearing NCon is C-eligible; NString + Tagged both on C"
+        (2 :: Word64) cAllocs
 
   , -- Fallback: a 'Tagged' NCon whose first field is a U64 literal >= 2^63.
     -- 'encodeSlotC' calls 'toIntegralSized n :: Maybe Int64', which returns
@@ -17118,12 +17437,17 @@ rcM2b2ContinuationOwnedTests =
 --   toList                        : +N alloc (N Cons cells; Nil is inline,
 --                                   stat-invisible)
 
--- | Helper: look up a prim in 'RCP.rcPrimTable' or fail.
-lookupPrim :: Text -> IO St.RCPrim
-lookupPrim name =
-  case Map.lookup name RCP.rcPrimTable of
+-- | Helper: look up an RC prim by @(module, name)@ in 'RCP.rcPrimTable' or fail.
+lookupPrimQ :: Text -> Text -> IO St.RCPrim
+lookupPrimQ mn name =
+  case Map.lookup (mn, name) RCP.rcPrimTable of
     Just p  -> pure p
-    Nothing -> assertFailure ("rcPrimTable is missing prim: " <> T.unpack name)
+    Nothing -> assertFailure
+      ("rcPrimTable is missing prim: " <> T.unpack mn <> "." <> T.unpack name)
+
+-- | Convenience wrapper that looks up an Array prim by bare name under 'Std.Array'.
+lookupPrim :: Text -> IO St.RCPrim
+lookupPrim name = lookupPrimQ (T.pack "Std.Array") name
 
 -- | Helper: call 'rpFn' with args and an initial store, asserting it returns
 -- @Right (PRDone result, store')@.
@@ -18303,9 +18627,642 @@ regionRoutingTests = testGroup "Region routing"
       Region.planRegions regShape1 @?= Region.planRegions regShape1
   ]
 
+-- ---------------------------------------------------------------------------
+-- Std.String prim tests (Slice E1, Task 4)
+--
+-- These tests drive the String prims directly on the abstract heap (like
+-- 'rcArrayPrimTests'), verifying RC accounting (alloc/free balance, 0-alloc
+-- for non-append ops), correct return values, OOB errors, and multi-byte
+-- UTF-8 handling. The wok smoke programs in 'test/rc-string' provide the
+-- end-to-end tri-backend oracle.
+
+-- | Look up a String prim from 'Std.String' module.  The prim table is keyed
+-- by @(module, name)@, so 'lookupPrim' (which defaults to @Std.Array@) cannot
+-- be reused here.
+lookupStrPrim :: Text -> IO St.RCPrim
+lookupStrPrim = lookupPrimQ (T.pack "Std.String")
+
+-- | Look up a prim from 'Std.Base' module (e.g. @eqString@).
+lookupBasePrim :: Text -> IO St.RCPrim
+lookupBasePrim = lookupPrimQ (T.pack "Std.Base")
+
+rcStringPrimTests :: TestTree
+rcStringPrimTests = testGroup "rc string prims"
+  [ -- ---------------------------------------------------------------
+    -- byteLength
+    -- ---------------------------------------------------------------
+    testCase "byteLength: ASCII string returns byte count, 0 alloc, drops string" $ do
+      pByteLength <- lookupStrPrim (T.pack "byteLength")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 105])) s0  -- "hi"
+      (result, s2) <- callPrim pByteLength [St.RVBox sa] s1
+      result @?= St.RVLit (Anf.LInt 2)
+      St.stAllocs (St.stStats s2) - St.stAllocs (St.stStats s1) @?= 0
+      St.stLive (St.stStats s2) @?= baseline
+
+  , testCase "byteLength: multi-byte UTF-8 returns byte count, not codepoint count" $ do
+      -- "he\xC3\xA9" is 'h','e',U+00E9 = 4 bytes but only 3 codepoints
+      pByteLength <- lookupStrPrim (T.pack "byteLength")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 101, 0xC3, 0xA9])) s0
+      (result, s2) <- callPrim pByteLength [St.RVBox sa] s1
+      result @?= St.RVLit (Anf.LInt 4)
+      St.stLive (St.stStats s2) @?= baseline
+
+  -- ---------------------------------------------------------------
+  -- byteAt
+  -- ---------------------------------------------------------------
+  , testCase "byteAt: returns the correct byte as U64, 0 alloc, drops string" $ do
+      pByteAt <- lookupStrPrim (T.pack "byteAt")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [65, 66, 67])) s0  -- "ABC"
+      (result, s2) <- callPrim pByteAt [St.RVBox sa, St.RVLit (Anf.LInt 1)] s1
+      result @?= St.RVLit (Anf.LInt 66)  -- 'B' = 66
+      St.stAllocs (St.stStats s2) - St.stAllocs (St.stStats s1) @?= 0
+      St.stLive (St.stStats s2) @?= baseline
+
+  , testCase "byteAt OOB: raises PrimError" $ do
+      pByteAt <- lookupStrPrim (T.pack "byteAt")
+      let s0       = St.emptyStore
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 105])) s0  -- "hi"
+      expectPrimError pByteAt [St.RVBox sa, St.RVLit (Anf.LInt 5)] s1 "out of bounds"
+
+  -- ---------------------------------------------------------------
+  -- length (codepoint count)
+  -- ---------------------------------------------------------------
+  , testCase "length: ASCII string codepoint count == byte count" $ do
+      pLength <- lookupStrPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 101, 108, 108, 111])) s0  -- "hello"
+      (result, s2) <- callPrim pLength [St.RVBox sa] s1
+      result @?= St.RVLit (Anf.LInt 5)
+      St.stLive (St.stStats s2) @?= baseline
+
+  , testCase "length: multi-byte UTF-8 codepoint count < byte count" $ do
+      -- "h\xC3\xA9llo": 5 codepoints, 6 bytes
+      pLength <- lookupStrPrim (T.pack "length")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 0xC3, 0xA9, 108, 108, 111])) s0
+      (result, s2) <- callPrim pLength [St.RVBox sa] s1
+      result @?= St.RVLit (Anf.LInt 5)
+      St.stLive (St.stStats s2) @?= baseline
+
+  -- ---------------------------------------------------------------
+  -- index (codepoint access)
+  -- ---------------------------------------------------------------
+  , testCase "index: returns the correct Char at position 0" $ do
+      pIndex <- lookupStrPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 101, 108, 108, 111])) s0  -- "hello"
+      (result, s2) <- callPrim pIndex [St.RVBox sa, St.RVLit (Anf.LInt 0)] s1
+      result @?= St.RVLit (Anf.LChar 'h')
+      St.stLive (St.stStats s2) @?= baseline
+
+  , testCase "index: returns the multi-byte codepoint at position 1" $ do
+      -- "h\xC3\xA9llo": index 1 should be U+00E9 = '\233'
+      pIndex <- lookupStrPrim (T.pack "index")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 0xC3, 0xA9, 108, 108, 111])) s0
+      (result, s2) <- callPrim pIndex [St.RVBox sa, St.RVLit (Anf.LInt 1)] s1
+      result @?= St.RVLit (Anf.LChar '\233')
+      St.stLive (St.stStats s2) @?= baseline
+
+  , testCase "index OOB: raises PrimError" $ do
+      pIndex <- lookupStrPrim (T.pack "index")
+      let s0       = St.emptyStore
+          (sa, s1) = St.allocPure (St.NString (BS.pack [104, 105])) s0  -- "hi"
+      expectPrimError pIndex [St.RVBox sa, St.RVLit (Anf.LInt 5)] s1 "out of bounds"
+
+  -- ---------------------------------------------------------------
+  -- append
+  -- ---------------------------------------------------------------
+  , testCase "append: concatenates two strings, +1 alloc, drops both inputs" $ do
+      pAppend <- lookupStrPrim (T.pack "append")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [97, 98])) s0  -- "ab"
+          (sb, s2) = St.allocPure (St.NString (BS.pack [99, 100])) s1  -- "cd"
+      (result, s3) <- callPrim pAppend [St.RVBox sa, St.RVBox sb] s2
+      -- One new NString "abcd" allocated; sa and sb freed. Net: 0 live delta.
+      St.stAllocs (St.stStats s3) - St.stAllocs (St.stStats s2) @?= 1
+      St.stLive (St.stStats s3) @?= baseline + 1
+      -- Verify rendered bytes
+      case result of
+        St.RVBox na -> do
+          c <- runExceptT (St.deref na s3)
+          case c of
+            Right cell -> case St.cNode cell of
+              St.NString bs -> bs @?= BS.pack [97, 98, 99, 100]
+              other -> assertFailure ("expected NString, got: " <> show other)
+            Left e -> assertFailure ("deref failed: " <> show e)
+        other -> assertFailure ("expected RVBox, got: " <> show other)
+      -- Drop result to return to baseline
+      s4 <- dropResult result s3
+      St.stLive (St.stStats s4) @?= baseline
+
+  -- ---------------------------------------------------------------
+  -- eqString
+  -- ---------------------------------------------------------------
+  , testCase "eqString: equal strings return True (boxed Bool), drops both" $ do
+      pEq <- lookupBasePrim (T.pack "eqString")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [120])) s0  -- "x"
+          (sb, s2) = St.allocPure (St.NString (BS.pack [120])) s1  -- "x"
+      (result, s3) <- callPrim pEq [St.RVBox sa, St.RVBox sb] s2
+      -- sa and sb dropped; True NCon is an inline immediate (nullary, no cell),
+      -- so live count returns to baseline (no net heap delta).
+      St.stLive (St.stStats s3) @?= baseline
+      case St.renderRCValue s3 result of
+        Right t -> t @?= T.pack "True"
+        Left e  -> assertFailure ("render failed: " <> show e)
+      s4 <- dropResult result s3
+      St.stLive (St.stStats s4) @?= baseline
+
+  , testCase "eqString: unequal strings return False, drops both" $ do
+      pEq <- lookupBasePrim (T.pack "eqString")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [97])) s0  -- "a"
+          (sb, s2) = St.allocPure (St.NString (BS.pack [98])) s1  -- "b"
+      (result, s3) <- callPrim pEq [St.RVBox sa, St.RVBox sb] s2
+      case St.renderRCValue s3 result of
+        Right t -> t @?= T.pack "False"
+        Left e  -> assertFailure ("render failed: " <> show e)
+      s4 <- dropResult result s3
+      St.stLive (St.stStats s4) @?= baseline
+  ]
+
+-- ---------------------------------------------------------------------------
+-- String Slice E1 (Task 5): QuickCheck property suite (spec §8)
+--
+-- Every property calls the REAL RC prim implementations and validates results
+-- against the INDEPENDENT 'Data.Text' oracle.  CRUCIALLY, each byte-touching op
+-- is run on BOTH RC backends, making each property a THREE-WAY differential:
+--
+--     AbstractHeap  ==  CHeap (real C FFI)  ==  Data.Text oracle
+--
+-- The CHeap run goes through the actual novel C code: 'wokStringAlloc',
+-- 'wokStringData' + the body 'memcpy', the C-cell byte reads ('wokStringByteGet'
+-- via 'deref'), and 'append's memcpy into a fresh C 'wok_string' cell.  Random
+-- multi-byte stress on the FFI is the soundness floor of this slice; without it
+-- the FFI is exercised only by four fixed corpus files.
+--
+-- The oracle is never a re-derivation of the prim's own logic:
+--
+--   P1  byteLength vs length: oracle = BS.length (encodeUtf8 t) vs Tx.length t
+--   P2  length of append: oracle = Tx.length strA + Tx.length strB
+--   P3  byteLength of append: oracle = sum of BS.length . encodeUtf8
+--   P4  append byte layout: oracle = encodeUtf8 (Tx.append strA strB)
+--   P5  eqString reflexive / symmetric / oracle = (strA == strB)
+--   P6  index / byteAt agreement with T.index / BS.index at sampled offsets
+--   P7  OOB: index / byteAt at i >= length / byteLength -> PrimError (both RC
+--       backends)
+--
+-- SOUNDNESS RATIONALE:
+-- The RC prims decode the raw 'ByteString' from the NString cell and do their
+-- own UTF-8 arithmetic.  The 'Data.Text' oracle encodes / decodes via
+-- 'Data.Text.Encoding', a SEPARATE implementation.  A divergence reveals a real
+-- bug in the RC prim (on either backend), not in the test.
+--
+-- The generator 'genUtf8Text' deliberately includes multi-byte scalars (accented
+-- Latin, CJK, emoji) by weighting a non-ASCII character set heavily enough that
+-- an all-ASCII result is almost impossible (cover requirement: 80% multi-byte).
+-- ---------------------------------------------------------------------------
+
+-- | Generator: a 'Text' containing a mix of ASCII and multi-byte UTF-8
+-- codepoints.  Emoji (4-byte) and CJK (3-byte) are included so the generator
+-- reliably exercises the >127 byte paths.
+--
+-- The 'Int' argument is the QuickCheck size; we clamp the string length to the
+-- range [0..max 1 size] to keep test execution fast while letting the shrinker
+-- converge to minimal counterexamples.
+genUtf8Text :: QC.Gen T.Text
+genUtf8Text = QC.sized $ \sz -> do
+  n <- QC.choose (0, max 1 sz)
+  cs <- QC.vectorOf n genUtf8Char
+  pure (T.pack cs)
+
+-- | Single codepoint weighted toward multi-byte UTF-8.
+-- Weights: ASCII(32..126) = 30, accented Latin = 30, CJK = 20, emoji = 20.
+-- Expected fraction of multi-byte scalars per codepoint: 70%.
+genUtf8Char :: QC.Gen Char
+genUtf8Char = QC.frequency
+  [ (30, QC.choose ('\x20', '\x7E'))   -- printable ASCII (1-byte)
+  , (30, QC.elements accentedLatin)    -- Latin Extended (2-byte in UTF-8)
+  , (20, QC.elements cjkSamples)       -- CJK Unified Ideographs (3-byte)
+  , (20, QC.elements emojiSamples)     -- emoji (4-byte)
+  ]
+
+accentedLatin :: [Char]
+accentedLatin = "àáâãäåæçèéêëìíîïðñòóôõöùúûüýþÿ\x00C6\x00D8\x00E0\x00FC"
+
+cjkSamples :: [Char]
+cjkSamples = "\x4E2D\x6587\x65E5\x672C\x8BED\x9F99\x98CE\x897F\x4EBA\x5929"
+
+emojiSamples :: [Char]
+emojiSamples = "\x1F600\x1F609\x1F4A9\x1F525\x1F680\x1F40D\x1F431\x1F984"
+
+-- | A fresh empty store on a given backend.  AbstractHeap reuses 'emptyStore';
+-- CHeap needs a live 'WokHeap' bound into 'stBackend'.
+emptyStoreOn :: St.HeapBackend -> St.Store
+emptyStoreOn b = St.emptyStore { St.stBackend = b }
+
+-- | Run an IO action with a fresh 'CHeap' backend, bracketing the 'WokHeap' so
+-- it is always freed (even on exception), and assert the C run is leak-clean:
+-- after the action, the C runtime's own 'wok_stat_live' is 0 and
+-- 'wok_stat_allocs' == 'wok_stat_frees'.  This is what proves the per-op CHeap
+-- run does not leak a real cell on the success path.
+withCHeapBalanced :: String -> (St.HeapBackend -> IO a) -> IO a
+withCHeapBalanced label act =
+  Control.Exception.bracket Heap.wokHeapNew Heap.wokHeapFree $ \hp -> do
+    r <- act (St.CHeap hp)
+    cLive   <- Heap.wokStatLive   hp
+    cAllocs <- Heap.wokStatAllocs hp
+    cFrees  <- Heap.wokStatFrees  hp
+    assertEqual (label <> ": C wok_stat_live must be 0 (no leak)") (0 :: Int64) cLive
+    assertEqual (label <> ": C wok_stat_allocs == wok_stat_frees") cAllocs cFrees
+    pure r
+
+-- | Allocate an 'NString' cell from a 'Text' on the GIVEN backend (CHeap routes
+-- to the real 'wokStringAlloc' + body memcpy; AbstractHeap to the IntMap mirror).
+-- Uses the real 'St.alloc' dispatch, NOT 'allocPure', so the C path is genuinely
+-- exercised on a CHeap store.
+allocStringOn :: T.Text -> St.Store -> IO (St.Addr, St.Store)
+allocStringOn t s = do
+  r <- runExceptT (St.alloc (St.NString (TxEnc.encodeUtf8 t)) s)
+  case r of
+    Right x -> pure x
+    Left e  -> assertFailure ("allocStringOn failed: " <> show e)
+                 >> error "unreachable"
+
+-- | Call a string prim and return @(result, newStore)@ (any backend).
+callStrPrim :: St.RCPrim -> [St.RCValue] -> St.Store -> IO (St.RCValue, St.Store)
+callStrPrim = callPrim
+
+-- | Extract the integer from an RVLit (LInt _) or fail.
+asInt :: String -> St.RCValue -> IO Integer
+asInt _ctx (St.RVLit (Anf.LInt n)) = pure n
+asInt ctx  v = assertFailure (ctx <> ": expected RVLit (LInt _), got: " <> show v)
+
+-- | Extract the Char from an RVLit (LChar _) or fail.
+asChar :: String -> St.RCValue -> IO Char
+asChar _ctx (St.RVLit (Anf.LChar c)) = pure c
+asChar ctx  v = assertFailure (ctx <> ": expected RVLit (LChar _), got: " <> show v)
+
+-- | The two RC backends a per-op property runs on: AbstractHeap (the IntMap
+-- mirror) and CHeap (the real C runtime).  A property body of type
+-- @(St.HeapBackend -> IO Property)@ is run once per backend and the results
+-- conjoined; the CHeap run is leak-checked via 'withCHeapBalanced'.
+onBothBackends :: String -> (St.HeapBackend -> IO Property) -> IO Property
+onBothBackends label body = do
+  abstractR <- body St.AbstractHeap
+  cheapR    <- withCHeapBalanced label body
+  pure (abstractR .&&. cheapR)
+
+-- P1: byteLength s >= length s, with equality iff s is all-ASCII.
+-- THREE-WAY: 'length' and 'byteLength' run on BOTH backends; the oracle is
+-- BS.length (encodeUtf8 t) and Tx.length t, computed independently.  A bug in
+-- the UTF-8 codepoint decoder or the byte counter on EITHER backend surfaces.
+prop_stringByteLengthGeLength :: Property
+prop_stringByteLengthGeLength =
+  QC.forAll genUtf8Text $ \t ->
+    QC.ioProperty $ onBothBackends "P1" $ \backend -> do
+      pLength     <- lookupStrPrim (T.pack "length")
+      pByteLength <- lookupStrPrim (T.pack "byteLength")
+      let s0             = emptyStoreOn backend
+          baseline       = St.stLive (St.stStats s0)
+          oracleLen      = toInteger (T.length t)
+          oracleByteLen  = toInteger (BS.length (TxEnc.encodeUtf8 t))
+          oracleAllAscii = oracleLen == oracleByteLen
+      (sa, s1)      <- allocStringOn t s0
+      (sb, s2)      <- allocStringOn t s1
+      (lenVal, s3)  <- callStrPrim pLength     [St.RVBox sa] s2
+      (byteVal, s4) <- callStrPrim pByteLength [St.RVBox sb] s3
+      rcLen     <- asInt "P1 length"     lenVal
+      rcByteLen <- asInt "P1 byteLength" byteVal
+      St.stLive (St.stStats s4) @?= baseline
+      pure $ QC.conjoin
+        [ QC.counterexample ("P1 length: RC=" <> show rcLen <> " oracle=" <> show oracleLen)
+            (rcLen == oracleLen)
+        , QC.counterexample ("P1 byteLength: RC=" <> show rcByteLen <> " oracle=" <> show oracleByteLen)
+            (rcByteLen == oracleByteLen)
+        , QC.counterexample ("P1 byteLen >= len: " <> show rcByteLen <> " < " <> show rcLen)
+            (rcByteLen >= rcLen)
+        , QC.counterexample "P1 equality iff all-ASCII"
+            ((rcByteLen == rcLen) == oracleAllAscii)
+        ]
+
+-- P2: length (append a b) == length a + length b.
+-- THREE-WAY: the RC 'append' (allocates a new cell -- a real C cell on CHeap)
+-- then 'length' on the result, on both backends; the oracle sums Tx.length.
+prop_stringLengthAppend :: Property
+prop_stringLengthAppend =
+  QC.forAll genUtf8Text $ \strA ->
+  QC.forAll genUtf8Text $ \strB ->
+    QC.ioProperty $ onBothBackends "P2" $ \backend -> do
+      pLength <- lookupStrPrim (T.pack "length")
+      pAppend <- lookupStrPrim (T.pack "append")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          oracleA  = toInteger (T.length strA)
+          oracleB  = toInteger (T.length strB)
+      (sa, s1) <- allocStringOn strA s0
+      (sb, s2) <- allocStringOn strB s1
+      -- append consumes sa and sb, allocates a new cell
+      (cat, s3) <- callStrPrim pAppend [St.RVBox sa, St.RVBox sb] s2
+      -- length consumes cat
+      (lenVal, s4) <- callStrPrim pLength [cat] s3
+      rcLen <- asInt "P2 length(append)" lenVal
+      St.stLive (St.stStats s4) @?= baseline
+      pure $ QC.counterexample
+        ("P2: length(append)=" <> show rcLen <> " oracle=" <> show (oracleA + oracleB))
+        (rcLen == oracleA + oracleB)
+
+-- P3: byteLength (append a b) == byteLength a + byteLength b.
+-- THREE-WAY: same as P2 but the byte oracle BS.length . encodeUtf8.
+prop_stringByteLengthAppend :: Property
+prop_stringByteLengthAppend =
+  QC.forAll genUtf8Text $ \strA ->
+  QC.forAll genUtf8Text $ \strB ->
+    QC.ioProperty $ onBothBackends "P3" $ \backend -> do
+      pByteLength <- lookupStrPrim (T.pack "byteLength")
+      pAppend     <- lookupStrPrim (T.pack "append")
+      let s0        = emptyStoreOn backend
+          baseline  = St.stLive (St.stStats s0)
+          oracleA   = toInteger (BS.length (TxEnc.encodeUtf8 strA))
+          oracleB   = toInteger (BS.length (TxEnc.encodeUtf8 strB))
+      (sa, s1)  <- allocStringOn strA s0
+      (sb, s2)  <- allocStringOn strB s1
+      (cat, s3)     <- callStrPrim pAppend     [St.RVBox sa, St.RVBox sb] s2
+      (byteVal, s4) <- callStrPrim pByteLength [cat] s3
+      rcByteLen <- asInt "P3 byteLength(append)" byteVal
+      St.stLive (St.stStats s4) @?= baseline
+      pure $ QC.counterexample
+        ("P3: byteLength(append)=" <> show rcByteLen <> " oracle=" <> show (oracleA + oracleB))
+        (rcByteLen == oracleA + oracleB)
+
+-- P4: append byte-layout correctness against the Data.Text oracle.
+-- THREE-WAY: 'append strA strB' allocates a new cell (a real C cell on CHeap via
+-- the body memcpy); we read EVERY byte of the result back via 'byteAt' and
+-- assert it equals 'encodeUtf8 (Tx.append strA strB)' at each offset.  This
+-- checks the concatenated byte LAYOUT directly (an off-by-one or wrong-length
+-- memcpy surfaces), not mere self-consistency.  Associativity then follows from
+-- byte-layout correctness; it is not separately re-asserted (Text.append is
+-- trivially associative, so re-deriving it would be vacuous).
+prop_stringAppendByteLayout :: Property
+prop_stringAppendByteLayout =
+  QC.forAll genUtf8Text $ \strA ->
+  QC.forAll genUtf8Text $ \strB ->
+    QC.ioProperty $ onBothBackends "P4" $ \backend -> do
+      pAppend <- lookupStrPrim (T.pack "append")
+      pByteAt <- lookupStrPrim (T.pack "byteAt")
+      let oracleBytes = TxEnc.encodeUtf8 (T.append strA strB)
+          n           = BS.length oracleBytes
+          s0          = emptyStoreOn backend
+          baseline    = St.stLive (St.stStats s0)
+      (sa, s1)  <- allocStringOn strA s0
+      (sb, s2)  <- allocStringOn strB s1
+      (cat, s3) <- callStrPrim pAppend [St.RVBox sa, St.RVBox sb] s2
+      case cat of
+        St.RVBox a -> do
+          -- We hold ONE ref to the result throughout.  For each byte read we
+          -- incref 'a' once (so 'byteAt' has its own ref to consume) and call
+          -- 'byteAt', which drops that extra ref.  Our held ref survives every
+          -- read; we drop it once at the end.  This threads the store correctly
+          -- and handles n == 0 (no reads; just the final drop) uniformly.
+          let readByte (acc, st) i = do
+                stD <- dupNTimes a 1 st     -- incref once for byteAt to consume
+                (bv, st') <- callStrPrim pByteAt
+                               [St.RVBox a, St.RVLit (Anf.LInt (fromIntegral i))] stD
+                rb <- asInt "P4 byteAt" bv
+                let oracleByte = fromIntegral (BS.index oracleBytes i) :: Integer
+                pure (QC.counterexample
+                        ("P4 byteAt at " <> show i <> ": RC=" <> show rb
+                          <> " oracle=" <> show oracleByte)
+                        (rb == oracleByte) : acc, st')
+          (checks, sRead) <- Control.Monad.foldM readByte ([], s3) [0 .. n - 1]
+          -- Drop our held ref to the result; heap returns to baseline.
+          sFinal <- dropResult cat sRead
+          St.stLive (St.stStats sFinal) @?= baseline
+          pure $ QC.conjoin
+            [ QC.counterexample ("P4 byte count: result=" <> show n) True
+            , QC.conjoin checks
+            ]
+        _ ->
+          pure (QC.counterexample "P4: append did not return a boxed string" False)
+
+-- P5: eqString reflexive and symmetric; eqString a b iff a and b have the same
+-- codepoints.  THREE-WAY: the byte-compare runs on both backends; the oracle is
+-- (strA == strB) on 'Data.Text'.  A bug in the byte-compare (first byte only,
+-- wrong length) yields False on reflexivity or disagrees with the oracle.
+prop_stringEqString :: Property
+prop_stringEqString =
+  QC.forAll genUtf8Text $ \strA ->
+  QC.forAll genUtf8Text $ \strB ->
+    QC.ioProperty $ onBothBackends "P5" $ \backend -> do
+      pEq <- lookupBasePrim (T.pack "eqString")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          oracleEq = strA == strB
+      -- Reflexivity needs a pair of cells for the same text
+      (sa1, s1) <- allocStringOn strA s0
+      (sa2, s2) <- allocStringOn strA s1
+      -- Symmetry needs two independent pairs
+      (sa3, s3) <- allocStringOn strA s2
+      (sb1, s4) <- allocStringOn strB s3
+      (sa4, s5) <- allocStringOn strA s4
+      (sb2, s6) <- allocStringOn strB s5
+      (sb3, s7) <- allocStringOn strB s6
+      (sb4, s8) <- allocStringOn strB s7
+      -- Reflexivity: eqString a a
+      (reflexVal, s9) <- callStrPrim pEq [St.RVBox sa1, St.RVBox sa2] s8
+      -- Symmetry: eqString a b and eqString b a
+      (abVal, s10) <- callStrPrim pEq [St.RVBox sa3, St.RVBox sb1] s9
+      (baVal, s11) <- callStrPrim pEq [St.RVBox sb2, St.RVBox sa4] s10
+      -- eqString b b must also be True (reflexivity for strB)
+      (oracleVal, s12) <- callStrPrim pEq [St.RVBox sb3, St.RVBox sb4] s11
+      let renderBool v = case St.renderRCValue s12 v of
+                           Right rendered -> rendered == T.pack "True"
+                           Left _         -> False
+          rcReflex  = renderBool reflexVal
+          rcAB      = renderBool abVal
+          rcBA      = renderBool baVal
+          rcSame    = renderBool oracleVal
+      s13 <- dropResult reflexVal s12
+      s14 <- dropResult abVal s13
+      s15 <- dropResult baVal s14
+      s16 <- dropResult oracleVal s15
+      St.stLive (St.stStats s16) @?= baseline
+      pure $ QC.conjoin
+        [ QC.counterexample "P5 reflexive: eqString a a must be True" rcReflex
+        , QC.counterexample "P5 symmetric: eqString a b == eqString b a"
+            (rcAB == rcBA)
+        , QC.counterexample
+            ("P5 oracle: eqString a b iff a==b; oracle=" <> show oracleEq
+              <> " RC=" <> show rcAB)
+            (rcAB == oracleEq)
+        , QC.counterexample
+            ("P5 eqString b b must be True; got: " <> show rcSame)
+            rcSame
+        ]
+
+-- P6: index and byteAt agree with the Text/encodeUtf8 reference at sampled
+-- in-bounds offsets.  THREE-WAY: both byte-touching reads run on both backends
+-- (on CHeap they hit the C-cell byte reads via 'deref'); the oracle is
+-- T.index / BS.index.  A wrong UTF-8 decoder (3- or 4-byte sequences) disagrees.
+-- A fixed ASCII char is appended to guarantee a non-empty string.
+prop_stringIndexByteAtNonEmpty :: Property
+prop_stringIndexByteAtNonEmpty =
+  QC.forAll genUtf8Text $ \prefix ->
+    let t = T.snoc prefix 'A' in   -- always non-empty ASCII fallback
+    QC.forAll (QC.choose (0, T.length t - 1)) $ \cpIdx ->
+    QC.forAll (QC.choose (0, BS.length (TxEnc.encodeUtf8 t) - 1)) $ \byteIdx ->
+      QC.ioProperty $ onBothBackends "P6" $ \backend -> do
+        pIndex  <- lookupStrPrim (T.pack "index")
+        pByteAt <- lookupStrPrim (T.pack "byteAt")
+        let s0         = emptyStoreOn backend
+            baseline   = St.stLive (St.stStats s0)
+            bs         = TxEnc.encodeUtf8 t
+            oracleCP   = T.index t cpIdx
+            oracleByte = BS.index bs byteIdx
+        (sa, s1) <- allocStringOn t s0
+        (sb, s2) <- allocStringOn t s1
+        (cpVal, s3)   <- callStrPrim pIndex
+                           [St.RVBox sa, St.RVLit (Anf.LInt (fromIntegral cpIdx))]
+                           s2
+        (byteVal, s4) <- callStrPrim pByteAt
+                           [St.RVBox sb, St.RVLit (Anf.LInt (fromIntegral byteIdx))]
+                           s3
+        rcCP   <- asChar "P6 index" cpVal
+        rcByte <- asInt  "P6 byteAt" byteVal
+        St.stLive (St.stStats s4) @?= baseline
+        pure $ QC.conjoin
+          [ QC.counterexample
+              ("P6 index at " <> show cpIdx <> ": RC=" <> show rcCP
+                <> " oracle=" <> show oracleCP)
+              (rcCP == oracleCP)
+          , QC.counterexample
+              ("P6 byteAt at " <> show byteIdx <> ": RC=" <> show rcByte
+                <> " oracle=" <> show (fromIntegral oracleByte :: Integer))
+              (rcByte == fromIntegral oracleByte)
+          ]
+
+-- P7: OOB: index s i raises a 'PrimError' when i >= codepoint length; byteAt s i
+-- raises a 'PrimError' when i >= byte length.  THREE-WAY: checked on BOTH RC
+-- backends (AbstractHeap and CHeap).  The error MUST be a 'PrimError'
+-- specifically (the spec wording), not merely any runtime error: a non-PrimError
+-- failure (e.g. a store error) does NOT count as a pass.  The
+-- 'rc-string-oob/*.wok' corpus additionally covers the reference interpreter
+-- end-to-end, so all three interpreters reject OOB.
+prop_stringOOB :: Property
+prop_stringOOB =
+  QC.forAll genUtf8Text $ \t ->
+    QC.ioProperty $ onBothBackends "P7" $ \backend -> do
+      pIndex  <- lookupStrPrim (T.pack "index")
+      pByteAt <- lookupStrPrim (T.pack "byteAt")
+      let cpLen      = T.length t
+          byteLen    = BS.length (TxEnc.encodeUtf8 t)
+          -- cpLen and byteLen are themselves >= the respective lengths, so both
+          -- are guaranteed out-of-bounds regardless of t's content.
+          oobCPIdx   = fromIntegral cpLen
+          oobByteIdx = fromIntegral byteLen
+          s0         = emptyStoreOn backend
+      (sa, s1) <- allocStringOn t s0
+      (sb, s2) <- allocStringOn t s1
+      -- The OOB prim throws BEFORE it drops its argument, so on the error path it
+      -- does NOT consume the cell (error-path leak is declared unobservable, spec
+      -- §5.3).  Both calls run against 's2'; their Left-stores are discarded, and
+      -- the cells 'sa'/'sb' are still live at rc 1 in 's2'.  We OWN them, so after
+      -- observing the errors we explicitly drop them off 's2' to keep the CHeap
+      -- run leak-clean (so 'withCHeapBalanced' still validates no UNINTENDED leak,
+      -- while honouring that the prim itself need not free on the error path).
+      res1 <- runExceptT (St.rpFn pIndex  [St.RVBox sa, St.RVLit (Anf.LInt oobCPIdx)]   s2)
+      res2 <- runExceptT (St.rpFn pByteAt [St.RVBox sb, St.RVLit (Anf.LInt oobByteIdx)] s2)
+      -- The error MUST be a PrimError specifically.  Any other Left, or a Right,
+      -- is a failure.  'Store' has no Show, so describe only the outcome.
+      let isPrimErr r = case r of
+                          Left (IV.PrimError _) -> True
+                          _                     -> False
+          describe r = case r of
+                         Left e  -> "error " <> show e
+                         Right _ -> "SUCCEEDED (no error)"
+          indexOOB  = isPrimErr res1
+          byteAtOOB = isPrimErr res2
+      -- Clean up the two input cells we still own in 's2' so the CHeap heap
+      -- returns to baseline (no UNINTENDED leak; the C runtime free counters
+      -- balance).  dropResult walks valueChildren and drops each addr.
+      s3 <- dropResult (St.RVBox sa) s2
+      _  <- dropResult (St.RVBox sb) s3
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("P7 index OOB at " <> show (toInteger oobCPIdx :: Integer)
+              <> " (cpLen=" <> show cpLen <> "): expected PrimError, got: " <> describe res1)
+            indexOOB
+        , QC.counterexample
+            ("P7 byteAt OOB at " <> show (toInteger oobByteIdx :: Integer)
+              <> " (byteLen=" <> show byteLen <> "): expected PrimError, got: " <> describe res2)
+            byteAtOOB
+        ]
+
+-- | Non-vacuity cover check: at least 80% of generated strings must contain a
+-- multi-byte codepoint (i.e. byteLen > cpLen) OR be empty.  This guards against
+-- the generator accidentally producing all-ASCII strings.
+prop_stringGeneratorMultiByteCoverage :: Property
+prop_stringGeneratorMultiByteCoverage =
+  QC.forAll genUtf8Text $ \t ->
+    let cpLen        = T.length t
+        byteLen      = BS.length (TxEnc.encodeUtf8 t)
+        hasMultiByte = byteLen > cpLen || cpLen == 0
+    in QC.checkCoverage $
+       QC.cover 80 hasMultiByte "contains multi-byte codepoint (or empty)" $
+       QC.property True   -- always passes; the cover annotation enforces distribution
+
+-- | Incref the address 'a' exactly 'k' times (k >= 0) on the given store.
+-- Used by P4 to give the appended result enough refs for n consuming byteAt
+-- reads.  'St.incref' bumps the rc by one on each call and works on both the
+-- CAddr (C runtime) and HAddr (abstract) backends.
+dupNTimes :: St.Addr -> Int -> St.Store -> IO St.Store
+dupNTimes _ k s | k <= 0 = pure s
+dupNTimes a k s = do
+  r <- runExceptT (St.incref a s)
+  case r of
+    Right s' -> dupNTimes a (k - 1) s'
+    Left e   -> assertFailure ("dupNTimes: incref failed: " <> show e)
+                  >> error "unreachable"
+
 -- -------------------------------------------------------------------------
 -- Registration
 -- -------------------------------------------------------------------------
+
+rcStringPropertyTests :: TestTree
+rcStringPropertyTests =
+  localOption (QuickCheckTests 150) $
+    testGroup "rc string properties (Suite E1: AbstractHeap == CHeap == Text oracle)"
+      [ testProperty "P1: byteLength s >= length s; equal iff all-ASCII"
+          prop_stringByteLengthGeLength
+      , testProperty "P2: length (append a b) == length a + length b"
+          prop_stringLengthAppend
+      , testProperty "P3: byteLength (append a b) == byteLength a + byteLength b"
+          prop_stringByteLengthAppend
+      , testProperty "P4: append byte layout == encodeUtf8 (a <> b) (byte-by-byte)"
+          prop_stringAppendByteLayout
+      , testProperty "P5: eqString reflexive, symmetric, oracle-faithful"
+          prop_stringEqString
+      , testProperty "P6 (non-empty): index and byteAt agree with Text/encodeUtf8 reference"
+          prop_stringIndexByteAtNonEmpty
+      , testProperty "P7: index/byteAt OOB raises PrimError (both RC backends)"
+          prop_stringOOB
+      , testProperty "P-cov: generator produces multi-byte strings (non-vacuity)"
+          prop_stringGeneratorMultiByteCoverage
+      ]
 
 rcArrayPropertyTests :: TestTree
 rcArrayPropertyTests =
@@ -18738,6 +19695,53 @@ rcRegionCorpusTests = testGroup "rc-region-corpus"
 
   , testCase "05-letrec-head-capture-escape: full six-stat parity + arena-leak invariant" $
       rcRegionParityHarness "test/rc-region/05-letrec-head-capture-escape.wok"
+
+  , -- -----------------------------------------------------------------------
+    -- 06-string-literal-discard (Slice E1, Task 3): a string literal now
+    -- allocates a counted NString cell (was inline).  "hi" (2 ASCII bytes) is
+    -- bound and DISCARDED, so Perceus inserts a __rc_drop on the boxed binder.
+    -- Expected on BOTH backends:
+    --   * the string allocates exactly ONE cell, freed exactly once
+    --     (allocs == frees, stLive == baseline at end);
+    --   * peak_bytes charges the rounded cell size 16 + 8*ceil(2/8) == 24;
+    --   * String is ALWAYS Heap, never arena (arena_peak == 0).
+    testCase "06-string-literal-discard: literal allocates a counted cell (allocs==frees, peak_bytes==24, no arena)" $ do
+      (absR, cR, _cAllocs, cPeakBytes, _cArenaBytes, cArenaPeak) <-
+        withBothBackendsArena "test/rc-region/06-string-literal-discard.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          let aSt = RCM.rcStats a
+              cSt = RCM.rcStats c
+          assertEqual "output is 5" (T.pack "5") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          -- The literal allocated a real cell: at least one counted alloc beyond
+          -- the baseline (the NString cell).
+          assertEqual "string allocated exactly one cell (allocs - baseline == 1)"
+            (RCM.rcBaseline c + 1) (St.stAllocs cSt)
+          -- Balanced: allocs == frees + baseline, stLive back to baseline.
+          assertEqual "no counted leak (C): stLive == baseline"
+            (RCM.rcBaseline c) (St.stLive cSt)
+          assertEqual "no counted leak (C): allocs - frees == baseline"
+            (RCM.rcBaseline c) (St.stAllocs cSt - St.stFrees cSt)
+          assertEqual "no counted leak (abstract): stLive == baseline"
+            (RCM.rcBaseline a) (St.stLive aSt)
+          assertEqual "no counted leak (abstract): allocs - frees == baseline"
+            (RCM.rcBaseline a) (St.stAllocs aSt - St.stFrees aSt)
+          -- peak_bytes charges the rounded WokString cell size for 2 bytes: 24.
+          assertEqual "C peak_bytes == 24 (16 + 8*ceil(2/8))"
+            (24 :: Word64) cPeakBytes
+          assertEqual "abstract peak_bytes == 24"
+            (24 :: Word64) (fromIntegral (St.stPeakBytes aSt))
+          -- String is NEVER arena-routed.
+          assertEqual "abstract arena_peak == 0 (String is always Heap)"
+            (0 :: Int) (St.stArenaPeak aSt)
+          assertEqual "C arena_peak == 0 (String is always Heap)"
+            (0 :: Word64) cArenaPeak
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , testCase "06-string-literal-discard: full six-stat parity + arena-leak invariant" $
+      rcRegionParityHarness "test/rc-region/06-string-literal-discard.wok"
   ]
 
 -- ---------------------------------------------------------------------------

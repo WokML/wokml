@@ -112,15 +112,19 @@ dropHint = PN.rcDropName
 
 -- | True iff a value of this type is heap-allocated (and so reference-counted).
 isBoxedType :: CType -> Bool
--- UNBOXED iff the value is an 'RVLit' in the RC interpreter -- i.e. exactly the
--- literal types: U64/U32/Char/Unit/String/Never. These live inline and are
--- never reference-counted (a literal resolves to 'RVLit', and __rc_dup/__rc_drop
--- are no-ops on it).
+-- UNBOXED iff the value is an 'RVLit' in the RC interpreter -- i.e. the inline
+-- literal types: U64/U32/Char/Unit/Never. These live inline and are never
+-- reference-counted (a literal resolves to 'RVLit', and __rc_dup/__rc_drop are
+-- no-ops on it).
 isBoxedType (CTCon TcU64    []) = False
 isBoxedType (CTCon TcU32    []) = False
 isBoxedType (CTCon TcChar   []) = False
 isBoxedType (CTCon TcUnit   []) = False
-isBoxedType (CTCon TcString []) = False
+-- String is BOXED as of Slice E1 (Task 3): a string literal allocates a counted
+-- 'NString' cell (no longer an inline 'RVLit (LStr s)'), so Perceus inserts
+-- @__rc_dup@/@__rc_drop@ on String binders and Reachable tracks them as boxed
+-- locals, exactly like any other heap value.
+isBoxedType (CTCon TcString []) = True
 isBoxedType (CTCon TcNever  []) = False
 -- Bool is BOXED: the RC interpreter has no scalar boolean -- it allocates a
 -- nullary constructor cell (NCon True/False, an RVBox) for every Bool (see

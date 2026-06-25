@@ -1,0 +1,44 @@
+module Main
+import Std.Base
+
+-- FBIP String-field reuse (String Slice E1 follow-up): exercises the newly-enabled
+-- reuse pairing for constructors carrying a String field.
+--
+-- Since Slice E1, 'slotClassOf (CTCon TcString []) = KPointer', so a constructor
+-- with a String field has a KPointer slot for that field. When a case-match
+-- rebuilds the SAME constructor with a different String (still KPointer) and the
+-- same U64 (KLitInt), the slot-kind signatures match: [KPointer, KLitInt] ==
+-- [KPointer, KLitInt]. The reuse pairing fires; each Box shell is reused in place
+-- (rc == 1 gate), so the fused run records fewer allocs than the non-FBIP run.
+--
+-- The test:
+--   * maps a 3-element 'BoxList' with 'relabel' (replaces each String, keeps U64).
+--   * the fused run saves EXACTLY 3 Box allocs (one per list cell) vs non-FBIP.
+--   * output is the sum of the three U64 fields (1 + 2 + 3 = 6), verifying the
+--     U64 slots are preserved correctly through the in-place reuse.
+--   * abstract == C on all stats (the differential oracle).
+
+data Box = Box String U64
+
+data BoxList = BNil | BCons Box BoxList
+
+relabel : Box -> Box
+relabel b = case b of
+  Box _ n -> Box "x" n
+
+mapRelabel : BoxList -> BoxList
+mapRelabel xs = case xs of
+  BNil      -> BNil
+  BCons b bs -> BCons (relabel b) (mapRelabel bs)
+
+sumFields : BoxList -> U64
+sumFields xs = case xs of
+  BNil       -> 0
+  BCons b bs ->
+    case b of
+      Box _ n -> n + sumFields bs
+
+main =
+  sumFields (mapRelabel (BCons (Box "a" 1)
+                        (BCons (Box "b" 2)
+                        (BCons (Box "c" 3) BNil))))

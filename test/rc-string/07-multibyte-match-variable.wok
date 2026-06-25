@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Regression test (B1, multi-byte): matching a String VARIABLE containing a
+-- multi-byte UTF-8 codepoint against a string-literal pattern.  Exercises the
+-- decodeUtf8 path in the NString branch of the fix.
+-- "hello" where the second char is U+00E9 (2-byte UTF-8), so "h\xC3\xA9llo".
+-- classify "helo" -> 0 (wrong string)
+-- classify "hllo" -> 0 (wrong string)
+-- classify "hello" -> 0 (ASCII, wrong)
+-- classify s        -> 1 (correct multi-byte match)
+-- Return: 1
+
+classify : String -> U64
+classify s = case s of
+  "héllo" -> 1
+  _ -> 0
+
+main : U64
+main =
+  let s = "héllo" in
+  classify s

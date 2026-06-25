@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+
+-- String literal allocation (Slice E1, Task 3): a string literal now allocates a
+-- counted NString cell (was inline). Here the literal "hi" is bound and then
+-- DISCARDED (the body returns a U64, never using the string), so Perceus inserts a
+-- __rc_drop on the boxed binder. Expected on BOTH RC backends:
+--   * the string allocates exactly one cell (allocs == frees, live == 0 at end);
+--   * peak_bytes == 16 + 8*ceil(2/8) == 24 (the rounded WokString cell size for 2
+--     ASCII bytes);
+--   * String is ALWAYS Heap (never arena): arena_peak == 0.
+
+discard : U64 -> U64
+discard n =
+  let s = "hi" in
+  n
+
+main = discard 5

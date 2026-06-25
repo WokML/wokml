@@ -97,6 +97,18 @@ dict$Eq$Option d$Eq$0 =
   let t.3 = Eq$Dict(t.1, t.2)
   t.3
 
+dict$Eq$String$m0 =
+  eqString
+
+dict$Eq$String$m1 x y =
+  let t.1 = dict$Eq$String$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$String =
+  let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
+
 reader e c =
   let t = c(self)
   let _drop.1 = __rc_drop(e)

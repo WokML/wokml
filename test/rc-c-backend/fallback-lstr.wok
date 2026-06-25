@@ -1,11 +1,13 @@
 module Main
 import Std.Base
 
--- Fallback (Task 3): a constructor with a string ('LStr') field. 'encodeSlot'
--- returns 'Nothing' for an 'LStr', so the whole 'Tagged' 'NCon' falls back to
--- the ABSTRACT heap even under the C backend (other encodable cells still route
--- to C). The program must still render the correct result and return to its
--- baseline with balanced stats.
+-- String field as a POINTER cell (Slice E1, Task 3): a constructor with a
+-- 'String' field. A string literal now allocates a counted 'NString' cell, and
+-- the field stores its pointer ('encodeSlotC' -> 'KPointer'), so the whole
+-- 'Tagged' NCon is C-eligible (it no longer falls back to the abstract heap).
+-- Both the 'NString' cell and the 'Tagged' NCon route to the C heap; the program
+-- still renders the correct result and returns to its baseline with balanced
+-- stats.
 
 data Tagged = Tagged String U64
 

@@ -1,8 +1,8 @@
 unwrap p =
-  join j30(n) =
+  join j34(n) =
     n
   case p of
-    Box f -> jump j30(f)
+    Box f -> jump j34(f)
 
 main =
   let t.1 = Box(7)

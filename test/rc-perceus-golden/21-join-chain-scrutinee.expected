@@ -1,25 +1,25 @@
 headCons xs =
-  join j82(r) =
+  join j91(r) =
     let h = r
     let t = Cell(h, xs)
     t
-  join j84() =
-    jump j82(0)
-  join j85(y.1) =
-    jump j82(y.1)
-  join j87(y.2) =
-    jump j82(y.2)
+  join j93() =
+    jump j91(0)
+  join j94(y.1) =
+    jump j91(y.1)
+  join j96(y.2) =
+    jump j91(y.2)
   case xs of
-    Nil -> jump j84()
+    Nil -> jump j93()
     Cons f.1 f.2 ->
       let _dup = __rc_dup(f.2)
       case f.2 of
         Nil ->
           let _drop.1 = __rc_drop(f.2)
-          jump j85(f.1)
+          jump j94(f.1)
         Cons f.3 f.4 ->
           let _drop.2 = __rc_drop(f.2)
-          jump j87(f.1)
+          jump j96(f.1)
 
 main =
   let t.3 = Nil
@@ -118,6 +118,18 @@ dict$Eq$Option d$Eq$0 =
   let t.2 = dict$Eq$Option$m1(d$Eq$0)
   let t.3 = Eq$Dict(t.1, t.2)
   t.3
+
+dict$Eq$String$m0 =
+  eqString
+
+dict$Eq$String$m1 x y =
+  let t.1 = dict$Eq$String$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$String =
+  let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
 
 reader e c =
   let t = c(self)

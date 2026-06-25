@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.String
+
+-- main returns a String directly, exercising the top-level result drop path
+-- (valueChildren / dropAddr on NString) that no other corpus program covers.
+-- All existing corpus programs return U64 so the NString cell is always freed
+-- INSIDE the program via prim consumption, never via the interpreter's result
+-- drop.  Here the interpreter must drop the result String cell itself after
+-- rendering it for output.
+--
+-- Expected output: the string "hello world" (show-quoted as Haskell does it,
+-- matching the reference renderValue / renderRCValue).
+--
+-- Memory: byteLength "hello world" = 11, ceil(11/8)=2, cell_bytes=32.
+-- The append creates one cell (+1 alloc); the literal cells are discarded
+-- before main returns (Perceus drops them); the result cell is freed by the
+-- interpreter after rendering.
+-- allocs == frees, live == 0 at exit.
+
+main : String
+main = append "hello " "world"

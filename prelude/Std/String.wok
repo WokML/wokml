@@ -1,0 +1,20 @@
+module Std.String
+import Std.Base
+
+-- String is a flat UTF-8 byte buffer (Slice E1). The tycon is pre-registered
+-- in the compiler's initial environment (kind *, arity 0); no extern type
+-- declaration is needed here.
+--
+-- Naming convention (no qualified imports yet, so names carry their view):
+--   length / index      = codepoint-level (UTF-8 decoded)
+--   byteLength / byteAt = byte-level (raw UTF-8 bytes)
+--
+-- NOTE: importing BOTH Std.String and Std.Array unqualified in the same module
+-- will cause a name conflict on 'length' and 'index' (qualified imports are a
+-- deferred slice). Keep string-only programs array-free, and vice versa.
+
+extern length     : String -> U64
+extern index      : String -> U64 -> Char
+extern byteLength : String -> U64
+extern byteAt     : String -> U64 -> U64
+extern append     : String -> String -> String

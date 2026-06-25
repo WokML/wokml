@@ -307,6 +307,113 @@ int main(void) {
         wok_heap_free(h);
     }
 
+    /* --- WokString: alloc/len/data/byte_get round-trip (Task 1, Slice E1) ------------- */
+    /* Test byte_len in {0, 1, 7, 8, 9, 500}: write bytes via wok_string_data, read via
+       wok_string_byte_get, check wok_string_len, free, assert live==0 and allocs==frees. */
+    {
+        static const uint64_t byte_lens[] = {0u, 1u, 7u, 8u, 9u, 500u};
+        static const size_t   nlens = sizeof(byte_lens) / sizeof(byte_lens[0]);
+        for (size_t li = 0; li < nlens; li++) {
+            uint64_t byte_len = byte_lens[li];
+            WokHeap* h = wok_heap_new();
+
+            WokObj* s = wok_string_alloc(h, byte_len);
+            assert(s != NULL);
+            assert(wok_tag(s)        == WOK_STRING_TAG);
+            assert(wok_string_len(s) == byte_len);
+            assert(wok_rc(s)         == 1u);
+
+            /* Write known bytes, read them back. */
+            uint8_t* body = wok_string_data(s);
+            for (uint64_t i = 0u; i < byte_len; i++) {
+                body[i] = (uint8_t)((i * 37u + 13u) & 0xFFu);
+            }
+            for (uint64_t i = 0u; i < byte_len; i++) {
+                uint64_t got = wok_string_byte_get(s, i);
+                assert(got == (uint64_t)((i * 37u + 13u) & 0xFFu));
+            }
+
+            /* peak_bytes must be the rounded cell size: 16 + 8*ceil(byte_len/8) */
+            uint64_t expected_bytes = 16u + 8u * ((byte_len + 7u) / 8u);
+            assert(wok_stat_peak_bytes(h) == expected_bytes);
+
+            assert(wok_dec(s) == 0u);
+            wok_free(h, s);
+            assert(wok_stat_live(h)   == 0);
+            assert(wok_stat_allocs(h) == wok_stat_frees(h));
+            wok_heap_free(h);
+        }
+    }
+
+    /* --- WokString: size-class sharing with WokArray of the same byte size ------------ */
+    /* A WokString of byte_len=7 has cell size 16+8*1=24 bytes -> class 2.
+       A WokArray of len=1 also has cell size 16+8*1=24 bytes -> class 2.
+       After freeing the string, allocating an array of the same byte size must reuse it
+       (arena: pointer identity; both cases: reused count increments). */
+    {
+        WokHeap* h = wok_heap_new();
+        /* byte_len=7 -> ceil(7/8)=1 -> class = 1+1 = 2, same as WokArray len=1 (class=1+1=2) */
+        WokObj* str = wok_string_alloc(h, 7u);
+        assert(wok_string_len(str) == 7u);
+#ifndef WOK_RC_MALLOC
+        uint64_t reused_before = wok_stat_reused(h);
+#endif
+        assert(wok_dec(str) == 0u);
+        wok_free(h, str);
+
+        WokObj* arr = wok_array_alloc(h, 1u, 0u);
+#ifndef WOK_RC_MALLOC
+        assert(arr == str);                           /* arena: pointer-identity reuse */
+        assert(wok_stat_reused(h) == reused_before + 1u);
+#else
+        (void)str;
+#endif
+        assert(wok_tag(arr)          == WOK_ARRAY_TAG);
+        assert(wok_array_len(arr)    == 1u);
+        assert(wok_dec(arr) == 0u);
+        wok_free(h, arr);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
+    /* --- WokString: wok_free tag dispatch does not misroute a string as an NCon ------- */
+    /* Alloc an NCon (arity=2, 24 bytes) then a WokString (byte_len=7 -> 24 bytes, class 2).
+       They share the same class. Free both; verify live==0 (misroute would compute wrong
+       byte size via arity and corrupt cur_bytes). */
+    {
+        WokHeap* h = wok_heap_new();
+        WokObj* ncon = wok_alloc(h, 5u, 2u);
+        WokObj* str  = wok_string_alloc(h, 7u);
+        assert(wok_dec(ncon) == 0u);
+        wok_free(h, ncon);
+        assert(wok_dec(str) == 0u);
+        wok_free(h, str);
+        assert(wok_stat_live(h) == 0);
+        assert(wok_stat_allocs(h) == wok_stat_frees(h));
+        wok_heap_free(h);
+    }
+
+    /* --- WokString: large path (byte_len >= 8*(WOK_NUM_CLASSES-2)+1 = 497 -> class >= 64 -> malloc) ---- */
+    /* byte_len=500 -> ceil(500/8)=63 -> class=64 >= WOK_NUM_CLASSES -> large/malloc path */
+    {
+        WokHeap* h = wok_heap_new();
+        WokObj* s = wok_string_alloc(h, 500u);
+        assert(wok_string_len(s) == 500u);
+        uint8_t* body = wok_string_data(s);
+        for (uint64_t i = 0u; i < 500u; i++) {
+            body[i] = (uint8_t)(i & 0xFFu);
+        }
+        for (uint64_t i = 0u; i < 500u; i++) {
+            assert(wok_string_byte_get(s, i) == (uint64_t)(i & 0xFFu));
+        }
+        /* peak_bytes: 16 + 8*ceil(500/8) = 16 + 8*63 = 16 + 504 = 520 bytes */
+        assert(wok_stat_peak_bytes(h) == 520u);
+        assert(wok_dec(s) == 0u);
+        wok_free(h, s);
+        assert(wok_stat_live(h) == 0);
+        wok_heap_free(h);
+    }
+
     printf("OK\n");
     return 0;
 }

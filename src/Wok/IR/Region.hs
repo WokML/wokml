@@ -282,10 +282,12 @@ collectPlacements place = go
 -- the arm still holds it (use-after-free).
 placeLet :: Binder -> Rhs -> Expr -> Placement
 placeLet bd _ cont                              -- the 'Rhs' is unused: the mutation
-                                                -- fence is binder-TYPE-based ('TcArray'),
-                                                -- not RHS-based.
+                                                -- and string fences are binder-TYPE-
+                                                -- based ('TcArray'/'TcString'), not
+                                                -- RHS-based.
   | boxedBinder bd
   , not (isArrayBinder bd)
+  , not (isStringBinder bd)
   , not (arenaEscapes (Set.singleton (binderUnique bd)) cont)
   = Arena
   | otherwise
@@ -336,3 +338,26 @@ isArrayBinder = isArrayType . bndType
 isArrayType :: CType -> Bool
 isArrayType (CTCon TcArray _) = True
 isArrayType _                 = False
+
+-- | True iff the binder names a String value. This is the STRING FENCE (Slice E1,
+-- Task 3): a String is a variable-length 'NString' byte cell, but the arena bump
+-- allocator is @(tag, arity)@-shaped (@wok_arena_alloc(tag, arity)@) and CANNOT
+-- hold a byte cell --- there is no @wok_arena_string_alloc@ (deferred). So a String
+-- allocation is ALWAYS born on the counted 'Heap', never the arena, regardless of
+-- whether it escapes. Keyed on the closed type ('TcString'), the value-rep truth.
+--
+-- DEFENCE-IN-DEPTH (load-bearing if a future slice adds a String-allocating RHS).
+-- Today no String value is an 'isAlloc' RHS the region pass routes (a string
+-- LITERAL is an 'RAtom', allocated during atom resolution on the counted path, and
+-- @append@ is an 'RApp' prim call --- neither is an 'RCon'/'RRecord'/'RLam'/array
+-- alloc), so a String binder never even reaches 'placeLet'. This fence makes the
+-- "String is always Heap" invariant EXPLICIT and LOCAL anyway: should a later slice
+-- introduce a String-producing allocation RHS, this guard keeps it off the arena
+-- (over-tagging Arena for a variable-length cell would be a use-after-free / a
+-- corrupt @(tag,arity)@ bump). It mirrors the array mutation fence exactly.
+isStringBinder :: Binder -> Bool
+isStringBinder = isStringType . bndType
+
+isStringType :: CType -> Bool
+isStringType (CTCon TcString []) = True
+isStringType _                   = False

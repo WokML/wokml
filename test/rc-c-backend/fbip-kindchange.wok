@@ -3,17 +3,17 @@ import Std.Base
 
 -- FBIP slot-kind-change refusal (Task 5, §6.3): a map that changes a field's
 -- STORAGE CLASS. The matched cell is 'ConsI U64 ListI' (head slot 'KLitInt'); the
--- rebuilt cell is 'ConsS String ListS' (head slot 'NonEncodable'). The §6.3
--- slot-kind-signature guard compares [KLitInt, KPointer] /= [NonEncodable,
--- KPointer] and REFUSES to pair, so the map keeps a plain '__rc_drop' + 'RCon':
--- it allocates the output spine FRESH (no reuse). This is the regression guard
--- against the C descriptor mis-decode (re-stamping an Int cell with a String
--- payload would decode the string handle as an Int on readback). Output and
--- counts must still match abstract == C.
+-- rebuilt cell is 'ConsS String ListS' (head slot 'KPointer', since Slice E1 a
+-- String is a counted 'NString' pointer cell). The §6.3 slot-kind-signature guard
+-- compares [KLitInt, KPointer] /= [KPointer, KPointer] and REFUSES to pair, so the
+-- map keeps a plain '__rc_drop' + 'RCon': it allocates the output spine FRESH (no
+-- reuse). This is the regression guard against the C descriptor mis-decode
+-- (re-stamping an Int cell as a pointer cell would decode the Int payload as a
+-- heap handle on readback). Output and counts must still match abstract == C.
 --
 -- ('Int -> Char' is not expressible in current wok --- there is no Char literal
 -- or U64->Char conversion --- so we use the closest expressible kind-change,
--- KLitInt -> NonEncodable via String, which exercises the same §6.3 guard. The
+-- KLitInt -> KPointer via String, which exercises the same §6.3 guard. The
 -- unit-level kindchange golden in 'rc-reuse-pairing' covers Int->Char directly.)
 
 data ListI = NilI | ConsI U64 ListI

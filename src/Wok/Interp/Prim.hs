@@ -2,20 +2,33 @@ module Wok.Interp.Prim
   ( primTable
   ) where
 
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
+import qualified Data.Text.Encoding as TxEnc
 import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.Value
   ( Prim (..), PrimResult (..), PrimTable, RuntimeError (..), Value (..), renderValue )
 
 
+-- | Primitive lookup table, keyed by @(module, name)@.  Using the full
+-- qualified pair prevents silent shadowing when two modules export the same
+-- bare name (e.g., @length@ in both @Std.Array@ and @Std.String@).
 primTable :: PrimTable
-primTable = Map.fromList [ (primName p, p) | p <- prims ]
+primTable = Map.fromList [ ((mn, primName p), p) | (mn, p) <- taggedPrims ]
 
-prims :: [Prim]
-prims =
+-- | All primitives tagged with their defining module.
+taggedPrims :: [(Text, Prim)]
+taggedPrims =
+  map (PN.stdBaseModule,)    basePrims
+  ++ map (PN.stdControlModule,) controlPrims
+  ++ map (PN.stdArrayModule,)   arrayPrims
+  ++ map (PN.stdStringModule,)  stringPrims
+
+basePrims :: [Prim]
+basePrims =
   [ arith (Tx.pack "+")   (+)
   , arith (Tx.pack "-")   (-)
   , arith (Tx.pack "*")   (*)
@@ -29,7 +42,12 @@ prims =
   , boolOp (Tx.pack "||") (||)
   , appendP
   , dollarP
-  , coroSuspP
+  , eqStringP
+  ]
+
+controlPrims :: [Prim]
+controlPrims =
+  [ coroSuspP
   , coroUnwrapP
   , coroResumeP
   , coroDoneP
@@ -39,13 +57,26 @@ prims =
   , contCellNewP
   , contStoreP
   , contTakeP
-  , arrayNewP
+  ]
+
+arrayPrims :: [Prim]
+arrayPrims =
+  [ arrayNewP
   , arrayFromListP
   , arrayToListP
   , arrayIndexP
   , arrayLengthP
   , arraySetP
   , arrayResizeP
+  ]
+
+stringPrims :: [Prim]
+stringPrims =
+  [ stringLengthP
+  , stringIndexP
+  , stringByteLengthP
+  , stringByteAtP
+  , stringAppendP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -224,16 +255,17 @@ asInt :: Value -> Either RuntimeError Integer
 asInt (VLit (LInt n)) = Right n
 asInt v = Left (PrimError (Tx.pack "expected U64, got " <> renderValue v))
 
--- | Extract a non-negative array index/length from a U64 literal, rejecting
--- negatives. This mirrors the RC interpreter's 'asIndex' exactly so the two
--- sides of the differential oracle stay in lockstep on out-of-range inputs (a
--- negative argument must FAIL on both sides, not succeed on one).
-asIndexInt :: Value -> Either RuntimeError Int
-asIndexInt (VLit (LInt n))
-  | n < 0                           = Left (PrimError (Tx.pack "Array: negative index"))
-  | n > toInteger (maxBound :: Int) = Left (PrimError (Tx.pack "Array: index out of range"))
+-- | Extract a non-negative index/length from a U64 literal, rejecting
+-- negatives. Shared by the Array and String prims, so the messages are
+-- domain-neutral. This mirrors the RC interpreter's 'asIndex' exactly so the
+-- two sides of the differential oracle stay in lockstep on out-of-range inputs
+-- (a negative argument must FAIL on both sides, not succeed on one).
+asU64Index :: Value -> Either RuntimeError Int
+asU64Index (VLit (LInt n))
+  | n < 0                           = Left (PrimError (Tx.pack "negative index"))
+  | n > toInteger (maxBound :: Int) = Left (PrimError (Tx.pack "index out of range"))
   | otherwise                       = Right (fromInteger n)
-asIndexInt v = Left (PrimError (Tx.pack "Array: expected U64 index, got " <> renderValue v))
+asU64Index v = Left (PrimError (Tx.pack "expected U64 index, got " <> renderValue v))
 
 asBool :: Value -> Either RuntimeError Bool
 asBool v@(VCon t []) =
@@ -318,7 +350,7 @@ dollarP = mkPrim (Tx.pack "$") 2 $ \args -> case args of
 arrayNewP :: Prim
 arrayNewP = mkPrim PN.arrayNewName 2 $ \args -> case args of
   [k, v] -> do
-    n <- asIndexInt k
+    n <- asU64Index k
     Right (PRDone (VCon (Tx.pack "Array") (replicate n v)))
   _ -> Left (ArityError PN.arrayNewName)
 
@@ -349,7 +381,7 @@ arrayToListP = mkPrim PN.arrayToListName 1 $ \args -> case args of
 arrayIndexP :: Prim
 arrayIndexP = mkPrim PN.arrayIndexName 2 $ \args -> case args of
   [VCon t vs, iv] | t == Tx.pack "Array" -> do
-    i <- asIndexInt iv
+    i <- asU64Index iv
     case drop i vs of
       (x : _) -> Right (PRDone x)
       []      -> Left (PrimError (Tx.pack "Array.index: out of bounds"))
@@ -368,7 +400,7 @@ arrayLengthP = mkPrim PN.arrayLengthName 1 $ \args -> case args of
 arraySetP :: Prim
 arraySetP = mkPrim PN.arraySetName 3 $ \args -> case args of
   [VCon t vs, iv, v] | t == Tx.pack "Array" -> do
-    i <- asIndexInt iv
+    i <- asU64Index iv
     if i >= length vs
       then Left (PrimError (Tx.pack "Array.set: out of bounds"))
       else
@@ -382,10 +414,81 @@ arraySetP = mkPrim PN.arraySetName 3 $ \args -> case args of
 arrayResizeP :: Prim
 arrayResizeP = mkPrim PN.arrayResizeName 3 $ \args -> case args of
   [VCon t vs, mv, fill] | t == Tx.pack "Array" -> do
-    m <- asIndexInt mv
+    m <- asU64Index mv
     let n    = length vs
         kept = take m vs
         ext  = replicate (max 0 (m - n)) fill
     Right (PRDone (VCon (Tx.pack "Array") (kept ++ ext)))
   [v, _, _] -> Left (PrimError (Tx.pack "Array.resize: not an array: " <> renderValue v))
   _         -> Left (ArityError PN.arrayResizeName)
+
+-- ---------------------------------------------------------------------------
+-- Std.String prims (reference interpreter side, Slice E1).
+--
+-- Strings are represented as @VLit (LStr Text)@ in the reference machine.
+-- The reference 'Text' value provides the semantics; codepoint and byte ops
+-- are derived from it via 'Data.Text' and 'Data.Text.Encoding'. No RC
+-- accounting exists here (the reference machine has no store).
+--
+-- The 'mkPrim' shape mirrors 'arrayLengthP'/'arrayIndexP' above.
+
+-- | @length s@: codepoint count. O(n) in text length (UTF-8 decode).
+stringLengthP :: Prim
+stringLengthP = mkPrim PN.stringLengthName 1 $ \args -> case args of
+  [VLit (LStr t)] ->
+    Right (PRDone (VLit (LInt (fromIntegral (Tx.length t)))))
+  [v] -> Left (PrimError (Tx.pack "String.length: not a string: " <> renderValue v))
+  _   -> Left (ArityError PN.stringLengthName)
+
+-- | @index s i@: the i-th codepoint as a Char (0-based, bounds-checked).
+-- OOB raises 'PrimError'.
+stringIndexP :: Prim
+stringIndexP = mkPrim PN.stringIndexName 2 $ \args -> case args of
+  [VLit (LStr t), iv] -> do
+    i <- asU64Index iv
+    let n = Tx.length t
+    if i >= n
+      then Left (PrimError (Tx.pack "String.index: out of bounds"))
+      else Right (PRDone (VLit (LChar (Tx.index t i))))
+  [v, _] -> Left (PrimError (Tx.pack "String.index: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.stringIndexName)
+
+-- | @byteLength s@: byte count of the UTF-8 encoding. O(n) here (the reference
+-- 'Text' is re-encoded to count bytes); O(1) on the RC side, where the bytes are
+-- already materialized in the 'NString' cell.
+stringByteLengthP :: Prim
+stringByteLengthP = mkPrim PN.stringByteLengthName 1 $ \args -> case args of
+  [VLit (LStr t)] ->
+    Right (PRDone (VLit (LInt (fromIntegral (BS.length (TxEnc.encodeUtf8 t))))))
+  [v] -> Left (PrimError (Tx.pack "String.byteLength: not a string: " <> renderValue v))
+  _   -> Left (ArityError PN.stringByteLengthName)
+
+-- | @byteAt s i@: the i-th UTF-8 byte as a U64 (0-based, bounds-checked).
+-- OOB raises 'PrimError'.
+stringByteAtP :: Prim
+stringByteAtP = mkPrim PN.stringByteAtName 2 $ \args -> case args of
+  [VLit (LStr t), iv] -> do
+    i <- asU64Index iv
+    let bs = TxEnc.encodeUtf8 t
+    if i >= BS.length bs
+      then Left (PrimError (Tx.pack "String.byteAt: out of bounds"))
+      else Right (PRDone (VLit (LInt (fromIntegral (BS.index bs i)))))
+  [v, _] -> Left (PrimError (Tx.pack "String.byteAt: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.stringByteAtName)
+
+-- | @append a b@: concatenate two strings.
+stringAppendP :: Prim
+stringAppendP = mkPrim PN.stringAppendName 2 $ \args -> case args of
+  [VLit (LStr a), VLit (LStr b)] ->
+    Right (PRDone (VLit (LStr (Tx.append a b))))
+  [v, _] -> Left (PrimError (Tx.pack "String.append: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.stringAppendName)
+
+-- | @eqString a b@: codepoint equality of two strings (== byte equality for
+-- valid UTF-8, since UTF-8 encoding is injective on codepoint sequences).
+eqStringP :: Prim
+eqStringP = mkPrim PN.eqStringName 2 $ \args -> case args of
+  [VLit (LStr a), VLit (LStr b)] ->
+    Right (PRDone (boolVal (a == b)))
+  [v, _] -> Left (PrimError (Tx.pack "eqString: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.eqStringName)

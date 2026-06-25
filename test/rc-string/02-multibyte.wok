@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Multi-byte string test: "hero" where the second char is the 2-byte UTF-8
+-- codepoint U+00E9 (LATIN SMALL LETTER E WITH ACUTE).  Written directly as
+-- the Unicode character so the source file is UTF-8 encoded.
+--   s = "héllo"   -- 5 codepoints; bytes: h(1) é(2) l(1) l(1) o(1) = 6 bytes
+--   byteLength s -> 6
+--   length s     -> 5
+-- Return byteLength * 10 + length = 65 (easy to verify without Char compare)
+
+main : U64
+main =
+  let s  = "héllo" in
+  let bl = byteLength s in
+  let n  = length s in
+  bl * 10 + n

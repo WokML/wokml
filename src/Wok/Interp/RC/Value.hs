@@ -74,6 +74,7 @@ module Wok.Interp.RC.Value
   , RCPrimTable
     -- * Atom resolution and binder helpers
   , resolveRCAtom
+  , resolveRCAtomAlloc
   , bindRCBinder
   , bindRCBinders
     -- * Rendering
@@ -87,6 +88,8 @@ module Wok.Interp.RC.Value
   , wokArrayTag
   , slotKindToElemKind
   , elemKindToSlotKind
+    -- * String C-cell support
+  , wokStringTag
     -- * Array in-place mutation helpers (Slice C)
   , atIndex
   , setAt
@@ -99,6 +102,9 @@ import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, except)
 import Data.Bits (shiftL, shiftR, toIntegralSized, (.&.), (.|.))
+import qualified Data.ByteString as BS
+import Data.ByteString (ByteString)
+import qualified Data.Text.Encoding as TxEnc
 import Data.Int (Int64)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
@@ -111,7 +117,8 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Data.Word (Word8, Word32, Word64)
-import Foreign.Ptr (Ptr, ptrToWordPtr, wordPtrToPtr, WordPtr (..))
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr, wordPtrToPtr, WordPtr (..))
 import Wok.Interp.RC.Heap (WokObj, WokHeap)
 import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.Value (RuntimeError (..))
@@ -642,6 +649,17 @@ data Node
   -- 'countedRefs . nodeValues'), so freeing an array drops each counted element
   -- exactly once -- no special 'NCont'-style routing. 'dup' bumps only the array
   -- cell (elements shared via the cell, identical to 'NCon').
+  | NString ByteString
+  -- INVARIANT: bytes are always valid UTF-8 (literals via encodeUtf8, append concatenates
+  -- valid sequences); strict decodeUtf8 on them cannot throw. E2 slicing must preserve this.
+  -- ^ A flat UTF-8 byte buffer (String Slice E1): a 'WokString' C cell on the C
+  -- backend, mirrored on the abstract heap. Bytes are opaque: the cell has NO
+  -- child refs, so the drop cascade is empty ('nodeValues' returns @[]@, and
+  -- 'dropAddr' on the C cell simply calls 'wok_free' with no child iteration).
+  -- 'alloc (NString bs)' on 'CHeap' calls 'wokStringAlloc' then memcpys the bytes
+  -- in via 'wokStringData'; on 'AbstractHeap' it uses 'allocPure'.
+  -- 'nodeCEligible (NString _) = False': the string has its own dedicated alloc
+  -- path (not the generic 'NCon' slot encoding).
   | NRecord Text (Map Text RCValue)
   | NClosure REnv [Binder] Expr CaptureMode
   -- ^ The 'REnv' captures live RC values. Compare 'VClosure' in
@@ -926,9 +944,12 @@ internTag con s = case Map.lookup con (stTagFwd s) of
   Just w  -> (w, s)
   Nothing ->
     let raw = fromIntegral (Map.size (stTagFwd s))
-        -- Skip the reserved WOK_ARRAY_TAG value so no constructor tag collides
-        -- with the C array discriminator.
-        w   = if raw >= wokArrayTag then raw + 1 else raw
+        -- Skip the reserved WOK_ARRAY_TAG (0xFFFF) and WOK_STRING_TAG (0xFFFE)
+        -- so no constructor tag ever collides with the C array or string
+        -- discriminators. Apply the bumps in descending order so the first
+        -- reserved tag encountered shifts raw past the second too.
+        w0  = if raw >= wokStringTag then raw + 1 else raw
+        w   = if w0  >= wokArrayTag  then w0  + 1 else w0
     in ( w
        , s { stTagFwd  = Map.insert con w (stTagFwd s)
            , stTagRev  = IM.insert (fromIntegral w) con (stTagRev s)
@@ -954,6 +975,12 @@ tagName w s = IM.findWithDefault (error "tagName: unknown tag id") (fromIntegral
 -- a 'WokArray', never an 'NCon'.
 wokArrayTag :: Word32
 wokArrayTag = 0xFFFF
+
+-- | The reserved C tag value for string cells (WOK_STRING_TAG). 'internTag' is
+-- guarded to never assign this value (or 'wokArrayTag') to a constructor, so a
+-- 'CAddr' cell with this tag is always a 'WokString', never an 'NCon'.
+wokStringTag :: Word32
+wokStringTag = 0xFFFE
 
 -- | The kind of a single raw slot word in a compact C cell.
 data SlotKind = KLitInt | KLitChar | KLitUnit | KPointer
@@ -1397,6 +1424,9 @@ alloc (NCon con vs) s = allocNCon con vs s
 alloc (NArray vs)   s = case stBackend s of
   CHeap hp     -> allocNArray hp vs s
   AbstractHeap -> pure (allocPure (NArray vs) s)
+alloc (NString bs)  s = case stBackend s of
+  CHeap hp     -> allocNString hp bs s
+  AbstractHeap -> pure (allocPure (NString bs) s)
 alloc n             s = pure (allocPure n s)
 
 -- | A nullary constructor becomes an inline immediate carrying the interned
@@ -1512,6 +1542,28 @@ allocNArray hp vs s =
                      (zip [0..] encoded)
       pure (CAddr p, s { stStats = recordAlloc (16 + 8 * length vs) (stStats s) })
 
+-- | Allocate a 'WokString' C cell for an 'NString' node. Called only under the
+-- 'CHeap' backend; the 'AbstractHeap' branch in 'alloc' keeps 'NString' on the
+-- 'IntMap'.
+--
+-- BYTES. The cell byte size is '16 + 8*ceil(byte_len/8)' (8-rounded body),
+-- matching 'wok_string_alloc' charge and 'wouldBeCBytes (NString bs)' exactly
+-- so the differential oracle sees identical 'peak_bytes' on both backends.
+--
+-- MEMCPY. After allocation, the byte content of 'bs' is bulk-copied into the
+-- cell body via 'wokStringData' (a raw pointer to the body) + 'copyBytes'.
+-- 'BS.useAsCStringLen' pins the 'ByteString' for the duration of the copy.
+-- The cell owns no child refs (bytes are opaque), so no RC work is needed here.
+allocNString :: Ptr WokHeap -> ByteString -> Store -> RC (Addr, Store)
+allocNString hp bs s = do
+  let byteLen = fromIntegral (BS.length bs) :: Word64
+      charged  = wouldBeCBytes (NString bs)
+  p    <- liftIO (H.wokStringAlloc hp byteLen)
+  dest <- liftIO (H.wokStringData p)
+  liftIO $ BS.useAsCStringLen bs (\(src, len) ->
+             copyBytes dest (castPtr src) len)
+  pure (CAddr p, s { stStats = recordAlloc charged (stStats s) })
+
 -- | The pure core of 'alloc': always allocates on the abstract 'IntMap' heap,
 -- returning an 'HAddr'. Charges 'wouldBeCBytes n' to 'stCurBytes'/'stPeakBytes'
 -- so the abstract run's byte high-water tracks what would land on the C heap.
@@ -1559,6 +1611,7 @@ allocPureFallback n s =
 -- natural does not).
 nodeCEligible :: Node -> Bool
 nodeCEligible (NCon _ vs) = length vs <= 255 && all (isJust . encodeSlotC) vs
+nodeCEligible (NString _) = False  -- has its own dedicated alloc path (not NCon slot encoding)
 nodeCEligible _           = False
 
 -- | The field count of a node (FBIP placement match). Only an 'NCon' has a
@@ -1582,8 +1635,13 @@ wouldBeCBytes :: Node -> Int
 wouldBeCBytes n@(NCon _ vs)
   | nodeCEligible n = 8 + 8 * length vs
   | otherwise       = 0
-wouldBeCBytes (NArray vs) = 16 + 8 * length vs
-wouldBeCBytes _           = 0
+wouldBeCBytes (NArray vs)  = 16 + 8 * length vs
+-- Cell byte size = 16 + 8*ceil(byte_len/8). The body rounds UP to an 8-byte
+-- granule so the next bumped cell stays 8-aligned (contrast NArray, whose body
+-- is already word-aligned and needs no rounding). Matches wok_string_alloc
+-- charge exactly so AbstractHeap and CHeap agree on peak_bytes.
+wouldBeCBytes (NString bs) = 16 + 8 * ((BS.length bs + 7) `div` 8)
+wouldBeCBytes _            = 0
 
 -- | Allocate a node into the STATIC immortal region. Returns a NEGATIVE 'Addr'
 -- and the updated 'Store'. Unlike 'alloc', this does NOT touch 'stStats': a
@@ -1699,9 +1757,13 @@ readCCell p s = do
     then do
       vs <- readCArrayValues p
       pure (Cell 0 (NArray vs) 0)
-    else do
-      vs <- readCConValues p s
-      pure (Cell 0 (NCon (tagName tid s) vs) 0)
+    else if tid == wokStringTag
+      then do
+        bs <- readCStringBytes p
+        pure (Cell 0 (NString bs) 0)
+      else do
+        vs <- readCConValues p s
+        pure (Cell 0 (NCon (tagName tid s) vs) 0)
 
 -- | Decode a C array cell's slots back to @[RCValue]@, reading the header
 -- @elemkind@ once. Delegates to 'readCArraySlots' with the decoded kind. Used by
@@ -1725,6 +1787,16 @@ readCArraySlots kind p = do
   len <- H.wokArrayLen p
   mapM (fmap (decodeSlotC kind) . H.wokArraySlotGet p)
        (take (fromIntegral len) [0 ..])
+
+-- | Read all bytes of a 'WokString' C cell back into a 'ByteString'. Used by
+-- 'readCCell' (deref) and the 'dropAddr' cascade (which reads no bytes -- it
+-- only needs the byte_len for the free-stats delta, not the content -- but
+-- 'deref' on a string CAddr requires this to reconstruct the node faithfully).
+readCStringBytes :: Ptr WokObj -> IO ByteString
+readCStringBytes p = do
+  len  <- H.wokStringLen p
+  dataPtr <- H.wokStringData p
+  BS.packCStringLen (castPtr dataPtr, fromIntegral len)
 
 -- | Decode a C cell's slots back to @[RCValue]@ via its per-constructor
 -- descriptor --- the single @tag -> kinds -> decode@ path shared by 'readCCell'
@@ -1860,15 +1932,21 @@ dropAddr a0 s0 = go [a0] s0
           tid <- liftIO (H.wokTag p)
           -- Compute the byte delta BEFORE freeing: the same formula used at
           -- allocation so stCurBytes stays balanced. Arrays = 16 + 8*len;
+          -- Strings = 16 + 8*ceil(byte_len/8) (8-rounded body);
           -- NCons = 8 + 8*arity (both C-eligible, same layout as wok_alloc /
-          -- wok_array_alloc charge).
+          -- wok_array_alloc / wok_string_alloc charge).
           bytes <- if tid == wokArrayTag
                      then do
                        len <- liftIO (H.wokArrayLen p)
                        pure (16 + 8 * fromIntegral (len :: Word64))
-                     else do
-                       ar <- liftIO (H.wokArity p)
-                       pure (8 + 8 * fromIntegral (ar :: Word32))
+                     else if tid == wokStringTag
+                       then do
+                         blen <- liftIO (H.wokStringLen p)
+                         pure (16 + 8 * fromIntegral ((blen + 7) `div` 8 :: Word64))
+                       else do
+                         ar <- liftIO (H.wokArity p)
+                         pure (8 + 8 * fromIntegral (ar :: Word32))
+          -- Strings have no child refs (bytes are opaque): cascade is empty.
           kids <- if tid == wokArrayTag
                     then do
                       kind <- elemKindToSlotKind <$> liftIO (H.wokArrayElemKind p)
@@ -1880,7 +1958,10 @@ dropAddr a0 s0 = go [a0] s0
                         -- pointer-scheme: decode slots (reusing the kind already
                         -- read) and collect counted refs
                         KPointer -> countedRefs <$> liftIO (readCArraySlots kind p)
-                    else countedRefs <$> liftIO (readCConValues p s)
+                    else if tid == wokStringTag
+                      -- String bytes are opaque: no child refs, no cascade.
+                      then pure []
+                      else countedRefs <$> liftIO (readCConValues p s)
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats bytes s)
@@ -1990,6 +2071,9 @@ nodeValues (NCon _ vs)          = vs
 -- Every element slot is a counted child; the generic cascade frees each counted
 -- one exactly once (uncounted slots are skipped by 'countedRefs').
 nodeValues (NArray vs)          = vs
+-- Bytes are opaque (no child refs). Drop cascade is empty: 'dropAddr' on an
+-- 'NString' frees only the cell itself, with no child iteration.
+nodeValues (NString _)          = []
 nodeValues (NRecord _ m)        = Map.elems m
 nodeValues (NClosure env _ _ _) = Map.elems env
 nodeValues (NGroupCode _)       = []
@@ -2224,8 +2308,10 @@ data RCPrim = RCPrim
 -- no @PRDrive@ analogue: the no-handler fragment has no scheduler.
 data RCPrimResult = PRDone RCValue | PRApply RCValue [RCValue]
 
--- | Primitive lookup table, keyed by the bodyless global's hint text.
-type RCPrimTable = Map Text RCPrim
+-- | Primitive lookup table, keyed by the qualified @(module, name)@ of the
+-- prelude @extern@. Matches the reference machine's 'PrimTable' convention;
+-- prevents collisions when two modules export the same bare name.
+type RCPrimTable = Map (Text, Text) RCPrim
 
 -- ---------------------------------------------------------------------------
 -- Atom resolution and binder helpers
@@ -2247,6 +2333,33 @@ resolveRCAtom sc (AVar n) =
   case Map.lookup (nameUniq n) (rscEnv sc) of
     Just v  -> Right v
     Nothing -> Left (UnboundVar (nameHint n))
+
+-- | Resolve an atom in a position that OWNS the resulting value (a 'Let'-bound
+-- RHS, a 'Ret'/'Jump' result, a constructor/record field, or a call/op argument
+-- the callee consumes). Identical to 'resolveRCAtom' EXCEPT a STRING LITERAL
+-- @ALit (LStr s)@ ALLOCATES a fresh counted 'NString' cell (UTF-8-encoding @s@)
+-- instead of producing an inline @RVLit (LStr s)@ (String Slice E1, Task 3, spec
+-- §5.5). The fresh cell is born at rc 1 and is OWNED by whatever this position
+-- binds it to --- the binder Perceus drops, the constructor cascade, or the callee
+-- parameter --- so it is reference-counted balanced like any other boxed value.
+--
+-- ONLY string literals diverge from the pure resolver; every other atom (a
+-- variable, a non-string literal, a prim) goes through 'resolveRCAtom' unchanged
+-- and threads the store untouched. This is deliberately NOT used at the 'Case'
+-- SCRUTINEE / 'RProj' parent / instance-handle positions: those do NOT own the
+-- value (a literal scrutinee is matched in place; Perceus's 'scrutineeParent'
+-- returns 'Nothing' for a literal, so nothing would drop an allocated cell), so
+-- they keep the pure 'resolveRCAtom' (an inline @RVLit (LStr s)@) --- which leaks
+-- nothing because it allocates nothing. A VARIABLE scrutinee of String type is
+-- already an 'RVBox' in the env (allocated at its own binding site) and resolves
+-- through the pure path correctly.
+resolveRCAtomAlloc :: RCScope -> Atom -> Store -> RC (RCValue, Store)
+resolveRCAtomAlloc _  (ALit (LStr s)) st = do
+  (a, st') <- alloc (NString (TxEnc.encodeUtf8 s)) st
+  pure (RVBox a, st')
+resolveRCAtomAlloc sc a st = do
+  v <- liftRC (resolveRCAtom sc a)
+  pure (v, st)
 
 bindRCBinder :: Binder -> RCValue -> REnv -> REnv
 bindRCBinder b v = Map.insert (nameUniq (bndName b)) v
@@ -2294,6 +2407,12 @@ renderValueWith drf = goVal
     goNode s (NArray vs) = do
       parts <- mapM (goVal s) vs
       pure (Tx.pack "[" <> Tx.intercalate (Tx.pack ", ") parts <> Tx.pack "]")
+    -- Render a string identically to the reference interpreter's 'renderLit (LStr text)':
+    -- decode the bytes as UTF-8 (valid by the 'NString' invariant) and apply Haskell's
+    -- 'show', producing a double-quoted escaped string. Byte-identical to the reference so
+    -- the differential oracle can compare the two backends' output.
+    goNode _ (NString bs) =
+      pure (Tx.pack (show (TxEnc.decodeUtf8 bs)))
     goNode s (NRecord t m) = do
       parts <- mapM (\(l, fv) -> do tv <- goVal s fv
                                     pure (l <> Tx.pack " = " <> tv)) (Map.toList m)

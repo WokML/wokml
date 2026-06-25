@@ -1,10 +1,10 @@
 sumPairs p.1 p.2 =
-  join j81(x, xs, y, ys) =
+  join j90(x, xs, y, ys) =
     let t.1 = +(x, y)
     let t.2 = sumPairs(xs, ys)
     let t.3 = +(t.1, t.2)
     t.3
-  join j89() =
+  join j98() =
     0
   case p.1 of
     Cons f.1 f.2 ->
@@ -14,15 +14,15 @@ sumPairs p.1 p.2 =
         Cons f.3 f.4 ->
           let _dup.2 = __rc_dup(f.4)
           let _drop.2 = __rc_drop(p.2)
-          jump j81(f.1, f.2, f.3, f.4)
+          jump j90(f.1, f.2, f.3, f.4)
         _ ->
           let _drop.3 = __rc_drop(p.2)
           let _drop.4 = __rc_drop(f.2)
-          jump j89()
+          jump j98()
     _ ->
       let _drop.5 = __rc_drop(p.1)
       let _drop.6 = __rc_drop(p.2)
-      jump j89()
+      jump j98()
 
 main =
   let t.3 = Nil
@@ -125,6 +125,18 @@ dict$Eq$Option d$Eq$0 =
   let t.2 = dict$Eq$Option$m1(d$Eq$0)
   let t.3 = Eq$Dict(t.1, t.2)
   t.3
+
+dict$Eq$String$m0 =
+  eqString
+
+dict$Eq$String$m1 x y =
+  let t.1 = dict$Eq$String$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$String =
+  let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
 
 reader e c =
   let t = c(self)

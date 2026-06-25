@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Regression test (B1): matching a String VARIABLE against a string-literal
+-- pattern via case-of.  Before the fix the RC interpreter's boxed-scrutinee
+-- path dropped all AltLit arms for NString nodes, so the match fell through to
+-- the default and silently returned 0 instead of 1.
+
+classify : String -> U64
+classify s = case s of
+  "hi" -> 1
+  _ -> 0
+
+main : U64
+main =
+  let s = "hi" in
+  classify s
