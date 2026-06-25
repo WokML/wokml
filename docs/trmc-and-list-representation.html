@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRMC and the flat-array question, for wok lists</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --warn:#c0392b; --good:#2e7d32; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:780px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.85rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.18rem;margin:46px 0 2px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.82rem;line-height:1.5}
+  .hlt{color:var(--accent);font-weight:700}
+  .yes{color:var(--good);font-weight:600}
+  .no{color:var(--warn);font-weight:600}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:200px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .box.bad{border-color:var(--warn);background:#fbeeee}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0}
+  .row>*{flex:1;min-width:150px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:18px 0}
+  .card,.step{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card h3{margin:0 0 6px;font-size:.95rem}
+  .step{display:flex;flex-direction:column;gap:9px;min-height:120px}
+  .step .line{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--accent);min-height:2.2em}
+  .step .body{flex:1;display:grid;place-items:center;font-family:ui-monospace,monospace;font-size:.74rem;text-align:center;line-height:1.5}
+
+  .badge{display:inline-grid;place-items:center;min-width:25px;height:25px;padding:0 7px;border-radius:13px;
+    background:var(--accent);color:#fff;font:700 .8rem ui-monospace,monospace}
+  .badge.zero{background:var(--warn)}
+  .label{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:18px 0}
+  .note.warn{border-left-color:var(--warn)}
+  .note b{color:var(--accent)}
+  .note.warn b{color:var(--warn)}
+  table{border-collapse:collapse;width:100%;margin:16px 0;font-size:.9rem}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  td.mono{font-family:ui-monospace,monospace;font-size:.85em}
+  .src{font-size:.82rem;color:var(--mut)}
+  .src a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>TRMC, and is a flat array really faster than our cons list?</h1>
+  <p class="sub">Two questions about wok's built-in list <code>[a]</code> = <code>Cons head tail</code> / <code>Nil</code>. First: what TRMC actually does. Second: whether LuaJIT-style flat arrays beat cons lists, and what that means for a reference-counted language with no compacting GC.</p>
+
+  <h2>1 &middot; Why naive <code>map</code> / <code>chars</code> piles up stack</h2>
+  <p>The recursive call sits <em>inside</em> the <code>Cons</code>, so it is not in tail position. The machine must remember "wrap what comes back in <code>Cons (f x) _</code>" before it can recurse &mdash; one remembered frame per element.</p>
+  <pre>map f xs = case xs of
+  Nil        -> Nil
+  Cons x rs  -> Cons (f x) (<span class="hlt">map f rs</span>)   -- recursive call is an ARGUMENT, not the tail</pre>
+  <div class="flow">
+    <div class="box">map f [10,20,30]<small>remember: Cons 11 _</small></div>
+    <div class="arrow">&darr; recurse</div>
+    <div class="box">map f [20,30]<small>remember: Cons 21 _</small></div>
+    <div class="arrow">&darr; recurse</div>
+    <div class="box">map f [30]<small>remember: Cons 31 _</small></div>
+    <div class="arrow">&darr; recurse</div>
+    <div class="box bad">map f [] = Nil<small>now unwind, building cons cells</small></div>
+  </div>
+  <p class="cap">fig 1 &mdash; N elements means N stacked frames. Long lists overflow the stack.</p>
+
+  <h2>2 &middot; What TRMC does: build forward through a "hole"</h2>
+  <p>Tail Recursion Modulo Cons rewrites the function to allocate each <code>Cons</code> <em>before</em> recursing, leaving its tail field as an empty <span class="hlt">hole</span>. It keeps a pointer to that hole, fills it on the next step, and tail-calls &mdash; so the recursion becomes a flat loop. The one-hole context <code>Cons (f x) _</code> becomes a mutable pointer instead of a stacked frame.</p>
+  <div class="grid">
+    <div class="step"><div class="line">step 0: alloc Cons 11</div><div class="body">[ 11 | <span class="hlt">&#9633;</span> ]<br>hole &rarr; tail of cell0</div><div class="label">result head fixed</div></div>
+    <div class="step"><div class="line">step 1: alloc Cons 21, fill hole</div><div class="body">[ 11 | &bull;]&rarr;[ 21 | <span class="hlt">&#9633;</span> ]<br>hole &rarr; tail of cell1</div><div class="label">advance</div></div>
+    <div class="step"><div class="line">step 2: alloc Cons 31, fill hole</div><div class="body">[11|&bull;]&rarr;[21|&bull;]&rarr;[ 31 | <span class="hlt">&#9633;</span> ]<br>hole &rarr; tail of cell2</div><div class="label">advance</div></div>
+    <div class="step"><div class="line">step 3: input empty</div><div class="body">[11|&bull;]&rarr;[21|&bull;]&rarr;[31| Nil ]<br>fill last hole with Nil</div><div class="label">done</div></div>
+  </div>
+  <p class="cap">fig 2 &mdash; the list grows left-to-right; the hole (&#9633;) is the only thing carried between steps</p>
+  <div class="row">
+    <div class="box">naive recursion<small>stack frames used</small><span class="badge zero">N</span></div>
+    <div class="box hi">TRMC loop<small>stack frames used</small><span class="badge">1</span></div>
+  </div>
+  <p class="cap">fig 2b &mdash; TRMC turns O(N) stack into O(1). This is the same idea as OCaml's <code>[@tail_mod_cons]</code> and Koka's TRMC.</p>
+
+  <h2>3 &middot; Why TRMC wins (the part that was missing)</h2>
+  <p>Picture building a list like coupling train cars. The naive way, you can't attach a car until every car behind it is built &mdash; so you stand there holding the whole half-finished train. That "holding" <em>is</em> the stack, and it grows with every element. TRMC lays the first car down, leaves the rear coupling open (the <span class="hlt">hole</span>), and snaps each new car onto the open coupling as it goes. You only ever hold the latest coupling. Same train &mdash; but your arms stay empty.</p>
+  <p>The superiority only becomes obvious when you compare it to what people <em>actually</em> do when naive recursion overflows: build the list <em>backwards</em> into an accumulator, then reverse it at the end. That is stack-safe &mdash; but it walks the data twice and allocates a whole throwaway reversed list. TRMC is the only choice that is good on every axis at once:</p>
+  <table>
+    <tr><th>on a long list</th><th>naive recursion</th><th>build-and-reverse (the usual fix)</th><th>TRMC</th></tr>
+    <tr><td>stack used</td><td class="no">O(N) &mdash; overflows, crashes</td><td class="yes">O(1)</td><td class="yes">O(1)</td></tr>
+    <tr><td>passes over the data</td><td class="yes">1</td><td class="no">2</td><td class="yes">1</td></tr>
+    <tr><td>extra allocation</td><td class="yes">none</td><td class="no">a second throwaway list</td><td class="yes">none</td></tr>
+    <tr><td>output order</td><td class="yes">natural</td><td class="no">reversed (needs the flip)</td><td class="yes">natural</td></tr>
+    <tr><td>can run fully in place</td><td class="no">no (O(N) stack)</td><td class="no">no (extra list)</td><td class="yes">yes, with reuse</td></tr>
+  </table>
+  <div class="note"><b>The superiority in one line:</b> you write <code>map</code> the obvious way, and TRMC makes it stack-safe, single-pass, and in natural order &mdash; no rewrite, no second pass, no scratch list. And because it builds through a hole pointer, it lines up exactly with the reuse wok already has: over a list you uniquely own, a purely functional <code>map</code> then runs with <span class="hlt">zero allocation and constant stack</span> &mdash; the speed of a hand-written C loop, from ordinary functional code.</div>
+  <div class="note"><b>Concrete:</b> <code>map (+1)</code> over 10,000,000 items &mdash; naive recursion <span class="no">crashes with a stack overflow</span>; build-and-reverse survives but takes 20,000,000 steps and allocates a 10M-cell scratch list; <span class="yes">TRMC takes 10,000,000 steps once, in order, in constant stack</span>.</div>
+
+  <h2>4 &middot; The catch that decides foldChars</h2>
+  <p>TRMC's whole win is on one axis &mdash; stack depth, output order, and enabling in-place reuse. There is a separate axis it deliberately does not touch:</p>
+  <div class="note warn"><b>TRMC removes stack depth, not allocations.</b> It still builds N fresh <code>Cons</code> cells &mdash; one <code>Cons (f x) &#9633;</code> per element. It changes <em>how</em> the list is built (a forward loop), never <em>how many</em> cells exist.</div>
+  <p>Allocations are only avoided by <b>reuse</b> (Perceus, which wok already has): when you transform a list you uniquely own, each consumed input cell is handed straight to the next output cell &mdash; net zero allocation. But that needs an input list to cannibalize. Building a list from <em>non-list</em> input &mdash; a string into a char list &mdash; has nothing to reuse.</p>
+  <div class="grid2">
+    <div class="card"><span class="label">reuse applies</span><h3><code>map f uniqueList</code></h3><p>TRMC (O(1) stack) + reuse (0 alloc). The best case. Input cells become output cells.</p></div>
+    <div class="card"><span class="label">reuse cannot apply</span><h3><code>chars s</code> (string &rarr; list)</h3><p>No input cells exist to reuse. N allocations are unavoidable &mdash; TRMC or not.</p></div>
+  </div>
+  <div class="note"><b>So for foldChars:</b> the only ways to avoid the throwaway char list are (a) <em>don't build it</em> &mdash; the dedicated fold frame &mdash; or (b) deforestation/fusion, a compile-time rewrite that an interpreter can't do. Optimizing <code>[]</code> does not compete with the frame. They are orthogonal.</div>
+
+  <h2>5 &middot; Cons cell vs flat array, in memory</h2>
+  <p>This is the LuaJIT question. A cons list is N separate cells chained by pointers; a flat array is one contiguous block. The difference is mechanical, not a matter of taste.</p>
+  <div class="grid2">
+    <div class="card"><span class="label">wok cons list</span><h3>24 bytes / element, scattered</h3>
+      <pre>cell @0x A: [hdr|11|&bull;]---+
+                          |
+cell @0x F: [hdr|21|&bull;]&lt;--+ ---+
+                              |
+cell @0x3: [hdr|31|Nil]&lt;------+</pre>
+      <p>8B header + head slot + tail pointer. Traversal chases pointers to wherever <code>malloc</code> put each cell.</p></div>
+    <div class="card"><span class="label">flat array (LuaJIT table / wok Array)</span><h3>8 bytes / element, contiguous</h3>
+      <pre>[ 11 | 21 | 31 | .. ] one block
+  &uarr; index i = base + i*8 (O(1))
+  &uarr; 8 elements per 64B cache line</pre>
+      <p>One allocation, no per-element header, prefetcher-friendly linear scan.</p></div>
+  </div>
+
+  <h2>6 &middot; Is the array actually faster? Yes &mdash; with caveats</h2>
+  <table>
+    <tr><th>dimension</th><th>flat array</th><th>cons list</th></tr>
+    <tr><td>memory / element</td><td class="mono">8 B</td><td class="mono">24 B (~3x)</td></tr>
+    <tr><td>sequential traversal</td><td>contiguous, prefetched</td><td class="mono">pointer-chasing, cache-miss-prone</td></tr>
+    <tr><td>allocations to build N</td><td class="mono">1 (amortized)</td><td class="mono">N</td></tr>
+    <tr><td>index <code>at i</code></td><td class="mono">O(1)</td><td class="mono">O(n)</td></tr>
+    <tr><td>prepend</td><td class="mono">O(n) (shift/copy)</td><td class="mono">O(1)</td></tr>
+    <tr><td>structural sharing</td><td>copy needed</td><td>free (share the tail)</td></tr>
+    <tr><td>pattern match head/tail</td><td>awkward</td><td>natural</td></tr>
+  </table>
+  <p>For bulk and indexed work the array wins decisively, and the empirical literature backs this even where lists "should" win (insertion that requires a search first). The advantage shrinks or reverses for small N, prepend-heavy code, and persistent/shared structures &mdash; where cons lists keep their classic strengths.</p>
+
+  <div class="note warn"><b>Sharper for wok specifically:</b> wok is reference-counted with <em>no compacting/copying GC</em>. A cons cell is allocated once and never relocated, so a long-lived list's cells stay wherever they landed &mdash; maximally scattered. Copying GCs (OCaml, Java) can re-colocate survivors onto shared cache lines and partially heal this; wok cannot. So wok's cons lists are <em>more</em> cache-hostile than the ML/JVM baseline &mdash; except when bump-allocated together in one <span class="hlt">arena</span> (Region R1), which lays them out contiguously and recovers much of the locality.</div>
+
+  <div class="note"><b>The point:</b> wok already has the flat option &mdash; <code>Array a</code>. The right answer is not to reshape <code>[]</code> into an array (uniform polymorphism forecloses it, the same wall that stopped Array Slice D), but to keep both: <code>Array</code> for bulk / indexed / append, <code>[]</code> for prepend / sharing / pattern-matching. The one cons-list improvement worth its own future slice is <b>TRMC</b> &mdash; the producer half of the Koka story wok is missing. And in today's tree-walking interpreter, per-element dispatch overhead dwarfs cache effects anyway: the array's locality win is real but mostly cashes in at the codegen endpoint.</div>
+
+  <h2>7 &middot; Can we fuse list + array into one type?</h2>
+  <p>You can &mdash; what you are describing already has names. A linked chain of small flat blocks is an <b>unrolled list</b> (constant block size) or a <b>VList</b> (geometrically growing blocks). TRMC builds either one's spine fine: fill a block's slots, and when it is full the hole jumps to a freshly linked block. The build path gets great locality and few allocations. The question is what it costs on every <em>other</em> path.</p>
+  <table>
+    <tr><th>structure</th><th>index</th><th>prepend</th><th>sharing</th><th>traversal locality</th><th>head/tail match</th></tr>
+    <tr><td>cons list + TRMC</td><td class="no">O(n)</td><td class="yes">O(1)</td><td class="yes">free, per-cell</td><td class="no">poor (scattered)</td><td class="yes">trivial</td></tr>
+    <tr><td>unrolled / chunked list</td><td>O(n/K)</td><td>O(1) amortized</td><td class="no">block-granular</td><td class="yes">good (within block)</td><td class="no">needs an offset</td></tr>
+    <tr><td>growable vector (<code>Array</code>)</td><td class="yes">O(1)</td><td class="no">O(n)</td><td class="no">copy</td><td class="yes">best</td><td class="no">awkward</td></tr>
+    <tr><td>RRB-tree (do-it-all)</td><td>O(log n)</td><td>O(log n)</td><td class="yes">free</td><td>good</td><td>O(log n)</td></tr>
+  </table>
+  <p>No row is all-green. The unrolled list buys locality by making head/tail decomposition carry an <em>offset</em> &mdash; every list value becomes (block, offset) instead of one pointer &mdash; and by coarsening sharing to whole blocks. The RRB-tree is the genuine "do it all" (Scala's <code>Vector</code>, Clojure), but at an O(log n) factor on everything and a large build &mdash; a third type, not a replacement for either existing one.</p>
+
+  <div class="note warn"><b>Why chunking the list is wrong for wok specifically:</b> wok frees by reference counting, with no compacting GC. A cons cell is freed the instant its last owner drops it &mdash; consuming a list reclaims it element-by-element, promptly, and FBIP reuse recycles it. A chunk can only be freed once <em>all</em> K of its elements are dead and no tail-view points into it; holding the tail of a list pins the whole head block, including elements you already consumed. Chunking trades Perceus's prompt, precise reclamation for coarse, block-granular reclamation, and weakens in-place reuse. That is fine on the JVM (Clojure, Scala &mdash; a tracing GC sweeps anyway); under reference counting it is a regression.</div>
+
+  <h2>8 &middot; 1.5x, 2x, or constant block?</h2>
+  <p>This is really two questions for two different structures, and the answer flips between them:</p>
+  <div class="grid2">
+    <div class="card"><span class="label">copy-on-grow buffer (a vector)</span><h3>Geometric is mandatory</h3><p>A single buffer you reallocate-and-copy must grow by a constant <em>factor</em>, or total copy work is O(n&sup2;). The only real choice is the factor.</p></div>
+    <div class="card"><span class="label">linked blocks (a chunked list)</span><h3>Constant block size</h3><p>You never copy existing blocks &mdash; you link a new one &mdash; so there is nothing to amortize. A fixed K tuned to a cache line (~8&ndash;16 for 8-byte elements) is simplest and best. Geometric blocks (a VList) only buy O(1)-average indexing, which a pattern-matched list never needs.</p></div>
+  </div>
+  <div class="note"><b>1.5x vs 2x, for the vector case:</b> below the golden ratio &phi;&nbsp;&asymp;&nbsp;1.618 the sum of previously freed buffers eventually exceeds the next request, so the allocator can <em>reuse</em> them &mdash; 1.5x does this, 2x never can (1+2+4 &lt; 8, so it bumps forward forever). So 1.5x keeps peak memory and fragmentation lower (Folly, MSVC); 2x does fewer copies and is simpler (Rust <code>Vec</code>, libstdc++). For wok &mdash; the oracle tracks <code>peak_bytes</code> and there is no compacting GC to hide fragmentation &mdash; <span class="hlt">1.5x is the better default</span> if <code>Array</code> ever gains an amortized push-back.</div>
+
+  <div class="note"><b>The combination that actually fits wok:</b> don't fuse them into one type. Put <b>TRMC</b> on the cons list (stack-safe, in-place producers) and a <b>1.5x push-back builder</b> on <code>Array</code> (bulk, indexed), bridged by <code>fromList</code>/<code>toArray</code>. Each idea improves the type it belongs to. The unified do-everything sequence (RRB-tree) is a real option &mdash; defer it until profiling demands it.</div>
+
+  <p class="src">Sources: Reinking/Xie/de Moura/Leijen, <a href="https://xnning.github.io/papers/perceus.pdf">Perceus</a> (PLDI 2021); Leijen &amp; Lorenzen, <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2023/07/trmc-popl23.pdf">Tail Recursion Modulo Context</a> (POPL 2023); Lorenzen/Leijen/Swierstra, <a href="https://webspace.science.uu.nl/~swier004/publications/2023-icfp.pdf">FP&sup2;</a> (ICFP 2023); OCaml <a href="https://ocaml.org/manual/5.4/tail_mod_cons.html">tail_mod_cons</a>; Chilimbi &amp; Hill, <a href="http://www.cs.cmu.edu/afs/cs/academic/class/15745-s05/www/papers/p1-chilimbi.pdf">Cache-Conscious Structure Layout</a> (PLDI 1999); <a href="https://arxiv.org/html/2306.06942v2">RIP Linked List</a> empirical study; Stroustrup, "Why you should avoid Linked Lists" (GoingNative 2012); LuaJIT <a href="https://github.com/LuaJIT/LuaJIT/blob/v2.1/src/lj_obj.h">lj_obj.h</a> (NaN-boxed TValue); Bagwell, "Fast Functional Lists, Hash-Lists, Deques and Variable-Length Arrays" (VList, EPFL 2002); Bagwell &amp; Rompf, <a href="https://infoscience.epfl.ch/record/169879">RRB-Trees</a> (2011); Facebook Folly <a href="https://github.com/facebook/folly/blob/main/folly/docs/FBVector.md">FBVector</a> (1.5x growth rationale).</p>
+
+</div>
+</body>
+</html>

@@ -7,10 +7,12 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import qualified Data.Text.Encoding as TxEnc
+import Data.Word (Word64)
 import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.Value
   ( Prim (..), PrimResult (..), PrimTable, RuntimeError (..), Value (..), renderValue )
+import Wok.Runtime.StringZilla (szHash)
 
 
 -- | Primitive lookup table, keyed by @(module, name)@.  Using the full
@@ -77,6 +79,9 @@ stringPrims =
   , stringByteLengthP
   , stringByteAtP
   , stringAppendP
+  , stringIndexOfFromRawP
+  , stringHashP
+  , stringEditDistanceP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -492,3 +497,63 @@ eqStringP = mkPrim PN.eqStringName 2 $ \args -> case args of
     Right (PRDone (boolVal (a == b)))
   [v, _] -> Left (PrimError (Tx.pack "eqString: not a string: " <> renderValue v))
   _      -> Left (ArityError PN.eqStringName)
+
+-- | Byte-level "find from offset"; absolute position or maxBound
+-- (== WOK_SZ_NOT_FOUND). Independent pure Haskell implementation used by the
+-- reference side to cross-validate the StringZilla FFI result.
+refFindFrom :: BS.ByteString -> BS.ByteString -> Int -> Word64
+refFindFrom hay needle from
+  | from > BS.length hay = maxBound
+  | BS.null needle       = fromIntegral from
+  | BS.null post         = maxBound
+  | otherwise            = fromIntegral (from + BS.length pre)
+  where (pre, post) = BS.breakSubstring needle (BS.drop from hay)
+
+-- | Byte-level unit-cost Levenshtein (two-row DP). d[i][j] = dist(a[0..i), b[0..j)).
+-- Independent pure Haskell implementation used by the reference side to
+-- cross-validate the StringZilla FFI result.
+refLevenshtein :: BS.ByteString -> BS.ByteString -> Word64
+refLevenshtein sa sb = fromIntegral (last (foldl nextRow [0 .. length bb] (BS.unpack sa)))
+  where
+    bb = BS.unpack sb
+    nextRow [] _ = []
+    nextRow (p0 : ps) ca = p0 + 1 : build (p0 + 1) (zip3 (p0 : ps) ps bb)
+      where
+        build _ [] = []
+        build left ((diag, up, cb) : rest) =
+          let cost = if ca == cb then 0 else 1
+              cell = min (up + 1) (min (left + 1) (diag + cost)) :: Int
+          in cell : build cell rest
+
+-- | @indexOfFromRaw hay needle from@: first byte offset of needle in hay at/after
+-- @from@, or the maxBound sentinel if absent. Uses the independent pure Haskell
+-- 'refFindFrom' (not the StringZilla FFI) to cross-validate the RC side.
+stringIndexOfFromRawP :: Prim
+stringIndexOfFromRawP = mkPrim PN.stringIndexOfFromRawName 3 $ \args -> case args of
+  [VLit (LStr hay), VLit (LStr needle), VLit (LInt from)] ->
+    let bh = TxEnc.encodeUtf8 hay
+        bn = TxEnc.encodeUtf8 needle
+        fi = fromIntegral from
+    in Right (PRDone (VLit (LInt (toInteger (refFindFrom bh bn fi)))))
+  [v, _, _] -> Left (PrimError (Tx.pack "String.indexOfFromRaw: not a string: " <> renderValue v))
+  _         -> Left (ArityError PN.stringIndexOfFromRawName)
+
+-- | @hash s@: StringZilla sz_hash of the UTF-8 bytes (unseeded, deterministic).
+stringHashP :: Prim
+stringHashP = mkPrim PN.stringHashName 1 $ \args -> case args of
+  [VLit (LStr s)] ->
+    Right (PRDone (VLit (LInt (toInteger (szHash (TxEnc.encodeUtf8 s))))))
+  [v] -> Left (PrimError (Tx.pack "String.hash: not a string: " <> renderValue v))
+  _   -> Left (ArityError PN.stringHashName)
+
+-- | @editDistance a b@: byte-level unit-cost Levenshtein. Uses the independent
+-- pure Haskell 'refLevenshtein' (not the StringZilla FFI) to cross-validate
+-- the RC side.
+stringEditDistanceP :: Prim
+stringEditDistanceP = mkPrim PN.stringEditDistanceName 2 $ \args -> case args of
+  [VLit (LStr a), VLit (LStr b)] ->
+    let ba = TxEnc.encodeUtf8 a
+        bb = TxEnc.encodeUtf8 b
+    in Right (PRDone (VLit (LInt (toInteger (refLevenshtein ba bb)))))
+  [v, _] -> Left (PrimError (Tx.pack "String.editDistance: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.stringEditDistanceName)

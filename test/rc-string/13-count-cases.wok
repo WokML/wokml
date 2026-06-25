@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+import Std.String
+
+-- count: zero / one / many / adjacent / empty-needle cases.
+--
+-- count "banana" "an"    -> 2  (non-overlapping: positions 1, 3)
+-- count "banana" "xx"    -> 0
+-- count "banana" "a"     -> 3
+-- count "" "a"            -> 0
+-- count "aaa" "aa"       -> 1  (non-overlapping: pos 0 consumes 2 bytes, pos 2 is leftover "a")
+-- count "banana" ""      -> 0  (empty needle always 0)
+-- count "abcabc" "abc"   -> 2
+--
+-- Result: 2 + 0 + 3 + 0 + 1 + 0 + 2 = 8
+
+main : U64
+main =
+  let a = count "banana" "an" in
+  let b = count "banana" "xx" in
+  let c = count "banana" "a" in
+  let d = count "" "a" in
+  let e = count "aaa" "aa" in
+  let f = count "banana" "" in
+  let g = count "abcabc" "abc" in
+  a + b + c + d + e + f + g

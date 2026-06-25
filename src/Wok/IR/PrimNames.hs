@@ -66,6 +66,9 @@ module Wok.IR.PrimNames
   , stringByteAtName
   , stringAppendName
   , eqStringName
+  , stringIndexOfFromRawName
+  , stringHashName
+  , stringEditDistanceName
   ) where
 
 import Data.Set (Set)
@@ -218,3 +221,16 @@ stringAppendName = Tx.pack "append"
 -- | @eqString a b@: byte-equality comparison; defining module is 'Std.Base'.
 eqStringName :: Text
 eqStringName = Tx.pack "eqString"
+
+-- | @indexOfFromRaw hay needle from@: first byte offset of needle in hay at/after
+-- @from@, or the maxBound sentinel if absent. (StringZilla find; the search primitive.)
+stringIndexOfFromRawName :: Text
+stringIndexOfFromRawName = Tx.pack "indexOfFromRaw"
+
+-- | @hash s@: StringZilla sz_hash of the UTF-8 bytes (unseeded, deterministic).
+stringHashName :: Text
+stringHashName = Tx.pack "hash"
+
+-- | @editDistance a b@: byte-level unit-cost Levenshtein (StringZilla sz_edit_distance).
+stringEditDistanceName :: Text
+stringEditDistanceName = Tx.pack "editDistance"

@@ -1,0 +1,5 @@
+StringZilla vendored for wok String Slice E2
+Source: https://github.com/ashvardanian/StringZilla
+Version: v3.12.5 (single-header C API; sz_find / sz_hash / sz_edit_distance)
+License: Apache-2.0 (see LICENSE)
+Why v3 not v4: v4 is multi-header and dropped edit-distance from the core C API.

@@ -20,6 +20,7 @@ import Wok.Interp.RC.Value
   , continuationOwned, valueChildren
   , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC )
 import Wok.Interp.Value (RuntimeError (..))
+import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
 
 -- | The RC primitive table. Mirrors the reference 'Wok.Interp.Prim.primTable'
 -- (arithmetic, comparison, boolean, apply) operating on 'RVLit'/'RVBox', PLUS
@@ -99,6 +100,9 @@ rcStringPrims =
   , stringByteLength
   , stringByteAt
   , stringAppend
+  , stringIndexOfFromRaw
+  , stringHash
+  , stringEditDistance
   ]
 
 -- ---------------------------------------------------------------------------
@@ -821,3 +825,39 @@ eqString = RCPrim PN.eqStringName 2 [] $ \args s -> case args of
     (boolV, s3) <- allocBool eq s2
     pure (PRDone boolV, s3)
   _ -> throwE (ArityError (Tx.pack "eqString"))
+
+-- | @indexOfFromRaw hay needle from@: first byte offset of needle in hay at/after
+-- @from@, or the maxBound sentinel if absent. Calls the StringZilla FFI
+-- ('szFind'). Consumes both string inputs. RC: 0 alloc.
+stringIndexOfFromRaw :: RCPrim
+stringIndexOfFromRaw = RCPrim PN.stringIndexOfFromRawName 3 [] $ \args s -> case args of
+  [hayV@(RVBox ha), needleV@(RVBox na), fromV] -> do
+    bh <- stringBytes hayV s
+    bn <- stringBytes needleV s
+    i  <- asStringIndex fromV
+    s1 <- dropAddr ha s
+    s2 <- dropAddr na s1
+    pure (PRDone (RVLit (LInt (toInteger (szFind bh bn i)))), s2)
+  _ -> throwE (ArityError (Tx.pack "String.indexOfFromRaw"))
+
+-- | @hash s@: StringZilla sz_hash of the UTF-8 bytes (unseeded, deterministic).
+-- Consumes 's'. RC: 0 alloc.
+stringHash :: RCPrim
+stringHash = RCPrim PN.stringHashName 1 [] $ \args s -> case args of
+  [sv@(RVBox a)] -> do
+    b  <- stringBytes sv s
+    s1 <- dropAddr a s
+    pure (PRDone (RVLit (LInt (toInteger (szHash b)))), s1)
+  _ -> throwE (ArityError (Tx.pack "String.hash"))
+
+-- | @editDistance a b@: byte-level unit-cost Levenshtein (StringZilla
+-- sz_edit_distance). Consumes both inputs. RC: 0 alloc.
+stringEditDistance :: RCPrim
+stringEditDistance = RCPrim PN.stringEditDistanceName 2 [] $ \args s -> case args of
+  [av@(RVBox aa), bv@(RVBox ba)] -> do
+    bsa <- stringBytes av s
+    bsb <- stringBytes bv s
+    s1  <- dropAddr aa s
+    s2  <- dropAddr ba s1
+    pure (PRDone (RVLit (LInt (toInteger (szEditDistance bsa bsb)))), s2)
+  _ -> throwE (ArityError (Tx.pack "String.editDistance"))

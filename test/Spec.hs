@@ -53,6 +53,7 @@ import qualified Wok.Interp.RC.Value as St
 import qualified Wok.Interp.RC.Prim as RCP
 import qualified Wok.Interp.RC.Machine as RCM
 import qualified Wok.Interp.RC.Heap as Heap
+import qualified Wok.Runtime.StringZilla as SZ
 import Data.Word (Word32, Word64)
 import Data.Int (Int64)
 import qualified Wok.IR.Name as Name
@@ -4701,7 +4702,8 @@ interpPrimTests = testGroup "InterpPrim"
               ++ map (T.pack "Std.Array",)
                   ["new","fromList","toList","index","length","set","resize"]
               ++ map (T.pack "Std.String",)
-                  ["length","index","byteLength","byteAt","append"]
+                  ["length","index","byteLength","byteAt","append"
+                  ,"indexOfFromRaw","hash","editDistance"]
               )
   , testCase "addition" $
       case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
@@ -19238,6 +19240,186 @@ dupNTimes a k s = do
     Left e   -> assertFailure ("dupNTimes: incref failed: " <> show e)
                   >> error "unreachable"
 
+-- =========================================================================
+-- Suite E2: StringZilla prim properties (indexOf / editDistance / hash)
+-- =========================================================================
+
+-- | Haskell reference for non-overlapping occurrence count (mirrors countFrom).
+refCount :: BS.ByteString -> BS.ByteString -> Int -> Int
+refCount _hay needle _from | BS.null needle = 0
+refCount hay needle from
+  | from > BS.length hay = 0
+  | BS.null post         = 0
+  | otherwise            =
+      1 + refCount hay needle (from + BS.length pre + BS.length needle)
+  where
+    (pre, post) = BS.breakSubstring needle (BS.drop from hay)
+
+-- | Haskell reference for refFindFrom (pure breakSubstring, no FFI).
+refFindFromSpec :: BS.ByteString -> BS.ByteString -> Int -> Word64
+refFindFromSpec hay needle from
+  | from > BS.length hay = maxBound
+  | BS.null needle       = fromIntegral from
+  | BS.null post         = maxBound
+  | otherwise            = fromIntegral (from + BS.length pre)
+  where (pre, post) = BS.breakSubstring needle (BS.drop from hay)
+
+-- | Haskell reference for byte-level Levenshtein (two-row DP).
+refLevenshteinSpec :: BS.ByteString -> BS.ByteString -> Word64
+refLevenshteinSpec sa sb =
+  fromIntegral (last (foldl nextRow [0 .. BS.length sb] (BS.unpack sa)))
+  where
+    bb = BS.unpack sb
+    nextRow [] _ = []
+    nextRow (p0 : ps) ca = p0 + 1 : build (p0 + 1) (zip3 (p0 : ps) ps bb)
+      where
+        build _ [] = []
+        build left ((diag, up, cb) : rest) =
+          let cost = if ca == cb then 0 else 1 :: Int
+              cell = min (up + 1) (min (left + 1) (diag + cost))
+          in cell : build cell rest
+
+-- | Sentinel returned by indexOfFromRaw when the needle is absent (UINT64_MAX).
+notFoundSentinel :: Integer
+notFoundSentinel = toInteger (maxBound :: Word64)
+
+-- P8: indexOfFromRaw hay needle 0 agrees with the pure Haskell reference.
+-- Also checks that the absent case returns UINT64_MAX (not some other value).
+-- THREE-WAY: AbstractHeap and CHeap must agree; both must match the Haskell oracle.
+prop_stringIndexOfFromRaw :: Property
+prop_stringIndexOfFromRaw =
+  QC.forAll genUtf8Text $ \hay ->
+  QC.forAll genUtf8Text $ \needle ->
+    QC.ioProperty $ onBothBackends "P8" $ \backend -> do
+      pIndexOfFromRaw <- lookupStrPrim (T.pack "indexOfFromRaw")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          bh       = TxEnc.encodeUtf8 hay
+          bn       = TxEnc.encodeUtf8 needle
+          oracle   = toInteger (refFindFromSpec bh bn 0)
+      (sha, s1) <- allocStringOn hay    s0
+      (sna, s2) <- allocStringOn needle s1
+      (res, s3) <- callStrPrim pIndexOfFromRaw
+                     [St.RVBox sha, St.RVBox sna, St.RVLit (Anf.LInt 0)] s2
+      rcPos <- asInt "P8 indexOfFromRaw" res
+      St.stLive (St.stStats s3) @?= baseline
+      pure $ QC.counterexample
+        ("P8 indexOfFromRaw: RC=" <> show rcPos <> " oracle=" <> show oracle
+          <> " hay=" <> T.unpack hay <> " needle=" <> T.unpack needle)
+        (rcPos == oracle)
+
+-- P9: contains hay needle iff indexOfFromRaw hay needle 0 /= UINT64_MAX.
+-- Tests both the found (Some) and absent (None) paths; multi-byte strings
+-- are included via 'genUtf8Text'.
+prop_stringContains :: Property
+prop_stringContains =
+  QC.forAll genUtf8Text $ \hay ->
+  QC.forAll genUtf8Text $ \needle ->
+    QC.ioProperty $ onBothBackends "P9" $ \backend -> do
+      pIndexOfFromRaw <- lookupStrPrim (T.pack "indexOfFromRaw")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          bh       = TxEnc.encodeUtf8 hay
+          bn       = TxEnc.encodeUtf8 needle
+          oracle   = refFindFromSpec bh bn 0 /= maxBound
+      (sha, s1) <- allocStringOn hay    s0
+      (sna, s2) <- allocStringOn needle s1
+      (res, s3) <- callStrPrim pIndexOfFromRaw
+                     [St.RVBox sha, St.RVBox sna, St.RVLit (Anf.LInt 0)] s2
+      rcPos <- asInt "P9 contains(via indexOfFromRaw)" res
+      St.stLive (St.stStats s3) @?= baseline
+      let rcContains = rcPos /= notFoundSentinel
+      pure $ QC.counterexample
+        ("P9 contains: RC=" <> show rcContains <> " oracle=" <> show oracle
+          <> " hay=" <> T.unpack hay <> " needle=" <> T.unpack needle)
+        (rcContains == oracle)
+
+-- P10: count of non-overlapping occurrences (via repeated indexOfFromRaw) agrees
+-- with a pure Haskell reference.  Tests the empty-needle short-circuit (-> 0),
+-- the zero-occurrences case, and the multi-occurrence case.
+prop_stringCount :: Property
+prop_stringCount =
+  QC.forAll genUtf8Text $ \hay ->
+  QC.forAll genUtf8Text $ \needle ->
+    QC.ioProperty $ onBothBackends "P10" $ \backend -> do
+      pIndexOfFromRaw <- lookupStrPrim (T.pack "indexOfFromRaw")
+      let s0       = emptyStoreOn backend
+          bh       = TxEnc.encodeUtf8 hay
+          bn       = TxEnc.encodeUtf8 needle
+          oracle   = refCount bh bn 0
+          needleByteLen = BS.length bn
+      -- Replicate count loop: repeatedly call indexOfFromRaw starting from
+      -- the position after each found match, until not found.
+      let loop :: Int -> Int -> St.Store -> IO (Int, St.Store)
+          loop from acc s
+            | BS.null bn = pure (acc, s)
+            | otherwise  = do
+                (sha', s1) <- allocStringOn hay    s
+                (sna', s2) <- allocStringOn needle s1
+                (res,  s3) <- callStrPrim pIndexOfFromRaw
+                                [St.RVBox sha', St.RVBox sna', St.RVLit (Anf.LInt (toInteger from))] s2
+                pos <- asInt "P10 count loop" res
+                if pos == notFoundSentinel
+                  then pure (acc, s3)
+                  else loop (fromInteger pos + needleByteLen) (acc + 1) s3
+      let baseline = St.stLive (St.stStats s0)
+      (rcCount, s1) <- loop 0 0 s0
+      St.stLive (St.stStats s1) @?= baseline
+      pure $ QC.counterexample
+        ("P10 count: RC=" <> show rcCount <> " oracle=" <> show oracle
+          <> " hay=" <> T.unpack hay <> " needle=" <> T.unpack needle)
+        (rcCount == oracle)
+
+-- P11: editDistance a b equals the pure Haskell Levenshtein reference (both
+-- backends).  Includes the symmetric property (d(a,b) == d(b,a)) and triangle
+-- inequality (d(a,c) <= d(a,b) + d(b,c)) as lightweight conjoined checks.
+prop_stringEditDistance :: Property
+prop_stringEditDistance =
+  QC.forAll genUtf8Text $ \strA ->
+  QC.forAll genUtf8Text $ \strB ->
+    QC.ioProperty $ onBothBackends "P11" $ \backend -> do
+      pEditDistance <- lookupStrPrim (T.pack "editDistance")
+      let s0      = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          ba       = TxEnc.encodeUtf8 strA
+          bb       = TxEnc.encodeUtf8 strB
+          oracle   = toInteger (refLevenshteinSpec ba bb)
+          oracleBA = toInteger (refLevenshteinSpec bb ba)
+      (sa1, s1) <- allocStringOn strA s0
+      (sb1, s2) <- allocStringOn strB s1
+      (res,  s3) <- callStrPrim pEditDistance [St.RVBox sa1, St.RVBox sb1] s2
+      rcDist <- asInt "P11 editDistance(a,b)" res
+      St.stLive (St.stStats s3) @?= baseline
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("P11 editDistance(a,b): RC=" <> show rcDist <> " oracle=" <> show oracle
+              <> " a=" <> T.unpack strA <> " b=" <> T.unpack strB)
+            (rcDist == oracle)
+        , QC.counterexample
+            ("P11 editDistance symmetric: oracle(a,b)=" <> show oracle
+              <> " oracle(b,a)=" <> show oracleBA)
+            (oracle == oracleBA)
+        ]
+
+-- P12: hash a is deterministic (both backends return the same U64) and agrees
+-- with the Haskell szHash reference.
+prop_stringHash :: Property
+prop_stringHash =
+  QC.forAll genUtf8Text $ \str ->
+    QC.ioProperty $ onBothBackends "P12" $ \backend -> do
+      pHash <- lookupStrPrim (T.pack "hash")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          oracle   = toInteger (SZ.szHash (TxEnc.encodeUtf8 str))
+      (sha, s1) <- allocStringOn str s0
+      (res, s2) <- callStrPrim pHash [St.RVBox sha] s1
+      rcHash <- asInt "P12 hash" res
+      St.stLive (St.stStats s2) @?= baseline
+      pure $ QC.counterexample
+        ("P12 hash: RC=" <> show rcHash <> " oracle=" <> show oracle
+          <> " str=" <> T.unpack str)
+        (rcHash == oracle)
+
 -- -------------------------------------------------------------------------
 -- Registration
 -- -------------------------------------------------------------------------
@@ -19262,6 +19444,34 @@ rcStringPropertyTests =
           prop_stringOOB
       , testProperty "P-cov: generator produces multi-byte strings (non-vacuity)"
           prop_stringGeneratorMultiByteCoverage
+      , testProperty "P8: indexOfFromRaw matches pure Haskell reference (ASCII + multi-byte)"
+          prop_stringIndexOfFromRaw
+      , testProperty "P9: contains iff indexOfFromRaw /= UINT64_MAX"
+          prop_stringContains
+      , testProperty "P10: count of non-overlapping occurrences matches Haskell reference"
+          prop_stringCount
+      , testProperty "P11: editDistance matches Haskell Levenshtein; symmetric"
+          prop_stringEditDistance
+      , testProperty "P12: hash is deterministic; agrees with szHash reference"
+          prop_stringHash
+      -- P13: golden pin of CONCRETE sz_hash values. sz_hash has no independent
+      -- pure-Haskell equivalent, so P12 and the three-way differential are both
+      -- szHash-vs-szHash tautologies that a degenerate/constant hash would pass.
+      -- These anchor the actual distinct values: they catch a constant hash AND a
+      -- StringZilla version/algorithm change. Regenerate ONLY on a deliberate bump.
+      , testCase "P13a: golden sz_hash \"hello\"" $
+          SZ.szHash (TxEnc.encodeUtf8 (T.pack "hello")) @?= 1363158538477170947
+      , testCase "P13b: golden sz_hash \"h\233llo\" (multi-byte UTF-8)" $
+          SZ.szHash (TxEnc.encodeUtf8 (T.pack "h\233llo")) @?= 6121992711004724104
+      , testCase "P13c: golden sz_hash \"\" (empty)" $
+          SZ.szHash (TxEnc.encodeUtf8 (T.pack "")) @?= 0
+      , testCase "P13d: golden sz_hash long ASCII" $
+          SZ.szHash (TxEnc.encodeUtf8 (T.pack "The quick brown fox jumps over the lazy dog"))
+            @?= 16768718267878484903
+      , testCase "P13e: distinct inputs hash distinctly (rejects a degenerate hash)" $
+          let hs = map (SZ.szHash . TxEnc.encodeUtf8 . T.pack)
+                       ["hello", "h\233llo", "The quick brown fox jumps over the lazy dog"]
+          in Data.List.nub hs @?= hs
       ]
 
 rcArrayPropertyTests :: TestTree

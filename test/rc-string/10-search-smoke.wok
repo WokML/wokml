@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Smoke test for StringZilla-backed search ops (Slice E2 Task 3).
+--
+-- Verifies:
+--   contains "banana" "an"         -> True  -> 1
+--   count "banana" "an"            -> 2
+--   indexOf "banana" "na"          -> Some 2 -> 2
+--   editDistance "kitten" "sitting" -> 3
+--   hash "hello"                   -> runs (any value; not added to result)
+--
+-- Result: 1 + 2 + 2 + 3 = 8
+
+optionU64ToU64 : Option U64 -> U64
+optionU64ToU64 o = case o of
+  None   -> 0
+  Some v -> v
+
+boolToU64 : Bool -> U64
+boolToU64 b = case b of
+  True  -> 1
+  False -> 0
+
+main : U64
+main =
+  let c  = boolToU64 (contains "banana" "an") in
+  let k  = count "banana" "an" in
+  let io = optionU64ToU64 (indexOf "banana" "na") in
+  let ed = editDistance "kitten" "sitting" in
+  let _h = hash "hello" in
+  c + k + io + ed

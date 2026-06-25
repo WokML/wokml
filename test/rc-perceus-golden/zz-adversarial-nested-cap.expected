@@ -1,27 +1,27 @@
 build a b xs =
-  join j93(r.1) =
+  join j102(r.1) =
     let h = r.1
     let t.1 = Cell(h, a, b)
     t.1
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      join j96(r.2) =
+      join j105(r.2) =
         let g.1 = r.2
-        jump j93(g.1)
+        jump j102(g.1)
       case b of
-        Nil -> jump j96(0)
-        Cons p _.1 -> jump j96(p)
+        Nil -> jump j105(0)
+        Cons p _.1 -> jump j105(p)
     Cons y _.2 ->
       let _drop.2 = __rc_drop(xs)
-      join j103(r.3) =
+      join j112(r.3) =
         let g.2 = r.3
-        jump j93(g.2)
+        jump j102(g.2)
       case a of
-        Nil -> jump j103(y)
+        Nil -> jump j112(y)
         Cons q _.3 ->
           let t.2 = +(y, q)
-          jump j103(t.2)
+          jump j112(t.2)
 
 main =
   let t.1 = Nil
@@ -514,3 +514,70 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+notFound =
+  18446744073709551615
+
+indexOfFrom s n from =
+  let t.4 = indexOfFromRaw(s, n, from)
+  let r = t.4
+  let t.1 = eqU64(r, notFound)
+  case t.1 of
+    True ->
+      let _drop.1 = __rc_drop(t.1)
+      let t.2 = None
+      t.2
+    False ->
+      let _drop.2 = __rc_drop(t.1)
+      let t.3 = Some(r)
+      t.3
+
+indexOf s n =
+  let t = indexOfFrom(s, n, 0)
+  t
+
+contains s n =
+  let t.1 = indexOf(s, n)
+  case t.1 of
+    Some _ ->
+      let _drop.1 = __rc_drop(t.1)
+      let t.2 = True
+      t.2
+    None ->
+      let _drop.2 = __rc_drop(t.1)
+      let t.3 = False
+      t.3
+
+count s n =
+  let _dup = __rc_dup(n)
+  let t.1 = byteLength(n)
+  let t.2 = eqU64(t.1, 0)
+  case t.2 of
+    True ->
+      let _drop.1 = __rc_drop(t.2)
+      let _drop.2 = __rc_drop(s)
+      let _drop.3 = __rc_drop(n)
+      0
+    False ->
+      let _drop.4 = __rc_drop(t.2)
+      let t.3 = countFrom(s, n, 0, 0)
+      t.3
+
+countFrom s n from acc =
+  let _dup.1 = __rc_dup(s)
+  let _dup.2 = __rc_dup(n)
+  let t.1 = indexOfFrom(s, n, from)
+  case t.1 of
+    None ->
+      let _drop.1 = __rc_drop(t.1)
+      let _drop.2 = __rc_drop(s)
+      let _drop.3 = __rc_drop(n)
+      acc
+    Some i ->
+      let _drop.4 = __rc_drop(t.1)
+      let _dup.3 = __rc_dup(n)
+      let t.2 = byteLength(n)
+      let t.3 = +(i, t.2)
+      let t.4 = +(acc, 1)
+      let t.5 = countFrom(s, n, t.3, t.4)
+      t.5

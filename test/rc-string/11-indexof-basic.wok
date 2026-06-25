@@ -1,0 +1,34 @@
+module Main
+import Std.Base
+import Std.String
+
+-- indexOf / indexOfFrom: present / absent / at-boundary / from-offset.
+-- All cases on ASCII strings.
+--
+-- indexOf "banana" "na"    -> Some 2  -> 2
+-- indexOf "banana" "xx"    -> None    -> 0
+-- indexOf "banana" "b"     -> Some 0  -> 0   (at byte 0)
+-- indexOf "banana" "a"     -> Some 1  -> 1
+-- indexOf "" "x"           -> None    -> 0
+-- indexOf "x" ""            -> Some 0 -> 0   (empty needle = position 0)
+-- indexOfFrom "banana" "na" 3 -> Some 4 -> 4  (skip first "na" at 2)
+-- indexOfFrom "banana" "na" 5 -> None   -> 0  (from past last occurrence)
+--
+-- Result: 2 + 0 + 0 + 1 + 0 + 0 + 4 + 0 = 7
+
+optionU64 : Option U64 -> U64
+optionU64 o = case o of
+  None   -> 0
+  Some v -> v
+
+main : U64
+main =
+  let a = optionU64 (indexOf "banana" "na") in
+  let b = optionU64 (indexOf "banana" "xx") in
+  let c = optionU64 (indexOf "banana" "b") in
+  let d = optionU64 (indexOf "banana" "a") in
+  let e = optionU64 (indexOf "" "x") in
+  let f = optionU64 (indexOf "x" "") in
+  let g = optionU64 (indexOfFrom "banana" "na" 3) in
+  let h = optionU64 (indexOfFrom "banana" "na" 5) in
+  a + b + c + d + e + f + g + h

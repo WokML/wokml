@@ -113,8 +113,11 @@ library
         Wok.Interp.RC.Value
         Wok.Interp.RC.Prim
         Wok.Interp.RC.Machine
+        Wok.Runtime.StringZilla
     c-sources:        runtime/wok_rc.c
+                      runtime/wok_str_ops.c
     include-dirs:     runtime
+                      runtime/vendor
     cc-options:       -std=c17 -O3 -fstrict-aliasing -Wstrict-aliasing=2 -fwrapv
                       -Werror -Wall -Wextra -Wpedantic -Wconversion
                       -Wdouble-promotion -Wstrict-prototypes -Wformat-security

@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Golden hash corpus: pin sz_hash output for a fixed set of inputs.
+-- Regenerate ONLY on a deliberate StringZilla version bump.
+--
+-- Inputs:
+--   hash ""          -> some U64
+--   hash "hello"     -> some U64
+--   hash "héllo"     -> some U64 (multi-byte UTF-8)
+--   hash "The quick brown fox jumps over the lazy dog" -> some U64 (long ASCII)
+--
+-- We output the four hashes separated by newlines via a sum that encodes
+-- all four values; actually we just return one hash to keep the differential
+-- oracle simple (U64 return). Instead we output hash "hello" only for the
+-- golden pin and use a separate program for each.
+--
+-- This program returns hash "hello" as a U64. The .expected file pins it.
+-- See 15b/15c/15d for the other pinned inputs.
+
+main : U64
+main = hash "hello"

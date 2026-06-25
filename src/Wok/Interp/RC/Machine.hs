@@ -1076,13 +1076,40 @@ runModuleRCUncheckedWith backend cm@(CoreModule binds) = runExceptT $ do
 -- list (in bind order), and a store pre-loaded with one placeholder static cell
 -- per bind. The placeholders are overwritten by 'installBinds' before 'main'
 -- runs, so they are never observed.
+--
+-- LITERAL CAF FAST PATH: a 0-arity bind whose body is @Ret (ALit l)@ for a
+-- non-string literal (i.e. @LInt@, @LChar@, @LUnit@) maps the bind's 'Unique'
+-- directly to @RVLit l@ in 'knotEnv'. Function closures capture 'knotEnv', so
+-- they see the real literal instead of a placeholder 'NCon'; 'installBinds'
+-- skips evaluation for these binds (nothing to force). String literals (@LStr@)
+-- are excluded: a string-literal CAF allocates a counted 'NString' cell, which
+-- needs the normal boxed-CAF install path.
 reserveStatic :: [TopBind] -> (REnv, [Addr], Store)
 reserveStatic = go (initSentinel emptyStore) Map.empty []
   where
     go s env addrs [] = (env, reverse addrs, s)
+    go s env addrs (TopBind n [] body : rest)
+      | Just l <- literalCafBody body, not (isLStr l) =
+          -- Literal non-string CAF: no static cell needed; seed knotEnv directly.
+          -- We still allocate a placeholder so the address list stays in sync with
+          -- the bind list (installBinds zips them), but knotEnv maps the Unique to
+          -- the literal, not to the placeholder address.
+          let (a, s') = allocStatic placeholderNode s
+          in go s' (Map.insert (nameUniq n) (RVLit l) env) (a : addrs) rest
     go s env addrs (TopBind n _ _ : rest) =
       let (a, s') = allocStatic placeholderNode s
       in go s' (Map.insert (nameUniq n) (RVBox a) env) (a : addrs) rest
+
+-- | If a 0-arity top-level bind body is a bare literal return, extract the
+-- literal. Used by 'reserveStatic' for the literal-CAF fast path.
+literalCafBody :: Expr -> Maybe Lit
+literalCafBody (Ret (ALit l)) = Just l
+literalCafBody _              = Nothing
+
+-- | True iff the literal is a string (requires 'NString' allocation, not inline).
+isLStr :: Lit -> Bool
+isLStr (LStr _) = True
+isLStr _        = False
 
 -- | A never-observed placeholder cell occupying a reserved static address until
 -- 'installBinds' writes the bind's real node.
@@ -1110,6 +1137,14 @@ installBinds renv knotEnv = go
           in go bs s' env as
       | nameHint n == Tx.pack "main" =
           go bs s env as
+      -- LITERAL CAF FAST PATH (mirrors 'reserveStatic'): a 0-arity bind whose
+      -- body is a bare non-string literal needs no runtime evaluation --- its
+      -- value is already seeded into 'knotEnv' by 'reserveStatic'. We skip
+      -- 'runExprRCBracketed' and bind the literal directly in the accumulator env.
+      -- The placeholder static cell at 'a' is left in place; it is unreachable
+      -- from any live closure (they see 'RVLit l' via 'knotEnv', not 'RVBox a').
+      | Just l <- literalCafBody body, not (isLStr l) =
+          go bs s (Map.insert (nameUniq n) (RVLit l) env) as
       | otherwise = do
           -- The CAF body is bracketed too: a 0-arity top-level bind whose body
           -- routes an 'Arena' alloc opens/closes its arena exactly like 'main' or a

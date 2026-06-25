@@ -1,0 +1,28 @@
+module Main
+import Std.Base
+import Std.String
+
+-- editDistance: equal / pure-insert / pure-delete / substitute / multi-byte.
+--
+-- editDistance "kitten" "sitting"  -> 3
+-- editDistance "abc" "abc"         -> 0  (equal)
+-- editDistance "" "abc"            -> 3  (pure insert)
+-- editDistance "abc" ""            -> 3  (pure delete)
+-- editDistance "a" "b"             -> 1  (single substitution)
+-- editDistance "héllo" "hello"     -> 2  (é = 2 bytes [C3 A9], e = 1 byte [65];
+--                                         byte-level Levenshtein counts byte ops:
+--                                         one delete + one substitute = 2, NOT 1)
+--   byte sequences: [h,0xC3,0xA9,l,l,o] vs [h,e,l,l,o]
+--   = delete 0xC3, substitute 0xA9->e = 2 ops
+--
+-- Result: 3 + 0 + 3 + 3 + 1 + 2 = 12
+
+main : U64
+main =
+  let a = editDistance "kitten" "sitting" in
+  let b = editDistance "abc" "abc" in
+  let c = editDistance "" "abc" in
+  let d = editDistance "abc" "" in
+  let e = editDistance "a" "b" in
+  let f = editDistance "héllo" "hello" in
+  a + b + c + d + e + f
