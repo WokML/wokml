@@ -64,7 +64,7 @@ import Wok.IR.ReusePairing (reusePairing)
 import qualified Wok.IR.ReusePairing as RP
 import qualified Wok.IR.Escape as Esc
 import qualified Wok.IR.Region as Region
-import Wok.IR.Region (Placement (..))
+import Wok.IR.Region (Placement (..), SliceRep (..))
 import Wok.IR.Reachable
   ( pruneToReachable, exprUniques
   , firstOrderNoHandlerViolations, m2bHandlerViolations
@@ -244,12 +244,16 @@ main = do
     , rcArrayNodeTests
     , rcArrayCCellTests
     , rcStringNodeTests
+    , rcStringViewNodeTests
     , rcStringCCellTests
     , rcInlineStringTests
     , rcInlineStringSlotTests
     , rcArrayPrimTests
     , rcStringPrimTests
     , regionRoutingTests
+    , rcSliceRoutingTests
+    , rcSliceDeathTests
+    , rcSliceAdversarialTests
     , wokRcHeapTests
     , wokRcReuseTests
     , wokRcReservedTests
@@ -339,6 +343,7 @@ main = do
     , rcArrayPropertyTests
     , rcStringPropertyTests
     , rcInlineStringPropertyTests
+    , rcStringViewPropertyTests
     , rcArraySliceCTests
     -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
     -- hardening; each test group verifies the floor bites when disabled):
@@ -4709,7 +4714,7 @@ interpPrimTests = testGroup "InterpPrim"
                   ["new","fromList","toList","index","length","set","resize"]
               ++ map (T.pack "Std.String",)
                   ["length","index","byteLength","byteAt","append"
-                  ,"indexOfFromRaw","hash","editDistance"]
+                  ,"indexOfFromRaw","hash","editDistance","slice","byteSlice"]
               )
   , testCase "addition" $
       case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
@@ -7501,6 +7506,247 @@ rcStringNodeTests = testGroup "rc string node"
       case St.renderRCValue s1 (St.RVBox a) of
         Left e  -> assertFailure ("renderRCValue NString failed: " <> show e)
         Right t -> t @?= T.pack (show (T.pack "h\233llo"))
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC StringView node tests (String Slice E4, Task 1)
+--
+-- Tests the NStringView constructor on the AbstractHeap backend:
+--   * 'nodeValues' returns '[RVBox parent]' (the one counted child).
+--   * 'nodeCEligible' is False (own alloc path).
+--   * 'wouldBeCBytes' is 32 (fixed-size view cell).
+--   * 'allocNStringView' increfs the parent then allocates the view cell; drop
+--     of the view decrefs the parent, returning stLive to the pre-view baseline.
+--   * 'stringBytes' on an NStringView returns the windowed ByteString (O(1) slice).
+--   * 'renderRCValue' on a view renders the same text as the materialized substring.
+
+rcStringViewNodeTests :: TestTree
+rcStringViewNodeTests = testGroup "rcStringView"
+  [ testCase "nodeValues NStringView returns [RVBox parent]" $ do
+      let s0     = St.emptyStore
+          (pa, _) = St.allocPure (St.NString (TxEnc.encodeUtf8 (T.pack "hello world"))) s0
+      St.nodeValues (St.NStringView pa 6 5) @?= [St.RVBox pa]
+
+  , testCase "nodeCEligible NStringView is False (own alloc path)" $ do
+      let s0     = St.emptyStore
+          (pa, _) = St.allocPure (St.NString (TxEnc.encodeUtf8 (T.pack "hello world"))) s0
+      St.nodeCEligible (St.NStringView pa 6 5) @?= False
+
+  , testCase "wouldBeCBytes NStringView is 32 (header 8 + ptr 8 + offset 8 + len 8)" $ do
+      let s0     = St.emptyStore
+          (pa, _) = St.allocPure (St.NString (TxEnc.encodeUtf8 (T.pack "hello world"))) s0
+      St.wouldBeCBytes (St.NStringView pa 6 5) @?= (32 :: Int)
+
+  , testCase "stringBytes on NStringView at offset 6 len 5 equals 'world'" $ do
+      -- Build "hello world" on the abstract heap, then a view over bytes 6..10.
+      let bs     = TxEnc.encodeUtf8 (T.pack "hello world")  -- 11 bytes
+          s0     = St.emptyStore
+          (pa, s1) = St.allocPure (St.NString bs) s0
+      r <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r of
+        Left e  -> assertFailure ("allocNStringView failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- stringBytes on the view should return exactly the 5 bytes "world".
+      rb <- runExceptT (RCP.stringBytes (St.RVBox va) s2)
+      case rb of
+        Left e   -> assertFailure ("stringBytes on NStringView failed: " <> show e)
+        Right got -> got @?= TxEnc.encodeUtf8 (T.pack "world")
+
+  , testCase "drop view: parent refcount returns to pre-view baseline" $ do
+      -- Alloc the parent; record the live count; alloc the view (parent rc bumped
+      -- to 2); drop the view; assert stLive returns to the pre-view baseline (1
+      -- live cell: the parent) AND the parent cell's own refcount went 2 -> 1.
+      let bs       = TxEnc.encodeUtf8 (T.pack "hello world")  -- 11 bytes (> maxInlineStr)
+          s0       = St.emptyStore
+          (pa, s1) = St.allocPure (St.NString bs) s0
+          baseline = St.stLive (St.stStats s1)  -- 1 (just the parent)
+          -- The parent's own refcount: 1 immediately after its alloc.
+          parentRc st = St.cRc <$> St.derefPure pa st
+      r <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r of
+        Left e  -> assertFailure ("allocNStringView failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- After alloc: 2 live cells (parent + view), and the parent's rc is 2
+      -- (allocNStringView increfed it -- the view owns one counted ref).
+      St.stLive (St.stStats s2) @?= baseline + 1
+      parentRc s2 @?= Right 2
+      -- Drop the view: parent is decreffed (rc 2->1), view cell freed.
+      case St.dropAddrPure va s2 of
+        Left e  -> assertFailure ("dropAddrPure view failed: " <> show e)
+        Right s3 -> do
+          St.stLive (St.stStats s3) @?= baseline
+          -- The parent cell survives with its rc restored to 1 (its own binding).
+          parentRc s3 @?= Right 1
+
+  , testCase "renderRCValue NStringView renders same text as materialized substring" $ do
+      let bs     = TxEnc.encodeUtf8 (T.pack "hello world")
+          s0     = St.emptyStore
+          (pa, s1) = St.allocPure (St.NString bs) s0
+      r <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r of
+        Left e  -> assertFailure ("allocNStringView failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      case St.renderRCValue s2 (St.RVBox va) of
+        Left e  -> assertFailure ("renderRCValue NStringView failed: " <> show e)
+        Right t -> t @?= T.pack (show (T.pack "world"))
+
+  -- -------------------------------------------------------------------------
+  -- CHeap backend: WokStringView C cell (E4 Task 2)
+  -- -------------------------------------------------------------------------
+  -- Run the same alloc/deref/drop sequence on the real C heap and assert:
+  --   * allocNStringView on CHeap returns a CAddr (the WokStringView cell);
+  --   * deref of the CAddr reconstructs the NStringView node with correct fields;
+  --   * stringBytes on the CAddr view returns the windowed bytes;
+  --   * dropAddr balances: C wok_stat_live == 0, allocs == frees;
+  --   * peak_bytes on the CHeap run == 32 (the parent string) + 32 (the view).
+  --
+  -- 'onBothBackends' runs the body on AbstractHeap then CHeap (leak-checked),
+  -- conjoining the results -- a failure on either backend surfaces.
+
+  , testCase "CHeap: allocNStringView returns CAddr WokStringView cell" $ do
+      hp <- Heap.wokHeapNew
+      let bs     = TxEnc.encodeUtf8 (T.pack "hello world")  -- 11 bytes > maxInlineStr
+          s0     = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (pa, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r2 <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("allocNStringView CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      assertBool "allocNStringView CHeap: result is CAddr"
+        (case va of St.CAddr _ -> True; _ -> False)
+      -- peak_bytes must equal parent cell + view cell = (16+8*2) + 32 = 32 + 32 = 64.
+      let expectedPeakBytes = St.wouldBeCBytes (St.NString bs) + 32
+      St.stPeakBytes (St.stStats s2) @?= expectedPeakBytes
+      -- Drop both cells; heap must balance.
+      r3 <- runExceptT (St.dropAddr va s2)
+      s3 <- case r3 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr view CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r4 <- runExceptT (St.dropAddr pa s3)
+      case r4 of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("dropAddr parent CHeap failed: " <> show e) }
+        Right _ -> do
+          cLive   <- Heap.wokStatLive   hp
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "CHeap view: wok_stat_live == 0 after drop" (0 :: Int64) cLive
+          assertEqual "CHeap view: allocs == frees" cAllocs cFrees
+          Heap.wokHeapFree hp
+
+  , testCase "CHeap: deref CAddr view reconstructs NStringView with correct fields" $ do
+      hp <- Heap.wokHeapNew
+      let bs     = TxEnc.encodeUtf8 (T.pack "hello world")  -- 11 bytes
+          s0     = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (pa, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r2 <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("allocNStringView CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r3 <- runExceptT (St.deref va s2)
+      case r3 of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("deref view CHeap failed: " <> show e) }
+        Right c -> do
+          St.cNode c @?= St.NStringView pa 6 5
+          r4 <- runExceptT (St.dropAddr va s2)
+          s3 <- case r4 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr view CHeap failed: " <> show e) >> error "unreachable" }
+            Right x -> pure x
+          r5 <- runExceptT (St.dropAddr pa s3)
+          case r5 of
+            Left e -> do { Heap.wokHeapFree hp
+                         ; assertFailure ("dropAddr parent CHeap failed: " <> show e) }
+            Right _ -> do
+              cAllocs <- Heap.wokStatAllocs hp
+              cFrees  <- Heap.wokStatFrees  hp
+              assertEqual "CHeap deref: allocs == frees" cAllocs cFrees
+              Heap.wokHeapFree hp
+
+  , testCase "CHeap: stringBytes on CAddr view returns windowed bytes" $ do
+      hp <- Heap.wokHeapNew
+      let bs     = TxEnc.encodeUtf8 (T.pack "hello world")  -- 11 bytes
+          s0     = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (pa, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r2 <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("allocNStringView CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r3 <- runExceptT (RCP.stringBytes (St.RVBox va) s2)
+      case r3 of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("stringBytes CAddr view failed: " <> show e) }
+        Right got -> do
+          got @?= TxEnc.encodeUtf8 (T.pack "world")
+          r4 <- runExceptT (St.dropAddr va s2)
+          s3 <- case r4 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr view CHeap failed: " <> show e) >> error "unreachable" }
+            Right x -> pure x
+          r5 <- runExceptT (St.dropAddr pa s3)
+          case r5 of
+            Left e -> do { Heap.wokHeapFree hp
+                         ; assertFailure ("dropAddr parent CHeap failed: " <> show e) }
+            Right _ -> do
+              cAllocs <- Heap.wokStatAllocs hp
+              cFrees  <- Heap.wokStatFrees  hp
+              assertEqual "CHeap stringBytes: allocs == frees" cAllocs cFrees
+              Heap.wokHeapFree hp
+
+  , testCase "CHeap: drop view decrefs parent, then drop parent: C heap balanced" $ do
+      hp <- Heap.wokHeapNew
+      let bs     = TxEnc.encodeUtf8 (T.pack "hello world")  -- 11 bytes
+          s0     = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      (pa, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      r2 <- runExceptT (St.allocNStringView pa 6 5 s1)
+      (va, s2) <- case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("allocNStringView CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      -- 2 C cells live (parent + view).
+      cLive0 <- Heap.wokStatLive hp
+      assertEqual "2 C cells live after alloc" (2 :: Int64) cLive0
+      -- Drop the view: the view cell is freed, parent rc drops from 2 to 1.
+      r3 <- runExceptT (St.dropAddr va s2)
+      s3 <- case r3 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("dropAddr view CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      cLive1 <- Heap.wokStatLive hp
+      assertEqual "1 C cell live after view drop (parent survives)" (1 :: Int64) cLive1
+      -- Drop the parent: C heap fully balanced.
+      r4 <- runExceptT (St.dropAddr pa s3)
+      case r4 of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("dropAddr parent CHeap failed: " <> show e) }
+        Right _ -> do
+          cLive2  <- Heap.wokStatLive   hp
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "0 C cells live after parent drop" (0 :: Int64) cLive2
+          assertEqual "CHeap: allocs == frees" cAllocs cFrees
+          Heap.wokHeapFree hp
   ]
 
 -- ---------------------------------------------------------------------------
@@ -18924,6 +19170,1109 @@ regionRoutingTests = testGroup "Region routing"
   ]
 
 -- ---------------------------------------------------------------------------
+-- Wok.IR.Region  (SliceRep borrow routing, String Slice E4 Task 4)
+-- ---------------------------------------------------------------------------
+--
+-- The L5 borrow-passing router tags each slice/byteSlice VIEW binder
+-- Window | Counted | Copy by reusing the SAME per-binder escape analysis that
+-- routes Arena | Heap (a new consumer of Wok.IR.Escape.arenaEscapes, spec §6).
+-- These tests pin the planner's per-site verdict, and AC3 asserts an INDEPENDENT
+-- routing oracle (a second, separately-written re-derivation) matches the planner
+-- EXACTLY over a corpus (mismatch == 0), so a routing bug surfaces as a mismatch.
+--
+-- D1/§6 soundness direction (mirrors Placement): Counted/Copy are the ALWAYS-SAFE
+-- answers (like Heap); Window is the only routing that licenses dropping the
+-- refcount at codegen, so it is emitted ONLY when the view is proven non-escaping
+-- AND the parent is referenceable AND the body is in the arena soundness envelope.
+-- The interpreter realizes Window and Counted identically (always counts, D2), so a
+-- mis-route is never a runtime UAF; this annotation is consumed by codegen / Task 5.
+
+-- A slice prim application RHS: slice/byteSlice over a parent atom + two index args.
+sliceRhs :: Anf.Atom -> Anf.Rhs
+sliceRhs parent =
+  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+    [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 5)]
+
+byteSliceRhs :: Anf.Atom -> Anf.Rhs
+byteSliceRhs parent =
+  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringByteSliceName))
+    [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 5)]
+
+regStrTy :: Ty.CType
+regStrTy = Ty.CTCon Ty.TcString []
+
+-- The 'SliceRep' the planner assigns a view binder 'Unique', or Nothing if the
+-- binder carries no slice-rep entry (it is not a slice site).
+sliceRepOf :: Int -> Anf.CoreModule -> Maybe SliceRep
+sliceRepOf u cm = Map.lookup (Unique u) (Region.rpSliceRep (Region.planRegions cm))
+
+-- Slice shape 1 (Window): a NON-escaping slice of a referenceable (heap, param)
+-- parent.  f s = let v = slice s 0 5 in case v of _ -> 0
+-- v is only a Case scrutinee (matched in place = NOT an escape, the §5.1
+-- relaxation); s is a function param (not locally Arena-placed). So
+-- not escapes && not parentArena -> Window.
+sliceShapeWindow :: Anf.CoreModule
+sliceShapeWindow = regModule $ Anf.TopBind (regNm "f" 8000) [regBnd "s" 8001 regStrTy]
+  (Anf.Let (regBnd "v" 8002 regStrTy) (sliceRhs (Anf.AVar (regNm "s" 8001)))
+  (Anf.Case (Anf.AVar (regNm "v" 8002))
+     [ Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 0))) ]))
+
+-- Slice shape 2 (Counted via escape): the slice is RETURNED (escapes); the parent
+-- is a referenceable param.  g s = let v = slice s 0 5 in v
+-- escapes && not parentArena -> Counted.
+sliceShapeCounted :: Anf.CoreModule
+sliceShapeCounted = regModule $ Anf.TopBind (regNm "g" 8100) [regBnd "s" 8101 regStrTy]
+  (Anf.Let (regBnd "v" 8102 regStrTy) (sliceRhs (Anf.AVar (regNm "s" 8101)))
+  (Anf.Ret (Anf.AVar (regNm "v" 8102))))
+
+-- Slice shape 3 (Counted via the module-wide handler disable, AC5): a body whose
+-- slice WOULD be Window, but a SIBLING top-level installs a handler, so arenas are
+-- disabled module-wide and every slice routes the always-safe Counted (no Window,
+-- no Copy -- there is no arena).
+--   h s   = let v = byteSlice s 0 5 in case v of _ -> 0   (would be Window)
+--   hdlr  = with { return r -> r } (Ret 0)                (forces the disable)
+sliceShapeHandlerDisabled :: Anf.CoreModule
+sliceShapeHandlerDisabled = Anf.CoreModule
+  [ Anf.TopBind (regNm "h" 8200) [regBnd "s" 8201 regStrTy]
+      (Anf.Let (regBnd "v" 8202 regStrTy) (byteSliceRhs (Anf.AVar (regNm "s" 8201)))
+      (Anf.Case (Anf.AVar (regNm "v" 8202))
+         [ Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 0))) ]))
+  , Anf.TopBind (regNm "hdlr" 8210) []
+      (Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+         (Anf.Handler
+            (regBnd "r" 8211 regU64, Anf.Ret (Anf.AVar (regNm "r" 8211)))
+            [] Nothing Nothing Nothing))
+  ]
+
+-- Slice shape 4 (Counted via the per-body continuation fence): the body fires a
+-- FREE effect op (an ROp), so capturesContinuation gates the whole body to Heap and
+-- opens no arena; the slice in that body routes the always-safe Counted (it would
+-- be Window otherwise).  k s = let _ = E.op () in let v = slice s 0 5 in (case v of _ -> 0)
+sliceShapeContFenced :: Anf.CoreModule
+sliceShapeContFenced = regModule $ Anf.TopBind (regNm "k" 8300) [regBnd "s" 8301 regStrTy]
+  (Anf.Let (regBnd "o" 8302 regU64)
+     (Anf.ROp Nothing (T.pack "E") (T.pack "op") [])
+  (Anf.Let (regBnd "v" 8303 regStrTy) (sliceRhs (Anf.AVar (regNm "s" 8301)))
+  (Anf.Case (Anf.AVar (regNm "v" 8303))
+     [ Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 0))) ])))
+
+-- Slice shape 5 (Counted; a RESUMING handler arm + a slice, NO ROp). The body is a
+-- Handle whose op-arm RESUMES (its resume binder escapes the arm: aliased to kk and
+-- returned -> m2bResumeEscapes fires). The handled expr contains a slice that would
+-- otherwise be Window. The planner routes the slice Counted via the module-wide
+-- handler disable (a Handle in the module forces all-Counted); 'capturesContinuation's
+-- goHandler ALSO fires on the resume-escape, and so must the oracle's 'oracleFiresOp'
+-- (FIX 1a) -- they must AGREE (mismatch == 0). This is the resuming-handler shape
+-- Task 5's death-tests use; it pins the m2bResumeEscapes mirror in the oracle.
+--   r5 s = with { return rv -> rv
+--               ; E.op(arg) -> let kk = resume in (case (slice s 0 5) of _ -> kk) }
+--          (let v = slice s 0 5 in case v of _ -> 0)
+sliceShapeResumingHandler :: Anf.CoreModule
+sliceShapeResumingHandler =
+  regModule $ Anf.TopBind (regNm "r5" 8500) [regBnd "s" 8501 regStrTy]
+    (Anf.Handle
+       (Anf.Let (regBnd "v" 8502 regStrTy) (sliceRhs (Anf.AVar (regNm "s" 8501)))
+       (Anf.Case (Anf.AVar (regNm "v" 8502))
+          [ Anf.AltDefault (Anf.Ret (Anf.ALit (Anf.LInt 0))) ]))
+       (Anf.Handler
+          (regBnd "rv" 8503 regU64, Anf.Ret (Anf.AVar (regNm "rv" 8503)))
+          [ Anf.OpArm (T.pack "E") (T.pack "op")
+              [regBnd "arg" 8504 regU64]
+              (regBnd "resume" 8505 regU64)        -- the resume binder
+              (Anf.Let (regBnd "kk" 8506 regU64)
+                 (Anf.RAtom (Anf.AVar (regNm "resume" 8505)))  -- alias-rename = escape
+              (Anf.Let (regBnd "vw" 8507 regStrTy) (sliceRhs (Anf.AVar (regNm "s" 8501)))
+              (Anf.Case (Anf.AVar (regNm "vw" 8507))
+                 [ Anf.AltDefault (Anf.Ret (Anf.AVar (regNm "kk" 8506))) ]))) ]
+          Nothing Nothing Nothing))
+
+-- The corpus the independent oracle (AC3) checks against the planner.
+sliceCorpus :: [(String, Anf.CoreModule)]
+sliceCorpus =
+  [ ("window",            sliceShapeWindow)
+  , ("counted-escape",    sliceShapeCounted)
+  , ("handler-disable",   sliceShapeHandlerDisabled)
+  , ("cont-fenced",       sliceShapeContFenced)
+  , ("resuming-handler",  sliceShapeResumingHandler)
+  ]
+
+-- | The INDEPENDENT routing oracle (AC3). A SECOND, separately-written derivation
+-- of the expected 'SliceRep' for every slice binder in a module, written WITHOUT
+-- reference to 'Region.rpSliceRep'. It re-derives the three decision inputs:
+--   * @disabled@: the module installs a handler (module-wide arena disable) OR the
+--     slice's enclosing top-body fires a free effect op (continuation fence). Both
+--     re-derived here by a fresh walk, not borrowed from Region.
+--   * @escapes@:  Wok.IR.Escape.arenaEscapes over the slice's continuation (the
+--     shared analysis -- the oracle is independent in the DECISION, not in the
+--     escape primitive Region itself reuses).
+--   * @parentArena@: the slice's parent atom names a binder the planner placed in
+--     Arena (a lookup in the public 'rpPlacement', a separate validated artifact).
+-- When @disabled@ the rep is Counted; else Window iff not escapes && not parentArena,
+-- Copy iff escapes && parentArena, otherwise Counted.
+oracleSliceReps :: Anf.CoreModule -> Map.Map Unique SliceRep
+oracleSliceReps cm@(Anf.CoreModule binds) =
+  let moduleHasHandler = any (oracleHasHandle . topBody) binds
+      placements       = Region.rpPlacement (Region.planRegions cm)
+  in Map.unions [ oracleTop moduleHasHandler placements (topBody b) | b <- binds ]
+  where
+    topBody (Anf.TopBind _ _ body) = body
+    oracleTop moduleHasHandler placements body =
+      let disabled = moduleHasHandler || oracleFiresOp body
+      in oracleWalk disabled placements body
+
+-- | Re-derive a slice binder's rep for one body, recursing through every Expr form
+-- (mirrors collectSliceReps, written independently).
+oracleWalk :: Bool -> Map.Map Unique Region.Placement -> Anf.Expr -> Map.Map Unique SliceRep
+oracleWalk disabled placements = go
+  where
+    go (Anf.Ret _)            = Map.empty
+    go (Anf.Let bd r e)       =
+      let here = case oracleSliceParent r of
+                   Just parent -> Map.singleton (Anf.binderUnique bd)
+                                    (oracleRep disabled placements bd parent e)
+                   Nothing     -> Map.empty
+      in here `Map.union` goRhs r `Map.union` go e
+    go (Anf.LetRec defs e)    = Map.unions (go e : [ go d | (_, _, d) <- defs ])
+    go (Anf.Case _ alts)      = Map.unions (map goAlt alts)
+    go (Anf.LetJoin _ _ jb e) = go jb `Map.union` go e
+    go (Anf.Jump _ _)         = Map.empty
+    go (Anf.Handle e h)       =
+      go e `Map.union` go (snd (Anf.hReturn h))
+        `Map.union` Map.unions (map (go . Anf.oaBody) (Anf.hOps h))
+    goAlt (Anf.AltCon _ _ e)  = go e
+    goAlt (Anf.AltLit _ e)    = go e
+    goAlt (Anf.AltDefault e)  = go e
+    goRhs (Anf.RLam _ e)      = go e
+    goRhs _                   = Map.empty
+
+-- | The independent rep decision for one slice binder.
+oracleRep
+  :: Bool -> Map.Map Unique Region.Placement
+  -> Anf.Binder -> Anf.Atom -> Anf.Expr -> SliceRep
+oracleRep disabled placements bd parent cont
+  | disabled                       = Counted
+  | not escapes && not parentArena = Window
+  | escapes && parentArena         = Copy
+  | otherwise                      = Counted
+  where
+    escapes     = Esc.arenaEscapes (Set.singleton (Anf.binderUnique bd)) cont
+    parentArena = case parent of
+      Anf.AVar n -> Map.lookup (Name.nameUniq n) placements == Just Arena
+      _          -> False
+
+-- | The parent atom of a slice/byteSlice application, else Nothing (oracle copy of
+-- 'sliceParent', written independently).
+oracleSliceParent :: Anf.Rhs -> Maybe Anf.Atom
+oracleSliceParent (Anf.RApp (Anf.APrim key) (parent : _))
+  | key == (PN.stdStringModule, PN.stringSliceName)     = Just parent
+  | key == (PN.stdStringModule, PN.stringByteSliceName) = Just parent
+oracleSliceParent _ = Nothing
+
+-- | True iff a Handle appears anywhere in the expression (oracle re-derivation of
+-- the module-wide handler disable signal).
+oracleHasHandle :: Anf.Expr -> Bool
+oracleHasHandle = go
+  where
+    go (Anf.Ret _)            = False
+    go (Anf.Let _ r e)        = goRhs r || go e
+    go (Anf.LetRec defs e)    = any (\(_, _, d) -> go d) defs || go e
+    go (Anf.Case _ alts)      = any goAlt alts
+    go (Anf.LetJoin _ _ jb e) = go jb || go e
+    go (Anf.Jump _ _)         = False
+    go (Anf.Handle _ _)       = True
+    goAlt (Anf.AltCon _ _ e)  = go e
+    goAlt (Anf.AltLit _ e)    = go e
+    goAlt (Anf.AltDefault e)  = go e
+    goRhs (Anf.RLam _ e)      = go e
+    goRhs _                   = False
+
+-- | True iff the body's continuation can be captured (oracle re-derivation of the
+-- per-body continuation fence, mirroring 'capturesContinuation' faithfully). TWO
+-- ways the continuation is captured: (b) a FREE effect op ('ROp') anywhere reifies
+-- the body's continuation outward; (a) a handler op-arm whose @resume@ binder
+-- ESCAPES its arm body ('Esc.m2bResumeEscapes', the SAME predicate the planner's
+-- 'goHandler' uses). The oracle must catch BOTH, else a resuming-handler-arm body
+-- with a slice but no 'ROp' would mismatch the planner (planner forces Counted via
+-- the fence; a weaker oracle could expect Window). Task 5's death-test programs are
+-- exactly these resuming-handler shapes.
+oracleFiresOp :: Anf.Expr -> Bool
+oracleFiresOp = go
+  where
+    go (Anf.Ret _)            = False
+    go (Anf.Let _ r e)        = goRhs r || go e
+    go (Anf.LetRec defs e)    = any (\(_, _, d) -> go d) defs || go e
+    go (Anf.Case _ alts)      = any goAlt alts
+    go (Anf.LetJoin _ _ jb e) = go jb || go e
+    go (Anf.Jump _ _)         = False
+    go (Anf.Handle e h)       = go e || goHandler h
+    goAlt (Anf.AltCon _ _ e)  = go e
+    goAlt (Anf.AltLit _ e)    = go e
+    goAlt (Anf.AltDefault e)  = go e
+    goRhs (Anf.ROp{})         = True
+    goRhs (Anf.RLam _ e)      = go e
+    goRhs _                   = False
+    -- Mirror 'capturesContinuation's goHandler: an op-arm whose resume escapes its
+    -- body (case (a)), the return arm, and each op-arm body.
+    goHandler h =
+      any (\oa -> Esc.m2bResumeEscapes (Anf.oaResume oa) (Anf.oaBody oa)) (Anf.hOps h)
+        || go (snd (Anf.hReturn h))
+        || any (go . Anf.oaBody) (Anf.hOps h)
+
+rcSliceRoutingTests :: TestTree
+rcSliceRoutingTests = testGroup "rcSliceRouting"
+  [ testCase "window: non-escaping slice of a referenceable parent -> Window" $
+      sliceRepOf 8002 sliceShapeWindow @?= Just Window
+
+  , testCase "counted: escaping slice of a referenceable parent -> Counted" $
+      sliceRepOf 8102 sliceShapeCounted @?= Just Counted
+
+  , testCase "handler-disable (AC5): module-wide arena disable -> Counted, no Window" $ do
+      -- The slice would be Window (non-escaping, param parent), but a sibling handler
+      -- disables arenas module-wide, so it routes the always-safe Counted.
+      sliceRepOf 8202 sliceShapeHandlerDisabled @?= Just Counted
+      regArenaBodies sliceShapeHandlerDisabled @?= Set.empty
+
+  , testCase "cont-fenced (AC5 sibling): per-body continuation fence -> Counted" $ do
+      -- The body fires a free op, so capturesContinuation gates it to Heap/no-arena;
+      -- the slice routes the always-safe Counted (not Window).
+      sliceRepOf 8303 sliceShapeContFenced @?= Just Counted
+      Set.member (Unique 8300) (regArenaBodies sliceShapeContFenced) @?= False
+
+  , testCase "resuming-handler (FIX 1b): slice in a resuming-arm body -> Counted" $ do
+      -- A Handle whose op-arm RESUMES (resume escapes the arm) + a slice + NO ROp.
+      -- The slice (both the handled-expr one and the in-arm one) routes Counted, and
+      -- the oracle must AGREE -- the m2bResumeEscapes path is the only continuation
+      -- signal here. (The Handle also triggers the module-wide disable, which is why
+      -- the planner forces Counted; the AC3 corpus check above proves the oracle's
+      -- rep map matches the planner's EXACTLY for this shape, mismatch == 0.)
+      sliceRepOf 8502 sliceShapeResumingHandler @?= Just Counted
+      sliceRepOf 8507 sliceShapeResumingHandler @?= Just Counted
+      regArenaBodies sliceShapeResumingHandler @?= Set.empty
+      -- Directly exercise the oracle's m2bResumeEscapes mirror (FIX 1a), bypassing the
+      -- moduleHasHandler || short-circuit: oracleFiresOp on a resuming-arm handler body
+      -- with NO ROp can be True ONLY via goHandler's m2bResumeEscapes arm. A weaker
+      -- oracle (ROp-only) would return False here and mismatch the planner on a body
+      -- like Task 5's death-tests; this assertion pins the faithful mirror.
+      let resumingArmBody =
+            Anf.Handle (Anf.Ret (Anf.ALit (Anf.LInt 0)))
+              (Anf.Handler
+                 (regBnd "rv" 8513 regU64, Anf.Ret (Anf.AVar (regNm "rv" 8513)))
+                 [ Anf.OpArm (T.pack "E") (T.pack "op") []
+                     (regBnd "resume" 8514 regU64)
+                     (Anf.Let (regBnd "kk" 8515 regU64)
+                        (Anf.RAtom (Anf.AVar (regNm "resume" 8514)))  -- escape, no ROp
+                     (Anf.Ret (Anf.AVar (regNm "kk" 8515)))) ]
+                 Nothing Nothing Nothing)
+      assertBool "oracleFiresOp must fire on a resuming-arm handler body (no ROp)"
+        (oracleFiresOp resumingArmBody)
+
+  , testCase "AC3: independent routing oracle matches the planner EXACTLY (mismatch == 0)" $ do
+      -- For every corpus module, the planner's rpSliceRep must equal the independently
+      -- re-derived oracle map. A routing bug shows up here as a mismatch, not a UAF.
+      let mismatches =
+            [ (label, Region.rpSliceRep (Region.planRegions cm), oracleSliceReps cm)
+            | (label, cm) <- sliceCorpus
+            , Region.rpSliceRep (Region.planRegions cm) /= oracleSliceReps cm ]
+      assertBool ("planner-vs-oracle mismatches: " <> show mismatches) (null mismatches)
+
+  , testCase "AC4: Copy arm -- arena-born parent + escaping view -> Copy" $ do
+      -- Copy is structurally unreachable through planRegions today (a slice's parent
+      -- always escapes via the slice argument, so placeLet routes it Heap, never
+      -- Arena -- which is SOUND: the parent stays counted so the view never dangles).
+      -- The Copy arm is nonetheless a real routing answer (the codegen / future
+      -- borrowing-prim fallback), so it is exercised here directly: an Arena-parent
+      -- placement map + an escaping view (slice RETURNED) must yield Copy.
+      let vBnd    = regBnd "v" 8402 regStrTy
+          rhs     = sliceRhs (Anf.AVar (regNm "p" 8401))
+          cont    = Anf.Ret (Anf.AVar (regNm "v" 8402))   -- v escapes (returned)
+          placeAr = Map.singleton (Unique 8401) Arena     -- parent born in the arena
+      Region.sliceRep placeAr vBnd rhs cont @?= Copy
+      -- Control: the SAME view with a referenceable (non-Arena) parent is Counted,
+      -- not Copy -- proving the Copy verdict is driven by the parent placement.
+      Region.sliceRep Map.empty vBnd rhs cont @?= Counted
+
+  , testCase "backend-independence: rpSliceRep is a function of the IR (idempotent)" $
+      Region.rpSliceRep (Region.planRegions sliceShapeWindow)
+        @?= Region.rpSliceRep (Region.planRegions sliceShapeWindow)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Window-routing death-test with teeth + negative control (String Slice E4 Task 5)
+-- ---------------------------------------------------------------------------
+--
+-- THE INVARIANT. A 'Window'-routed view CLAIMS it does not outlive its birth
+-- activation (so codegen may drop the parent's refcount edge). The interpreter
+-- realizes 'Window' as a COUNTED window (spec D2), so a mis-route is never a runtime
+-- UAF -- which means correct non-escaping code is never mis-counted. The death-test,
+-- gated behind 'runExprRCDeathTest's flag, checks the routing CLAIM directly: it
+-- brackets every activation, registers each 'Window'-routed view born inside it, and
+-- at the activation's exit asserts NONE is still alive (present in the store). A
+-- non-escaping view is dropped (and DELETED from the store) before the close -> the
+-- check passes. An escaping view (returned / stored) is kept alive by its escaping
+-- owner -> still present at close -> the invariant FIRES
+-- (@"view escaped its birth activation (death-test)"@).
+--
+-- ZERO FALSE POSITIVES. The view stays counted, so the spec's false-positive trap
+-- (uncount the view -> the slice prim, which consumes its parent, frees the parent
+-- at the slice -> a later read sees a freed parent and fires on CORRECT code) cannot
+-- arise: nothing is uncounted, and the check reads only LIVE-cell membership, never
+-- freed memory. The correct corpus below runs UNDER the flag and fires on NONE.
+--
+-- REAL TEETH (the permanent negative control). A view DELIBERATELY mis-routed
+-- 'Window' despite escaping (forced via 'rceForceWindow') MUST trip the invariant.
+-- The control programs return / store the forced-'Window' view, so it is alive at
+-- the activation close and the test asserts the fire as its EXPECTED failure. If the
+-- teeth ever stop biting (the fire stops), these test cases fail -- the load-bearing
+-- control (the R1 orphan-slab precedent).
+
+-- | A long (> 'maxInlineStr' = 7 bytes) string literal whose slice is therefore an
+-- 'NStringView' cell (a short slice would be an uncounted 'InlineStr', which the
+-- death-test never registers -- it is not a counted view). 21 bytes.
+deathParentLit :: Anf.Atom
+deathParentLit = Anf.ALit (Anf.LStr (T.pack "hello world long here"))
+
+-- | @slice s 0 10@ over an atom -- a 10-byte window (> 7) => an 'NStringView'.
+deathSliceRhs :: Anf.Atom -> Anf.Rhs
+deathSliceRhs parent =
+  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+    [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 10)]
+
+-- | @byteSlice s 0 10@ over an atom -- a 10-byte window (> 7) => an 'NStringView'.
+deathByteSliceRhs :: Anf.Atom -> Anf.Rhs
+deathByteSliceRhs parent =
+  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringByteSliceName))
+    [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 10)]
+
+-- | The Perceus-synthesized @__rc_drop@ name (matched by HINT, like the reuse tests).
+deathDropName :: Name
+deathDropName = Name.Name PN.rcDropName (Unique (-901))
+
+-- | Run a hand-instrumented Expr under the death-test flag, forcing the given view
+-- binder 'Unique's to 'Window' (the negative-control override). The slice-rep map is
+-- empty (the force-set is the only routing source here), matching how a deliberately
+-- mis-routed slice is constructed. Returns the run result.
+runDeath :: Set.Set Unique -> Anf.Expr -> IO (Either IV.RuntimeError (St.RCValue, St.Store))
+runDeath forced =
+  RCM.runExprRCDeathTest RCP.rcPrimTable Map.empty forced
+    Map.empty (St.initSentinel St.emptyStore)
+
+-- | Assert a death-test run SUCCEEDS (the invariant did NOT fire) and renders the
+-- given expected output. Proves zero false positives on a correct (non-escaping)
+-- program run with its view genuinely registered as 'Window'.
+assertDeathPasses :: String -> Set.Set Unique -> Anf.Expr -> Text -> IO ()
+assertDeathPasses lbl forced e expected =
+  runDeath forced e >>= \case
+    Left err -> assertFailure (lbl <> ": expected success but the death-test fired/failed: " <> show err)
+    Right (v, s) ->
+      case St.renderRCValue s v of
+        Left err  -> assertFailure (lbl <> ": render failed: " <> show err)
+        Right txt -> txt @?= expected
+
+-- | Assert a death-test run FIRES the escape invariant (the permanent negative
+-- control). A 'Left' carrying any OTHER error, or a success, fails the test -- so the
+-- teeth are load-bearing: if the fire ever stops, this fails.
+assertDeathFires :: String -> Set.Set Unique -> Anf.Expr -> IO ()
+assertDeathFires lbl forced e =
+  runDeath forced e >>= \case
+    Left (IV.PrimError m)
+      | T.pack "view escaped its birth activation" `T.isInfixOf` m -> pure ()
+    Left e' -> assertFailure (lbl <> ": expected the escape invariant to fire, got a different error: " <> show e')
+    Right _ -> assertFailure (lbl <> ": NEGATIVE CONTROL DID NOT FIRE -- a forced-Window escaping view passed the death-test (the teeth are broken)")
+
+rcSliceDeathTests :: TestTree
+rcSliceDeathTests = testGroup "rcSliceDeath"
+  [ -- =====================================================================
+    -- (a) ZERO FALSE POSITIVES: correct, non-escaping Window views never fire.
+    -- =====================================================================
+
+    -- A non-escaping slice whose view is dropped before the activation returns.
+    -- The view is genuinely registered as 'Window' (forced), so the bracket is
+    -- active; it dies (rc->0, deleted) before close -> the invariant does NOT fire.
+    --   let s = "hello world long here"   -- NString (21B)
+    --       v = slice s 0 10              -- NStringView "hello worl" (10B), Window
+    --       _ = __rc_drop v               -- v dies here (cascade decrefs s -> s freed)
+    --   in 0
+    testCase "non-escaping Window view dropped before return: passes (no false positive)" $ do
+      let e = runFresh $ do
+                nS <- freshName (T.pack "s")
+                nV <- freshName (T.pack "v")
+                nD <- freshName (T.pack "_d")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+                  (Anf.Let (rcBnd nD)
+                     (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nV])
+                  (Anf.Ret (Anf.ALit (Anf.LInt 0)))))
+          -- Force the view binder 'Window' so the bracket genuinely activates.
+          forced = forcedUniquesOf [(T.pack "v")] e
+      assertDeathPasses "drop-before-return" forced e (T.pack "0")
+
+    -- Same for byteSlice (the O(1) byte-indexed view): non-escaping, dropped, passes.
+  , testCase "non-escaping Window byteSlice view dropped before return: passes" $ do
+      let e = runFresh $ do
+                nS <- freshName (T.pack "s")
+                nV <- freshName (T.pack "v")
+                nD <- freshName (T.pack "_d")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathByteSliceRhs (Anf.AVar nS))
+                  (Anf.Let (rcBnd nD)
+                     (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nV])
+                  (Anf.Ret (Anf.ALit (Anf.LInt 0)))))
+          forced = forcedUniquesOf [T.pack "v"] e
+      assertDeathPasses "byteslice-drop-before-return" forced e (T.pack "0")
+
+    -- A view matched-in-place (a Case scrutinee, the §5.1 non-escape) then dropped:
+    -- the genuine 'Window' shape the planner routes. Passes.
+    --   let s = "..." ; v = slice s 0 10 in (case v of _ -> let _ = __rc_drop v in 0)
+  , testCase "non-escaping Window view matched-in-place then dropped: passes" $ do
+      let e = runFresh $ do
+                nS <- freshName (T.pack "s")
+                nV <- freshName (T.pack "v")
+                nD <- freshName (T.pack "_d")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+                  (Anf.Case (Anf.AVar nV)
+                     [ Anf.AltDefault
+                         (Anf.Let (rcBnd nD)
+                            (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nV])
+                         (Anf.Ret (Anf.ALit (Anf.LInt 0)))) ]))
+          forced = forcedUniquesOf [T.pack "v"] e
+      assertDeathPasses "matched-in-place" forced e (T.pack "0")
+
+    -- Slice-of-slice (flatten): the inner view @v1@ is CONSUMED by the outer slice
+    -- prim (it flattens @v2@ to point at the ROOT @s@, incref'ing the root and
+    -- dropping its @v1@ input), so @v1@ is freed at the @v2@ slice -- absent from the
+    -- store before the close (its registration clears cleanly). The OUTER view @v2@
+    -- is non-escaping and dropped before return. Both were forced 'Window'; both are
+    -- dead at close -> passes. Pins the flatten-on-construction register/clear path.
+    --   let s  = "..." ; v1 = slice s 0 15 ; v2 = slice v1 0 10   -- v2 consumes v1
+    --       _  = __rc_drop v2                                       -- decrefs root s
+    --   in 0
+  , testCase "slice-of-slice both non-escaping and dropped: passes" $ do
+      let e = runFresh $ do
+                nS  <- freshName (T.pack "s")
+                nV1 <- freshName (T.pack "v1")
+                nV2 <- freshName (T.pack "v2")
+                nD2 <- freshName (T.pack "_d2")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV1)
+                     (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+                        [Anf.AVar nS, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 15)])
+                  (Anf.Let (rcBnd nV2) (deathSliceRhs (Anf.AVar nV1))
+                  (Anf.Let (rcBnd nD2)
+                     (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nV2])
+                  (Anf.Ret (Anf.ALit (Anf.LInt 0))))))
+          forced = forcedUniquesOf [T.pack "v1", T.pack "v2"] e
+      assertDeathPasses "slice-of-slice" forced e (T.pack "0")
+
+    -- Control that the flag-off path is unperturbed: the SAME escaping program that
+    -- the negative control fires on passes silently when NOT forced Window and run
+    -- with the flag effectively off (empty force-set, empty slice-reps). Confirms the
+    -- death-test never fires unless a view is actually routed 'Window'.
+  , testCase "escaping view NOT routed Window (flag inert): passes (release parity)" $ do
+      let e = runFresh $ do
+                nS <- freshName (T.pack "s")
+                nV <- freshName (T.pack "v")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+                  (Anf.Ret (Anf.AVar nV)))
+      -- No forced Window: the escaping view routes (effectively) Counted -> no
+      -- registration -> the close finds an empty window-set -> passes. The rendered
+      -- view is the 10-byte codepoint window of the parent (a String renders quoted).
+      assertDeathPasses "escape-not-window" Set.empty e (T.pack (show ("hello worl" :: String)))
+
+    -- =====================================================================
+    -- (b) REAL TEETH: a forced-Window ESCAPING view trips the invariant.
+    --     PERMANENT NEGATIVE CONTROLS -- if any stops firing, the test FAILS.
+    -- =====================================================================
+
+    -- The view is RETURNED (escapes), forced 'Window'. It is alive at the
+    -- activation's close -> the invariant FIRES.
+    --   let s = "..." ; v = slice s 0 10 in v          -- v escapes via return
+  , testCase "NEGATIVE CONTROL: forced-Window view returned (escapes) FIRES" $ do
+      let e = runFresh $ do
+                nS <- freshName (T.pack "s")
+                nV <- freshName (T.pack "v")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+                  (Anf.Ret (Anf.AVar nV)))
+          forced = forcedUniquesOf [T.pack "v"] e
+      assertDeathFires "return-escape" forced e
+
+    -- Same teeth on byteSlice: a forced-Window escaping byteSlice view FIRES.
+  , testCase "NEGATIVE CONTROL: forced-Window byteSlice view returned FIRES" $ do
+      let e = runFresh $ do
+                nS <- freshName (T.pack "s")
+                nV <- freshName (T.pack "v")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathByteSliceRhs (Anf.AVar nS))
+                  (Anf.Ret (Anf.AVar nV)))
+          forced = forcedUniquesOf [T.pack "v"] e
+      assertDeathFires "byteslice-return-escape" forced e
+
+    -- The view is STORED in an outliving cons cell that is returned (escapes), forced
+    -- 'Window'. The cons keeps the view alive past the activation close -> FIRES.
+    --   let s = "..." ; v = slice s 0 10 ; nil = Nil ; xs = Cons v nil in xs
+  , testCase "NEGATIVE CONTROL: forced-Window view stored in returned cons FIRES" $ do
+      let e = runFresh $ do
+                nS   <- freshName (T.pack "s")
+                nV   <- freshName (T.pack "v")
+                nNil <- freshName (T.pack "nil")
+                nXs  <- freshName (T.pack "xs")
+                pure $
+                  Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+                  (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+                  (Anf.Let (rcBnd nNil) (Anf.RCon (T.pack "Nil") [])
+                  (Anf.Let (rcBnd nXs)
+                     (Anf.RCon (T.pack "Cons") [Anf.AVar nV, Anf.AVar nNil])
+                  (Anf.Ret (Anf.AVar nXs)))))
+          forced = forcedUniquesOf [T.pack "v"] e
+      assertDeathFires "store-in-cons-escape" forced e
+  ]
+
+-- | Collect the 'Unique's of the binders in an Expr whose name HINTS are in the
+-- given list. Used to build the 'rceForceWindow' override from readable binder
+-- names without hard-coding the fresh-supply integers.
+-- NOTE (partial traversal, intentional): collects binder Uniques whose name
+-- matches a hint, walking only Let/Case/LetJoin-body/Handle. It does NOT descend
+-- into LetRec function-member bodies or bind LetRec/LetJoin parameter binders --
+-- the death-test programs never force a name living in those positions. A future
+-- caller that needs such a name must extend the walk.
+forcedUniquesOf :: [Text] -> Anf.Expr -> Set.Set Unique
+forcedUniquesOf hints = Set.fromList . go
+  where
+    want b = nameHint (Anf.bndName b) `elem` hints
+    keep b = [ nameUniq (Anf.bndName b) | want b ]
+    go (Anf.Let b _ e)        = keep b ++ go e
+    go (Anf.Case _ alts)      = concatMap goAlt alts
+    go (Anf.LetRec _ e)       = go e
+    go (Anf.LetJoin _ _ jb e) = go jb ++ go e
+    go (Anf.Ret _)            = []
+    go (Anf.Jump _ _)         = []
+    go (Anf.Handle e h)       = go e ++ go (snd (Anf.hReturn h))
+                                  ++ concatMap (go . Anf.oaBody) (Anf.hOps h)
+    goAlt (Anf.AltCon _ _ e)  = go e
+    goAlt (Anf.AltLit _ e)    = go e
+    goAlt (Anf.AltDefault e)  = go e
+
+-- ---------------------------------------------------------------------------
+-- Adversarial UAF exploit programs + savings/leak oracle (String Slice E4 Task 7)
+--
+-- Five layers of evidence close the Task-7 gate:
+--
+--   [counted / release-path]    each .wok program produces the CORRECT output on all
+--                               three backends (reference, RC AbstractHeap, RC CHeap).
+--                               Driven by 'rcParityHarness' (abstract==C + output parity)
+--                               and 'rcDifferentialHarness' (already auto-wired via the
+--                               corpus auto-discovery in 'main').
+--
+--   [forced-window / death-test] the same adversarial escape shape, expressed as a
+--                               hand-built 'Anf.Expr', fires the escape invariant when
+--                               the view binder is forced to 'Window' (via
+--                               'forcedUniquesOf ["v"]' + 'assertDeathFires').
+--                               The passing-side variant ('assertDeathPasses') confirms
+--                               the same shape with no forced binder does NOT fire.
+--
+--   [no-copy savings oracle]    a view of a long-byte window costs 32B (fixed view cell,
+--                               zero new byte buffer) vs a materialized independent string
+--                               of the same bytes costing 16 + roundup(N,8).  Pinned on
+--                               BOTH RC backends via 'stPeakBytes'.
+--
+--   [leak balance]              after all views and their parents drop, frees == allocs
+--                               and 'stLive' returns to baseline, on BOTH RC backends.
+--
+--   [sanitizer + full suite]    ASan/LSan clean ('scripts/asan-runtime.sh'); full
+--                               'cabal test wok-tests' green.
+
+-- ---------------------------------------------------------------------------
+-- Four adversarial shapes (correct-output evidence on BOTH RC backends):
+--   40-adversarial-escape-closure.wok      output 15
+--   41-adversarial-store-parent-dropped.wok output 15
+--   42-adversarial-slice-of-slice-mid-dies.wok output 10
+--   43-adversarial-append-outlives.wok     output 18
+-- ---------------------------------------------------------------------------
+
+-- | Run one adversarial corpus program and assert output parity on the abstract
+-- + C backends AND that the expected output matches the value computed independently.
+adversarialOutputCheck :: FilePath -> Text -> Assertion
+adversarialOutputCheck path expected = do
+  (absR, cR, _, _) <- withBothBackends path
+  case (absR, cR) of
+    (Right a, Right c) -> do
+      assertEqual (path <> ": abstract output") expected (RCM.rcOutput a)
+      assertEqual (path <> ": C output") expected (RCM.rcOutput c)
+      assertEqual (path <> ": abstract == C output") (RCM.rcOutput a) (RCM.rcOutput c)
+    (Left e, _) -> assertFailure (path <> ": abstract backend failed: " <> show e)
+    (_, Left e) -> assertFailure (path <> ": C backend failed: " <> show e)
+
+-- ---------------------------------------------------------------------------
+-- Death-test ANF programs for the four adversarial shapes
+--
+-- Each shape has two variants:
+--   (a) PASSES: the view 'v' is dropped/consumed before return (not escaping).
+--       Forced Window via 'forcedUniquesOf ["v"]' to activate the bracket.
+--   (b) FIRES: the view 'v' escapes (returned / stored / captured). Forced
+--       Window via 'forcedUniquesOf ["v"]' -> the bracket detects 'v' alive at
+--       activation close -> fires "@view escaped its birth activation@".
+-- ---------------------------------------------------------------------------
+
+-- Shape 1: escape-closure.
+--
+-- FIRES: 'v' is captured by a lambda 'f' which is RETURNED.  The closure holds
+-- 'v' alive (via its env) at activation close -> FIRES.
+--
+--   let s = "hello world long here"
+--   let v = slice s 0 10           -- NStringView (forced Window)
+--   let f = \param -> v            -- closure captures v
+--   f                              -- return f; v alive inside f -> FIRES
+--
+-- PASSES: 'f' is CALLED (not returned), the returned 'v' is explicitly dropped,
+-- then the original 'v' is also dropped (it was never passed into the closure
+-- without a dup, so both the closure-call's incref and the original binding
+-- must be balanced).
+--
+--   let s = "..."
+--   let v = slice s 0 10
+--   let f = \param -> v
+--   let r = f 0                    -- call f: incref v (body entry), body returns v
+--   let _ = __rc_drop r            -- drop returned v (rc 2->1)
+--   let _ = __rc_drop v            -- drop original v binding (rc 1->0, freed)
+--   0
+
+adv1EscapeClosureFires :: Anf.Expr
+adv1EscapeClosureFires = runFresh $ do
+  nS     <- freshName (T.pack "s")
+  nV     <- freshName (T.pack "v")
+  nParam <- freshName (T.pack "param")
+  nF     <- freshName (T.pack "f")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+    (Anf.Let (rcBnd nF)
+       (Anf.RLam [rcBnd nParam] (Anf.Ret (Anf.AVar nV)))
+    (Anf.Ret (Anf.AVar nF))))
+
+adv1EscapeClosurePasses :: Anf.Expr
+adv1EscapeClosurePasses = runFresh $ do
+  nS     <- freshName (T.pack "s")
+  nV     <- freshName (T.pack "v")
+  nParam <- freshName (T.pack "param")
+  nF     <- freshName (T.pack "f")
+  nR     <- freshName (T.pack "r")
+  nD1    <- freshName (T.pack "_d1")
+  nD2    <- freshName (T.pack "_d2")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+    (Anf.Let (rcBnd nF)
+       (Anf.RLam [rcBnd nParam] (Anf.Ret (Anf.AVar nV)))
+    (Anf.Let (rcBnd nR)
+       -- Call f: nV is incref'd (body entry), body returns nV. r = va (rc 2).
+       (Anf.RApp (Anf.AVar nF) [Anf.ALit (Anf.LInt 0)])
+    (Anf.Let (rcBnd nD1)
+       (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nR])
+    (Anf.Let (rcBnd nD2)
+       (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nV])
+    (Anf.Ret (Anf.ALit (Anf.LInt 0))))))))
+
+-- Shape 2: store-parent-dropped.
+--
+-- FIRES: 'v' is stored in a 'Box' constructor cell which is RETURNED.
+-- 'v' is alive inside the cons at activation close -> FIRES.
+--
+--   let v = slice s 0 10
+--   let box = Box v
+--   box                             -- returned; v alive inside box -> FIRES
+--
+-- PASSES: the box is explicitly dropped before return, cascading v to 0.
+--
+--   let v = slice s 0 10
+--   let box = Box v
+--   let _ = __rc_drop box          -- cascade: decref v -> 0, freed
+--   0
+
+adv2StoreParentDroppedFires :: Anf.Expr
+adv2StoreParentDroppedFires = runFresh $ do
+  nS   <- freshName (T.pack "s")
+  nV   <- freshName (T.pack "v")
+  nBox <- freshName (T.pack "box")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+    (Anf.Let (rcBnd nBox)
+       (Anf.RCon (T.pack "Box") [Anf.AVar nV])
+    (Anf.Ret (Anf.AVar nBox))))
+
+adv2StoreParentDroppedPasses :: Anf.Expr
+adv2StoreParentDroppedPasses = runFresh $ do
+  nS   <- freshName (T.pack "s")
+  nV   <- freshName (T.pack "v")
+  nBox <- freshName (T.pack "box")
+  nD   <- freshName (T.pack "_d")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+    (Anf.Let (rcBnd nBox)
+       (Anf.RCon (T.pack "Box") [Anf.AVar nV])
+    (Anf.Let (rcBnd nD)
+       (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nBox])
+    (Anf.Ret (Anf.ALit (Anf.LInt 0))))))
+
+-- Shape 3: slice-of-slice with escaping outer view.
+--
+-- FIRES: the outer view 'v2' (which roots at the root buffer via flatten)
+-- is RETURNED.  v2 is alive at activation close -> FIRES.
+-- v1 is consumed by the slice prim during v2's construction (freed at that
+-- point, so forcing v1 Window would PASS -- not the interesting direction here).
+--
+--   let s  = "hello world long here" (21B)
+--   let v1 = slice s 0 15           -- NStringView over s (forced Window too)
+--   let v2 = slice v1 0 10          -- flatten: v2 roots at s; v1 freed
+--   v2                              -- v2 escapes -> FIRES
+--
+-- PASSES: v2 is dropped before return (v1 was already freed by the slice prim).
+--
+--   let v2 = (as above)
+--   let _ = __rc_drop v2            -- decref root s -> 0, freed
+--   0
+
+adv3SliceOfSliceFires :: Anf.Expr
+adv3SliceOfSliceFires = runFresh $ do
+  nS  <- freshName (T.pack "s")
+  nV1 <- freshName (T.pack "v1")
+  nV2 <- freshName (T.pack "v2")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV1)
+       (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+          [Anf.AVar nS, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 15)])
+    (Anf.Let (rcBnd nV2) (deathSliceRhs (Anf.AVar nV1))
+    (Anf.Ret (Anf.AVar nV2))))
+
+adv3SliceOfSlicePasses :: Anf.Expr
+adv3SliceOfSlicePasses = runFresh $ do
+  nS  <- freshName (T.pack "s")
+  nV1 <- freshName (T.pack "v1")
+  nV2 <- freshName (T.pack "v2")
+  nD  <- freshName (T.pack "_d")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV1)
+       (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+          [Anf.AVar nS, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 15)])
+    (Anf.Let (rcBnd nV2) (deathSliceRhs (Anf.AVar nV1))
+    (Anf.Let (rcBnd nD)
+       (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nV2])
+    (Anf.Ret (Anf.ALit (Anf.LInt 0))))))
+
+-- Shape 4: append-outlives (view fed to append, result outlives both operands).
+--
+-- FIRES: if 'v' is returned DIRECTLY (escaping) rather than fed to append,
+-- the Window claim is violated -> FIRES.  This is the exploit: a
+-- 'Window'-routed view that escapes before append can read it.
+--
+--   let v = slice s 0 10
+--   v                               -- v escapes -> FIRES
+--
+-- PASSES: 'v' is consumed by the 'append' prim (drops v, freeing the parent);
+-- the append result is then also dropped.  v is dead at close -> PASSES.
+--
+--   let v   = slice s 0 10
+--   let sfx = "!!!"                 -- InlineStr, short
+--   let a   = append v sfx          -- append consumes v (drop v, rc->0, freed)
+--   let _   = __rc_drop a
+--   0
+
+-- A 3-byte suffix InlineStr atom for the append-outlives shape.
+adv4SuffixAtom :: Anf.Atom
+adv4SuffixAtom = Anf.ALit (Anf.LStr (T.pack "!!!"))
+
+adv4AppendOutlivesFires :: Anf.Expr
+adv4AppendOutlivesFires = runFresh $ do
+  nS <- freshName (T.pack "s")
+  nV <- freshName (T.pack "v")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+    (Anf.Ret (Anf.AVar nV)))
+
+adv4AppendOutlivesPasses :: Anf.Expr
+adv4AppendOutlivesPasses = runFresh $ do
+  nS   <- freshName (T.pack "s")
+  nV   <- freshName (T.pack "v")
+  nSfx <- freshName (T.pack "sfx")
+  nA   <- freshName (T.pack "a")
+  nD   <- freshName (T.pack "_d")
+  pure $
+    Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
+    (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
+    (Anf.Let (rcBnd nSfx) (Anf.RAtom adv4SuffixAtom)
+    (Anf.Let (rcBnd nA)
+       (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringAppendName))
+          [Anf.AVar nV, Anf.AVar nSfx])
+    (Anf.Let (rcBnd nD)
+       (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nA])
+    (Anf.Ret (Anf.ALit (Anf.LInt 0)))))))
+
+-- ---------------------------------------------------------------------------
+-- The adversarial test group
+-- ---------------------------------------------------------------------------
+
+rcSliceAdversarialTests :: TestTree
+rcSliceAdversarialTests = testGroup "rcSliceAdversarial"
+  [ -- ==========================================================================
+    -- Evidence axis 1: CORRECT OUTPUT ON ALL 3 BACKENDS (counted / release path)
+    --
+    -- Each .wok program is run through the full pipeline on BOTH RC backends
+    -- (abstract heap + C heap) and asserted to produce the expected output.
+    -- The reference-interpreter comparison is also covered: the corpus
+    -- auto-discovery in 'main' wires all four files to 'rcDifferentialHarness'
+    -- (abstract==reference) and 'rcCBackendParity' (abstract==C parity).
+    -- ==========================================================================
+
+    testCase "40-escape-closure: correct output (15) on both RC backends" $
+      adversarialOutputCheck
+        "test/rc-string/40-adversarial-escape-closure.wok"
+        (T.pack "15")
+
+  , testCase "41-store-parent-dropped: correct output (15) on both RC backends" $
+      adversarialOutputCheck
+        "test/rc-string/41-adversarial-store-parent-dropped.wok"
+        (T.pack "15")
+
+  , testCase "42-slice-of-slice-mid-dies: correct output (10) on both RC backends" $
+      adversarialOutputCheck
+        "test/rc-string/42-adversarial-slice-of-slice-mid-dies.wok"
+        (T.pack "10")
+
+  , testCase "43-append-outlives: correct output (18) on both RC backends" $
+      adversarialOutputCheck
+        "test/rc-string/43-adversarial-append-outlives.wok"
+        (T.pack "18")
+
+  , -- ==========================================================================
+    -- Evidence axis 2: FORCED-WINDOW FIRES (death-test / exploit path)
+    --
+    -- Each adversarial shape, with its escaping view binder forced to 'Window'
+    -- via 'forcedUniquesOf ["v"]', TRIPS the escape invariant.  The passing-side
+    -- variant (same shape but the view is consumed/dropped before return) does NOT
+    -- fire, proving zero false positives on these specific adversarial patterns.
+    -- ==========================================================================
+
+    -- Shape 1: escape-closure -- v captured by a returned lambda -> FIRES.
+    testCase "adv1 escape-closure: FIRES when forced-Window view captured by returned closure" $ do
+      let forced = forcedUniquesOf [T.pack "v"] adv1EscapeClosureFires
+      assertDeathFires "escape-closure-fires" forced adv1EscapeClosureFires
+
+  , testCase "adv1 escape-closure: PASSES when forced-Window view is called then dropped (non-escaping)" $ do
+      let forced = forcedUniquesOf [T.pack "v"] adv1EscapeClosurePasses
+      assertDeathPasses "escape-closure-passes" forced adv1EscapeClosurePasses (T.pack "0")
+
+    -- Shape 2: store-parent-dropped -- v stored in Box constructor, Box returned -> FIRES.
+  , testCase "adv2 store-parent-dropped: FIRES when forced-Window view stored in returned Box" $ do
+      let forced = forcedUniquesOf [T.pack "v"] adv2StoreParentDroppedFires
+      assertDeathFires "store-parent-dropped-fires" forced adv2StoreParentDroppedFires
+
+  , testCase "adv2 store-parent-dropped: PASSES when forced-Window view in Box is dropped before return" $ do
+      let forced = forcedUniquesOf [T.pack "v"] adv2StoreParentDroppedPasses
+      assertDeathPasses "store-parent-dropped-passes" forced adv2StoreParentDroppedPasses (T.pack "0")
+
+    -- Shape 3: slice-of-slice with escaping outer view -- outer (v2) returned -> FIRES.
+    -- v1 (intermediate) is consumed by the slice prim (flatten) and freed before
+    -- the activation closes; forcing v1 Window would not fire (it's already dead).
+    -- Forcing v2 Window FIRES because v2 escapes via return.
+  , testCase "adv3 slice-of-slice-mid-dies: FIRES when forced-Window outer view is returned" $ do
+      let forced = forcedUniquesOf [T.pack "v2"] adv3SliceOfSliceFires
+      assertDeathFires "slice-of-slice-outer-fires" forced adv3SliceOfSliceFires
+
+  , testCase "adv3 slice-of-slice-mid-dies: PASSES when forced-Window outer view is dropped before return" $ do
+      let forced = forcedUniquesOf [T.pack "v2"] adv3SliceOfSlicePasses
+      assertDeathPasses "slice-of-slice-outer-passes" forced adv3SliceOfSlicePasses (T.pack "0")
+
+  , testCase "adv3 slice-of-slice-mid-dies: mid (v1) consumed by slice prim -- forcing v1 Window PASSES (v1 already dead at close)" $ do
+      -- v1 is freed when the flatten builds v2. Forcing v1 Window registers it,
+      -- but it is removed from the store by the flatten drop. At activation close
+      -- v1 is not present -> no fire. This is the "intermediate consumed" proof.
+      let forced = forcedUniquesOf [T.pack "v1"] adv3SliceOfSlicePasses
+      assertDeathPasses "slice-of-slice-mid-consumed" forced adv3SliceOfSlicePasses (T.pack "0")
+
+    -- Shape 4: append-outlives -- v returned without being fed to append -> FIRES;
+    -- v consumed by append (dropped inside append prim) -> PASSES.
+  , testCase "adv4 append-outlives: FIRES when forced-Window view returned instead of consumed by append" $ do
+      let forced = forcedUniquesOf [T.pack "v"] adv4AppendOutlivesFires
+      assertDeathFires "append-outlives-fires" forced adv4AppendOutlivesFires
+
+  , testCase "adv4 append-outlives: PASSES when forced-Window view is consumed by append before return" $ do
+      let forced = forcedUniquesOf [T.pack "v"] adv4AppendOutlivesPasses
+      assertDeathPasses "append-outlives-passes" forced adv4AppendOutlivesPasses (T.pack "0")
+
+    -- ==========================================================================
+    -- Evidence axis 3: NO-COPY SAVINGS ORACLE (AC3)
+    --
+    -- A view of an N-byte window costs a FIXED 32-byte view cell with ZERO new
+    -- byte buffer, regardless of N.  Materializing the same window as an
+    -- independent NString costs 'wouldBeCBytes (NString wb)' = 16 + roundup(N,8).
+    --
+    -- Demonstration with N=41 bytes:
+    --   parent string: "hello wonderful world extra text here ok!" (41B)
+    --   wouldBeCBytes (NString 41B) = 16 + 8*ceil(41/8) = 16 + 8*6 = 16+48 = 64
+    --   view of full 41B window: 32B (fixed, always)
+    --   win: 64 - 32 = 32 bytes saved vs an independent copy
+    --
+    -- Asserted on BOTH RC backends (abstract heap then CHeap).
+    -- The 'peak_bytes' delta is the direct measure: after alloc parent + alloc view,
+    -- stPeakBytes == parentCBytes + 32 (view cell fixed).  Materializing the same
+    -- window separately gives stPeakBytes == parentCBytes + matCBytes.
+    -- ==========================================================================
+
+  , testCase "savings: view cell = 32B fixed; materialised = 64B for 41-byte window (AbstractHeap)" $ do
+      let parentBs    = TxEnc.encodeUtf8 (T.pack "hello wonderful world extra text here ok!")
+          -- 41 bytes: wouldBeCBytes = 16 + 8*ceil(41/8) = 16 + 8*6 = 64
+          parentCBytes = St.wouldBeCBytes (St.NString parentBs)
+          s0           = St.emptyStore
+      -- Alloc parent
+      (pa, s1) <- allocStringHelper parentBs s0
+      -- Alloc view (all 41 bytes)
+      rv <- runExceptT (St.allocNStringView pa 0 41 s1)
+      (va, s2) <- case rv of
+        Left e  -> assertFailure ("allocNStringView failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- peak_bytes after parent + view
+      let viewPeak = St.stPeakBytes (St.stStats s2)
+      -- Expected: parent cell + view cell
+      assertEqual "view savings (abstract): parent + 32B view"
+        (parentCBytes + 32) viewPeak
+      -- Drop view (decref parent -> rc 1); drop parent
+      rv2 <- runExceptT (St.dropAddr va s2)
+      s3  <- case rv2 of
+        Left e  -> assertFailure ("drop view failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      _s4 <- case St.dropAddrPure pa s3 of
+        Left e  -> assertFailure ("drop parent failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- Materialised comparison: same bytes, fresh NString
+      let matCBytes = St.wouldBeCBytes (St.NString parentBs)
+      assertEqual "materialised: 16 + roundup(41,8)*8 = 64"
+        (64 :: Int) matCBytes
+      -- The win: view (32) vs materialised (64): saves 32 bytes
+      assertBool "view is strictly cheaper than materialised (32 < 64)"
+        (32 < matCBytes)
+
+  , testCase "savings: view cell = 32B fixed; materialised = 64B for 41-byte window (CHeap)" $ do
+      hp <- Heap.wokHeapNew
+      let parentBs    = TxEnc.encodeUtf8 (T.pack "hello wonderful world extra text here ok!")
+          parentCBytes = St.wouldBeCBytes (St.NString parentBs)
+          s0           = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NString parentBs) s0)
+      (pa, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      rv <- runExceptT (St.allocNStringView pa 0 41 s1)
+      (va, s2) <- case rv of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("allocNStringView CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      -- peak_bytes: parent cell + view cell
+      let viewPeak = St.stPeakBytes (St.stStats s2)
+      assertEqual "CHeap view savings: parent + 32B view"
+        (parentCBytes + 32) viewPeak
+      -- Drop view, drop parent
+      rv2 <- runExceptT (St.dropAddr va s2)
+      s3 <- case rv2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("drop view CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      rv3 <- runExceptT (St.dropAddr pa s3)
+      case rv3 of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("drop parent CHeap failed: " <> show e) }
+        Right _ -> do
+          cLive   <- Heap.wokStatLive   hp
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          assertEqual "CHeap savings: wok_stat_live == 0 after all drops" (0 :: Int64) cLive
+          assertEqual "CHeap savings: allocs == frees" cAllocs cFrees
+          Heap.wokHeapFree hp
+      -- Materialised comparison
+      let matCBytes = St.wouldBeCBytes (St.NString parentBs)
+      assertEqual "materialised: 16 + roundup(41,8)*8 = 64" (64 :: Int) matCBytes
+      assertBool "CHeap view is strictly cheaper than materialised (32 < 64)"
+        (32 < matCBytes)
+
+    -- ==========================================================================
+    -- Evidence axis 4: LEAK BALANCE (AC4)
+    --
+    -- After all views and their parents have been dropped, 'frees == allocs' and
+    -- 'stLive' returns to the pre-allocation baseline, on BOTH RC backends.
+    -- ==========================================================================
+
+  , testCase "leak-balance: view + parent, drop both: frees == allocs (AbstractHeap)" $ do
+      let parentBs = TxEnc.encodeUtf8 (T.pack "hello wonderful world")
+          s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      (pa, s1) <- allocStringHelper parentBs s0
+      rv <- runExceptT (St.allocNStringView pa 0 15 s1)
+      (va, s2) <- case rv of
+        Left e  -> assertFailure ("allocNStringView failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- 2 live cells: parent + view
+      assertEqual "2 live after alloc" (baseline + 2) (St.stLive (St.stStats s2))
+      -- Drop view (cascade decref parent, rc 2->1); view freed.
+      rv2 <- runExceptT (St.dropAddr va s2)
+      s3  <- case rv2 of
+        Left e  -> assertFailure ("drop view failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      assertEqual "1 live after view drop (parent survives)" (baseline + 1) (St.stLive (St.stStats s3))
+      -- Drop parent (rc 1->0, freed).
+      s4 <- case St.dropAddrPure pa s3 of
+        Left e  -> assertFailure ("drop parent failed: " <> show e) >> error "unreachable"
+        Right x -> pure x
+      -- All balanced: back to baseline, allocs == frees.
+      assertEqual "0 live after parent drop" baseline (St.stLive (St.stStats s4))
+      assertEqual "allocs == frees"
+        (St.stAllocs (St.stStats s4)) (St.stFrees (St.stStats s4))
+
+  , testCase "leak-balance: view + parent, drop both: frees == allocs (CHeap)" $ do
+      hp <- Heap.wokHeapNew
+      let parentBs = TxEnc.encodeUtf8 (T.pack "hello wonderful world")
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NString parentBs) s0)
+      (pa, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NString CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      rv <- runExceptT (St.allocNStringView pa 0 15 s1)
+      (va, s2) <- case rv of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("allocNStringView CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      rv2 <- runExceptT (St.dropAddr va s2)
+      s3  <- case rv2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("drop view CHeap failed: " <> show e) >> error "unreachable" }
+        Right x -> pure x
+      rv3 <- runExceptT (St.dropAddr pa s3)
+      case rv3 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("drop parent CHeap failed: " <> show e) }
+        Right _ -> do
+          cLive   <- Heap.wokStatLive   hp
+          cAllocs <- Heap.wokStatAllocs hp
+          cFrees  <- Heap.wokStatFrees  hp
+          Heap.wokHeapFree hp
+          -- Leak balance: C runtime fully balanced.
+          assertEqual "CHeap leak-balance: wok_stat_live == 0" (0 :: Int64) cLive
+          assertEqual "CHeap leak-balance: allocs == frees" cAllocs cFrees
+  ]
+
+-- ---------------------------------------------------------------------------
 -- Std.String prim tests (Slice E1, Task 4)
 --
 -- These tests drive the String prims directly on the abstract heap (like
@@ -19116,6 +20465,261 @@ rcStringPrimTests = testGroup "rc string prims"
         Left e  -> assertFailure ("render failed: " <> show e)
       s4 <- dropResult result s3
       St.stLive (St.stStats s4) @?= baseline
+
+  -- ---------------------------------------------------------------
+  -- slice (E4 Task 3)
+  -- ---------------------------------------------------------------
+  , testCase "slice: ASCII window <= 7B is InlineStr, 0 new allocs, drops input" $ do
+      -- "hello world" (11B); slice 0 5 = "hello" (5B <= maxInlineStr=7) -> InlineStr.
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          bs       = TxEnc.encodeUtf8 (T.pack "hello world")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+          allocsBefore = St.stAllocs (St.stStats s1)
+      (result, s2) <- callPrim pSlice [St.RVBox sa, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 5)] s1
+      -- Result must be InlineStr (the RVBox wraps the InlineStr addr).
+      case result of
+        St.RVBox (St.InlineStr wb) -> TxEnc.decodeUtf8 wb @?= T.pack "hello"
+        _ -> assertFailure ("expected InlineStr, got: " <> show result)
+      -- 0 new allocs (InlineStr is never heap-allocated).
+      St.stAllocs (St.stStats s2) - allocsBefore @?= 0
+      -- Live count returns to pre-alloc baseline (sa was dropped by the prim).
+      St.stLive (St.stStats s2) @?= baseline
+
+  , testCase "slice: long window > 7B is NStringView, incref parent, drops input" $ do
+      -- "hello wonderful world" (21B); slice 6 15 = "wonderful world" (15B > 7) -> NStringView.
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0       = St.emptyStore
+          bs       = TxEnc.encodeUtf8 (T.pack "hello wonderful world")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+          baseline = St.stLive (St.stStats s1)  -- 1 live: the parent
+      (result, s2) <- callPrim pSlice [St.RVBox sa, St.RVLit (Anf.LInt 6), St.RVLit (Anf.LInt 15)] s1
+      -- Result must be an HAddr or CAddr (a view cell), NOT InlineStr.
+      case result of
+        St.RVBox (St.InlineStr _) -> assertFailure "expected NStringView cell, got InlineStr"
+        St.RVBox _ -> pure ()  -- HAddr or CAddr: good
+        _ -> assertFailure ("expected RVBox of NStringView, got: " <> show result)
+      -- 2 live cells: parent + view (view is a new allocation).
+      St.stLive (St.stStats s2) @?= baseline + 1
+      -- The view's bytes must match the expected substring.
+      rb <- runExceptT (RCP.stringBytes result s2)
+      case rb of
+        Left e   -> assertFailure ("stringBytes on view failed: " <> show e)
+        Right wb -> TxEnc.decodeUtf8 wb @?= T.pack "wonderful world"
+      -- Drop the result; heap returns to baseline.
+      r3 <- runExceptT (case result of
+              St.RVBox a -> St.dropAddr a s2
+              _          -> pure s2)
+      case r3 of
+        Left e  -> assertFailure ("drop result failed: " <> show e)
+        Right s3 -> St.stLive (St.stStats s3) @?= baseline - 1  -- parent also freed since prim dropped it
+
+  , testCase "slice: saturating bounds -- start >= length gives empty string" $ do
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0 = St.emptyStore
+          bs = TxEnc.encodeUtf8 (T.pack "hi")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+      (result, _s2) <- callPrim pSlice [St.RVBox sa, St.RVLit (Anf.LInt 10), St.RVLit (Anf.LInt 5)] s1
+      -- start (10) >= length (2), so result is empty string.
+      case result of
+        St.RVBox (St.InlineStr wb) -> BS.length wb @?= 0
+        _ -> assertFailure ("expected InlineStr empty, got: " <> show result)
+
+  , testCase "slice: multibyte UTF-8, codepoint indexing is correct" $ do
+      -- "héllo": h(1B) + é(2B) + l + l + o = 5 codepoints, 6 bytes.
+      -- slice 1 3 = codepoints [1,4) = "éll" = 4 bytes.
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0 = St.emptyStore
+          bs = TxEnc.encodeUtf8 (T.pack "héllo")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+      (result, _s2) <- callPrim pSlice [St.RVBox sa, St.RVLit (Anf.LInt 1), St.RVLit (Anf.LInt 3)] s1
+      case result of
+        St.RVBox (St.InlineStr wb) -> TxEnc.decodeUtf8 wb @?= T.pack "éll"
+        _ -> assertFailure ("expected InlineStr for 4-byte window, got: " <> show result)
+
+  , testCase "slice of NStringView: flatten produces single view over root, not chain" $ do
+      -- Build root -> mid-view -> inner-view; inner must point at root, not mid.
+      -- Ownership trace (flatten path):
+      --   1. allocPure NString -> pa (rc=1, live=1). baseline=1.
+      --   2. slice pa 0 15: allocNStringView pa 0 15 (incref pa->2), dropAddr pa (rc 2->1).
+      --      After: pa rc=1, mid=NStringView(pa,0,15) rc=1. live=2 (pa+mid).
+      --   3. slice mid 6 9: deref mid -> NStringView(pa,0,_); root=pa, absOff=6.
+      --      allocNStringView pa 6 9 (incref pa->2), dropAddr mid (mid rc=1->0, frees mid,
+      --      cascade drops pa: pa rc=2->1). After: pa rc=1, inner=NStringView(pa,6,9). live=2.
+      --   Note: mid is CONSUMED by step 3 (its owned ref is passed to slice as input).
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "hello wonderful world")  -- 21 bytes
+          (pa, s1) = St.allocPure (St.NString bs) s0
+          baseline = St.stLive (St.stStats s1)  -- 1 (just pa)
+      -- mid = slice [owns pa] -> NStringView (15B > 7). pa consumed, mid alive.
+      (mid, s2) <- callPrim pSlice [St.RVBox pa, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 15)] s1
+      -- inner = slice [owns mid] -> NStringView over ROOT pa (9B > 7). mid consumed, inner alive.
+      (inner, s3) <- callPrim pSlice [mid, St.RVLit (Anf.LInt 6), St.RVLit (Anf.LInt 9)] s2
+      -- Bytes must be correct ("wonderful" = chars 6..14 of "hello wonderful world").
+      rb <- runExceptT (RCP.stringBytes inner s3)
+      case rb of
+        Left e   -> assertFailure ("stringBytes on inner failed: " <> show e)
+        Right wb -> TxEnc.decodeUtf8 wb @?= T.pack "wonderful"
+      -- live=2 (pa + inner). pa rc=1 (inner's counted ref). baseline was 1.
+      St.stLive (St.stStats s3) @?= baseline + 1
+      -- Drop inner: inner rc=1->0, freed, cascade drops pa (rc=1->0, freed). live=0.
+      s4 <- case inner of
+        St.RVBox a -> do
+          r <- runExceptT (St.dropAddr a s3)
+          case r of
+            Left e  -> assertFailure ("drop inner failed: " <> show e) >> pure s3
+            Right x -> pure x
+        _ -> pure s3
+      -- Both pa and inner are now freed. live = baseline - 1 = 0.
+      St.stLive (St.stStats s4) @?= baseline - 1
+
+  -- ---------------------------------------------------------------
+  -- byteSlice (E4 Task 3)
+  -- ---------------------------------------------------------------
+  , testCase "byteSlice: valid ASCII boundaries, result matches expected bytes" $ do
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "hello world")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+      (result, _s2) <- callPrim pByteSlice [St.RVBox sa, St.RVLit (Anf.LInt 6), St.RVLit (Anf.LInt 5)] s1
+      case result of
+        St.RVBox (St.InlineStr wb) -> TxEnc.decodeUtf8 wb @?= T.pack "world"
+        _ -> assertFailure ("expected InlineStr for 'world', got: " <> show result)
+
+  , testCase "byteSlice: valid multibyte boundaries (not splitting a codepoint)" $ do
+      -- "héllo" = 6 bytes: h[0] é[1,2] l[3] l[4] o[5]
+      -- byteSlice 0 1 = "h" (byte 0); byteSlice 3 3 = "llo" (bytes 3,4,5)
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "héllo")
+          (sa1, s1) = St.allocPure (St.NString bs) s0
+          (sa2, s2) = St.allocPure (St.NString bs) s1
+      (r1, _s3) <- callPrim pByteSlice [St.RVBox sa1, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 1)] s2
+      (r2, _s4) <- callPrim pByteSlice [St.RVBox sa2, St.RVLit (Anf.LInt 3), St.RVLit (Anf.LInt 3)] _s3
+      case r1 of
+        St.RVBox (St.InlineStr wb) -> TxEnc.decodeUtf8 wb @?= T.pack "h"
+        _ -> assertFailure ("byteSlice 0 1: expected InlineStr 'h', got: " <> show r1)
+      case r2 of
+        St.RVBox (St.InlineStr wb) -> TxEnc.decodeUtf8 wb @?= T.pack "llo"
+        _ -> assertFailure ("byteSlice 3 3: expected InlineStr 'llo', got: " <> show r2)
+
+  , testCase "byteSlice: start splits 2-byte codepoint -> PrimError" $ do
+      -- "héllo": h[0] é[1=0xC3, 2=0xA9] l[3] l[4] o[5]
+      -- byte 2 (0xA9) is a continuation byte of é -> start=2 splits é -> PrimError.
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "héllo")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+      expectPrimError pByteSlice [St.RVBox sa, St.RVLit (Anf.LInt 2), St.RVLit (Anf.LInt 3)] s1
+        "splits a multibyte codepoint"
+
+  , testCase "byteSlice: end splits 2-byte codepoint -> PrimError" $ do
+      -- "héllo": byte 2 is the second byte of é (0xA9). end=2 would split é.
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "héllo")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+      expectPrimError pByteSlice [St.RVBox sa, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 2)] s1
+        "splits a multibyte codepoint"
+
+  , testCase "byteSlice: saturating bounds -- start > byteLength returns empty" $ do
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "hi")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+      (result, _s2) <- callPrim pByteSlice [St.RVBox sa, St.RVLit (Anf.LInt 100), St.RVLit (Anf.LInt 5)] s1
+      case result of
+        St.RVBox (St.InlineStr wb) -> BS.length wb @?= 0
+        _ -> assertFailure ("expected InlineStr empty, got: " <> show result)
+
+  , testCase "byteSlice on AbstractHeap: long window > 7B produces NStringView, drops input" $ do
+      -- "hello wonderful world" (21B); byteSlice 6 15 -> 15B > 7 -> NStringView.
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0 = St.emptyStore
+          bs = TxEnc.encodeUtf8 (T.pack "hello wonderful world")
+          (sa, s1) = St.allocPure (St.NString bs) s0
+          baseline = St.stLive (St.stStats s1)
+      (result, s2) <- callPrim pByteSlice [St.RVBox sa, St.RVLit (Anf.LInt 6), St.RVLit (Anf.LInt 15)] s1
+      case result of
+        St.RVBox (St.InlineStr _) -> assertFailure "expected NStringView, got InlineStr"
+        St.RVBox _ -> pure ()
+        _ -> assertFailure ("expected RVBox, got: " <> show result)
+      rb <- runExceptT (RCP.stringBytes result s2)
+      case rb of
+        Left e   -> assertFailure ("stringBytes failed: " <> show e)
+        Right wb -> TxEnc.decodeUtf8 wb @?= T.pack "wonderful world"
+      St.stLive (St.stStats s2) @?= baseline + 1  -- parent + view live
+
+  , testCase "byteSlice on an NStringView input: valid boundary flattens to root-backed view" $ do
+      -- Build a view over a long multibyte parent, then byteSlice the VIEW with a
+      -- valid in-window boundary. Asserts: correct bytes, the result FLATTENS to a
+      -- single view over the ROOT (not view->view), and the live count proves it.
+      -- parent = "ABCDEFGHIJélmnopqrst": A-J(10B) + é(2B, bytes 10..11) + lmnopqrst(9B)
+      --   = 21 bytes, 20 codepoints.
+      pSlice     <- lookupStrPrim (T.pack "slice")
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "ABCDEFGHIJélmnopqrst")
+          (pa, s1) = St.allocPure (St.NString bs) s0
+          baseline = St.stLive (St.stStats s1)  -- 1 (just pa)
+      -- view = slice pa 0 15 -> codepoints 0..14 = "ABCDEFGHIJélmno" (16 bytes > 7 -> NStringView over pa).
+      (view, s2) <- callPrim pSlice [St.RVBox pa, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 15)] s1
+      case view of
+        St.RVBox (St.InlineStr _) -> assertFailure "setup: expected NStringView, got InlineStr"
+        St.RVBox _ -> pure ()
+        _ -> assertFailure ("setup: expected RVBox view, got: " <> show view)
+      -- byteSlice view 8 8 -> view bytes 8..15 = "IJélmno" (8 bytes: I,J,é(2),l,m,n,o > 7).
+      -- start=8 (byte 'I', codepoint start), end=16 (end of window): both valid boundaries.
+      -- This is the flatten path: result is an NStringView over the ROOT pa, NOT over view.
+      (result, s3) <- callPrim pByteSlice [view, St.RVLit (Anf.LInt 8), St.RVLit (Anf.LInt 8)] s2
+      case result of
+        St.RVBox (St.InlineStr _) -> assertFailure "expected flattened NStringView, got InlineStr"
+        St.RVBox _ -> pure ()
+        _ -> assertFailure ("expected RVBox view, got: " <> show result)
+      rb <- runExceptT (RCP.stringBytes result s3)
+      case rb of
+        Left e   -> assertFailure ("stringBytes on flattened view failed: " <> show e)
+        Right wb -> TxEnc.decodeUtf8 wb @?= T.pack "IJélmno"
+      -- Flatten proof (live count): view was CONSUMED by byteSlice; result holds the
+      -- only ref to pa. live = baseline + 1 (pa + result). If the chain were view->view,
+      -- dropping result would not reclaim pa; the drop below proves it does.
+      St.stLive (St.stStats s3) @?= baseline + 1
+      -- Drop result: result rc=1->0, freed, cascade drops pa (rc=1->0, freed). live=0.
+      s4 <- case result of
+        St.RVBox a -> do
+          r <- runExceptT (St.dropAddr a s3)
+          case r of
+            Left e  -> assertFailure ("drop result failed: " <> show e) >> pure s3
+            Right x -> pure x
+        _ -> pure s3
+      St.stLive (St.stStats s4) @?= baseline - 1  -- both pa and result freed
+
+  , testCase "byteSlice on an NStringView input: split boundary within the view window -> PrimError" $ do
+      -- Same view as above ("ABCDEFGHIJélmno", 16 bytes; é at view bytes 10..11).
+      -- byteSlice view 0 11: end=11 lands on byte 0xA9 (continuation byte of é,
+      -- inside the view window) -> PrimError. Exercises the boundary check reading
+      -- through the view's windowed bytes.
+      pSlice     <- lookupStrPrim (T.pack "slice")
+      pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+      let s0  = St.emptyStore
+          bs  = TxEnc.encodeUtf8 (T.pack "ABCDEFGHIJélmnopqrst")
+          (pa, s1) = St.allocPure (St.NString bs) s0
+      (view, s2) <- callPrim pSlice [St.RVBox pa, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 15)] s1
+      case view of
+        St.RVBox (St.InlineStr _) -> assertFailure "setup: expected NStringView, got InlineStr"
+        St.RVBox _ -> pure ()
+        _ -> assertFailure ("setup: expected RVBox view, got: " <> show view)
+      -- end=11 splits é (byte 11 of the VIEW window is the é continuation byte).
+      expectPrimError pByteSlice [view, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 11)] s2
+        "splits a multibyte codepoint"
+      -- Clean up: the failing prim does not consume its input (it errors before
+      -- dropAddr), so drop the view here to keep the store balanced for this scope.
+      _ <- case view of
+        St.RVBox a -> runExceptT (St.dropAddr a s2)
+        _          -> pure (Right s2)
+      pure ()
   ]
 
 -- ---------------------------------------------------------------------------
@@ -20284,6 +21888,771 @@ rcInlineStringPropertyTests =
           prop_inlineStrSearchOps
       , testProperty "PE7: hash on InlineStr agrees across backends (== szHash)"
           prop_inlineStrHash
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Suite E4: string-view QuickCheck properties (layer 4)
+--
+-- Six properties covering borrow-passing correctness and op-transparency for
+-- NStringView across all three string representations (view / WokString cell /
+-- InlineStr), driven on BOTH backends via 'onBothBackends'.
+--
+-- Generator notes:
+--   'genViewText':   UTF-8 text whose encoding is > 7 bytes (forces NStringView
+--                    on the long-window slice path; weighted multi-byte corpus).
+--   'genViewIndices': a (start, len) pair covering at least one codepoint; the
+--                    window may be <= 7 bytes (InlineStr) for short suffixes, so
+--                    properties using it must tolerate both representations. The
+--                    > 7-byte guarantee is on the TEXT ('genViewText'), not any
+--                    specific window.
+--   Edge cases explicitly covered: empty-window saturation (start >= cpLen),
+--   exactly-7-byte and exactly-8-byte windows (straddle the inline/view boundary),
+--   multibyte codepoints at slice boundaries, start==end (zero-length window),
+--   out-of-range start/len for saturation.
+--
+-- Independence guarantee: every property compares against 'Data.Text' /
+-- 'Data.ByteString' operations (separate implementations), never against the
+-- same prim under test.
+--
+-- PV1  Borrow-out survival    -- view keeps parent alive after prim drops input
+-- PV2  Nested-flatten         -- slice(slice s a b) c d: root-backed, byte-correct
+-- PV3  Window round-trip      -- slice s i n bytes == encodeUtf8(T.take n (T.drop i t))
+-- PV4  UTF-8 validity         -- every slice result is valid UTF-8;
+--                                byteSlice on split boundary raises PrimError
+-- PV5  Op-transparency        -- all E1/E2 ops on a view == same op on materialized copy
+-- PV6  Cross-type equality    -- eqString == byte-eq for every (view,cell,inline) pair
+-- ---------------------------------------------------------------------------
+
+-- | Generator: 'T.Text' whose UTF-8 encoding is at least @'St.maxInlineStr' + 1@
+-- bytes (so a full-range slice will produce an 'NStringView', not 'InlineStr').
+-- Uses the same weighted multi-byte generator as E2/E3; rejects until long enough.
+genViewText :: QC.Gen T.Text
+genViewText =
+  QC.suchThat genUtf8Text
+    (\t -> BS.length (TxEnc.encodeUtf8 t) > St.maxInlineStr)
+
+-- | Draw a (start, len) pair covering at least one codepoint of the given
+-- 'T.Text'.  Returns (codepoint-start, codepoint-length).  The resulting window
+-- may be <= 7 bytes (an 'InlineStr') for a short suffix, so callers must tolerate
+-- both 'InlineStr' and 'NStringView' results; the > 7-byte property is on the
+-- text ('genViewText'), not on any specific window.
+genViewIndices :: T.Text -> QC.Gen (Int, Int)
+genViewIndices t = do
+  let cpLen    = T.length t
+      -- Start must be small enough that at least 1 codepoint remains.
+      maxStart = max 0 (cpLen - 1)
+  start <- QC.choose (0, maxStart)
+  let afterText = T.drop start t
+      lenMax    = T.length afterText
+  -- Pick len in [1..lenMax] covering the whole remaining suffix.
+  len <- QC.choose (1, max 1 lenMax)
+  pure (start, len)
+
+-- | Call the slice prim with codepoint indices and return the result.
+-- Allocation: slice CONSUMES the input (one owned ref); callers must NOT use
+-- the input address after this call.
+callSlice :: St.RCPrim -> St.Addr -> Int -> Int -> St.Store
+          -> IO (St.RCValue, St.Store)
+callSlice pSlice a start len s =
+  callStrPrim pSlice
+    [ St.RVBox a
+    , St.RVLit (Anf.LInt (toInteger start))
+    , St.RVLit (Anf.LInt (toInteger len))
+    ] s
+
+-- | Get the 'ByteString' content of any string RCValue (view, cell, or inline)
+-- via 'RCP.stringBytes'.
+viewBytes :: St.RCValue -> St.Store -> IO BS.ByteString
+viewBytes v s = do
+  r <- runExceptT (RCP.stringBytes v s)
+  case r of
+    Right bs -> pure bs
+    Left e   -> assertFailure ("viewBytes: " <> show e) >> error "unreachable"
+
+-- | 'True' if the 'RCValue' is a non-inline boxed address (any 'HAddr'/'CAddr',
+-- i.e. NOT an 'InlineStr').  Used only on a 'slice'/'byteSlice' result, which can
+-- only be an 'NStringView' cell or an 'InlineStr' -- so here it means "is a view".
+isViewAddr :: St.RCValue -> Bool
+isViewAddr (St.RVBox (St.InlineStr _)) = False
+isViewAddr (St.RVBox _)                = True
+isViewAddr _                           = False
+
+-- PV1: Borrow-out survival.
+-- A slice result retains correct bytes after the prim has consumed (dropped) its
+-- input.  Specifically: allocate a parent, call slice, then READ the view's bytes
+-- -- the view's own counted ref must have kept the parent alive.
+-- The 'slice' prim drops the input when it builds the result; after it returns,
+-- the parent's ref-count is exactly 1 (owned by the view).  Reading via
+-- 'stringBytes' after the prim returns proves the parent is still alive.
+-- Oracle: 'T.take len (T.drop start t)' (Data.Text, independent).
+prop_viewBorrowOutSurvival :: Property
+prop_viewBorrowOutSurvival =
+  QC.forAll genViewText $ \t ->
+  QC.forAll (genViewIndices t) $ \(start, len) ->
+    QC.ioProperty $ onBothBackends "PV1" $ \backend -> do
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let oracleText   = T.take len (T.drop start t)
+          oracleBytes  = TxEnc.encodeUtf8 oracleText
+          s0           = emptyStoreOn backend
+          baseline     = St.stLive (St.stStats s0)
+      -- Allocate parent; prim consumes it.
+      (sa, s1)       <- allocStringOn t s0
+      (result, s2)   <- callSlice pSlice sa start len s1
+      -- After the prim, sa is consumed (its ref is now inside result's cell or
+      -- the parent's count has been decremented).  Read the result's bytes.
+      -- This is the borrow-out survival check: the bytes must still be readable.
+      gotBytes <- viewBytes result s2
+      -- Drop the result to verify heap balance.
+      s3 <- dropResult result s2
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PV1 borrow-out bytes: got=" <> show gotBytes
+              <> " oracle=" <> show oracleBytes
+              <> " t=" <> T.unpack t
+              <> " start=" <> show start <> " len=" <> show len)
+            (gotBytes == oracleBytes)
+        , QC.counterexample
+            ("PV1 heap balance after drop: live="
+              <> show (St.stLive (St.stStats s3))
+              <> " baseline=" <> show baseline)
+            (St.stLive (St.stStats s3) == baseline)
+        ]
+
+-- PV2: Nested-flatten.
+-- 'slice (slice s a b) c d' produces a SINGLE NStringView over the ROOT buffer
+-- (no two-hop view->view chain), and its bytes agree with the Data.Text reference
+-- double-slice.
+-- Proof of root-backing via live count: if the inner view backed the OUTER view
+-- (a chain), dropping the inner would cascade-free the outer view cell AND the
+-- outer parent cell; the live count would return to baseline - 1 (root freed too
+-- early).  Instead: outer view is consumed by the slice prim, inner view holds
+-- one ref to the root; live == baseline + 1 (root + inner).  Dropping inner
+-- returns to baseline - 1 (all freed).
+-- DESIGN: both the outer and inner windows MUST be > 7 bytes to force NStringView
+-- (InlineStr is uncounted and the live-count proof does not apply).  We ensure
+-- this by picking texts >= 16 bytes, outer window >= 8 bytes, inner >= 8 bytes.
+prop_viewNestedFlatten :: Property
+prop_viewNestedFlatten =
+  -- Need text with >= 16 bytes so we can have an outer window >= 8B and still
+  -- leave enough for an inner window >= 8B inside the outer window.
+  QC.forAll (QC.suchThat genViewText (\t -> BS.length (TxEnc.encodeUtf8 t) >= 16)) $ \t ->
+    QC.ioProperty $ onBothBackends "PV2" $ \backend -> do
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0         = emptyStoreOn backend
+          -- Outer window: the whole string.  Always >= 16 bytes by the generator guard.
+          outerStart = 0
+          outerLen   = T.length t          -- all codepoints
+          outerText  = t
+          -- Inner window: bytes [0, innerLen) where innerLen = bsLen `div` 2 >= 8.
+          -- We pick innerLen as half the BYTE length (>= 8 by our >=16B guard),
+          -- but must be on a codepoint boundary.  Take the first half of codepoints.
+          halfCp     = T.length outerText `div` 2
+          innerStart = 0
+          innerLen   = max 1 halfCp
+          -- Oracle: Data.Text double-slice.
+          oracleText  = T.take innerLen (T.drop innerStart outerText)
+          oracleBytes = TxEnc.encodeUtf8 oracleText
+          outerByteLen = BS.length (TxEnc.encodeUtf8 outerText)
+          innerByteLen = BS.length oracleBytes
+      (pa, s1) <- allocStringOn t s0
+      let baseline = St.stLive (St.stStats s1)  -- 1: just the root
+      -- Outer slice: pa consumed, midView is a counted NStringView over pa
+      -- (outer window is >=16B > 7B, so never InlineStr).
+      (midView, s2) <- callSlice pSlice pa outerStart outerLen s1
+      -- Inner slice: midView consumed.  Flatten: inner roots at pa.
+      (inner, s3) <- case midView of
+        St.RVBox midAddr -> callSlice pSlice midAddr innerStart innerLen s2
+        _ -> assertFailure "PV2: midView is not RVBox" >> error "unreachable"
+      -- Byte check.
+      gotBytes <- viewBytes inner s3
+      -- Live-count proof: mid was consumed (freed), inner holds the only ref to pa.
+      -- live = baseline + 1 (pa rc=1 + inner rc=1).
+      let liveAfter = St.stLive (St.stStats s3)
+      -- Drop inner: cascades pa to rc=0 -> freed. live = baseline - 1 = 0.
+      s4 <- dropResult inner s3
+      let liveAfterDrop = St.stLive (St.stStats s4)
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PV2 nested bytes: got=" <> show gotBytes
+              <> " oracle=" <> show oracleBytes
+              <> " t=" <> T.unpack t)
+            (gotBytes == oracleBytes)
+        , QC.counterexample
+            ("PV2 root-backing (live after double-slice): live=" <> show liveAfter
+              <> " expected=" <> show (baseline + 1)
+              <> " (root + inner; outer=" <> show outerByteLen <> "B inner=" <> show innerByteLen <> "B)")
+            -- Only assert the view proof when BOTH windows are >7B (NStringView).
+            -- If inner <= 7B it's InlineStr and the count is lower.
+            (innerByteLen > St.maxInlineStr QC.==> liveAfter == baseline + 1)
+        , QC.counterexample
+            ("PV2 heap balance after drop inner: live=" <> show liveAfterDrop
+              <> " expected=" <> show (baseline - 1))
+            (liveAfterDrop == baseline - 1)
+        ]
+
+-- PV3: Window round-trip.
+-- For any text t and in-range (start, len), 'slice t start len' has the bytes
+-- of 'encodeUtf8 (T.take len (T.drop start t))'.  The oracle is Data.Text's own
+-- codepoint operations; the prim re-derives the byte window independently via
+-- 'cpToByteOff'. Both must agree for all edge cases (empty window, OOB saturation,
+-- multibyte at boundary).
+-- Also asserts heap balance: parent consumed by prim, so drop(result) -> baseline.
+prop_viewWindowRoundTrip :: Property
+prop_viewWindowRoundTrip =
+  QC.forAll genUtf8Text $ \t ->
+  QC.forAll (genRangeIndices t) $ \(start, len) ->
+    QC.ioProperty $ onBothBackends "PV3" $ \backend -> do
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let oracleText  = T.take len (T.drop start t)
+          oracleBytes = TxEnc.encodeUtf8 oracleText
+          s0          = emptyStoreOn backend
+          baseline    = St.stLive (St.stStats s0)
+      (sa, s1)     <- allocStringOn t s0
+      (result, s2) <- callSlice pSlice sa start len s1
+      gotBytes     <- viewBytes result s2
+      s3           <- dropResult result s2
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PV3 window bytes: got=" <> show gotBytes
+              <> " oracle=" <> show oracleBytes
+              <> " t=" <> T.unpack t
+              <> " start=" <> show start <> " len=" <> show len)
+            (gotBytes == oracleBytes)
+        , QC.counterexample
+            ("PV3 heap balance: live=" <> show (St.stLive (St.stStats s3))
+              <> " baseline=" <> show baseline)
+            (St.stLive (St.stStats s3) == baseline)
+        ]
+
+-- | Generator: arbitrary (start, len) indices, including out-of-range values
+-- (for saturation coverage) and zero-length windows.  Does NOT require the
+-- window to be > 7 bytes (PV3 covers both inline and view results).
+genRangeIndices :: T.Text -> QC.Gen (Int, Int)
+genRangeIndices t = do
+  let cpLen = T.length t
+      -- Allow start up to cpLen+5 (tests OOB saturation -> empty window).
+      startBound = max 1 (cpLen + 5)
+  start <- QC.choose (0, startBound)
+  -- len up to cpLen+5 (exercises saturation of start+len >= cpLen).
+  len   <- QC.choose (0, max 1 (cpLen + 5))
+  pure (start, len)
+
+-- PV4: UTF-8 validity + byteSlice boundary error.
+-- Every 'slice' result is valid UTF-8 (verified via 'TxEnc.decodeUtf8'').
+-- 'byteSlice' on a boundary that splits a multi-byte codepoint raises PrimError.
+-- Oracle: TxEnc.decodeUtf8' is an independent UTF-8 validator.
+-- The byteSlice split check uses a constructed 2-byte codepoint at a known position.
+prop_viewUtf8Validity :: Property
+prop_viewUtf8Validity =
+  QC.forAll genUtf8Text $ \t ->
+  QC.forAll (genRangeIndices t) $ \(start, len) ->
+    QC.ioProperty $ onBothBackends "PV4" $ \backend -> do
+      pSlice <- lookupStrPrim (T.pack "slice")
+      let s0 = emptyStoreOn backend
+      (sa, s1)     <- allocStringOn t s0
+      (result, s2) <- callSlice pSlice sa start len s1
+      gotBytes     <- viewBytes result s2
+      _s3          <- dropResult result s2
+      -- Validity check: decodeUtf8' returns Right for valid UTF-8.
+      let isValid = case TxEnc.decodeUtf8' gotBytes of
+                      Right _ -> True
+                      Left _  -> False
+      pure $ QC.counterexample
+        ("PV4 slice result is not valid UTF-8: bytes=" <> show gotBytes
+          <> " t=" <> T.unpack t
+          <> " start=" <> show start <> " len=" <> show len)
+        isValid
+
+-- | PV4b: byteSlice raises PrimError when start or end splits a 2-byte codepoint.
+-- Uses a concrete 2-byte codepoint (é = 0xC3 0xA9) placed in a longer string so
+-- the resulting window exceeds 7 bytes and a view cell is produced on the success
+-- path.  Tests both the start-splits and end-splits error cases.
+-- IMPORTANT: 'expectPrimError' does NOT consume the input (prim errors before
+-- 'dropAddr'), so sa, sb, sc must be freed explicitly.
+prop_viewByteSliceSplitError :: Property
+prop_viewByteSliceSplitError =
+  QC.ioProperty $ onBothBackends "PV4b" $ \backend -> do
+    pByteSlice <- lookupStrPrim (T.pack "byteSlice")
+    -- "ABCDEFGHIJélmnopqrst": 10 ASCII + é(2B) + 9 ASCII = 21 bytes, 20 codepoints.
+    -- é is at BYTE positions 10 (0xC3) and 11 (0xA9).
+    let s0  = emptyStoreOn backend
+        bs  = TxEnc.encodeUtf8 (T.pack "ABCDEFGHIJélmnopqrst")
+    -- Alloc three copies: sa for start-split test, sb for end-split test,
+    -- sc for the valid-cut success path.
+    (sa, s1) <- allocStringHelper bs s0
+    (sb, s2) <- allocStringHelper bs s1
+    (sc, s3) <- allocStringHelper bs s2
+    -- start=11 splits é (byte 11 is the continuation byte 0xA9).
+    expectPrimError pByteSlice
+      [St.RVBox sa, St.RVLit (Anf.LInt 11), St.RVLit (Anf.LInt 5)] s3
+      "splits a multibyte codepoint"
+    -- end=11 (start=0, len=11) splits é.
+    expectPrimError pByteSlice
+      [St.RVBox sb, St.RVLit (Anf.LInt 0), St.RVLit (Anf.LInt 11)] s3
+      "splits a multibyte codepoint"
+    -- Valid cut: start=10, len=2 (exact é bytes). No error; drop result.
+    (res, s4) <- callStrPrim pByteSlice
+      [St.RVBox sc, St.RVLit (Anf.LInt 10), St.RVLit (Anf.LInt 2)] s3
+    s5 <- dropResult res s4
+    -- sa and sb were NOT consumed by the failing prims; drop them to stay leak-clean.
+    s6 <- dropResult (St.RVBox sa) s5
+    s7 <- dropResult (St.RVBox sb) s6
+    let baseline = St.stLive (St.stStats s0)
+    pure $ QC.counterexample
+      ("PV4b heap balance: live=" <> show (St.stLive (St.stStats s7))
+        <> " baseline=" <> show baseline)
+      (St.stLive (St.stStats s7) == baseline)
+
+-- | PV4c: focused regression for the WokStringView CAddr byteAt bug.
+-- A >7-byte view on the CHeap is a 'CAddr' pointing at a 'WokStringView' cell.
+-- Before the tag-guard fix, 'stringByteAt' took the CHeap fast-path
+-- ('wokStringLen' / 'wokStringByteGet') unconditionally on ANY 'CAddr',
+-- misreading the WokStringView layout (parent-ptr read as byte_len, indexing into
+-- offset/len fields -- silent garbage, possibly past the 32-byte cell).
+-- This test pins 'byteAt' at EVERY index of a known view window against the
+-- reference bytes, on BOTH backends (the CHeap run is where the bug lived).
+-- Concrete window: parent "ABCDEFGHIJélmnopqrst" (21B, é at bytes 10-11),
+-- view = slice 0 15 (codepoints 0..14 = "ABCDEFGHIJélmno", 16 bytes > 7 ->
+-- NStringView).  byteAt i for i in [0..15] must equal the i-th window byte.
+prop_viewByteAtOnView :: Property
+prop_viewByteAtOnView =
+  QC.ioProperty $ onBothBackends "PV4c" $ \backend -> do
+    pSlice  <- lookupStrPrim (T.pack "slice")
+    pByteAt <- lookupStrPrim (T.pack "byteAt")
+    let s0       = emptyStoreOn backend
+        parentBs = TxEnc.encodeUtf8 (T.pack "ABCDEFGHIJélmnopqrst")
+        -- The view window: codepoints 0..14 -> "ABCDEFGHIJélmno" (16 bytes).
+        winBytes = TxEnc.encodeUtf8 (T.take 15 (TxEnc.decodeUtf8 parentBs))
+        winLen   = BS.length winBytes
+        baseline = St.stLive (St.stStats s0)
+    -- Probe byteAt at every in-window index; one fresh view per probe (byteAt
+    -- consumes its input).  Each result must equal the reference window byte.
+    let probe :: Int -> St.Store -> IO (Bool, St.Store)
+        probe i st = do
+          (pa, st1)  <- allocStringHelper parentBs st
+          (view, st2) <- callSlice pSlice pa 0 15 st1
+          -- Confirm the slice produced a real view cell (not InlineStr) so the
+          -- CAddr fast-path is genuinely exercised on CHeap.
+          let isView = isViewAddr view
+          (bv, st3)  <- callStrPrim pByteAt [view, St.RVLit (Anf.LInt (toInteger i))] st2
+          rcByte     <- asInt "PV4c byteAt(view)" bv
+          let oracleByte = toInteger (BS.index winBytes i)
+          pure (isView && rcByte == oracleByte, st3)
+    let loop :: [Int] -> Bool -> St.Store -> IO (Bool, St.Store)
+        loop []       acc st = pure (acc, st)
+        loop (i:is) acc st = do
+          (ok, st') <- probe i st
+          loop is (acc && ok) st'
+    (allOk, sEnd) <- loop [0 .. winLen - 1] True s0
+    -- OOB index: byteAt at winLen must raise PrimError (view-windowed bound).
+    (paOOB, sOOB1) <- allocStringHelper parentBs sEnd
+    (viewOOB, sOOB2) <- callSlice pSlice paOOB 0 15 sOOB1
+    expectPrimError pByteAt
+      [viewOOB, St.RVLit (Anf.LInt (toInteger winLen))] sOOB2
+      "out of bounds"
+    -- expectPrimError does NOT consume the view; drop it to stay leak-clean.
+    sOOB3 <- dropResult viewOOB sOOB2
+    let liveEnd = St.stLive (St.stStats sOOB3)
+    pure $ QC.conjoin
+      [ QC.counterexample
+          ("PV4c byteAt on view disagreed with reference window bytes (winLen="
+            <> show winLen <> ")")
+          allOk
+      , QC.counterexample
+          ("PV4c heap balance: live=" <> show liveEnd <> " baseline=" <> show baseline)
+          (liveEnd == baseline)
+      ]
+
+-- PV5: Op-transparency.
+-- Every E1/E2 string op (length, byteLength, index, byteAt, append, indexOfFromRaw,
+-- hash, editDistance, eqString) applied to an NStringView equals the same op
+-- applied to the MATERIALIZED copy of that window (same bytes, fresh NString cell).
+-- Oracle: 'Data.Text' / 'Data.ByteString' for each op (independent reference).
+-- Note: 'append' is checked by verifying the result bytes equal the materialized
+-- concatenation.  'index'/'byteAt' are only checked for non-empty windows.
+prop_viewOpTransparency :: Property
+prop_viewOpTransparency =
+  QC.forAll genViewText $ \t ->
+  QC.forAll (genViewIndices t) $ \(start, len) ->
+    QC.ioProperty $ onBothBackends "PV5" $ \backend -> do
+      pSlice      <- lookupStrPrim (T.pack "slice")
+      pLength     <- lookupStrPrim (T.pack "length")
+      pByteLength <- lookupStrPrim (T.pack "byteLength")
+      pIndex      <- lookupStrPrim (T.pack "index")
+      pByteAt     <- lookupStrPrim (T.pack "byteAt")
+      pAppend     <- lookupStrPrim (T.pack "append")
+      pHash       <- lookupStrPrim (T.pack "hash")
+      pEditDist   <- lookupStrPrim (T.pack "editDistance")
+      pEqString   <- lookupBasePrim (T.pack "eqString")
+      let s0            = emptyStoreOn backend
+          baseline      = St.stLive (St.stStats s0)
+          winText       = T.take len (T.drop start t)
+          winBytes      = TxEnc.encodeUtf8 winText
+          oracleLen     = toInteger (T.length winText)
+          oracleByteLen = toInteger (BS.length winBytes)
+          nonEmpty      = not (BS.null winBytes)
+          cpIdx         = T.length winText - 1
+          byteIdx       = BS.length winBytes - 1
+          oracleHash    = toInteger (SZ.szHash winBytes)
+          asBool v s    = case St.renderRCValue s v of
+                            Right rendered -> rendered == T.pack "True"
+                            Left _         -> False
+      -- length
+      (sa2, s4) <- allocStringOn t s0
+      (sv2, s5) <- callSlice pSlice sa2 start len s4
+      (mc2, s6) <- allocStringHelper winBytes s5
+      (lenView, s7)  <- callStrPrim pLength [sv2] s6
+      (lenMat,  s8)  <- callStrPrim pLength [St.RVBox mc2] s7
+      rcLenV <- asInt "PV5 length(view)" lenView
+      rcLenM <- asInt "PV5 length(mat)"  lenMat
+      -- byteLength
+      (sa3, s9)  <- allocStringOn t s8
+      (sv3, s10) <- callSlice pSlice sa3 start len s9
+      (mc3, s11) <- allocStringHelper winBytes s10
+      (blView, s12) <- callStrPrim pByteLength [sv3] s11
+      (blMat,  s13) <- callStrPrim pByteLength [St.RVBox mc3] s12
+      rcBlV <- asInt "PV5 byteLength(view)" blView
+      rcBlM <- asInt "PV5 byteLength(mat)"  blMat
+      -- index / byteAt (only for non-empty window).
+      -- Both ops are tested on the VIEW and the materialized copy; the results
+      -- must agree with each other AND with the byte/Text oracle.  'byteAt' on a
+      -- view exercises the tag-guarded CHeap fast-path: a WokStringView CAddr
+      -- falls through to the byte-window path instead of misreading the cell.
+      (indexChecks, s_afterIndex) <-
+        if not nonEmpty
+          then pure ([], s13)
+          else do
+            -- index (view vs mat): both use the 'stringBytes' deref path.
+            (sa4,  s14) <- allocStringOn t s13
+            (sv4,  s15) <- callSlice pSlice sa4 start len s14
+            (mc4,  s16) <- allocStringHelper winBytes s15
+            let cpIdxLit = St.RVLit (Anf.LInt (toInteger cpIdx))
+            (cpView, s17) <- callStrPrim pIndex  [sv4,          cpIdxLit] s16
+            (cpMat,  s18) <- callStrPrim pIndex  [St.RVBox mc4, cpIdxLit] s17
+            rcCpV <- asChar "PV5 index(view)" cpView
+            rcCpM <- asChar "PV5 index(mat)"  cpMat
+            -- byteAt (view vs mat): the view path is the tag-guarded CHeap fix.
+            (sa5,  s19) <- allocStringOn t s18
+            (sv5,  s20) <- callSlice pSlice sa5 start len s19
+            (mc5,  s21) <- allocStringHelper winBytes s20
+            let byIdxLit = St.RVLit (Anf.LInt (toInteger byteIdx))
+            (byView, s22) <- callStrPrim pByteAt [sv5,          byIdxLit] s21
+            (byMat,  s23) <- callStrPrim pByteAt [St.RVBox mc5, byIdxLit] s22
+            rcByV <- asInt "PV5 byteAt(view)" byView
+            rcByM <- asInt "PV5 byteAt(mat)"  byMat
+            let oracleByte = toInteger (BS.index winBytes byteIdx)
+            pure
+              ( [ QC.counterexample
+                    ("PV5 index: view=" <> show rcCpV <> " mat=" <> show rcCpM
+                      <> " at cp=" <> show cpIdx <> " win=" <> T.unpack winText)
+                    (rcCpV == rcCpM)
+                , QC.counterexample
+                    ("PV5 byteAt: view=" <> show rcByV <> " mat=" <> show rcByM
+                      <> " oracle=" <> show oracleByte
+                      <> " at byte=" <> show byteIdx <> " win=" <> T.unpack winText)
+                    (rcByV == oracleByte && rcByM == oracleByte && rcByV == rcByM)
+                ]
+              , s23 )
+      -- append: result bytes of (view <> mat) == winBytes <> winBytes.
+      -- We allocate a second view and a second mat copy for this check.
+      (sa6, s_a0) <- allocStringOn t s_afterIndex
+      (sv6, s_a1) <- callSlice pSlice sa6 start len s_a0
+      (mc6, s_a2) <- allocStringHelper winBytes s_a1
+      (sa7, s_a3) <- allocStringOn t s_a2
+      (sv7, s_a4) <- callSlice pSlice sa7 start len s_a3
+      (mc7, s_a5) <- allocStringHelper winBytes s_a4
+      (appVV, s_a6) <- callStrPrim pAppend [sv6, sv7] s_a5
+      (appMM, s_a7) <- callStrPrim pAppend [St.RVBox mc6, St.RVBox mc7] s_a6
+      appVVBytes <- viewBytes appVV s_a7
+      appMMBytes <- viewBytes appMM s_a7
+      s_a8 <- dropResult appVV s_a7
+      s_a9 <- dropResult appMM s_a8
+      -- hash
+      (sa8, s_h0) <- allocStringOn t s_a9
+      (sv8, s_h1) <- callSlice pSlice sa8 start len s_h0
+      (mc8, s_h2) <- allocStringHelper winBytes s_h1
+      (hashView, s_h3) <- callStrPrim pHash [sv8] s_h2
+      (hashMat,  s_h4) <- callStrPrim pHash [St.RVBox mc8] s_h3
+      rcHashV <- asInt "PV5 hash(view)" hashView
+      rcHashM <- asInt "PV5 hash(mat)"  hashMat
+      -- editDistance (view vs view): for the same bytes this must be 0.
+      (sa9,  s_e0) <- allocStringOn t s_h4
+      (sv9,  s_e1) <- callSlice pSlice sa9 start len s_e0
+      (sa10, s_e2) <- allocStringOn t s_e1
+      (sv10, s_e3) <- callSlice pSlice sa10 start len s_e2
+      (distVV, s_e4) <- callStrPrim pEditDist [sv9, sv10] s_e3
+      rcDistVV <- asInt "PV5 editDistance(view,view)" distVV
+      -- eqString (view == same-bytes mat): must be True.
+      (sa11, s_q0) <- allocStringOn t s_e4
+      (sv11, s_q1) <- callSlice pSlice sa11 start len s_q0
+      (mc9,  s_q2) <- allocStringHelper winBytes s_q1
+      (eqVal, s_q3) <- callStrPrim pEqString [sv11, St.RVBox mc9] s_q2
+      let rcEqVM  = asBool eqVal s_q3
+      s_q4 <- dropResult eqVal s_q3
+      -- Final heap check.
+      let liveEnd = St.stLive (St.stStats s_q4)
+      pure $ QC.conjoin $
+        [ QC.counterexample
+            ("PV5 length view=" <> show rcLenV <> " mat=" <> show rcLenM
+              <> " oracle=" <> show oracleLen)
+            (rcLenV == oracleLen && rcLenM == oracleLen && rcLenV == rcLenM)
+        , QC.counterexample
+            ("PV5 byteLength view=" <> show rcBlV <> " mat=" <> show rcBlM
+              <> " oracle=" <> show oracleByteLen)
+            (rcBlV == oracleByteLen && rcBlM == oracleByteLen && rcBlV == rcBlM)
+        , QC.counterexample
+            ("PV5 append(view,view)==append(mat,mat): vv=" <> show appVVBytes
+              <> " mm=" <> show appMMBytes)
+            (appVVBytes == appMMBytes)
+        , QC.counterexample
+            ("PV5 hash view=" <> show rcHashV <> " mat=" <> show rcHashM
+              <> " oracle=" <> show oracleHash)
+            (rcHashV == oracleHash && rcHashM == oracleHash && rcHashV == rcHashM)
+        , QC.counterexample
+            ("PV5 editDistance(view,view same bytes) must be 0: got=" <> show rcDistVV)
+            (rcDistVV == 0)
+        , QC.counterexample
+            ("PV5 eqString(view==mat same bytes) must be True: got=" <> show rcEqVM)
+            rcEqVM
+        , QC.counterexample
+            ("PV5 heap balance: live=" <> show liveEnd <> " baseline=" <> show baseline)
+            (liveEnd == baseline)
+        ] ++ indexChecks
+
+-- PV6: Cross-type equality.
+-- 'eqString' agrees with raw byte equality for every ordered pair drawn from
+-- {view, WokString cell (NString), InlineStr}.  Each assertion compares the
+-- prim's result to the INDEPENDENT oracle (bytesA == bytesB) -- raw ByteString
+-- equality, never a re-derivation of eqString.
+--
+-- Length constraints determine which (representation, content) pairs are
+-- CONSTRUCTIBLE:
+--   * a view is ALWAYS > maxInlineStr (7) bytes (a <=7B window is InlineStr);
+--   * an InlineStr is ALWAYS <= maxInlineStr (7) bytes;
+--   * an NString cell can hold ANY length (a <=7B cell must be FORCED via
+--     'allocStringHeapForced', since 'alloc' would intercept it to InlineStr).
+-- So (view, inline) with EQUAL bytes is UNCONSTRUCTIBLE (disjoint length ranges);
+-- only the DIFFERENT case exists for that pair.
+--
+-- Pairings exercised (E = equal-bytes -> expect True; D = different -> False):
+--   (view, view):     E + D    (two >7B view windows)
+--   (view, cell):     E + D    (view vs NString cell, same/different bytes)
+--   (view, inline):   D only   (disjoint lengths -> equal is unconstructible)
+--   (cell, cell):     E + D    (two NString cells)
+--   (cell, inline):   E + D    (E via a FORCED short cell vs equal InlineStr,
+--                               proving eqString is byte-based across the
+--                               cell/inline boundary, not address-based;
+--                               D via a short cell vs a different InlineStr)
+--   (inline, inline): E + D    (two InlineStr values)
+-- Heap balance is asserted at the end.
+prop_viewCrossTypeEquality :: Property
+prop_viewCrossTypeEquality =
+  QC.forAll genViewText $ \t ->
+  QC.forAll (genViewIndices t) $ \(start, len) ->
+  QC.forAll genShortText $ \tShort ->
+    QC.ioProperty $ onBothBackends "PV6" $ \backend -> do
+      pSlice    <- lookupStrPrim (T.pack "slice")
+      pEqString <- lookupBasePrim (T.pack "eqString")
+      let winText    = T.take len (T.drop start t)
+          winBytes   = TxEnc.encodeUtf8 winText
+          shortBytes = TxEnc.encodeUtf8 tShort
+          -- Different-content string for cross-type-unequal checks: append 'X' to window.
+          diffBytes  = winBytes <> BS.pack [0x58]  -- 'X', ASCII, safe to append
+          -- A short (<=7B) byte string GUARANTEED to differ from any generated
+          -- string: a single NUL byte.  'genUtf8Char' never emits NUL, so this is
+          -- distinct from both 'winBytes' and 'shortBytes'.  Used as the
+          -- different-content operand for the short-string cross-type pairs, and
+          -- it fits InlineStr (1 byte <= 7).
+          shortDiffBytes = BS.pack [0x00]
+          -- 'eqString' result helper.
+          asBool v s = case St.renderRCValue s v of
+                         Right rendered -> rendered == T.pack "True"
+                         Left _         -> False
+          baseline0  = St.stLive (St.stStats (emptyStoreOn backend))
+      -- Helper: alloc a view of winBytes (always > 7B -> NStringView).
+      let allocView s = do
+            (sa, s1) <- allocStringOn t s
+            callSlice pSlice sa start len s1
+      -- Helper: alloc a cell of winBytes.
+      let allocCell s = do
+            (a, s1) <- allocStringHelper winBytes s
+            pure (St.RVBox a, s1)
+      -- Helper: alloc a cell of diffBytes.
+      let allocDiff s = do
+            (a, s1) <- allocStringHelper diffBytes s
+            pure (St.RVBox a, s1)
+      -- Helper: alloc an InlineStr of shortBytes (<=7B -> InlineStr).
+      let allocInline s = do
+            (a, s1) <- allocStringHelper shortBytes s
+            pure (St.RVBox a, s1)
+      -- Helper: alloc an InlineStr of shortDiffBytes (the guaranteed-different NUL).
+      let allocInlineDiff s = do
+            (a, s1) <- allocStringHelper shortDiffBytes s
+            pure (St.RVBox a, s1)
+      -- Helper: alloc a FORCED NString cell holding shortBytes (<=7B).  'alloc'
+      -- would intercept <=7B to InlineStr; 'allocStringHeapForced' bypasses that
+      -- so we get a real WokString/HAddr cell with short content -- the only way
+      -- to exercise the (cell, inline) EQUAL pairing (a cell and an inline that
+      -- hold the SAME <=7B bytes but in different representations).
+      let allocShortCell s = do
+            (a, s1) <- allocStringHeapForced shortBytes s
+            pure (St.RVBox a, s1)
+      -- Call eqString on two RCValues.
+      let callEq lv rv = callStrPrim pEqString [lv, rv]
+      let s0 = emptyStoreOn backend
+      -- (view, view) same bytes: expect True.
+      (va1, s1)  <- allocView s0
+      (va2, s2)  <- allocView s1
+      (vvEq, s3) <- callEq va1 va2 s2
+      let rcVV = asBool vvEq s3
+      s4 <- dropResult vvEq s3
+      -- (view, view) different: expect False.
+      (va3, s5)    <- allocView s4
+      (diff1, s6)  <- allocDiff s5
+      (vvNe, s7)   <- callEq va3 diff1 s6
+      let rcVVNe = asBool vvNe s7
+      s8 <- dropResult vvNe s7
+      -- (view, cell) same bytes: expect True.
+      (va4, s9)   <- allocView s8
+      (cell1, s10) <- allocCell s9
+      (vcEq, s11) <- callEq va4 cell1 s10
+      let rcVC = asBool vcEq s11
+      s12 <- dropResult vcEq s11
+      -- (view, cell) different bytes: expect False.
+      (va5, s13)   <- allocView s12
+      (diff2, s14) <- allocDiff s13
+      (vcNe, s15)  <- callEq va5 diff2 s14
+      let rcVCNe = asBool vcNe s15
+      s16 <- dropResult vcNe s15
+      -- (cell, cell) same bytes: expect True.
+      (cell2, s17) <- allocCell s16
+      (cell3, s18) <- allocCell s17
+      (ccEq, s19) <- callEq cell2 cell3 s18
+      let rcCC = asBool ccEq s19
+      s20 <- dropResult ccEq s19
+      -- (cell, cell) different: expect False.
+      (cell4, s21) <- allocCell s20
+      (diff3, s22) <- allocDiff s21
+      (ccNe, s23)  <- callEq cell4 diff3 s22
+      let rcCCNe = asBool ccNe s23
+      s24 <- dropResult ccNe s23
+      -- (view, inline) different: expect False.  Equal is unconstructible -- a view
+      -- is >7B and an inline is <=7B, so their byte ranges are disjoint.  The oracle
+      -- (winBytes == shortDiffBytes) is False here too (disjoint lengths / NUL), so
+      -- this both pins the False branch and stays an oracle-faithful comparison.
+      (va6, s25)   <- allocView s24
+      (inlD1, s26) <- allocInlineDiff s25
+      (viEq, s27)  <- callEq va6 inlD1 s26
+      let rcVI = asBool viEq s27
+      s28 <- dropResult viEq s27
+      -- (inline, inline) different: expect False.
+      (inl1, s29)  <- allocInline s28
+      (inlD2, s30) <- allocInlineDiff s29
+      (iiNe, s31)  <- callEq inl1 inlD2 s30
+      let rcIINe = asBool iiNe s31
+      s32 <- dropResult iiNe s31
+      -- (inline, inline) same bytes: expect True.
+      (inl2, s33) <- allocInline s32
+      (inl3, s34) <- allocInline s33
+      (iiEq, s35) <- callEq inl2 inl3 s34
+      let rcII = asBool iiEq s35
+      s36 <- dropResult iiEq s35
+      -- (cell, inline) SAME short bytes: expect True.  The cell is a FORCED short
+      -- WokString/HAddr cell; the inline is an InlineStr of the SAME bytes.  Equal
+      -- here proves eqString compares BYTES, not addresses, across the cell/inline
+      -- representation boundary (a <=7B cell never arises from 'alloc' -- E3 inlines
+      -- it -- so this pairing only exists via 'allocStringHeapForced').
+      (sc1, s37)  <- allocShortCell s36
+      (inl4, s38) <- allocInline s37
+      (ciEq, s39) <- callEq sc1 inl4 s38
+      let rcCI = asBool ciEq s39
+      s40 <- dropResult ciEq s39
+      -- (cell, inline) DIFFERENT short bytes: expect False.  Short cell vs the
+      -- guaranteed-different NUL inline.
+      (sc2, s41)   <- allocShortCell s40
+      (inlD3, s42) <- allocInlineDiff s41
+      (ciNe, s43)  <- callEq sc2 inlD3 s42
+      let rcCINe = asBool ciNe s43
+      s44 <- dropResult ciNe s43
+      -- Oracle bytes for the cross-type pairs (independent of eqString).
+      let oracleVI   = winBytes   == shortDiffBytes  -- (view, inline) diff -> False
+          oracleIINe = shortBytes == shortDiffBytes  -- (inline,inline) diff -> usually False
+          oracleII   = True                          -- (inline,inline) same bytes
+          oracleCI   = shortBytes == shortBytes      -- (cell, inline) same short -> True
+          oracleCINe = shortBytes == shortDiffBytes  -- (cell, inline) diff -> usually False
+      -- Final heap balance.
+      let liveEnd = St.stLive (St.stStats s44)
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PV6 (view,view) same bytes: got=" <> show rcVV
+              <> " win=" <> show winBytes)
+            rcVV
+        , QC.counterexample
+            ("PV6 (view,view) diff bytes: got=" <> show rcVVNe
+              <> " win=" <> show winBytes <> " diff=" <> show diffBytes)
+            (not rcVVNe)
+        , QC.counterexample
+            ("PV6 (view,cell) same bytes: got=" <> show rcVC
+              <> " win=" <> show winBytes)
+            rcVC
+        , QC.counterexample
+            ("PV6 (view,cell) diff bytes: got=" <> show rcVCNe)
+            (not rcVCNe)
+        , QC.counterexample
+            ("PV6 (cell,cell) same bytes: got=" <> show rcCC)
+            rcCC
+        , QC.counterexample
+            ("PV6 (cell,cell) diff bytes: got=" <> show rcCCNe)
+            (not rcCCNe)
+        , QC.counterexample
+            ("PV6 (view,inline) diff bytes [equal unconstructible]: got=" <> show rcVI
+              <> " oracle=" <> show oracleVI
+              <> " win=" <> show winBytes <> " inl=" <> show shortDiffBytes)
+            (rcVI == oracleVI)
+        , QC.counterexample
+            ("PV6 (inline,inline) diff bytes: got=" <> show rcIINe
+              <> " oracle=" <> show oracleIINe
+              <> " short=" <> show shortBytes <> " diff=" <> show shortDiffBytes)
+            (rcIINe == oracleIINe)
+        , QC.counterexample
+            ("PV6 (inline,inline) same bytes: got=" <> show rcII
+              <> " oracle=" <> show oracleII <> " short=" <> show shortBytes)
+            (rcII == oracleII)
+        , QC.counterexample
+            ("PV6 (cell,inline) same short bytes [byte-based, not address]: got=" <> show rcCI
+              <> " oracle=" <> show oracleCI <> " short=" <> show shortBytes)
+            (rcCI == oracleCI)
+        , QC.counterexample
+            ("PV6 (cell,inline) diff short bytes: got=" <> show rcCINe
+              <> " oracle=" <> show oracleCINe
+              <> " short=" <> show shortBytes <> " diff=" <> show shortDiffBytes)
+            (rcCINe == oracleCINe)
+        , QC.counterexample
+            ("PV6 heap balance: live=" <> show liveEnd
+              <> " baseline=" <> show baseline0)
+            (liveEnd == baseline0)
+        ]
+
+rcStringViewPropertyTests :: TestTree
+rcStringViewPropertyTests =
+  localOption (QuickCheckTests 150) $
+    testGroup "rcStringViewProperty (Suite E4: NStringView borrow + transparency)"
+      [ testProperty "PV1: borrow-out survival -- view bytes readable after prim drops input"
+          prop_viewBorrowOutSurvival
+      , testProperty "PV2: nested-flatten -- slice(slice s a b) c d is root-backed, byte-correct"
+          prop_viewNestedFlatten
+      , testProperty "PV3: window round-trip -- slice bytes agree with Data.Text codepoint oracle"
+          prop_viewWindowRoundTrip
+      , testProperty "PV4: UTF-8 validity -- every slice result decodes as valid UTF-8"
+          prop_viewUtf8Validity
+      , testProperty "PV4b: byteSlice split-boundary raises PrimError (concrete multibyte)"
+          prop_viewByteSliceSplitError
+      , testProperty "PV4c: byteAt on a CHeap WokStringView reads windowed bytes (tag-guard regression)"
+          prop_viewByteAtOnView
+      , testProperty "PV5: op-transparency -- all E1/E2 ops on view == same op on materialized copy"
+          prop_viewOpTransparency
+      , testProperty "PV6: cross-type equality -- eqString agrees with byte-eq for (view,cell,inline)"
+          prop_viewCrossTypeEquality
       ]
 
 rcArrayPropertyTests :: TestTree

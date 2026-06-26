@@ -69,6 +69,8 @@ module Wok.IR.PrimNames
   , stringIndexOfFromRawName
   , stringHashName
   , stringEditDistanceName
+  , stringSliceName
+  , stringByteSliceName
   ) where
 
 import Data.Set (Set)
@@ -234,3 +236,12 @@ stringHashName = Tx.pack "hash"
 -- | @editDistance a b@: byte-level unit-cost Levenshtein (StringZilla sz_edit_distance).
 stringEditDistanceName :: Text
 stringEditDistanceName = Tx.pack "editDistance"
+
+-- | @slice s start len@: codepoint window [start, start+len), saturating bounds.
+stringSliceName :: Text
+stringSliceName = Tx.pack "slice"
+
+-- | @byteSlice s start len@: byte window [start, start+len), saturating bounds;
+-- PrimError if a boundary splits a multibyte codepoint.
+stringByteSliceName :: Text
+stringByteSliceName = Tx.pack "byteSlice"

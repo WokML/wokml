@@ -538,6 +538,16 @@ contains s n =
       let t.3 = False
       t.3
 
+take s n =
+  let t = slice(s, 0, n)
+  t
+
+drop s n =
+  let _dup = __rc_dup(s)
+  let t.1 = length(s)
+  let t.2 = slice(s, n, t.1)
+  t.2
+
 count s n =
   let _dup = __rc_dup(n)
   let t.1 = byteLength(n)

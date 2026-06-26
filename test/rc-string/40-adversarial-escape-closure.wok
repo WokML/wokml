@@ -1,0 +1,26 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 7: adversarial shape 1 -- escape via closure.
+--
+-- A slice 'v' is captured by a closure 'f'; 'f' is called and the slice's
+-- byteLength is returned as the program result.  Under the counted (release)
+-- path the view's counted ref inside 'f's closure keeps the parent alive
+-- for the full duration of the call -> correct output.
+--
+-- The escaping shape: 'f' closes over 'v', so if 'v' were a bare 'Window'
+-- (uncounted) AND 'f' escaped its birth activation, the parent could be freed
+-- before the window is read.  This is exactly the exploit the death-test gates.
+--
+-- s     = "hello wonderful world" (21 bytes, > maxInlineStr -> WokString cell)
+-- v     = slice s 6 15            -> "wonderful world" (15 bytes > 7 -> NStringView)
+-- f     = \x -> byteLength v      -> closure capturing v
+-- main  = f 0                     -> 15
+
+main : U64
+main =
+  let s = "hello wonderful world" in
+  let v = slice s 6 15 in
+  let f = \x -> byteLength v in
+  f 0

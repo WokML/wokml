@@ -1,5 +1,5 @@
 classify xs =
-  join j100(r) =
+  join j104(r) =
     let n = r
     let t = Pair(n, xs)
     t
@@ -9,10 +9,10 @@ classify xs =
       case ys of
         Nil ->
           let _drop.1 = __rc_drop(ys)
-          jump j100(0)
+          jump j104(0)
         Cons z _ ->
           let _drop.2 = __rc_drop(ys)
-          jump j100(z)
+          jump j104(z)
 
 main =
   let t.2 = Nil
@@ -535,6 +535,16 @@ contains s n =
       let _drop.2 = __rc_drop(t.1)
       let t.3 = False
       t.3
+
+take s n =
+  let t = slice(s, 0, n)
+  t
+
+drop s n =
+  let _dup = __rc_dup(s)
+  let t.1 = length(s)
+  let t.2 = slice(s, n, t.1)
+  t.2
 
 count s n =
   let _dup = __rc_dup(n)

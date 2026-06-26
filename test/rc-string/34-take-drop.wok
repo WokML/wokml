@@ -1,0 +1,27 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 3: take and drop library functions (defined in Std.String over slice).
+-- s = "hello world" (11 bytes, 11 codepoints)
+-- take s 5 = "hello" (5 bytes)
+-- drop s 6 = "world" (5 bytes)
+-- take s 0 = "" (0 bytes)
+-- drop s 11 = "" (0 bytes, saturated)
+-- take s 11 = "hello world" (11 bytes)
+-- byteLength (take s 5)  = 5
+-- byteLength (drop s 6)  = 5
+-- byteLength (take s 0)  = 0
+-- byteLength (drop s 11) = 0
+-- byteLength (take s 11) = 11
+-- Total = 21
+
+main : U64
+main =
+  let s = "hello world" in
+  let a = byteLength (take s 5) in
+  let b = byteLength (drop s 6) in
+  let c = byteLength (take s 0) in
+  let d = byteLength (drop s 11) in
+  let e = byteLength (take s 11) in
+  a + b + c + d + e

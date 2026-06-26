@@ -1,0 +1,32 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 3: basic ASCII slice.
+-- "hello world" codepoints: h e l l o   w o r l d  (11 codepoints, 11 bytes)
+-- slice "hello world" 6 5 = "world"  (codepoints 6..10)
+-- slice "hello world" 0 5 = "hello"
+-- slice "hello world" 0 0 = ""       (empty)
+-- slice "hello world" 11 5 = ""      (start >= length, saturates)
+-- take "hello world" 5 = "hello"
+-- drop "hello world" 6 = "world"
+--
+-- We sum the byteLengths to get a numeric result:
+--   byteLength "world" = 5
+--   byteLength "hello" = 5
+--   byteLength ""      = 0
+--   byteLength ""      = 0
+--   byteLength "hello" = 5
+--   byteLength "world" = 5
+-- Total = 20
+
+main : U64
+main =
+  let s  = "hello world" in
+  let a  = byteLength (slice s 6 5) in
+  let b  = byteLength (slice s 0 5) in
+  let c  = byteLength (slice s 0 0) in
+  let d  = byteLength (slice s 11 5) in
+  let e  = byteLength (take s 5) in
+  let f  = byteLength (drop s 6) in
+  a + b + c + d + e + f

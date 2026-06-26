@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 3: slice producing a short (<=7 byte) result is an InlineStr (0 new cells).
+-- s = "hello world" (11 bytes, a WokString cell on CHeap)
+-- slice s 0 3 = "hel" (3 bytes) -> InlineStr, 0 new cells
+-- slice s 6 5 = "world" (5 bytes) -> InlineStr (5 <= 7), 0 new cells
+-- byteSlice s 0 4 = "hell" (4 bytes) -> InlineStr, 0 new cells
+-- Sum of byteLengths: 3 + 5 + 4 = 12
+
+main : U64
+main =
+  let s = "hello world" in
+  let a = byteLength (slice s 0 3) in
+  let b = byteLength (slice s 6 5) in
+  let c = byteLength (byteSlice s 0 4) in
+  a + b + c

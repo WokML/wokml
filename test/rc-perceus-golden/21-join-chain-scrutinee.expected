@@ -1,25 +1,25 @@
 headCons xs =
-  join j100(r) =
+  join j104(r) =
     let h = r
     let t = Cell(h, xs)
     t
-  join j102() =
-    jump j100(0)
-  join j103(y.1) =
-    jump j100(y.1)
-  join j105(y.2) =
-    jump j100(y.2)
+  join j106() =
+    jump j104(0)
+  join j107(y.1) =
+    jump j104(y.1)
+  join j109(y.2) =
+    jump j104(y.2)
   case xs of
-    Nil -> jump j102()
+    Nil -> jump j106()
     Cons f.1 f.2 ->
       let _dup = __rc_dup(f.2)
       case f.2 of
         Nil ->
           let _drop.1 = __rc_drop(f.2)
-          jump j103(f.1)
+          jump j107(f.1)
         Cons f.3 f.4 ->
           let _drop.2 = __rc_drop(f.2)
-          jump j105(f.1)
+          jump j109(f.1)
 
 main =
   let t.3 = Nil
@@ -542,6 +542,16 @@ contains s n =
       let _drop.2 = __rc_drop(t.1)
       let t.3 = False
       t.3
+
+take s n =
+  let t = slice(s, 0, n)
+  t
+
+drop s n =
+  let _dup = __rc_dup(s)
+  let t.1 = length(s)
+  let t.2 = slice(s, n, t.1)
+  t.2
 
 count s n =
   let _dup = __rc_dup(n)

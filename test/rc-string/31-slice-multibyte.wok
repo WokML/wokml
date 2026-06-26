@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 3: codepoint-indexed slice with multibyte UTF-8.
+-- s = "héllo": [h, é(2B), l, l, o] = 5 codepoints, 6 bytes
+-- slice s 1 3 = codepoints [1,4) = [é, l, l] = 4 bytes (é=2B + l=1B + l=1B)
+-- slice s 0 1 = [h] = 1 byte
+-- slice s 4 1 = [o] = 1 byte
+-- byteLength result checks:
+--   byteLength (slice s 1 3) = 4
+--   byteLength (slice s 0 1) = 1
+--   byteLength (slice s 4 1) = 1
+-- Total = 6
+
+main : U64
+main =
+  let s = "héllo" in
+  let a = byteLength (slice s 1 3) in
+  let b = byteLength (slice s 0 1) in
+  let c = byteLength (slice s 4 1) in
+  a + b + c

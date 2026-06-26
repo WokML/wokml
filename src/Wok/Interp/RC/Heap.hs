@@ -8,6 +8,7 @@ module Wok.Interp.RC.Heap
   , wokStatPeakBytes, wokStatPeakPhysicalBytes
   , wokArrayAlloc, wokArrayLen, wokArrayElemKind, wokArraySlotGet, wokArraySlotSet
   , wokStringAlloc, wokStringLen, wokStringData, wokStringByteGet
+  , wokStringViewAlloc, wokStringViewParent, wokStringViewOffset, wokStringViewLen
   , wokArenaOpen, wokArenaAlloc, wokArenaClose, wokStatArenaBytes, wokStatArenaPeak
   ) where
 
@@ -41,11 +42,15 @@ foreign import ccall unsafe "wok_array_len"        wokArrayLen      :: Ptr WokOb
 foreign import ccall unsafe "wok_array_elemkind"   wokArrayElemKind :: Ptr WokObj -> IO Word32
 foreign import ccall unsafe "wok_array_slot_get"   wokArraySlotGet  :: Ptr WokObj -> Word64 -> IO Word64
 foreign import ccall unsafe "wok_array_slot_set"   wokArraySlotSet  :: Ptr WokObj -> Word64 -> Word64 -> IO ()
-foreign import ccall unsafe "wok_string_alloc"     wokStringAlloc   :: Ptr WokHeap -> Word64 -> IO (Ptr WokObj)
-foreign import ccall unsafe "wok_string_len"       wokStringLen     :: Ptr WokObj -> IO Word64
-foreign import ccall unsafe "wok_string_data"      wokStringData    :: Ptr WokObj -> IO (Ptr Word8)
-foreign import ccall unsafe "wok_string_byte_get"  wokStringByteGet :: Ptr WokObj -> Word64 -> IO Word64
-foreign import ccall unsafe "wok_arena_open"       wokArenaOpen     :: Ptr WokHeap -> IO Word32
+foreign import ccall unsafe "wok_string_alloc"       wokStringAlloc      :: Ptr WokHeap -> Word64 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_string_len"         wokStringLen        :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_string_data"        wokStringData       :: Ptr WokObj -> IO (Ptr Word8)
+foreign import ccall unsafe "wok_string_byte_get"    wokStringByteGet    :: Ptr WokObj -> Word64 -> IO Word64
+foreign import ccall unsafe "wok_string_view_alloc"  wokStringViewAlloc  :: Ptr WokHeap -> Ptr WokObj -> Word64 -> Word64 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_string_view_parent" wokStringViewParent :: Ptr WokObj -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_string_view_offset" wokStringViewOffset :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_string_view_len"    wokStringViewLen    :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_arena_open"         wokArenaOpen        :: Ptr WokHeap -> IO Word32
 foreign import ccall unsafe "wok_arena_alloc"      wokArenaAlloc    :: Ptr WokHeap -> Word32 -> Word32 -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_arena_close"      wokArenaClose    :: Ptr WokHeap -> Word32 -> IO ()
 foreign import ccall unsafe "wok_stat_arena_bytes" wokStatArenaBytes :: Ptr WokHeap -> IO Word64

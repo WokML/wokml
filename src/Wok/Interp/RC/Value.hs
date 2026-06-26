@@ -56,6 +56,10 @@ module Wok.Interp.RC.Value
   , arenaAllocPure
   , arenaAlloc
   , arenaClose
+    -- * Window-set death-test (String Slice E4 Task 5; flag-gated, off in release)
+  , windowOpen
+  , windowRegister
+  , windowClose
   , deref
   , derefPure
   , mkClosure
@@ -92,7 +96,9 @@ module Wok.Interp.RC.Value
   , elemKindToSlotKind
     -- * String C-cell support
   , wokStringTag
+  , wokStringViewTag
   , maxInlineStr
+  , allocNStringView
     -- * Array in-place mutation helpers (Slice C)
   , atIndex
   , setAt
@@ -315,6 +321,17 @@ data RCKont
     -- cases in 'continuationOwned'/'continuationReservations'/'spliceKont'/
     -- 'rcFindHandler' are therefore TOTALITY cases, never exercised by an
     -- arena-opening run.
+  | KWindowCloseRC RCKont
+    -- ^ The PER-ACTIVATION WINDOW-SET BRACKET (String Slice E4 Task 5; death-test
+    -- only). Pushed ABOVE a body's continuation when the death-test flag is on, in
+    -- lockstep with the 'windowOpen' frame. When the body's final value returns into
+    -- this frame, it runs 'windowClose' (assert no 'Window'-routed view born in this
+    -- activation is still alive) and threads the value onward. Fires on EVERY exit
+    -- path STRUCTURALLY, exactly like 'KArenaCloseRC', and is likewise DEPTH-
+    -- INVISIBLE ('kontDepth' does not count it). It exists ONLY under the flag; the
+    -- release build never pushes it, so the pass-through cases in
+    -- 'continuationOwned'/'continuationReservations'/'spliceKont'/'rcFindHandler'
+    -- are TOTALITY cases, never exercised by a normal run.
   deriving (Eq, Show)
 
 -- | Number of frames in a continuation (the RC analogue of
@@ -333,6 +350,8 @@ kontDepth = go 0
     -- The arena bracket is DEPTH-INVISIBLE: it is bookkeeping, not a real
     -- continuation frame, so it must not shift a named handler's activation tag.
     go n (KArenaCloseRC k)   = go n k
+    -- The window-set bracket (death-test) is likewise depth-invisible bookkeeping.
+    go n (KWindowCloseRC k)  = go n k
 
 -- | The OWNED SET of a captured continuation prefix (M2b-1, the crux; spec §4.2):
 -- the addresses the continuation's own pending drop/move instructions would free
@@ -374,6 +393,9 @@ continuationOwned = dedup . go
     -- The arena bracket owns no continuation values (totality only; an
     -- arena-opening body is never reified into a captured prefix).
     go (KArenaCloseRC k)      = go k
+    -- The window-set bracket (death-test) owns no continuation values (totality
+    -- only; the death-test flag and continuation reification do not co-occur).
+    go (KWindowCloseRC k)     = go k
     -- A nested handler frame in the captured prefix owns its PARAMETER value (if
     -- any).  Only the parameter slot is owned by the frame itself; the rest of
     -- hsc is the captured enclosing scope, whose binders are owned by their own
@@ -512,6 +534,7 @@ continuationReservations k0 reserved = dedup (go k0)
     go (KLetRC _ _ sc k)     = fromValues (Map.elems (rscEnv sc)) ++ go k
     go (KAppRC vs k)         = fromValues vs ++ go k
     go (KArenaCloseRC k)     = go k  -- totality only (never reified, see KArenaCloseRC)
+    go (KWindowCloseRC k)    = go k  -- totality only (death-test never reified)
     -- PARAM-ONLY, mirroring 'continuationOwned's KHandleRC arm: a nested handler
     -- frame in the captured prefix OWNS only its parameter slot; the rest of its
     -- 'hsc' is the captured ENCLOSING scope (a DIFFERENT continuation's bindings).
@@ -634,6 +657,7 @@ spliceKont prefix tl = go prefix
     go (KHandleRC h tag sc k) = KHandleRC h tag sc (go k)
     go (KDropCellRC a k)      = KDropCellRC a (go k)
     go (KArenaCloseRC k)      = KArenaCloseRC (go k)  -- totality only (never reified)
+    go (KWindowCloseRC k)     = KWindowCloseRC (go k)  -- totality only (death-test never reified)
 
 -- ---------------------------------------------------------------------------
 -- Heap nodes
@@ -718,6 +742,23 @@ data Node
   -- once (the 'NCont' abort path) -- one free path, no double-free, no leak.
   -- @__cont_store@ moves the addr in WITHOUT an incref (the binder is consumed),
   -- so the cell holds the one counted edge the binder used to.
+  | NStringView Addr Int Int
+  -- ^ A ZERO-COPY BYTE WINDOW into a parent string buffer (String Slice E4 Task 1):
+  -- the parent 'Addr', the BYTE offset, and the BYTE length. The view does NOT
+  -- hold its own byte buffer; 'stringBytes' in 'Prim.hs' reads the parent's bytes
+  -- and returns an O(1) 'BS.take'/'BS.drop' slice.
+  --
+  -- RC DISCIPLINE. The view is COUNTED (unlike 'InlineStr'): it owns one counted
+  -- ref to the parent. 'nodeValues (NStringView p _ _) = [RVBox p]', so the
+  -- GENERIC 'cascadeChildren' yields '[p]' and dropping the view decrefs the
+  -- parent exactly once. No special 'cascadeChildren' arm is needed.
+  --
+  -- C CELL. The 32-byte @WokStringView@ C cell: 8-byte header
+  -- (@rc@/@tag@/@reserved@/@scan=0@) + parent pointer 8B + offset 8B + len 8B.
+  -- 'nodeCEligible (NStringView{}) = False' (own alloc path, not 'NCon' slot
+  -- encoding). 'wouldBeCBytes (NStringView{}) = 32'. The parent drop is
+  -- Haskell-driven ('dropAddr' reads the parent ptr before 'wok_free'), so the
+  -- C @scan@ field stays 0 (no C-side cascade).
   deriving (Eq, Show)
 
 -- | Whether a closure BODY receives ownership of its captures on entry. This is
@@ -874,6 +915,28 @@ data Store = Store
     -- handle to 'wok_arena_close' (which asserts @handle == arena_depth - 1@).
     -- Empty under 'AbstractHeap'. Pushed/popped in lockstep with 'stArena'/
     -- 'stArenaC'.
+  , stWindowSet  :: [IntSet]
+    -- ^ the per-activation WINDOW-SET stack for the 'Window'-routing death-test
+    -- (String Slice E4 Task 5; flag-gated). A STACK of 'HAddr'-index sets, head =
+    -- the innermost open activation. 'windowOpen' pushes an empty frame on every
+    -- activation entry; 'windowRegister' records a freshly-created 'Window'-routed
+    -- view's 'HAddr' index in the innermost frame; 'windowClose' checks at
+    -- activation exit that NO registered view is still ALIVE (present in 'stCells')
+    -- before popping the frame -- a still-live view escaped its birth activation,
+    -- so its 'Window' routing was a lie (the L5 soundness invariant). The check is
+    -- NON-DESTRUCTIVE on live cells (it only reads 'stCells' membership) and reads
+    -- no freed memory: a view dropped before close has been DELETED from 'stCells'
+    -- (the normal 'dropAddr' free path), so its index is absent = passes.
+    --
+    -- EMPTY under the release build (the death-test flag off): no frame is ever
+    -- pushed, so registration and the close check are skipped entirely and the
+    -- counted behaviour (spec D2) is byte-identical to today.
+    --
+    -- A 'Window' view always lives on the ABSTRACT heap as an 'HAddr' (the slice
+    -- prim's view cell, 'AbstractHeap' backend); 'CAddr' views (CHeap) are not
+    -- registered (a freed C cell cannot be safely probed for liveness), so the
+    -- death-test is an 'AbstractHeap' analysis tool, matching the corpus/negative-
+    -- control test seam ('runExprRC', AbstractHeap).
   }
 
 -- | Which heap an 'NCon' is allocated into. 'AbstractHeap' is the default and is
@@ -930,6 +993,7 @@ emptyStore = Store
   , stArena      = []
   , stArenaC     = []
   , stArenaHandles = []
+  , stWindowSet  = []
   }
 
 -- | Intern a constructor name to its stable tag-id, allocating a fresh id on
@@ -949,12 +1013,16 @@ internTag con s = case Map.lookup con (stTagFwd s) of
   Just w  -> (w, s)
   Nothing ->
     let raw = fromIntegral (Map.size (stTagFwd s))
-        -- Skip the reserved WOK_ARRAY_TAG (0xFFFF) and WOK_STRING_TAG (0xFFFE)
-        -- so no constructor tag ever collides with the C array or string
-        -- discriminators. Apply the bumps in descending order so the first
-        -- reserved tag encountered shifts raw past the second too.
-        w0  = if raw >= wokStringTag then raw + 1 else raw
-        w   = if w0  >= wokArrayTag  then w0  + 1 else w0
+        -- Skip the reserved tags so no constructor tag ever collides with a C
+        -- cell discriminator. Apply bumps in descending order (0xFFFD < 0xFFFE
+        -- < 0xFFFF) so the first reserved tag encountered shifts raw past the
+        -- higher ones too.
+        --   0xFFFD = WOK_STRING_VIEW_TAG (E4 string-view cell)
+        --   0xFFFE = WOK_STRING_TAG      (E1 string cell)
+        --   0xFFFF = WOK_ARRAY_TAG       (array cell)
+        w0  = if raw >= wokStringViewTag then raw + 1 else raw
+        w1  = if w0  >= wokStringTag     then w0  + 1 else w0
+        w   = if w1  >= wokArrayTag      then w1  + 1 else w1
     in ( w
        , s { stTagFwd  = Map.insert con w (stTagFwd s)
            , stTagRev  = IM.insert (fromIntegral w) con (stTagRev s)
@@ -986,6 +1054,13 @@ wokArrayTag = 0xFFFF
 -- 'CAddr' cell with this tag is always a 'WokString', never an 'NCon'.
 wokStringTag :: Word32
 wokStringTag = 0xFFFE
+
+-- | The reserved C tag value for string-view cells (WOK_STRING_VIEW_TAG). A
+-- 'CAddr' cell with this tag is always a 'WokStringView' (32-byte fixed cell:
+-- header + parent ptr + byte offset + byte len). 'internTag' is guarded to
+-- never assign this value (or 'wokStringTag' / 'wokArrayTag') to a constructor.
+wokStringViewTag :: Word32
+wokStringViewTag = 0xFFFD
 
 -- | Max UTF-8 byte length stored inline in the one-word value (slice E3).
 -- The KPointer slot word has 58 data bits above the 3-bit @111@ discriminant and
@@ -1454,6 +1529,64 @@ closeCArenaFrame s = case stArenaC s of
           pure s2 { stArenaC = restC, stArenaHandles = restH }
         [] -> liftRC (Left (PrimError (Tx.pack "arenaClose: C-arena handle stack underflow")))
 
+-- ---------------------------------------------------------------------------
+-- Window-set death-test (String Slice E4 Task 5; flag-gated, off in release)
+--
+-- The 'Window' routing CLAIMS a view does not outlive its birth activation (so
+-- codegen may drop the parent's refcount edge). The interpreter realizes 'Window'
+-- as a COUNTED window (spec D2 -- always increfs the parent), so a mis-route can
+-- never produce a runtime use-after-free; correct non-escaping code is therefore
+-- never mis-counted. This death-test, gated entirely behind the machine's flag,
+-- checks the ROUTING CLAIM directly: it brackets every activation and asserts that
+-- no 'Window'-routed view born inside it is still alive when the activation exits.
+--
+-- WHY ZERO FALSE POSITIVES. The view stays COUNTED, so a correct non-escaping view
+-- is dropped at its last use (Perceus) BEFORE the activation returns -- its cell is
+-- deleted from 'stCells', so 'windowClose' finds it absent (passes). An ESCAPING
+-- view (returned / stored / captured) is kept alive by the escaping owner's count,
+-- so it is still present in 'stCells' at the activation's return (fires). The check
+-- reads only LIVE-cell membership; it never probes freed memory. A naive
+-- "uncount the view + check parent-live-on-read" design would instead free the
+-- parent at the slice (the prim consumes its parent) and fire on CORRECT code --
+-- the false-positive trap the spec (§8 layer 1) records and this design avoids.
+
+-- | Push an empty window-set frame for a fresh activation (death-test only). The
+-- machine calls this on every body entry when the flag is on; 'windowClose' pops
+-- the matching frame on every exit path. Pushed/popped in lockstep with the
+-- activation bracket so the depths never diverge.
+windowOpen :: Store -> Store
+windowOpen s = s { stWindowSet = IS.empty : stWindowSet s }
+
+-- | Register a freshly-created 'Window'-routed view's address in the innermost
+-- window-set frame (death-test only). Only an abstract 'HAddr' view participates:
+-- a slice view on the 'AbstractHeap' backend is an 'HAddr', and a freed 'HAddr'
+-- cell is deleted from 'stCells' (so 'windowClose's liveness probe is safe). A
+-- 'CAddr' view (CHeap) or an uncounted/inline address is NOT a counted view cell
+-- this test can safely probe at close, so it is ignored (the test is an
+-- 'AbstractHeap' analysis tool, matching the corpus test seam). With no open frame
+-- (the flag off) registration is a no-op.
+windowRegister :: Addr -> Store -> Store
+windowRegister (HAddr i) s = case stWindowSet s of
+  []           -> s
+  (top : rest) -> s { stWindowSet = IS.insert i top : rest }
+windowRegister _ s = s
+
+-- | Close the innermost activation's window-set frame (death-test only). FIRES a
+-- catchable 'PrimError' if ANY registered view is still ALIVE (present in
+-- 'stCells') -- a 'Window'-routed view that outlived its birth activation, so its
+-- routing was a lie. A view dropped before close was deleted from 'stCells' (the
+-- normal free path), so its index is absent and the check passes. Pops the frame
+-- on success. With no open frame (the flag off) this is a no-op.
+windowClose :: Store -> RC Store
+windowClose s = case stWindowSet s of
+  []           -> pure s
+  (top : rest) ->
+    let escaped = [ i | i <- IS.toList top, IM.member i (stCells s) ]
+    in if null escaped
+         then pure s { stWindowSet = rest }
+         else liftRC (Left (PrimError
+                (Tx.pack "view escaped its birth activation (death-test)")))
+
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
 --
@@ -1614,6 +1747,38 @@ allocNString hp bs s = do
              copyBytes dest (castPtr src) len)
   pure (CAddr p, s { stStats = recordAlloc charged (stStats s) })
 
+-- | Allocate an 'NStringView' node: a counted window into a parent string buffer.
+-- The parent is increffed (the view owns one counted ref) then the view cell is
+-- allocated -- on the abstract 'IntMap' heap ('AbstractHeap') or as a 32-byte
+-- @WokStringView@ C cell ('CHeap', via 'wokStringViewAlloc').
+--
+-- BYTES. 'wouldBeCBytes (NStringView{}) = 32' (8-byte header + parent ptr 8B +
+-- offset 8B + len 8B), matching the @WokStringView@ C cell layout, so the
+-- differential oracle sees identical 'peak_bytes' on both backends.
+--
+-- RC INVARIANT. The single incref happens BEFORE the view cell is created. On
+-- 'AbstractHeap' 'allocPure' is total (cannot fail) so the order is safe; on
+-- 'CHeap' the parent must be a 'CAddr' and 'wokStringViewAlloc' does NOT incref --
+-- the Haskell side owns that one incref, matched by the one decref in 'dropAddr'.
+allocNStringView :: Addr -> Int -> Int -> Store -> RC (Addr, Store)
+allocNStringView parent off len s = case stBackend s of
+  CHeap hp -> do
+    -- The parent MUST be a CAddr on the CHeap backend: an NStringView on the C
+    -- heap can only reference a counted C cell (a WokString or WokStringView).
+    parentPtr <- case parent of
+      CAddr p -> pure p
+      _       -> liftRC (Left (PrimError
+                   (Tx.pack "allocNStringView CHeap: parent is not a CAddr")))
+    -- Incref the parent BEFORE allocating the view cell (mirrors the abstract
+    -- path; wok_string_view_alloc does NOT incref -- the Haskell side owns that).
+    liftIO (H.wokDup parentPtr)
+    p <- liftIO (H.wokStringViewAlloc hp parentPtr
+                   (fromIntegral off) (fromIntegral len))
+    pure (CAddr p, s { stStats = recordAlloc 32 (stStats s) })
+  AbstractHeap -> do
+    s1 <- incref parent s
+    pure (allocPure (NStringView parent off len) s1)
+
 -- | The pure core of 'alloc': always allocates on the abstract 'IntMap' heap,
 -- returning an 'HAddr'. Charges 'wouldBeCBytes n' to 'stCurBytes'/'stPeakBytes'
 -- so the abstract run's byte high-water tracks what would land on the C heap.
@@ -1660,9 +1825,10 @@ allocPureFallback n s =
 -- captures is integer width within @KLitInt@ (a small int encodes, a @>= 2^63@
 -- natural does not).
 nodeCEligible :: Node -> Bool
-nodeCEligible (NCon _ vs) = length vs <= 255 && all (isJust . encodeSlotC) vs
-nodeCEligible (NString _) = False  -- has its own dedicated alloc path (not NCon slot encoding)
-nodeCEligible _           = False
+nodeCEligible (NCon _ vs)    = length vs <= 255 && all (isJust . encodeSlotC) vs
+nodeCEligible (NString _)    = False  -- has its own dedicated alloc path (not NCon slot encoding)
+nodeCEligible (NStringView{}) = False  -- has its own dedicated alloc path
+nodeCEligible _              = False
 
 -- | The field count of a node (FBIP placement match). Only an 'NCon' has a
 -- meaningful physical arity for reuse; every other node kind reports 0 (it is
@@ -1690,8 +1856,11 @@ wouldBeCBytes (NArray vs)  = 16 + 8 * length vs
 -- granule so the next bumped cell stays 8-aligned (contrast NArray, whose body
 -- is already word-aligned and needs no rounding). Matches wok_string_alloc
 -- charge exactly so AbstractHeap and CHeap agree on peak_bytes.
-wouldBeCBytes (NString bs) = 16 + 8 * ((BS.length bs + 7) `div` 8)
-wouldBeCBytes _            = 0
+wouldBeCBytes (NString bs)    = 16 + 8 * ((BS.length bs + 7) `div` 8)
+-- View cell: 8-byte header + parent ptr 8B + offset 8B + len 8B = 32B fixed.
+-- Matches the WokStringView C cell layout exactly.
+wouldBeCBytes (NStringView{}) = 32
+wouldBeCBytes _               = 0
 
 -- | Allocate a node into the STATIC immortal region. Returns a NEGATIVE 'Addr'
 -- and the updated 'Store'. Unlike 'alloc', this does NOT touch 'stStats': a
@@ -1794,8 +1963,9 @@ deref (Inline tid)   s = pure (Cell 0 (NCon (tagName tid s) []) 0)
 deref (InlineStr bs) _ = pure (Cell 0 (NString bs) 0)
 
 -- | Reconstruct the 'Cell' of a C-heap cell from its header. Dispatches on the
--- tag field: 'wokArrayTag' (0xFFFF) produces an 'NArray'; any other tag produces
--- an 'NCon' via 'readCConValues'.
+-- tag field: 'wokArrayTag' (0xFFFF) produces an 'NArray'; 'wokStringTag'
+-- (0xFFFE) produces an 'NString'; 'wokStringViewTag' (0xFFFD) produces an
+-- 'NStringView'; any other tag produces an 'NCon' via 'readCConValues'.
 --
 -- THE @cRc@ FIELD IS A MEANINGLESS PLACEHOLDER (always 0) for a C cell: the real
 -- reference count lives in the C runtime (the @rc@ word of the @WokObj@). NO
@@ -1814,9 +1984,17 @@ readCCell p s = do
       then do
         bs <- readCStringBytes p
         pure (Cell 0 (NString bs) 0)
-      else do
-        vs <- readCConValues p s
-        pure (Cell 0 (NCon (tagName tid s) vs) 0)
+      else if tid == wokStringViewTag
+        then do
+          parentPtr <- H.wokStringViewParent p
+          off       <- H.wokStringViewOffset p
+          len       <- H.wokStringViewLen    p
+          pure (Cell 0 (NStringView (CAddr parentPtr)
+                                    (fromIntegral off)
+                                    (fromIntegral len)) 0)
+        else do
+          vs <- readCConValues p s
+          pure (Cell 0 (NCon (tagName tid s) vs) 0)
 
 -- | Decode a C array cell's slots back to @[RCValue]@, reading the header
 -- @elemkind@ once. Delegates to 'readCArraySlots' with the decoded kind. Used by
@@ -1990,8 +2168,9 @@ dropAddr a0 s0 = go [a0] s0
           -- Compute the byte delta BEFORE freeing: the same formula used at
           -- allocation so stCurBytes stays balanced. Arrays = 16 + 8*len;
           -- Strings = 16 + 8*ceil(byte_len/8) (8-rounded body);
+          -- StringViews = 32 (fixed, header + parent ptr + offset + len);
           -- NCons = 8 + 8*arity (both C-eligible, same layout as wok_alloc /
-          -- wok_array_alloc / wok_string_alloc charge).
+          -- wok_array_alloc / wok_string_alloc / wok_string_view_alloc charge).
           bytes <- if tid == wokArrayTag
                      then do
                        len <- liftIO (H.wokArrayLen p)
@@ -2000,9 +2179,15 @@ dropAddr a0 s0 = go [a0] s0
                        then do
                          blen <- liftIO (H.wokStringLen p)
                          pure (16 + 8 * fromIntegral ((blen + 7) `div` 8 :: Word64))
-                       else do
-                         ar <- liftIO (H.wokArity p)
-                         pure (8 + 8 * fromIntegral (ar :: Word32))
+                       else if tid == wokStringViewTag
+                         -- Fixed 32-byte view cell (header 8 + parent 8 + off 8 + len 8).
+                         then pure 32
+                         else do
+                           ar <- liftIO (H.wokArity p)
+                           pure (8 + 8 * fromIntegral (ar :: Word32))
+          -- Collect child refs for the cascade (read ALL fields before wok_free).
+          -- StringViews: the parent pointer is the ONE counted child (D8).
+          -- Read it BEFORE wok_free; add it to the worklist so dropAddr recurses.
           -- Strings have no child refs (bytes are opaque): cascade is empty.
           kids <- if tid == wokArrayTag
                     then do
@@ -2018,7 +2203,13 @@ dropAddr a0 s0 = go [a0] s0
                     else if tid == wokStringTag
                       -- String bytes are opaque: no child refs, no cascade.
                       then pure []
-                      else countedRefs <$> liftIO (readCConValues p s)
+                      else if tid == wokStringViewTag
+                        -- The view's only counted child is the parent (Haskell-driven
+                        -- drop, D8). Read the parent pointer BEFORE freeing the cell.
+                        then do
+                          parentPtr <- liftIO (H.wokStringViewParent p)
+                          pure [CAddr parentPtr]
+                        else countedRefs <$> liftIO (readCConValues p s)
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats bytes s)
@@ -2141,7 +2332,11 @@ nodeValues (NCont _ _)          = []
 -- The held continuation is an ordinary counted child of the cell (one 'RVBox');
 -- an empty cell has none. 'cascadeChildren' falls through to the generic
 -- 'countedRefs . nodeValues' default, so the cell's drop cascades to it once.
-nodeValues (NContCell mb)       = [ RVBox a | Just a <- [mb] ]
+nodeValues (NContCell mb)         = [ RVBox a | Just a <- [mb] ]
+-- The parent is the one counted child. The GENERIC 'cascadeChildren' (which calls
+-- 'countedRefs . nodeValues') yields '[p]', so dropping the view decrefs the
+-- parent exactly once. No special 'cascadeChildren' arm is needed.
+nodeValues (NStringView p _ _)  = [RVBox p]
 
 -- | The addresses to free when a node's cell is freed (the single free path,
 -- consumed by 'dropAddr'). For every node EXCEPT 'NCont' this is the counted refs
@@ -2473,6 +2668,20 @@ renderValueWith drf = goVal
     -- the differential oracle can compare the two backends' output.
     goNode _ (NString bs) =
       pure (Tx.pack (show (TxEnc.decodeUtf8 bs)))
+    -- Render a view as the windowed string: deref the parent, slice its bytes, decode.
+    -- Rendering produces the same text as the materialized substring (differential
+    -- oracle transparency: a view and an NString of the same bytes render identically).
+    -- A view's parent is ALWAYS a root 'NString' (spec D6 flatten-on-construction), so a
+    -- non-'NString' parent is an impossible internal state -- fail loudly rather than
+    -- silently default (the 'tagName'/'readCConValues' impossible-state idiom; this
+    -- generic 'Monad m' renderer has no 'throwE', so 'error' is the loud signal).
+    goNode s (NStringView p off len) = do
+      pc <- drf p s
+      case cNode pc of
+        NString pbs ->
+          let bs = BS.take len (BS.drop off pbs)
+          in pure (Tx.pack (show (TxEnc.decodeUtf8 bs)))
+        _ -> error "internal: NStringView parent is not NString"
     goNode s (NRecord t m) = do
       parts <- mapM (\(l, fv) -> do tv <- goVal s fv
                                     pure (l <> Tx.pack " = " <> tv)) (Map.toList m)

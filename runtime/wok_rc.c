@@ -272,7 +272,8 @@ void wok_free(WokHeap* h, WokObj* p) {
     if (WOK_UNLIKELY(p->rc != 0u)) { fprintf(stderr, "wok_rc: wok_free on rc!=0 (premature free)\n"); abort(); }
     /* Tag-first dispatch: array and string cells carry a runtime len at offset 8, not an
        arity byte. Check reserved tags BEFORE falling back to arity (their arity bytes have
-       different semantics: array stores elemkind, string stores 0). */
+       different semantics: array stores elemkind, string stores 0).
+       WokStringView is fixed 32 bytes (no runtime len field needed). */
     size_t bytes;
     if (WOK_UNLIKELY((uint32_t)p->tag == WOK_ARRAY_TAG)) {
         uint64_t len = wok_array_read_len(p);
@@ -280,6 +281,10 @@ void wok_free(WokHeap* h, WokObj* p) {
     } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_TAG)) {
         uint64_t byte_len = wok_string_read_byte_len(p);
         bytes = wok_string_cell_bytes(byte_len);
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_VIEW_TAG)) {
+        /* Fixed 32-byte cell: 8-byte header + parent ptr + offset + len. The parent is NOT
+           dropped here (scan=0, Haskell-driven drop -- see D8 of the E4 spec). */
+        bytes = 32u;
     } else {
         bytes = wok_cell_bytes((uint32_t)p->arity);
     }
@@ -421,6 +426,28 @@ WokObj* wok_string_alloc(WokHeap* h, uint64_t byte_len) {
     p->rc = 1u; p->tag = (uint16_t)WOK_STRING_TAG; p->arity = 0u; p->scan = 0u;
     /* Write byte_len at offset 8 (past the WokObj prefix). */
     memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_PHYS_ADD(h, sz);   /* per-cell malloc grows physical */
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_string_view_alloc(WokHeap* h, WokObj* parent, uint64_t off, uint64_t len) {
+    /* Fixed 32-byte cell: 8-byte header + parent ptr (8B) + offset (8B) + len (8B).
+       The parent is NOT incref'd here: the Haskell caller (allocNStringView) is responsible
+       for incref'ing the parent BEFORE calling this function. scan=0 (no C cascade; D8). */
+    size_t sz = 32u;
+    WokObj* p = (WokObj*)malloc(sz);
+    if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    p->rc = 1u; p->tag = (uint16_t)WOK_STRING_VIEW_TAG; p->arity = 0u; p->scan = 0u;
+    /* Write parent pointer at offset 8. */
+    uintptr_t parent_word = (uintptr_t)parent;
+    memcpy((char*)p + 8,  &parent_word, sizeof(uint64_t));
+    memcpy((char*)p + 16, &off,         sizeof(uint64_t));
+    memcpy((char*)p + 24, &len,         sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -640,9 +667,10 @@ void wok_free(WokHeap* h, WokObj* p) {
     /* Tag-first dispatch: array and string cells carry a runtime len at offset 8, not an
        arity byte.  Check reserved tags BEFORE falling back to arity (their arity bytes have
        different semantics: array stores elemkind, string stores 0).
+       WokStringView is fixed 32 bytes (size class 3, shared with NCon arity=3).
        Size class: bytes/8-1.  NCon arity a -> class=a.  WokArray len L -> class=L+1.
        WokString byte_len B -> class = 1+ceil(B/8) (via wok_string_class, the no-wrap guard
-       alloc uses so routing agrees). */
+       alloc uses so routing agrees).  WokStringView -> class=3 (32/8-1). */
     size_t bytes;
     size_t cls;
     if (WOK_UNLIKELY((uint32_t)p->tag == WOK_ARRAY_TAG)) {
@@ -653,6 +681,11 @@ void wok_free(WokHeap* h, WokObj* p) {
         uint64_t byte_len = wok_string_read_byte_len(p);
         bytes = wok_string_cell_bytes(byte_len);
         cls   = wok_string_class(byte_len);
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_VIEW_TAG)) {
+        /* Fixed 32-byte cell, size class 3 (32/8-1 = 3, shared with NCon arity=3).
+           The parent is NOT dropped here (scan=0, Haskell-driven drop -- D8). */
+        bytes = 32u;
+        cls   = 3u;
     } else {
         uint32_t arity = (uint32_t)p->arity;
         bytes = wok_cell_bytes(arity);
@@ -735,6 +768,51 @@ WokObj* wok_string_alloc(WokHeap* h, uint64_t byte_len) {
     p->rc = 1u; p->tag = (uint16_t)WOK_STRING_TAG; p->arity = 0u; p->scan = 0u;
     /* Write byte_len at offset 8 (past the WokObj prefix). */
     memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_string_view_alloc(WokHeap* h, WokObj* parent, uint64_t off, uint64_t len) {
+    /* Fixed 32-byte cell: 8-byte header + parent ptr (8B) + offset (8B) + len (8B).
+       Size class = 32/8 - 1 = 3 (shared free-list with NCon arity=3 / WokArray len=2).
+       The parent is NOT incref'd here: the Haskell caller (allocNStringView) is responsible
+       for incref'ing the parent BEFORE calling this function. scan=0 (no C cascade; D8). */
+    size_t  sz  = 32u;
+    size_t  cls = 3u;   /* 32/8 - 1 = 3, always in range (< WOK_NUM_CLASSES = 64) */
+    WokObj* p;
+    /* Structurally identical to wok_string_alloc/wok_array_alloc: the free-list/bump path is
+       wrapped in the same `if (cls < WOK_NUM_CLASSES)` guard so a future layout change cannot
+       desync the three allocators. The large (cls >= WOK_NUM_CLASSES) path is UNREACHABLE for a
+       fixed 32-byte cell (cls is the constant 3); the else branch mirrors the siblings (and
+       keeps `p` defined on every path so the compiler is satisfied without an init-to-NULL). */
+    if (cls < WOK_NUM_CLASSES) {
+        WokObj* head = h->freelist[cls];
+        if (head != NULL) {                       /* reuse from shared free-list */
+            h->freelist[cls] = fl_next(head);
+            p = head;
+            h->reused += 1u;
+        } else {                                  /* bump */
+            if (h->bump_ptr == NULL || sz > (size_t)(h->bump_end - h->bump_ptr)) {
+                wok_new_slab(h);
+            }
+            p = (WokObj*)h->bump_ptr;
+            h->bump_ptr += sz;
+        }
+    } else {                                      /* large: direct malloc (unreachable for cls=3) */
+        p = (WokObj*)malloc(sz);
+        if (WOK_UNLIKELY(p == NULL)) { abort(); }
+        WOK_PHYS_ADD(h, sz);
+    }
+    p->rc = 1u; p->tag = (uint16_t)WOK_STRING_VIEW_TAG; p->arity = 0u; p->scan = 0u;
+    /* Write parent pointer at offset 8, offset at 16, len at 24. */
+    uintptr_t parent_word = (uintptr_t)parent;
+    memcpy((char*)p + 8,  &parent_word, sizeof(uint64_t));
+    memcpy((char*)p + 16, &off,         sizeof(uint64_t));
+    memcpy((char*)p + 24, &len,         sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -940,6 +1018,29 @@ uint64_t wok_array_slot_get(const WokObj* p, uint64_t i) {
     assert((uint32_t)p->tag == WOK_ARRAY_TAG);
     assert(i < wok_array_read_len(p));
     return ((const uint64_t*)((const char*)p + 16))[i];
+}
+
+/* ---- WokStringView accessors (shared, no allocator involvement) --------------------- */
+
+WokObj* wok_string_view_parent(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_STRING_VIEW_TAG);
+    uintptr_t parent_word;
+    memcpy(&parent_word, (const char*)p + 8, sizeof(uint64_t));
+    return (WokObj*)parent_word;
+}
+
+uint64_t wok_string_view_offset(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_STRING_VIEW_TAG);
+    uint64_t off;
+    memcpy(&off, (const char*)p + 16, sizeof(uint64_t));
+    return off;
+}
+
+uint64_t wok_string_view_len(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_STRING_VIEW_TAG);
+    uint64_t len;
+    memcpy(&len, (const char*)p + 24, sizeof(uint64_t));
+    return len;
 }
 
 /* ---- shared across both backends (unchanged from slice 1) --------------------------- */

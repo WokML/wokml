@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 7: adversarial shape 3 -- slice-of-slice with intermediate view
+-- consumed by the flatten; the outer view must still read correct bytes.
+--
+-- 'slice (slice s 0 15) 6 9' triggers the flatten-on-construction rule:
+-- the intermediate view 'mid' (a 15-byte NStringView over 's') is CONSUMED
+-- by the outer slice prim; the outer view 'outer' is created as a DIRECT
+-- NStringView over 's' (the root buffer), not over 'mid'.  The intermediate
+-- 'mid' is freed at the moment 'outer' is produced.
+--
+-- Correctness check: if the flatten were wrong (outer pointed at mid, not s),
+-- and mid were freed before outer is used, reading 'outer' would be a
+-- use-after-free.  The death-test pins this: force 'outer' to Window; if the
+-- root ref is not kept counted, the parent dies and the check FIRES.
+--
+-- s     = "hello wonderful world" (21 bytes)
+-- mid   = slice s 0 15            -> "hello wonderful" (15 bytes NStringView over s)
+-- outer = slice mid 6 9           -> "wonderful" (9 bytes NStringView over s via flatten)
+-- direct = slice s 6 9            -> "wonderful" (same root, same bytes)
+-- result = eqString outer direct AND byteLength outer
+--        = 1 + 9 = 10  (eqString returns True = 1; byteLength = 9)
+
+main : U64
+main =
+  let s      = "hello wonderful world" in
+  let mid    = slice s 0 15 in
+  let outer  = slice mid 6 9 in
+  let direct = slice s 6 9 in
+  let eq     = if eqString outer direct then 1 else 0 in
+  eq + byteLength outer

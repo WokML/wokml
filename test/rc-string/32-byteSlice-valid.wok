@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 3: byteSlice with valid boundaries (no split).
+-- s = "héllo": h(1B) + é(2B=0xC3 0xA9) + l(1B) + l(1B) + o(1B) = 6 bytes
+-- byteSlice s 0 1 = "h" (byte 0, valid codepoint start) = 1 byte
+-- byteSlice s 3 3 = "llo" (bytes 3..5, all valid starts) = 3 bytes
+-- byteSlice s 0 3 = "hé" (bytes 0..2, é starts at byte 1) = 3 bytes
+-- byteSlice s 0 0 = "" (empty) = 0 bytes
+-- Total: 1 + 3 + 3 + 0 = 7
+
+main : U64
+main =
+  let s = "héllo" in
+  let a = byteLength (byteSlice s 0 1) in
+  let b = byteLength (byteSlice s 3 3) in
+  let c = byteLength (byteSlice s 0 3) in
+  let d = byteLength (byteSlice s 0 0) in
+  a + b + c + d

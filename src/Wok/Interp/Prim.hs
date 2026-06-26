@@ -2,12 +2,13 @@ module Wok.Interp.Prim
   ( primTable
   ) where
 
+import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import qualified Data.Text.Encoding as TxEnc
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.Value
@@ -82,6 +83,8 @@ stringPrims =
   , stringIndexOfFromRawP
   , stringHashP
   , stringEditDistanceP
+  , stringSliceP
+  , stringByteSliceP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -557,3 +560,51 @@ stringEditDistanceP = mkPrim PN.stringEditDistanceName 2 $ \args -> case args of
     in Right (PRDone (VLit (LInt (toInteger (refLevenshtein ba bb)))))
   [v, _] -> Left (PrimError (Tx.pack "String.editDistance: not a string: " <> renderValue v))
   _      -> Left (ArityError PN.stringEditDistanceName)
+
+-- | @slice s start len@: codepoint window [start, start+len), saturating bounds.
+-- The reference interpreter uses 'Data.Text' directly (codepoints are the
+-- natural unit): 'Tx.take'/'Tx.drop' with clamped indices.
+-- Always returns a valid 'Text' (and hence valid UTF-8).
+stringSliceP :: Prim
+stringSliceP = mkPrim PN.stringSliceName 3 $ \args -> case args of
+  [VLit (LStr t), startV, lenV] -> do
+    start <- asU64Index startV
+    len   <- asU64Index lenV
+    let cpLen  = Tx.length t
+        start' = min start cpLen
+        -- Overflow-safe saturating end (must match the RC peer's expression exactly
+        -- so the differential oracle stays meaningful): 'start + len' could overflow
+        -- Int; 'start' + min len (cpLen - start')' is <= cpLen and never overflows.
+        end'   = start' + min len (cpLen - start')
+        window = Tx.take (end' - start') (Tx.drop start' t)
+    Right (PRDone (VLit (LStr window)))
+  [v, _, _] -> Left (PrimError (Tx.pack "String.slice: not a string: " <> renderValue v))
+  _         -> Left (ArityError PN.stringSliceName)
+
+-- | True iff byte @i@ in @bs@ is a UTF-8 continuation byte (0x80..0xBF).
+refSplitsCodepoint :: BS.ByteString -> Int -> Bool
+refSplitsCodepoint bs i =
+  i > 0 && i < BS.length bs && ((BS.index bs i :: Word8) .&. 0xC0 == 0x80)
+
+-- | @byteSlice s start len@: byte window [start, start+len), saturating bounds.
+-- Raises 'PrimError' if a boundary falls in the middle of a multibyte codepoint.
+-- The reference interpreter re-encodes the 'Text' to 'ByteString', slices, then
+-- decodes back (valid UTF-8 invariant maintained by the boundary check).
+stringByteSliceP :: Prim
+stringByteSliceP = mkPrim PN.stringByteSliceName 3 $ \args -> case args of
+  [VLit (LStr t), startV, lenV] -> do
+    start <- asU64Index startV
+    len   <- asU64Index lenV
+    let bs      = TxEnc.encodeUtf8 t
+        byteLen = BS.length bs
+        start'  = min start byteLen
+        -- Overflow-safe saturating end (matches the RC peer): <= byteLen, no overflow.
+        end'    = start' + min len (byteLen - start')
+    if refSplitsCodepoint bs start'
+      then Left (PrimError (Tx.pack "String.byteSlice: start splits a multibyte codepoint"))
+      else if refSplitsCodepoint bs end'
+        then Left (PrimError (Tx.pack "String.byteSlice: end splits a multibyte codepoint"))
+        else let wb = BS.take (end' - start') (BS.drop start' bs)
+             in Right (PRDone (VLit (LStr (TxEnc.decodeUtf8 wb))))
+  [v, _, _] -> Left (PrimError (Tx.pack "String.byteSlice: not a string: " <> renderValue v))
+  _         -> Left (ArityError PN.stringByteSliceName)

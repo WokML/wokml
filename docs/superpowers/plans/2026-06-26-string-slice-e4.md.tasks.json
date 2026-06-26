@@ -1,0 +1,55 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-26-string-slice-e4.md",
+  "spec": "docs/superpowers/specs/2026-06-26-string-slice-e4-design.md",
+  "tasks": [
+    {
+      "id": 9,
+      "subject": "Task 1: NStringView node + abstract-heap windowing",
+      "status": "completed",
+      "description": "Add NStringView !Addr !Int !Int constructor + all -Werror arms in Value.hs; allocNStringView abstract path; stringBytes windowing arm in Prim.hs; rcStringViewNodeTests.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\",\"src/Wok/Interp/RC/Prim.hs\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"/rcStringView/\\\"' 2>&1 | tail -30\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 2: WokStringView C cell + CHeap alloc/deref/drop",
+      "status": "completed",
+      "blockedBy": [9],
+      "description": "32-byte WokStringView C cell (WOK_STRING_VIEW_TAG 0xFFFD, scan=0); wok_string_view_alloc malloc+arena + accessors + wok_free arm; Haskell allocNStringView CHeap path, deref CAddr, dropAddr CAddr third branch (Haskell-driven parent drop). FFI bindings.\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\",\"runtime/wok_rc.c\",\"src/Wok/Interp/RC/Value.hs\",\"src/Wok/Runtime/StringZilla.hs\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"/rcStringView/\\\"' 2>&1 | tail -30 && scripts/asan-runtime.sh 2>&1 | tail -20\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 3: slice/byteSlice prims + Std.String surface + D6 decision",
+      "status": "completed",
+      "blockedBy": [10],
+      "description": "stringSlice (codepoint) + stringByteSlice (byte + split-codepoint error) + shared buildSlice (D6: ≤7→InlineStr, InlineStr parent→InlineStr, else NStringView+incref, flatten-to-root). Std.String externs + take/drop. Corpus 30-35.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Prim.hs\",\"src/Wok/Interp/RC/PrimNames.hs\",\"prelude/Std/String.wok\",\"test/rc-string/\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"/rcStringPrim/ || /rcStringView/\\\"' 2>&1 | tail -30\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "Task 4: SliceRep routing in Escape/Region + routing oracle",
+      "status": "completed",
+      "blockedBy": [11],
+      "description": "SliceRep = Window|Counted|Copy in Region.hs (rpSliceRep, mirror Placement), derived per view binder via arenaEscapes/escapesFrom. Independent routing oracle asserts planner per site (mismatch==0).\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Region.hs\",\"src/Wok/IR/Escape.hs\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"/rcSliceRouting/\\\"' 2>&1 | tail -30\", \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "Task 5: Death-test build with teeth + negative control",
+      "status": "completed",
+      "blockedBy": [12],
+      "description": "Build-flagged death-test detecting a Window view that OUTLIVES its birth activation (the sound design — naive uncounting has interpreter-artifact false positives; view stays counted, registered in its birth activation, asserted dead at activation return via a KArenaCloseRC-shaped hook). Negative control: forced-Window escaping slice trips it. Release unchanged (always counts). ESCALATED to frontier (design judgment beyond plan steps).\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Machine.hs\",\"src/Wok/Interp/RC/Value.hs\",\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"/rcSliceDeath/\\\"' 2>&1 | tail -30\", \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "Task 6: QuickCheck view properties + cross-type eq + byteSlice boundary",
+      "status": "completed",
+      "blockedBy": [13],
+      "description": "rcStringViewPropertyTests onBothBackends vs Data.Text: borrow-out survival, nested-flatten, window round-trip, UTF-8 validity, op-transparency, cross-type eqString {view,cell,inline}.\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"/rcStringViewProperty/\\\"' 2>&1 | tail -30\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "Task 7: Adversarial UAF programs + savings/leak oracle + sanitizer gate",
+      "status": "completed",
+      "blockedBy": [14],
+      "description": "USER-ORDERED GATE. Four adversarial UAF programs (40-43): correct when counted, trip the death-test when forced-Window. No-copy savings (peak_bytes +32 vs 16+N) + leak balance assertions both RC backends. ASan/LSan clean + full suite green.\n\n```json:metadata\n{\"files\": [\"test/rc-string/40-adversarial-escape-closure.wok\",\"test/rc-string/41-adversarial-store-parent-dropped.wok\",\"test/rc-string/42-adversarial-slice-of-slice-mid-dies.wok\",\"test/rc-string/43-adversarial-append-outlives.wok\",\"test/Spec.hs\"], \"verifyCommand\": \"scripts/asan-runtime.sh 2>&1 | tail -20 && cabal test wok-tests 2>&1 | tail -20\", \"modelTier\": \"standard\", \"userGate\": true, \"tags\": [\"user-gate\"], \"requireEvidenceTokens\": [[\"counted\",\"window-counted\",\"release-path\"],[\"forced-window\",\"death-test\",\"uncounted\"]]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-26"
+}

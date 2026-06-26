@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 7: adversarial shape 4 -- view fed to 'append', whose result
+-- outlives both the view and the parent.
+--
+-- 'append' takes ownership of both arguments (Perceus inserts drop after the
+-- call); it reads the view's bytes through 'stringBytes' (which windows the
+-- parent cell transparently) and copies them into a freshly allocated NString
+-- result cell.  The result is INDEPENDENT of the parent buffer.
+--
+-- If the view were a bare 'Window' (uncounted) AND the parent were freed
+-- before 'append' reads the view bytes, the memcpy would read freed memory.
+-- The death-test pins this: force 'v' to Window AND return it (escaping)
+-- before it is fed to append FIRES.
+--
+-- s      = "hello wonderful world" (21 bytes -> WokString cell)
+-- v      = slice s 6 15            -> "wonderful world" (15 bytes NStringView)
+-- suffix = "!!!"                   -> 3 bytes (InlineStr, <=7B)
+-- result = append v suffix         -> "wonderful world!!!" (18 bytes, fresh NString)
+-- byteLength result = 18
+
+main : U64
+main =
+  let s      = "hello wonderful world" in
+  let v      = slice s 6 15 in
+  let suffix = "!!!" in
+  let result = append v suffix in
+  byteLength result

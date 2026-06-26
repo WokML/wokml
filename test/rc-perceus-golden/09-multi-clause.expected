@@ -1,10 +1,10 @@
 sumPairs p.1 p.2 =
-  join j99(x, xs, y, ys) =
+  join j103(x, xs, y, ys) =
     let t.1 = +(x, y)
     let t.2 = sumPairs(xs, ys)
     let t.3 = +(t.1, t.2)
     t.3
-  join j107() =
+  join j111() =
     0
   case p.1 of
     Cons f.1 f.2 ->
@@ -14,15 +14,15 @@ sumPairs p.1 p.2 =
         Cons f.3 f.4 ->
           let _dup.2 = __rc_dup(f.4)
           let _drop.2 = __rc_drop(p.2)
-          jump j99(f.1, f.2, f.3, f.4)
+          jump j103(f.1, f.2, f.3, f.4)
         _ ->
           let _drop.3 = __rc_drop(p.2)
           let _drop.4 = __rc_drop(f.2)
-          jump j107()
+          jump j111()
     _ ->
       let _drop.5 = __rc_drop(p.1)
       let _drop.6 = __rc_drop(p.2)
-      jump j107()
+      jump j111()
 
 main =
   let t.3 = Nil
@@ -549,6 +549,16 @@ contains s n =
       let _drop.2 = __rc_drop(t.1)
       let t.3 = False
       t.3
+
+take s n =
+  let t = slice(s, 0, n)
+  t
+
+drop s n =
+  let _dup = __rc_dup(s)
+  let t.1 = length(s)
+  let t.2 = slice(s, n, t.1)
+  t.2
 
 count s n =
   let _dup = __rc_dup(n)

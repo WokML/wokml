@@ -1,0 +1,36 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 7: adversarial shape 2 -- slice stored in a constructor cell,
+-- original parent binding consumed by the slice prim (the slice's counted
+-- ref keeps the parent alive).
+--
+-- 'v = slice s 6 15' produces an NStringView that holds ONE counted ref to
+-- 's's cell (the slice prim incref's the parent then drops its own input --
+-- the net is a TRANSFER of ownership from 's' into 'v').  Storing 'v' in
+-- a Box cell and extracting it later must still read the correct bytes,
+-- because the view's counted ref kept the parent cell alive.
+--
+-- If the view were a bare 'Window' (uncounted, codegen-era) AND the box
+-- outlived the parent's stack frame, the parent cell would be freed at frame
+-- exit, and a later read of the view would be a use-after-free.  The death-test
+-- catches this: forcing 'v' to 'Window' AND returning the box (which holds 'v')
+-- FIRES.
+--
+-- s      = "hello wonderful world" (21 bytes -> WokString cell)
+-- v      = slice s 6 15            -> "wonderful world" (15 bytes > 7 -> NStringView)
+-- box    = Box v                   -> stored; 'v's counted ref keeps the parent alive
+-- result = byteLength (unbox box)  -> 15 (correct even after 's' binding is gone)
+
+data Box = Box String
+
+unbox : Box -> String
+unbox (Box s) = s
+
+main : U64
+main =
+  let s   = "hello wonderful world" in
+  let v   = slice s 6 15 in
+  let box = Box v in
+  byteLength (unbox box)

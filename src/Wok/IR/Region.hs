@@ -26,8 +26,10 @@
 -- adds no new notion of "escapes" (spec §4.1, §5.3).
 module Wok.IR.Region
   ( Placement (..)
+  , SliceRep (..)
   , RegionPlan (..)
   , planRegions
+  , sliceRep
   ) where
 
 import Data.Map.Strict (Map)
@@ -49,6 +51,34 @@ import Wok.TypeChecking.Types (CType (..), TyCon (..))
 data Placement = Arena | Heap
   deriving (Eq, Show)
 
+-- | The backend-agnostic ROUTING of a @slice@/@byteSlice@ view binder (String
+-- Slice E4, spec §6 --- the L5 "borrow-passing" rung). Decided PER VIEW BINDER by
+-- the SAME per-binder escape analysis that routes 'Placement' (it is a new
+-- CONSUMER of 'Wok.IR.Escape.arenaEscapes', not a new analysis):
+--
+--   * 'Window'  --- the view binder does NOT escape its activation AND the parent
+--                   is referenceable (not arena-born). At CODEGEN this is a
+--                   borrowed fat pointer with NO refcount; the INTERPRETER realizes
+--                   it as a 'Counted' window (spec D2 --- always increfs the parent,
+--                   so a routing bug can never be a runtime use-after-free).
+--   * 'Counted' --- the view escapes (returned / stored / captured) but the parent
+--                   is referenceable. A counted window: incref parent on birth,
+--                   decref on death. Zero byte-copy.
+--   * 'Copy'    --- the parent is UNreferenceable (arena-born) AND the view escapes.
+--                   The fresh-'NString' fallback (an independent copy, no parent
+--                   reference). UNCONDITIONALLY safe.
+--
+-- SOUNDNESS DIRECTION (mirrors 'Placement', spec D1 / §6). 'Counted' and 'Copy' are
+-- the ALWAYS-SAFE answers, exactly as 'Heap' is for 'Placement'. 'Window' is the
+-- only routing that licenses dropping the refcount (at codegen), so it must be
+-- PROVEN: this pass emits 'Window' ONLY when the view is proven non-escaping AND the
+-- parent is not arena-born AND the body actually opens arenas (the same envelope
+-- 'Arena' placement is licensed in). When unsure, it answers 'Counted'. Over-tagging
+-- 'Window' for an escaping view would become a codegen use-after-free; nothing here
+-- ever does so.
+data SliceRep = Window | Counted | Copy
+  deriving (Eq, Show)
+
 -- | The routing plan for a whole module: the per-allocation-binder placement and
 -- the set of function-binder 'Unique's whose body opens an arena (routes at least
 -- one 'Arena' allocation). Keyed by 'Unique' so it composes with both backends
@@ -58,11 +88,16 @@ data RegionPlan = RegionPlan
     -- ^ placement for each allocation-binder 'Unique' in the module.
   , rpArenaBodies :: Set Unique
     -- ^ the function-binder 'Unique's whose body routes >= 1 'Arena' allocation.
+  , rpSliceRep :: Map Unique SliceRep
+    -- ^ the borrow ROUTING ('Window'/'Counted'/'Copy', spec §6) for each
+    -- @slice@/@byteSlice@ VIEW binder 'Unique' in the module. A NEW consumer of the
+    -- same per-binder escape analysis that fills 'rpPlacement'; backend-independent
+    -- (a function of the IR alone), so AbstractHeap and CHeap derive identical reps.
   } deriving (Eq, Show)
 
 -- | The empty plan (identity of the per-body merge below).
 emptyPlan :: RegionPlan
-emptyPlan = RegionPlan Map.empty Set.empty
+emptyPlan = RegionPlan Map.empty Set.empty Map.empty
 
 -- | Plan region placement for every top-level function body in a module. PURE,
 -- idempotent, and independent of heap state (spec §4.1): re-running on the same
@@ -88,8 +123,13 @@ planRegions :: CoreModule -> RegionPlan
 planRegions (CoreModule binds)
   | any (exprHasHandle . tbBody') binds =
       -- All-'Heap': record every allocation as 'Heap' (self-describing), no arena.
+      -- With arenas module-wide disabled there is no arena, so the no-rc 'Window'
+      -- routing is not licensed (its codegen soundness rides on the arena/stack
+      -- discipline this short-circuit suppresses); every slice routes the always-safe
+      -- 'Counted' (spec §6 / AC5). No parent is 'Arena', so 'Copy' cannot arise either.
       RegionPlan (Map.unions [ collectPlacements (\_ _ _ -> Heap) (tbBody' b) | b <- binds ])
                  Set.empty
+                 (Map.unions [ collectSliceReps (\_ _ _ -> Counted) (tbBody' b) | b <- binds ])
   | otherwise = foldr (mergePlan . planTop) emptyPlan binds
   where
     tbBody' (TopBind _ _ body) = body
@@ -113,11 +153,11 @@ exprHasHandle = go
     goRhs (RLam _ e)      = go e
     goRhs _               = False
 
--- | Union two plans. Placement keys are globally distinct 'Unique's (one per
--- allocation binder), so the maps never conflict.
+-- | Union two plans. Placement and slice-rep keys are globally distinct 'Unique's
+-- (one per allocation / view binder), so the maps never conflict.
 mergePlan :: RegionPlan -> RegionPlan -> RegionPlan
-mergePlan (RegionPlan p1 a1) (RegionPlan p2 a2) =
-  RegionPlan (Map.union p1 p2) (Set.union a1 a2)
+mergePlan (RegionPlan p1 a1 s1) (RegionPlan p2 a2 s2) =
+  RegionPlan (Map.union p1 p2) (Set.union a1 a2) (Map.union s1 s2)
 
 -- | Plan one top-level function body.
 --
@@ -134,12 +174,17 @@ planTop (TopBind nm _ body)
       -- Short-circuit: every allocation is 'Heap', no arena. We still RECORD each
       -- alloc as 'Heap' (rather than an empty map) so the plan is self-describing
       -- --- an absent key means "not an allocation", not "a continuation body".
-      RegionPlan (collectPlacements (\_ _ _ -> Heap) body) Set.empty
+      -- This body opens no arena, so (like the module-wide disable above) no slice
+      -- can route 'Window'/'Copy': every view binder routes the always-safe 'Counted'.
+      RegionPlan (collectPlacements (\_ _ _ -> Heap) body)
+                 Set.empty
+                 (collectSliceReps (\_ _ _ -> Counted) body)
   | otherwise =
       RegionPlan placements
         (if Arena `elem` Map.elems placements
            then Set.singleton (nameUniq nm)
            else Set.empty)
+        (collectSliceReps (sliceRep placements) body)
   where
     placements = collectPlacements placeLet body
 
@@ -292,6 +337,112 @@ placeLet bd _ cont                              -- the 'Rhs' is unused: the muta
   = Arena
   | otherwise
   = Heap
+
+-- ---------------------------------------------------------------------------
+-- Slice (view) borrow routing (String Slice E4, spec §6)
+--
+-- A NEW consumer of the SAME per-binder escape analysis 'placeLet' uses; it adds no
+-- new notion of "escapes". For each @let v = slice s i j in cont@ (or @byteSlice@)
+-- it records the 'SliceRep' the routing rule returns. The rule reuses
+-- 'arenaEscapes' on the view binder (the §5.1 non-escape check) and the placement
+-- of the PARENT (the slice's first argument atom) the SAME plan computed --- so a
+-- routing bug is a one-place edit, not a re-implementation of escape analysis.
+
+-- | Collect the 'SliceRep' of every @slice@/@byteSlice@ view binder in a body.
+-- For each @let v = rhs in cont@ whose @rhs@ is a slice prim application
+-- ('sliceParent' returns the parent atom), record the verdict @rep@ returns for
+-- @(v, rhs, cont)@; non-slice lets contribute no entry. Recurses through every
+-- 'Expr' form (mirroring 'collectPlacements' exactly) so a slice anywhere in the
+-- activation --- including nested 'RLam' bodies, handler arms, join bodies, and
+-- 'LetRec' members --- is recorded.
+collectSliceReps :: (Binder -> Rhs -> Expr -> SliceRep) -> Expr -> Map Unique SliceRep
+collectSliceReps rep = go
+  where
+    go (Ret _)            = Map.empty
+    go (Let bd r e)       =
+      let here = case sliceParent r of
+                   Just _  -> Map.singleton (binderUnique bd) (rep bd r e)
+                   Nothing -> Map.empty
+      in here `Map.union` goRhs r `Map.union` go e
+    go (LetRec defs e)    =
+      Map.unions (go e : [ go d | (_, _, d) <- defs ])
+    go (Case _ alts)      = Map.unions (map goAlt alts)
+    go (LetJoin _ _ jb e) = go jb `Map.union` go e
+    go (Jump _ _)         = Map.empty
+    go (Handle e h)       =
+      go e `Map.union` go (snd (hReturn h))
+        `Map.union` Map.unions (map (go . oaBody) (hOps h))
+    goAlt (AltCon _ _ e)  = go e
+    goAlt (AltLit _ e)    = go e
+    goAlt (AltDefault e)  = go e
+    goRhs (RLam _ e)      = go e
+    goRhs _               = Map.empty
+
+-- | The 'SliceRep' of a SINGLE view @let bd = slice s i j in cont@, given the
+-- placement map for the SAME body (spec §6). Let @escapes = arenaEscapes {bd} cont@
+-- (does the view binder escape its activation? --- the §5.1 non-escape check, the
+-- SAME predicate 'placeLet' uses) and @parentArena@ = the slice's parent (its first
+-- argument atom) names a binder THIS plan placed in 'Arena' (looked up in
+-- @placements@). Then:
+--
+--   * 'Window'  iff @not escapes && not parentArena@ --- the no-rc-at-codegen class,
+--                   emitted ONLY when the view is proven non-escaping AND the parent
+--                   is referenceable. Reached only on the arena-opening path
+--                   ('planTop' otherwise branch); a continuation-fenced body and a
+--                   handler-disabled module force 'Counted' upstream, so 'Window'
+--                   never escapes the arena soundness envelope.
+--   * 'Copy'    iff @escapes && parentArena@ --- the arena-born-parent + escaping-view
+--                   fallback: the parent cannot be reference-counted, so the view
+--                   materializes a fresh independent copy. Unconditionally safe.
+--   * 'Counted' otherwise --- the always-safe counted window (the conservative
+--                   answer, exactly as 'Heap' is for 'Placement').
+--
+-- A non-slice 'Rhs' never reaches here ('collectSliceReps' filters on 'sliceParent').
+-- A slice with NO parent atom (a malformed nullary application --- impossible for a
+-- saturated slice call) routes 'Counted', the safe default.
+--
+-- 'Copy' IS STRUCTURALLY UNREACHABLE THROUGH 'planRegions' TODAY (spec §10
+-- "unobservable-rare"), and that is SOUND: the parent of a slice always occurs as a
+-- non-head ARGUMENT of the slice 'RApp', which is an ESCAPING position
+-- ('escapingAtomsRhs'), so 'placeLet' always routes the parent 'Heap' (it must --- a
+-- view holds a reference into the parent buffer that outlives the call, so the parent
+-- must stay counted). Hence @parentArena@ is always 'False' for a real slice parent
+-- and the pipeline never emits 'Copy'; the interpreter never needs the copy fallback
+-- because the parent is always heap-counted. The 'Copy' arm is nonetheless a real,
+-- load-bearing routing answer (the codegen / future-borrowing-prim fallback when a
+-- parent genuinely cannot be referenced), so this function is exported and its 'Copy'
+-- branch is unit-tested directly with an 'Arena'-parent placement map.
+sliceRep :: Map Unique Placement -> Binder -> Rhs -> Expr -> SliceRep
+sliceRep placements bd r cont
+  | not escapes && not parentArena = Window
+  | escapes && parentArena         = Copy
+  | otherwise                      = Counted
+  where
+    escapes     = arenaEscapes (Set.singleton (binderUnique bd)) cont
+    parentArena = case sliceParent r of
+      Just (AVar n) -> Map.lookup (nameUniq n) placements == Just Arena
+      _             -> False   -- a non-binder parent (literal / prim / no atom) is
+                               -- never locally arena-placed -> referenceable.
+
+-- | The PARENT atom of a @slice@/@byteSlice@ application, or 'Nothing' if this RHS
+-- is not a slice prim call. A view binder is @let v = slice s i j@ /
+-- @let v = byteSlice s i j@, an 'RApp' whose head is the 'APrim' carrying the
+-- qualified @(Std.String, "slice"|"byteSlice")@ identity (the SAME identity layer
+-- 'isArrayAlloc' and the prim recognizers use). The parent @s@ is the FIRST argument
+-- atom (spec §4.3 / §6).
+sliceParent :: Rhs -> Maybe Atom
+sliceParent (RApp (APrim key) (parent : _))
+  | key `Set.member` sliceKeys = Just parent
+  | otherwise                  = Nothing
+sliceParent _                  = Nothing
+
+-- | The @(module, name)@ keys of the slice prims that produce a view binder.
+sliceKeys :: Set (Text, Text)
+sliceKeys =
+  Set.fromList
+    [ (PN.stdStringModule, PN.stringSliceName)
+    , (PN.stdStringModule, PN.stringByteSliceName)
+    ]
 
 -- | True iff this RHS is an ALLOCATION the pass routes: a constructor cell, a
 -- record cell, a closure cell, or an array-allocating @Std.Array@ prim. Other

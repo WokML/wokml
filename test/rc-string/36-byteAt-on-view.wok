@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 6 regression: byteAt on a SLICE VIEW (NStringView), not a WokString.
+-- A >7-byte slice window is an NStringView; on the C heap it is a CAddr to a
+-- WokStringView cell. byteAt must read the WINDOWED byte, not misread the view
+-- cell's parent-ptr/offset/len fields as a WokString body.
+--
+-- s   = "hello wonderful world" (21 bytes)
+-- view = slice s 6 15 = "wonderful world" (15 bytes > 7 -> NStringView over s)
+-- byteAt view 0  -> 'w' = 119   (view byte 0 == s byte 6)
+-- byteAt view 9  -> ' ' = 32    (the space between "wonderful" and "world")
+-- byteAt view 14 -> 'd' = 100   (last byte of the window)
+-- Sum: 119 + 32 + 100 = 251
+
+main : U64
+main =
+  let s    = "hello wonderful world" in
+  let view = slice s 6 15 in
+  let a    = byteAt view 0 in
+  let b    = byteAt view 9 in
+  let c    = byteAt view 14 in
+  a + b + c

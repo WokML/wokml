@@ -24,6 +24,10 @@ extern indexOfFromRaw : String -> String -> U64 -> U64   -- byte pos, or `notFou
 extern hash           : String -> U64                    -- sz_hash of the UTF-8 bytes (deterministic)
 extern editDistance   : String -> String -> U64          -- byte-level unit-cost Levenshtein
 
+-- Zero-copy slice prims (Slice E4)
+extern slice     : String -> U64 -> U64 -> String   -- codepoint window [start, start+len), saturating
+extern byteSlice : String -> U64 -> U64 -> String   -- byte window [start, start+len), saturating; PrimError if split
+
 -- "not found" sentinel returned by indexOfFromRaw (== C WOK_SZ_NOT_FOUND == UINT64_MAX).
 notFound : U64
 notFound = 18446744073709551615
@@ -43,6 +47,12 @@ contains : String -> String -> Bool
 contains s n = case indexOf s n of
   Some _ -> True
   None   -> False
+
+take : String -> U64 -> String
+take s n = slice s 0 n
+
+drop : String -> U64 -> String
+drop s n = slice s n (length s)
 
 -- count of NON-OVERLAPPING occurrences. Empty needle -> 0 (avoids the degenerate loop).
 count : String -> String -> U64

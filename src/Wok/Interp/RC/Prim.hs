@@ -1,11 +1,14 @@
 module Wok.Interp.RC.Prim
   ( rcPrimTable
+  , stringBytes
   ) where
 
 import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (throwE)
+import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
+import Data.Word (Word8)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
@@ -18,7 +21,8 @@ import Wok.Interp.RC.Value
   , Addr (..), HeapBackend (..)
   , Node (..), Cell (..), Store (..), alloc, deref, incref, dropAddr, dropReuse, writeNode
   , continuationOwned, valueChildren
-  , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC )
+  , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC
+  , maxInlineStr, allocNStringView, wokStringTag )
 import Wok.Interp.Value (RuntimeError (..))
 import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
 
@@ -103,6 +107,8 @@ rcStringPrims =
   , stringIndexOfFromRaw
   , stringHash
   , stringEditDistance
+  , stringSlice
+  , stringByteSlice
   ]
 
 -- ---------------------------------------------------------------------------
@@ -702,14 +708,18 @@ buildList vs0 s0 = do
 -- Byte ops ('byteLength', 'byteAt') operate directly on the raw bytes.
 -- 'eqString' is a byte-equality comparison.
 
--- | Extract the 'ByteString' from an 'NString' boxed handle. Fails if the
--- value is not a boxed 'NString'.
+-- | Extract the 'ByteString' from an 'NString' or 'NStringView' boxed handle.
+-- For 'NStringView', reads the parent's bytes and returns an O(1)
+-- 'BS.take'/'BS.drop' window (no copy). Fails if the value is not a string.
 stringBytes :: RCValue -> Store -> RC BS.ByteString
 stringBytes (RVBox a) s = do
   c <- deref a s
   case cNode c of
-    NString bs -> pure bs
-    _          -> throwE (PrimError (Tx.pack "String: not a string"))
+    NString bs           -> pure bs
+    NStringView p off len -> do
+      pb <- stringBytes (RVBox p) s
+      pure (BS.take len (BS.drop off pb))
+    _                    -> throwE (PrimError (Tx.pack "String: not a string"))
 stringBytes _ _ = throwE (PrimError (Tx.pack "String: not a string"))
 
 -- | Extract a non-negative string index from a U64 literal argument.
@@ -767,18 +777,33 @@ stringByteLength = RCPrim PN.stringByteLengthName 1 [] $ \args s -> case args of
 -- the single byte via 'wokStringByteGet' (no full-body copy). On 'AbstractHeap'
 -- (or any 'HAddr') the stored 'ByteString' already lives in Haskell memory so
 -- 'BS.index' is O(1) after the 'IntMap' lookup.
+--
+-- TAG GUARD (E4). A CHeap view is ALSO a 'CAddr', but it points at a
+-- 'WokStringView' cell (tag 'wokStringViewTag', layout parent\@8 / offset\@16 /
+-- len\@24) -- NOT a 'WokString' (tag 'wokStringTag', byte_len\@8 then inline
+-- bytes). 'wokStringLen' / 'wokStringByteGet' assume the WokString layout, so the
+-- O(1) fast path is correct ONLY for a genuine WokString. We therefore read the
+-- cell tag first and take the fast path only when it is 'wokStringTag'; a view
+-- (or any other CAddr cell) falls through to 'stringByteAtViaBytes', which routes
+-- through 'stringBytes' -> 'deref' -> 'NStringView' windowing (view-correct).
 stringByteAt :: RCPrim
 stringByteAt = RCPrim PN.stringByteAtName 2 [] $ \args s -> case args of
   [RVBox a@(CAddr p), iv] -> case stBackend s of
     CHeap _ -> do
-      i    <- asStringIndex iv
-      blen <- liftIO (H.wokStringLen p)
-      if i >= fromIntegral blen
-        then throwE (PrimError (Tx.pack "String.byteAt: out of bounds"))
-        else do
-          byte <- liftIO (H.wokStringByteGet p (fromIntegral i))
-          s1   <- dropAddr a s
-          pure (PRDone (RVLit (LInt (toInteger byte))), s1)
+      tid <- liftIO (H.wokTag p)
+      if tid == wokStringTag
+        then do
+          i    <- asStringIndex iv
+          blen <- liftIO (H.wokStringLen p)
+          if i >= fromIntegral blen
+            then throwE (PrimError (Tx.pack "String.byteAt: out of bounds"))
+            else do
+              byte <- liftIO (H.wokStringByteGet p (fromIntegral i))
+              s1   <- dropAddr a s
+              pure (PRDone (RVLit (LInt (toInteger byte))), s1)
+        -- A WokStringView CAddr (or any non-WokString cell): the WokString FFI
+        -- would misread the layout, so route through the byte-window path.
+        else stringByteAtViaBytes a (RVBox a) iv s
     AbstractHeap -> stringByteAtViaBytes a (RVBox a) iv s
   [RVBox a, iv] -> stringByteAtViaBytes a (RVBox a) iv s
   _ -> throwE (ArityError (Tx.pack "String.byteAt"))
@@ -861,3 +886,105 @@ stringEditDistance = RCPrim PN.stringEditDistanceName 2 [] $ \args s -> case arg
     s2  <- dropAddr ba s1
     pure (PRDone (RVLit (LInt (toInteger (szEditDistance bsa bsb)))), s2)
   _ -> throwE (ArityError (Tx.pack "String.editDistance"))
+
+-- ---------------------------------------------------------------------------
+-- Slice prims (String Slice E4, Task 3)
+-- ---------------------------------------------------------------------------
+
+-- | True if byte @i@ in @bs@ is a UTF-8 continuation byte (0x80..0xBF), i.e.
+-- it is not a codepoint boundary. Used by 'stringByteSlice' to detect splits.
+-- Position @i@ must be in @[0, BS.length bs)@ (caller responsibility).
+splitsCodepoint :: BS.ByteString -> Int -> Bool
+splitsCodepoint bs i =
+  i > 0 && i < BS.length bs && isContinuationByte (BS.index bs i)
+  where
+    isContinuationByte :: Word8 -> Bool
+    isContinuationByte b = (b .&. 0xC0) == 0x80
+
+-- | D6 decision procedure. Given the parent string value @sv@ (an 'RVBox a')
+-- and the raw byte window @wb@ extracted from that parent, return the
+-- representation:
+--
+--   * if @BS.length wb <= maxInlineStr@: an 'InlineStr' (0 new cells), drop @a@.
+--   * otherwise: flatten the parent to its root, call 'allocNStringView'
+--     (which increfs the root), then drop @a@ (which decrefs the old chain,
+--     yielding exactly +1 net ref on the root).
+--
+-- The 'Int' argument @thisOff@ is the BYTE offset of @wb@ within the parent's
+-- byte buffer (needed to compute the absolute offset on the flatten path).
+--
+-- Ownership: the prim is handed one owned ref to @a@. 'buildSlice' consumes
+-- it (dropping it exactly once).
+buildSlice :: RCValue -> Int -> BS.ByteString -> Store -> RC (RCPrimResult, Store)
+buildSlice (RVBox a) thisOff wb s
+  | BS.length wb <= maxInlineStr = do
+      -- Short window: InlineStr -- 0 new cells, always cheapest.
+      s1 <- dropAddr a s
+      pure (PRDone (RVBox (InlineStr wb)), s1)
+  | otherwise = do
+      -- Window > 7 bytes: must be a counted cell view.
+      -- Resolve the ROOT parent by peeking the node:
+      --   NStringView root o _ => parent=root, absOff=o+thisOff  (flatten)
+      --   NString _             => parent=a,    absOff=thisOff
+      c <- deref a s
+      (rootAddr, absOff) <- case cNode c of
+        NStringView root o _ -> pure (root, o + thisOff)
+        NString _            -> pure (a, thisOff)
+        _                    -> throwE (PrimError (Tx.pack "buildSlice: not a string cell"))
+      -- Alloc the view (increfs rootAddr).
+      (va, s1) <- allocNStringView rootAddr absOff (BS.length wb) s
+      -- Drop the input (decrefs a; if a was a view its cascade decrefs root,
+      -- balancing the incref above; net = 0 on root, +1 from the new view).
+      s2 <- dropAddr a s1
+      pure (PRDone (RVBox va), s2)
+buildSlice _ _ _ _ = throwE (PrimError (Tx.pack "buildSlice: expected RVBox"))
+
+-- | @slice s start len@: codepoint window [start, start+len), saturating bounds.
+-- Always valid UTF-8; 'byteSlice' is the O(1) escape hatch. RC: 0 or +1 alloc
+-- (0 when result <= maxInlineStr, +1 for NStringView otherwise).
+stringSlice :: RCPrim
+stringSlice = RCPrim PN.stringSliceName 3 [] $ \args s -> case args of
+  [sv@(RVBox _), startV, lenV] -> do
+    pb    <- stringBytes sv s
+    start <- asStringIndex startV
+    len   <- asStringIndex lenV
+    -- Codepoint -> byte offset: decode UTF-8, clamp codepoint indices, then
+    -- compute byte boundaries by re-encoding the relevant prefix.
+    let t          = TxEnc.decodeUtf8 pb      -- NString invariant: valid UTF-8
+        cpLen      = Tx.length t
+        start'     = min start cpLen
+        -- Overflow-safe saturating end: 'start + len' could overflow Int (both are
+        -- attacker-controlled U64s up to maxBound). 'start' + min len (cpLen - start')'
+        -- never overflows (len>=0, cpLen-start'>=0) and is <= cpLen by construction.
+        end'       = start' + min len (cpLen - start')
+        -- Byte offset of codepoint k: length of the UTF-8 encoding of the first k chars.
+        cpToByteOff k = BS.length (TxEnc.encodeUtf8 (Tx.take k t))
+        byteStart  = cpToByteOff start'
+        byteEnd    = cpToByteOff end'
+        wb         = BS.take (byteEnd - byteStart) (BS.drop byteStart pb)
+    buildSlice sv byteStart wb s
+  _ -> throwE (ArityError (Tx.pack "String.slice"))
+
+-- | @byteSlice s start len@: byte window [start, start+len), saturating bounds.
+-- Raises 'PrimError' if a boundary falls in the middle of a multibyte codepoint.
+-- O(1) to locate boundaries (unlike 'stringSlice'). RC: 0 or +1 alloc.
+stringByteSlice :: RCPrim
+stringByteSlice = RCPrim PN.stringByteSliceName 3 [] $ \args s -> case args of
+  [sv@(RVBox _), startV, lenV] -> do
+    pb    <- stringBytes sv s
+    start <- asStringIndex startV
+    len   <- asStringIndex lenV
+    let byteLen   = BS.length pb
+        start'    = min start byteLen
+        -- Overflow-safe saturating end (see 'stringSlice'): 'start + len' could
+        -- overflow Int; this form is <= byteLen and never overflows.
+        end'      = start' + min len (byteLen - start')
+    -- Boundary validity: neither start' nor end' may split a multibyte codepoint.
+    if splitsCodepoint pb start'
+      then throwE (PrimError (Tx.pack "String.byteSlice: start splits a multibyte codepoint"))
+      else if splitsCodepoint pb end'
+        then throwE (PrimError (Tx.pack "String.byteSlice: end splits a multibyte codepoint"))
+        else do
+          let wb = BS.take (end' - start') (BS.drop start' pb)
+          buildSlice sv start' wb s
+  _ -> throwE (ArityError (Tx.pack "String.byteSlice"))

@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E4 Task 3: slice-of-slice flatten correctness (AC4).
+-- The intermediate view must be > maxInlineStr (7) to be an NStringView
+-- (otherwise it is InlineStr and there is no chain to flatten).
+--
+-- s = "hello wonderful world" (21 bytes, > 7)
+-- mid = slice s 6 15 = "wonderful world" (15 bytes -> NStringView over s)
+-- inner = slice mid 10 5 = "world" (5 bytes -> InlineStr, from a view parent)
+-- direct = slice s 16 5 = "world" (same bytes)
+-- Check: eqString inner direct = True -> 1
+-- Also: byteLength (slice (slice s 0 15) 6 9) = byteLength "wonderful" = 9
+-- Sum: 1 + 9 = 10
+
+main : U64
+main =
+  let s     = "hello wonderful world" in
+  let mid   = slice s 6 15 in
+  let inner = slice mid 10 5 in
+  let dirct = slice s 16 5 in
+  let a     = if eqString inner dirct then 1 else 0 in
+  let b     = byteLength (slice (slice s 0 15) 6 9) in
+  a + b

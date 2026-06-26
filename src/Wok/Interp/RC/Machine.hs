@@ -4,6 +4,7 @@ module Wok.Interp.RC.Machine
   , stepRC
   , runRC
   , runExprRC
+  , runExprRCDeathTest
   , runModuleRC
   , runModuleRCWith
   , runModuleRCUnchecked
@@ -16,6 +17,7 @@ import Control.Monad (foldM)
 import Control.Monad.Trans.Except (ExceptT (..), throwE, runExceptT)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import qualified Data.Text.Encoding as TxEnc
@@ -26,7 +28,7 @@ import Wok.IR.Anf
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import qualified Wok.IR.PrimNames as PN
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
-import Wok.IR.Region (Placement (..), RegionPlan (..), planRegions)
+import Wok.IR.Region (Placement (..), RegionPlan (..), SliceRep (..), planRegions)
 import Wok.Interp.RC.Prim (rcPrimTable)
 import Wok.Interp.RC.Value
 import Wok.Interp.Value (RuntimeError (..))
@@ -53,9 +55,28 @@ data RCStep = RMore RCConfig | RDone RCValue Store
 -- ('enterBodyRC') opens an arena for any body that routes >= 1 'Arena' allocation.
 -- An EMPTY placement map disables arena routing entirely (every alloc is 'Heap',
 -- no body opens an arena) -- the behaviour of the public 'runExprRC' test seam.
+--
+-- 'rceSliceRep' / 'rceForceWindow' / 'rceDeathTest' drive the flag-gated
+-- 'Window'-routing death-test (String Slice E4 Task 5). When 'rceDeathTest' is on,
+-- 'enterBodyRC' brackets every activation with a window-set frame; a slice binder
+-- routed 'Window' (per 'rceSliceRep', OR forced via 'rceForceWindow' for the
+-- negative control) registers its view at the 'KLetRC' return; and each activation
+-- close asserts no registered view outlived its birth activation. With the flag OFF
+-- (the release default, 'False') none of this runs and the behaviour is byte-
+-- identical to the counted-only path (spec D2).
 data RCEnv = RCEnv
-  { rcePrims     :: RCPrimTable
-  , rcePlacement :: Map Unique Placement
+  { rcePrims       :: RCPrimTable
+  , rcePlacement   :: Map Unique Placement
+  , rceSliceRep    :: Map Unique SliceRep
+    -- ^ the borrow ROUTING ('rpSliceRep') per view binder. Consulted ONLY under the
+    -- death-test flag to decide which slice binders register a window view.
+  , rceForceWindow :: Set Unique
+    -- ^ TEST-ONLY override: binder 'Unique's forced to 'Window' regardless of the
+    -- planner. The negative control (a deliberately mis-routed escaping slice) lives
+    -- here; empty on every production path.
+  , rceDeathTest   :: Bool
+    -- ^ the death-test flag. 'False' in release (and the default test seam): the
+    -- window-set bracket is never installed, so behaviour is exactly today's.
   }
 
 -- | A single small-step. Halts on a return into the empty continuation.
@@ -72,8 +93,16 @@ transition env (REval expr sc k s) = evalExprRC env expr sc k s
 
 returnToRC :: RCEnv -> RCValue -> RCKont -> Store -> RC RCConfig
 returnToRC _   _ KDoneRC                _ = throwE (PrimError (Tx.pack "internal: returnToRC KDoneRC"))
-returnToRC _   v (KLetRC b body sc k)   s =
-  pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s)
+returnToRC env v (KLetRC b body sc k)   s =
+  -- DEATH-TEST REGISTRATION (String Slice E4 Task 5; flag-gated). When the flag is
+  -- on AND this binder is a 'Window'-routed slice (per 'rceSliceRep' or forced via
+  -- 'rceForceWindow' for the negative control) AND the produced value is a boxed
+  -- view, register the view's address in the innermost activation's window-set. The
+  -- activation close ('KWindowCloseRC') then asserts it did not outlive this
+  -- activation. With the flag off this is a no-op (the binding is unchanged).
+  let s' | windowRouted env b, RVBox a <- v = windowRegister a s
+         | otherwise                        = s
+  in pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
 -- OWNED: a 'KAppRC' over-application continuation holds an ANONYMOUS intermediate
 -- function value (the result of saturating the previous application) with no IR
 -- binder. The application is its sole owner, so it CONSUMES it (no Perceus drop
@@ -95,6 +124,15 @@ returnToRC _   v (KDropCellRC addr k)   s = do
 -- sound.
 returnToRC _   v (KArenaCloseRC k)      s = do
   s' <- arenaClose s
+  pure (RReturn v k s')
+-- WINDOW-SET BRACKET CLOSE (String Slice E4 Task 5; death-test only). The body that
+-- opened this window-set frame has produced its final value @v@ (every exit path
+-- threads through this frame, exactly like 'KArenaCloseRC'). 'windowClose' asserts
+-- no 'Window'-routed view born in this activation is still alive -- if one is, it
+-- escaped its birth activation and the 'Window' routing was a lie, so a catchable
+-- 'PrimError' fires. Only ever pushed when the death-test flag is on.
+returnToRC _   v (KWindowCloseRC k)     s = do
+  s' <- windowClose s
   pure (RReturn v k s')
 -- Normal completion of a handled computation (M2b-1 Task 3): run the return arm,
 -- binding the produced value to the return binder in the frame's captured scope.
@@ -713,15 +751,16 @@ matchAltsRC v alts sc k s = case v of
         go (AltDefault e : _) = pure (REval e sc k s)
 
 nodeTag :: Node -> Text
-nodeTag (NCon t _)    = t
-nodeTag (NArray _)    = Tx.pack "<array>"
-nodeTag (NString _)   = Tx.pack "<string>"
-nodeTag (NRecord t _) = t
-nodeTag NClosure{}    = Tx.pack "<closure>"
-nodeTag (NGroupCode _) = Tx.pack "<closure>"
-nodeTag (NEnv _)       = Tx.pack "<env>"
-nodeTag (NCont _ _)    = Tx.pack "<continuation>"
-nodeTag (NContCell _)  = Tx.pack "<cont-cell>"
+nodeTag (NCon t _)       = t
+nodeTag (NArray _)       = Tx.pack "<array>"
+nodeTag (NString _)      = Tx.pack "<string>"
+nodeTag (NStringView{})  = Tx.pack "<string-view>"
+nodeTag (NRecord t _)    = t
+nodeTag NClosure{}       = Tx.pack "<closure>"
+nodeTag (NGroupCode _)   = Tx.pack "<closure>"
+nodeTag (NEnv _)         = Tx.pack "<env>"
+nodeTag (NCont _ _)      = Tx.pack "<continuation>"
+nodeTag (NContCell _)    = Tx.pack "<cont-cell>"
 
 litText :: Lit -> Text
 litText (LInt n)  = Tx.pack (show n)
@@ -796,6 +835,9 @@ rcFindHandler mTarget lbl op = go id
     -- (arena-opening bodies are in the handler-free fragment), so this is never
     -- exercised; accumulate it into the prefix for completeness.
     go acc (KArenaCloseRC k)     = go (acc . KArenaCloseRC) k
+    -- Totality only: the window-set bracket (death-test) and effect-handler dispatch
+    -- do not co-occur in a normal run; accumulate it for completeness.
+    go acc (KWindowCloseRC k)    = go (acc . KWindowCloseRC) k
     go acc (KHandleRC h tag sc k)
       | matches h                = Just (acc, h, tag, sc, k)
       | otherwise                = go (acc . KHandleRC h tag sc) k
@@ -891,8 +933,35 @@ bodyOpensArena plc = go
 -- That join's saved continuation was captured AFTER the bracket was pushed, so it
 -- still threads through this 'KArenaCloseRC'. So jumping cannot route the body's
 -- result past the bracket to an outer-activation continuation.
+
+-- | True iff binder @b@ is a 'Window'-routed slice under the death-test flag: the
+-- flag is on AND (the planner routed it 'Window' OR the test forced it via
+-- 'rceForceWindow'). With the flag off this is always 'False' (no registration, no
+-- bracket), so the release behaviour is byte-identical to the counted-only path.
+windowRouted :: RCEnv -> Binder -> Bool
+windowRouted env b =
+  rceDeathTest env
+    && ( Map.lookup u (rceSliceRep env) == Just Window
+           || Set.member u (rceForceWindow env) )
+  where u = binderUnique b
+
 enterBodyRC :: RCEnv -> Expr -> RCScope -> RCKont -> Store -> RC RCConfig
 enterBodyRC env body sc k s
+  -- DEATH-TEST WINDOW-SET BRACKET (String Slice E4 Task 5; flag-gated). Under the
+  -- flag, EVERY activation pushes a window-set frame ('windowOpen') and a
+  -- 'KWindowCloseRC' frame so the close check runs on every exit path -- the same
+  -- structural bracket shape as the arena bracket below, but unconditional on the
+  -- body's contents (a 'Window' view registered here can be born in ANY body, not
+  -- only an arena-opening one). The arena bracket, if any, nests INSIDE the
+  -- window-set close: the arena's scan-out runs first, then the window-set check
+  -- sees the post-arena store.
+  | rceDeathTest env = do
+      let sW = windowOpen s
+      if bodyOpensArena (rcePlacement env) body
+        then do
+          s' <- arenaOpenRC sW
+          pure (REval body sc (KArenaCloseRC (KWindowCloseRC k)) s')
+        else pure (REval body sc (KWindowCloseRC k) sW)
   | bodyOpensArena (rcePlacement env) body = do
       s' <- arenaOpenRC s
       pure (REval body sc (KArenaCloseRC k) s')
@@ -924,8 +993,24 @@ runRC env = loop
 -- body.
 runExprRC :: RCPrimTable -> REnv -> Store -> Expr -> IO (Either RuntimeError (RCValue, Store))
 runExprRC prims env s e =
-  let renv = RCEnv prims Map.empty
+  let renv = RCEnv prims Map.empty Map.empty Set.empty False
   in runExceptT (runRC renv (REval e (RCScope env Map.empty) KDoneRC s))
+
+-- | Death-test test seam (String Slice E4 Task 5): evaluate an Expr like
+-- 'runExprRC' but with the 'Window'-routing death-test ON, threading a slice-rep
+-- map and a force-'Window' override (the negative control). The TOP-LEVEL body is
+-- bracketed via 'enterBodyRC' so the window-set frame is opened/closed exactly as a
+-- called body would be. Used ONLY by the test suite; no production path enables the
+-- flag. A 'Window'-routed view still alive at this top body's return raises the
+-- catchable @"view escaped its birth activation (death-test)"@ 'PrimError'.
+runExprRCDeathTest
+  :: RCPrimTable -> Map Unique SliceRep -> Set Unique -> REnv -> Store -> Expr
+  -> IO (Either RuntimeError (RCValue, Store))
+runExprRCDeathTest prims sliceReps forceWindow env s e =
+  let renv = RCEnv prims Map.empty sliceReps forceWindow True
+  in runExceptT $ do
+       cfg <- enterBodyRC renv e (RCScope env Map.empty) KDoneRC s
+       runRC renv cfg
 
 -- | The whole-module run seam (Region Slice R1): like 'runExprRC' but threads the
 -- supplied 'RCEnv' (carrying the region plan) AND applies the arena bracket to the
@@ -1041,7 +1126,11 @@ runModuleRCUncheckedWith backend cm@(CoreModule binds) = runExceptT $ do
   let plan
         | null (firstOrderNoHandlerViolations cm) = rpPlacement (planRegions cm)
         | otherwise                               = Map.empty
-      renv = RCEnv rcPrimTable plan
+      -- The death-test flag is OFF on the production path: 'rceSliceRep' is unused
+      -- (no window-set bracket installed), and the behaviour is the counted-only
+      -- path (spec D2), byte-identical to before. The slice-rep map is threaded in
+      -- (consistent with the plan) but only the flag-on test seam ever reads it.
+      renv = RCEnv rcPrimTable plan Map.empty Set.empty False
   -- 1. Reserve a static address for every top-level bind, building the knotted
   --    static env (every global maps to its handle before any body runs) and a
   --    store pre-loaded with placeholder static cells. The store carries the

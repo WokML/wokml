@@ -82,8 +82,8 @@ WOK_PURE uint64_t wok_stat_peak_physical_bytes(const WokHeap* h);
    len <= 62 (class < WOK_NUM_CLASSES 64) -> arena free-list; len >= 63 -> malloc.
    The arena free-list[len+1] is SHARED with NCon arity (len+1): identical byte size,
    shape-agnostic recycling.
-   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFF or 0xFFFE
-   (0xFFFE is the WOK_STRING_TAG, also reserved). */
+   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFF, 0xFFFE, or 0xFFFD
+   (0xFFFE is the WOK_STRING_TAG, 0xFFFD is the WOK_STRING_VIEW_TAG, both also reserved). */
 
 #define WOK_ARRAY_TAG 0xFFFFu
 
@@ -106,7 +106,8 @@ WOK_PURE uint64_t wok_array_slot_get(const WokObj* p, uint64_t i);
    Size class = (cell_bytes/8) - 1 = 1 + ceil(byte_len/8)  (shares the free-list with an
    NCon of that arity / a WokArray of that word-len -- identical byte size, shape-agnostic
    recycling).  class < WOK_NUM_CLASSES (64) -> arena free-list; else -> malloc.
-   WOK_STRING_TAG is reserved Haskell-side: internTag never returns 0xFFFE or 0xFFFF. */
+   WOK_STRING_TAG is reserved Haskell-side: internTag never returns 0xFFFE, 0xFFFF, or 0xFFFD
+   (0xFFFD is the WOK_STRING_VIEW_TAG, also reserved). */
 
 #define WOK_STRING_TAG 0xFFFEu
 
@@ -114,6 +115,29 @@ WokObj*          wok_string_alloc(WokHeap* h, uint64_t byte_len); /* rc=1, tag=W
 WOK_PURE uint64_t wok_string_len(const WokObj* p);                /* byte_len */
          uint8_t* wok_string_data(WokObj* p);                     /* pointer to body (bulk fill + FFI) */
 WOK_PURE uint64_t wok_string_byte_get(const WokObj* p, uint64_t i); /* one byte, zero-extended */
+
+/* ---- WokStringView: a zero-copy byte window into a WokString parent (Slice E4) -------
+   Layout (always 8-aligned, fixed 32 bytes):
+     offset  0  uint32 rc       \
+     offset  4  uint16 tag       |  8-byte WokObj-compatible prefix: wok_dup/wok_dec/wok_rc
+     offset  6  uint8  reserved  |  tag == WOK_STRING_VIEW_TAG marks a view cell.
+     offset  7  uint8  scan      /  reserved=0; scan=0 (NO C cascade -- Haskell-driven).
+     offset  8  uint64 parent    <- raw pointer to the parent WokString (or WokStringView) cell
+     offset 16  uint64 offset    <- byte offset into the parent's byte buffer
+     offset 24  uint64 len       <- byte length of the window
+   Total cell size: 32 bytes.  Fixed (no variable body), so no size-class arithmetic:
+     size_class = 32/8 - 1 = 3 (shares the free-list with NCon arity=3 / WokArray len=2).
+   The parent pointer is NOT decremented by wok_free (scan=0, no C cascade): the parent
+   drop is Haskell-driven via dropAddr, mirroring the WokArray pattern (D8 of the spec).
+   WOK_STRING_VIEW_TAG is reserved Haskell-side: internTag never returns 0xFFFD/0xFFFE/0xFFFF. */
+
+#define WOK_STRING_VIEW_TAG 0xFFFDu
+
+WokObj*          wok_string_view_alloc(WokHeap* h, WokObj* parent, uint64_t off, uint64_t len);
+                                                        /* rc=1, tag=WOK_STRING_VIEW_TAG, 32 bytes */
+WOK_PURE WokObj* wok_string_view_parent(const WokObj* p); /* raw parent pointer at offset 8 */
+WOK_PURE uint64_t wok_string_view_offset(const WokObj* p); /* byte offset at offset 16 */
+WOK_PURE uint64_t wok_string_view_len(const WokObj* p);    /* byte length at offset 24 */
 
 /* ---- Uncounted per-activation arena (Region Slice R1) -----------------------------
    A LIFO checkpoint over the bump allocator. wok_arena_alloc returns an UNCOUNTED cell
