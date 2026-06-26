@@ -54,8 +54,9 @@ import qualified Wok.Interp.RC.Prim as RCP
 import qualified Wok.Interp.RC.Machine as RCM
 import qualified Wok.Interp.RC.Heap as Heap
 import qualified Wok.Runtime.StringZilla as SZ
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
+import Data.Bits (shiftR, (.&.))
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
 import qualified Wok.IR.Perceus as Perceus
@@ -84,6 +85,8 @@ import qualified Data.Maybe
 import Data.List (sortBy)
 import Data.Ord (comparing)
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
+import Foreign.Ptr (castPtr)
+import Foreign.Marshal.Utils (copyBytes)
 
 main :: IO ()
 main = do
@@ -242,6 +245,8 @@ main = do
     , rcArrayCCellTests
     , rcStringNodeTests
     , rcStringCCellTests
+    , rcInlineStringTests
+    , rcInlineStringSlotTests
     , rcArrayPrimTests
     , rcStringPrimTests
     , regionRoutingTests
@@ -333,6 +338,7 @@ main = do
     , rcM2bPropertyTests
     , rcArrayPropertyTests
     , rcStringPropertyTests
+    , rcInlineStringPropertyTests
     , rcArraySliceCTests
     -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
     -- hardening; each test group verifies the floor bites when disabled):
@@ -7513,77 +7519,57 @@ rcStringNodeTests = testGroup "rc string node"
 rcStringCCellTests :: TestTree
 rcStringCCellTests = testGroup "rc string C-cell store algebra"
   [ -- Multi-byte UTF-8: "h\xc3\xa9llo" = 6 bytes.
-    -- ceil(6/8) = 1 -> cell_bytes = 16 + 8*1 = 24.
-    testCase "multi-byte UTF-8 string: alloc/len-readback/drop balanced" $ do
+    -- E3: 6 bytes <= maxInlineStr (7), so this becomes an InlineStr immediate --
+    -- zero allocation on both backends.  The test was updated for E3; the
+    -- corresponding heap-cell behavior is exercised by the 9-byte case below.
+    testCase "multi-byte UTF-8 string (6B, <=maxInlineStr): InlineStr, 0 allocs (E3)" $ do
       hp <- Heap.wokHeapNew
-      let bs       = TxEnc.encodeUtf8 (T.pack "h\233llo")  -- 6 bytes
-          charged  = St.wouldBeCBytes (St.NString bs)       -- 24
+      let bs       = TxEnc.encodeUtf8 (T.pack "h\233llo")  -- 6 bytes: <= maxInlineStr
           s0       = St.emptyStore { St.stBackend = St.CHeap hp }
-          baseline = St.stLive (St.stStats s0)
+          allocsBefore = St.stAllocs (St.stStats s0)
       r <- runExceptT (St.alloc (St.NString bs) s0)
-      (a, s1) <- case r of
+      case r of
         Left e  -> do { Heap.wokHeapFree hp
-                      ; assertFailure ("alloc NString failed: " <> show e) >> error "unreachable" }
-        Right x -> pure x
-      -- The string cell is live on both backends.
-      St.stLive (St.stStats s1) @?= baseline + 1
-      cLive0 <- Heap.wokStatLive hp
-      assertEqual "wok_stat_live == 1 after NString alloc" (1 :: Int64) cLive0
-      -- Byte accounting matches the rounded formula on both backends.
-      St.stPeakBytes (St.stStats s1) @?= charged
-      -- The cell is on the C heap (CAddr, not HAddr).
-      assertBool "NString allocated as CAddr on CHeap"
-        (case a of St.CAddr _ -> True; _ -> False)
-      -- Read back byte_len via FFI to confirm the cell was written correctly.
-      blen <- case a of
-        St.CAddr p -> Heap.wokStringLen p
-        _          -> assertFailure "expected CAddr" >> error "unreachable"
-      assertEqual "wokStringLen reads back correct byte count"
-        (fromIntegral (BS.length bs) :: Word64) blen
-      -- Drop: both counters return to baseline.
-      r2 <- runExceptT (St.dropAddr a s1)
-      case r2 of
-        Left e  -> do { Heap.wokHeapFree hp
-                      ; assertFailure ("dropAddr NString failed: " <> show e) }
-        Right s2 -> do
-          St.stLive (St.stStats s2) @?= baseline
-          St.stFrees (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
-          cLive1 <- Heap.wokStatLive hp
-          assertEqual "wok_stat_live == 0 after drop (no leak)" (0 :: Int64) cLive1
+                      ; assertFailure ("alloc InlineStr failed: " <> show e) }
+        Right (a, s1) -> do
+          -- E3: InlineStr -- no C cell, no alloc record.
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 0
           cAllocs <- Heap.wokStatAllocs hp
-          cFrees  <- Heap.wokStatFrees  hp
-          assertEqual "C heap: allocs == frees (fully balanced)" cAllocs cFrees
-          Heap.wokHeapFree hp
+          cAllocs @?= 0
+          assertBool "6-byte string is InlineStr (E3)"
+            (case a of St.InlineStr _ -> True; _ -> False)
+          -- dropAddr on InlineStr is a no-op.
+          r2 <- runExceptT (St.dropAddr a s1)
+          case r2 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr InlineStr failed: " <> show e) }
+            Right _ -> Heap.wokHeapFree hp
 
-  , -- Empty string: byte_len = 0, ceil(0/8) = 0, cell_bytes = 16.
-    testCase "empty string: alloc/drop balanced, wouldBeCBytes = 16" $ do
+  , -- Empty string: 0 bytes.
+    -- E3: 0 bytes <= maxInlineStr, so this becomes InlineStr -- zero allocation.
+    -- The test was updated for E3.
+    testCase "empty string (0B, <=maxInlineStr): InlineStr, 0 allocs (E3)" $ do
       hp <- Heap.wokHeapNew
-      let bs      = BS.empty
-          charged = St.wouldBeCBytes (St.NString bs)  -- 16
-          s0      = St.emptyStore { St.stBackend = St.CHeap hp }
-          baseline = St.stLive (St.stStats s0)
+      let bs  = BS.empty
+          s0  = St.emptyStore { St.stBackend = St.CHeap hp }
+          allocsBefore = St.stAllocs (St.stStats s0)
       r <- runExceptT (St.alloc (St.NString bs) s0)
-      (a, s1) <- case r of
+      case r of
         Left e  -> do { Heap.wokHeapFree hp
-                      ; assertFailure ("alloc NString failed: " <> show e) >> error "unreachable" }
-        Right x -> pure x
-      St.stPeakBytes (St.stStats s1) @?= charged
-      blen <- case a of
-        St.CAddr p -> Heap.wokStringLen p
-        _          -> assertFailure "expected CAddr" >> error "unreachable"
-      assertEqual "wokStringLen reads 0 for empty string" (0 :: Word64) blen
-      r2 <- runExceptT (St.dropAddr a s1)
-      case r2 of
-        Left e  -> do { Heap.wokHeapFree hp
-                      ; assertFailure ("dropAddr empty NString failed: " <> show e) }
-        Right s2 -> do
-          St.stLive (St.stStats s2) @?= baseline
-          cLive1 <- Heap.wokStatLive hp
-          assertEqual "wok_stat_live == 0 after drop" (0 :: Int64) cLive1
+                      ; assertFailure ("alloc empty InlineStr failed: " <> show e) }
+        Right (a, s1) -> do
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 0
           cAllocs <- Heap.wokStatAllocs hp
-          cFrees  <- Heap.wokStatFrees  hp
-          assertEqual "C heap: allocs == frees" cAllocs cFrees
-          Heap.wokHeapFree hp
+          cAllocs @?= 0
+          assertBool "empty string is InlineStr (E3)"
+            (case a of St.InlineStr _ -> True; _ -> False)
+          -- derefPure reconstructs the NString node.
+          case St.derefPure a s1 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("derefPure empty InlineStr failed: " <> show e) }
+            Right c -> do
+              St.cNode c @?= St.NString bs
+              Heap.wokHeapFree hp
 
   , -- 9-byte string: ceil(9/8) = 2 -> cell_bytes = 16 + 8*2 = 32.
     testCase "9-byte string: cell_bytes = 32, alloc/drop balanced" $ do
@@ -7660,9 +7646,10 @@ rcStringCCellTests = testGroup "rc string C-cell store algebra"
           assertEqual "C heap: allocs == frees" cAllocs cFrees
           Heap.wokHeapFree hp
 
-  , -- Empty-string roundtrip: byte_len 0, 'wokStringLen' is 0, no bytes to read.
-    -- Confirms the copy of a zero-length body neither over-reads nor corrupts.
-    testCase "byte-content roundtrip: empty string has byte_len 0 and no bytes" $ do
+  , -- Empty-string roundtrip: E3 makes "" an InlineStr (0 bytes <= maxInlineStr).
+    -- The derefPure synthesis yields NString BS.empty; dropAddr is a no-op.
+    -- The test was updated for E3; the CAddr path for empty strings no longer exists.
+    testCase "byte-content roundtrip: empty string is InlineStr, deref yields NString empty (E3)" $ do
       hp <- Heap.wokHeapNew
       let bs       = BS.empty
           s0       = St.emptyStore { St.stBackend = St.CHeap hp }
@@ -7672,23 +7659,322 @@ rcStringCCellTests = testGroup "rc string C-cell store algebra"
         Left e  -> do { Heap.wokHeapFree hp
                       ; assertFailure ("alloc empty NString failed: " <> show e) >> error "unreachable" }
         Right x -> pure x
-      p <- case a of
-        St.CAddr p -> pure p
-        _          -> assertFailure "expected CAddr" >> error "unreachable"
-      blen <- Heap.wokStringLen p
-      assertEqual "wokStringLen reads 0 for empty string" (0 :: Word64) blen
-      readBack <- mapM (Heap.wokStringByteGet p)
-                       (take (fromIntegral blen) [0 ..])
-      assertEqual "no bytes read back for empty string" ([] :: [Word64]) readBack
-      r2 <- runExceptT (St.dropAddr a s1)
-      case r2 of
+      -- E3: empty string is InlineStr.
+      assertBool "empty string is InlineStr (E3)"
+        (case a of St.InlineStr _ -> True; _ -> False)
+      -- derefPure synthesizes NString BS.empty (the round-trip hinge).
+      case St.derefPure a s1 of
         Left e  -> do { Heap.wokHeapFree hp
-                      ; assertFailure ("dropAddr empty roundtrip NString failed: " <> show e) }
-        Right s2 -> do
-          St.stLive (St.stStats s2) @?= baseline
-          cLive1 <- Heap.wokStatLive hp
-          assertEqual "wok_stat_live == 0 after drop" (0 :: Int64) cLive1
+                      ; assertFailure ("derefPure empty InlineStr failed: " <> show e) }
+        Right c -> do
+          St.cNode c @?= St.NString bs
+          -- stLive unchanged (InlineStr has no counted cell).
+          St.stLive (St.stStats s1) @?= baseline
+          -- C runtime: no cell allocated.
+          cAllocs <- Heap.wokStatAllocs hp
+          cAllocs @?= 0
           Heap.wokHeapFree hp
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC inline short-string tests (String Slice E3, Task 1)
+--
+-- Verifies that a short string (<=7 bytes) becomes an 'InlineStr' immediate
+-- with ZERO allocation on both backends, while an 8-byte string still
+-- allocates exactly one WokString cell.  Also confirms that 'derefPure' on
+-- an 'InlineStr' reconstructs the original bytes (the round-trip hinge).
+--
+-- Pattern mirrors 'rcStringCCellTests': abstract-heap tests use 'allocPure' /
+-- 'derefPure' directly; CHeap tests use 'runExceptT (St.alloc ...)' to drive
+-- the real dispatch.
+
+rcInlineStringTests :: TestTree
+rcInlineStringTests = testGroup "rc inline string (E3)"
+  [ -- -----------------------------------------------------------------------
+    -- Zero-alloc on abstract heap (AbstractHeap backend)
+    -- -----------------------------------------------------------------------
+    testCase "<=7-byte string: InlineStr immediate, 0 allocs on AbstractHeap" $ do
+      let bs       = BS.pack [97, 98, 99, 100, 101, 102, 103]  -- "abcdefg", 7 bytes
+          s0       = St.emptyStore
+          allocsBefore = St.stAllocs (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e       -> assertFailure ("alloc InlineStr failed: " <> show e)
+        Right (a, s1) -> do
+          -- No allocation recorded: InlineStr bypasses recordAlloc.
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 0
+          -- The address is InlineStr, not HAddr.
+          assertBool "7-byte string is InlineStr on AbstractHeap"
+            (case a of St.InlineStr _ -> True; _ -> False)
+
+  , testCase "8-byte string: WokString cell, 1 alloc on AbstractHeap" $ do
+      let bs       = BS.pack [97, 98, 99, 100, 101, 102, 103, 104]  -- "abcdefgh", 8 bytes
+          s0       = St.emptyStore
+          allocsBefore = St.stAllocs (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e        -> assertFailure ("alloc NString failed: " <> show e)
+        Right (a, s1) -> do
+          -- Exactly one allocation recorded for the heap cell.
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 1
+          -- The address is HAddr (abstract heap cell), not InlineStr.
+          assertBool "8-byte string is NOT InlineStr on AbstractHeap"
+            (case a of St.InlineStr _ -> False; _ -> True)
+
+    -- -----------------------------------------------------------------------
+    -- Zero-alloc on CHeap backend
+    -- -----------------------------------------------------------------------
+  , testCase "<=7-byte string: InlineStr immediate, 0 allocs on CHeap" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = BS.pack [97, 98, 99, 100, 101, 102, 103]  -- "abcdefg", 7 bytes
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          allocsBefore = St.stAllocs (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("alloc InlineStr CHeap failed: " <> show e) }
+        Right (a, s1) -> do
+          -- No allocation recorded on the Haskell side.
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 0
+          -- No allocation on the C side either.
+          cAllocs <- Heap.wokStatAllocs hp
+          cAllocs @?= 0
+          assertBool "7-byte string is InlineStr on CHeap"
+            (case a of St.InlineStr _ -> True; _ -> False)
+          Heap.wokHeapFree hp
+
+  , testCase "8-byte string: WokString cell, 1 alloc on CHeap" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = BS.pack [97, 98, 99, 100, 101, 102, 103, 104]  -- "abcdefgh", 8 bytes
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          allocsBefore = St.stAllocs (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e -> do { Heap.wokHeapFree hp
+                     ; assertFailure ("alloc NString CHeap 8B failed: " <> show e) }
+        Right (a, s1) -> do
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 1
+          assertBool "8-byte string is NOT InlineStr on CHeap"
+            (case a of St.InlineStr _ -> False; _ -> True)
+          -- Drop and verify balanced.
+          r2 <- runExceptT (St.dropAddr a s1)
+          case r2 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr 8B CHeap failed: " <> show e) }
+            Right _ -> do
+              cAllocs <- Heap.wokStatAllocs hp
+              cFrees  <- Heap.wokStatFrees hp
+              assertEqual "C heap: allocs == frees" cAllocs cFrees
+              Heap.wokHeapFree hp
+
+    -- -----------------------------------------------------------------------
+    -- deref round-trip: InlineStr -> NString
+    -- -----------------------------------------------------------------------
+  , testCase "InlineStr round-trips: derefPure yields NString with same bytes" $ do
+      let bs = BS.pack [104, 105]  -- "hi", 2 bytes
+          s0 = St.emptyStore
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e        -> assertFailure ("alloc hi failed: " <> show e)
+        Right (a, s1) -> do
+          assertBool "\"hi\" is InlineStr"
+            (case a of St.InlineStr _ -> True; _ -> False)
+          case St.derefPure a s1 of
+            Left e  -> assertFailure ("derefPure InlineStr failed: " <> show e)
+            Right c -> St.cNode c @?= St.NString bs
+
+    -- -----------------------------------------------------------------------
+    -- isInline / isUncounted
+    -- -----------------------------------------------------------------------
+  , testCase "isInline (InlineStr _) is True" $ do
+      let bs = BS.pack [104, 105]  -- "hi"
+      St.isInline (St.InlineStr bs) @?= True
+
+  , testCase "isUncounted (InlineStr _) is True" $ do
+      let bs = BS.pack [104, 105]  -- "hi"
+      St.isUncounted (St.InlineStr bs) @?= True
+
+    -- -----------------------------------------------------------------------
+    -- dropAddr on InlineStr is a no-op (no cascade, no free)
+    -- -----------------------------------------------------------------------
+  , testCase "dropAddr (InlineStr _) is a no-op: 0 frees, stLive unchanged" $ do
+      let bs = BS.pack [65, 66, 67]  -- "ABC", 3 bytes
+          s0 = St.emptyStore
+          freesBefore = St.stFrees (St.stStats s0)
+          liveBefore  = St.stLive (St.stStats s0)
+      r <- runExceptT (St.dropAddr (St.InlineStr bs) s0)
+      case r of
+        Left e  -> assertFailure ("dropAddr InlineStr failed: " <> show e)
+        Right s1 -> do
+          St.stFrees (St.stStats s1) @?= freesBefore
+          St.stLive  (St.stStats s1) @?= liveBefore
+
+    -- -----------------------------------------------------------------------
+    -- Empty string is inline (0 bytes <= 7)
+    -- -----------------------------------------------------------------------
+  , testCase "empty string is InlineStr (0 bytes <= maxInlineStr)" $ do
+      let s0 = St.emptyStore
+          allocsBefore = St.stAllocs (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString BS.empty) s0)
+      case r of
+        Left e        -> assertFailure ("alloc empty string failed: " <> show e)
+        Right (a, s1) -> do
+          St.stAllocs (St.stStats s1) - allocsBefore @?= 0
+          assertBool "empty string is InlineStr"
+            (case a of St.InlineStr _ -> True; _ -> False)
+
+    -- -----------------------------------------------------------------------
+    -- maxInlineStr boundary: exactly 7 bytes is inline, 8 is heap
+    -- -----------------------------------------------------------------------
+  , testCase "maxInlineStr boundary: 7-byte string is inline, 8-byte string is heap" $ do
+      let bs7 = BS.replicate 7 65  -- 7 x 'A'
+          bs8 = BS.replicate 8 65  -- 8 x 'A'
+          s0  = St.emptyStore
+      r7 <- runExceptT (St.alloc (St.NString bs7) s0)
+      r8 <- runExceptT (St.alloc (St.NString bs8) s0)
+      case (r7, r8) of
+        (Right (a7, _), Right (a8, _)) -> do
+          assertBool "7-byte: InlineStr"
+            (case a7 of St.InlineStr _ -> True; _ -> False)
+          assertBool "8-byte: not InlineStr"
+            (case a8 of St.InlineStr _ -> False; _ -> True)
+        _ -> assertFailure "alloc failed for boundary test"
+
+    -- -----------------------------------------------------------------------
+    -- String-literal CAF allocation (E3 Task 4)
+    -- -----------------------------------------------------------------------
+  , testCase "string-literal CAF (foo = \"/\") allocates 0 cells on both backends" $ do
+      cm <- elaboratedModuleOf "test/rc-string/29-string-literal-caf.wok"
+      let pruned = pruneToReachable cm
+          instrumented = reusePairing (Perceus.insertRC pruned)
+      -- AbstractHeap backend
+      absRun <- RCM.runModuleRC instrumented >>= \case
+        Left e  -> assertFailure ("AbstractHeap RC run failed: " <> show e)
+        Right r -> pure r
+      let absStats = RCM.rcStats absRun
+          absBaseline = RCM.rcBaseline absRun
+      assertEqual "AbstractHeap: string-literal CAF allocates 0 cells"
+        absBaseline (St.stAllocs absStats - St.stFrees absStats)
+      -- CHeap backend
+      hp <- Heap.wokHeapNew
+      cRun <- RCM.runModuleRCUncheckedWith (St.CHeap hp) instrumented >>= \case
+        Left e  -> Heap.wokHeapFree hp >> assertFailure ("CHeap RC run failed: " <> show e)
+        Right r -> pure r
+      let cStats = RCM.rcStats cRun
+          cBaseline = RCM.rcBaseline cRun
+      cAllocs <- Heap.wokStatAllocs hp
+      assertEqual "CHeap: string-literal CAF allocates 0 cells"
+        0 cAllocs
+      assertEqual "CHeap: live matches baseline"
+        cBaseline (St.stLive cStats)
+      -- Verify output is "\"/\"" (Haskell show renders with quotes and escaping)
+      assertEqual "rendered output is \"/\" (with show escaping)"
+        "\"/\"" (T.unpack (RCM.rcOutput absRun))
+      Heap.wokHeapFree hp
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC inline-string SLOT encoding (E3 Task 2)
+--
+-- These tests pin the bit-packing in 'encodeSlotC' / 'decodeSlotC' for the
+-- 'InlineStr' case and verify that a constructor whose only non-nullary field is
+-- a short string is C-eligible and round-trips on both backends.
+--
+-- Two sub-groups:
+--   (A) Value-level round-trip -- call 'St.encodeSlotC' then 'St.decodeSlotC'
+--       directly, so the bit layout is verified independently of the interpreter.
+--   (B) Interpreter-level round-trip -- run a tiny wok program on both backends
+--       and assert C-eligibility via 'cAllocs'.
+
+rcInlineStringSlotTests :: TestTree
+rcInlineStringSlotTests = testGroup "InlineStringSlot (E3 Task 2)"
+  [ -- -----------------------------------------------------------------------
+    -- (A) Value-level round-trip: encodeSlotC -> decodeSlotC
+    -- -----------------------------------------------------------------------
+    testGroup "value-level encode/decode round-trip"
+      [ testCase "empty string (0 bytes) encodes and decodes" $ do
+          let bs  = BS.empty
+              val = St.RVBox (St.InlineStr bs)
+          case St.encodeSlotC val of
+            Nothing       -> assertFailure "encodeSlotC returned Nothing for empty InlineStr"
+            Just (kind, w) -> do
+              kind @?= St.KPointer
+              -- low 3 bits must be 111
+              (w .&. 0x7) @?= 0x7
+              St.decodeSlotC kind w @?= val
+
+      , testCase "1-byte string encodes and decodes" $ do
+          let bs  = BS.pack [65]  -- "A"
+              val = St.RVBox (St.InlineStr bs)
+          case St.encodeSlotC val of
+            Nothing        -> assertFailure "encodeSlotC returned Nothing for 1-byte InlineStr"
+            Just (kind, w) -> do
+              kind @?= St.KPointer
+              (w .&. 0x7) @?= 0x7
+              -- length field = 1
+              fromIntegral ((w `shiftR` 3) .&. 0x7) @?= (1 :: Int)
+              St.decodeSlotC kind w @?= val
+
+      , testCase "7-byte string (maxInlineStr) encodes and decodes" $ do
+          let bs  = BS.pack [104, 105, 106, 107, 108, 109, 110]  -- "hijklmn"
+              val = St.RVBox (St.InlineStr bs)
+          case St.encodeSlotC val of
+            Nothing        -> assertFailure "encodeSlotC returned Nothing for 7-byte InlineStr"
+            Just (kind, w) -> do
+              kind @?= St.KPointer
+              (w .&. 0x7) @?= 0x7
+              fromIntegral ((w `shiftR` 3) .&. 0x7) @?= (7 :: Int)
+              St.decodeSlotC kind w @?= val
+
+      , testCase "\"hi\" (2 bytes) encodes and decodes" $ do
+          let bs  = BS.pack [104, 105]  -- "hi"
+              val = St.RVBox (St.InlineStr bs)
+          case St.encodeSlotC val of
+            Nothing        -> assertFailure "encodeSlotC returned Nothing for \"hi\" InlineStr"
+            Just (kind, w) -> St.decodeSlotC kind w @?= val
+
+      , testCase "nullary Inline re-encoding: low 3 bits = 011, decodes to same tag" $ do
+          let tid = 42 :: Word32
+              val = St.RVBox (St.Inline tid)
+          case St.encodeSlotC val of
+            Nothing        -> assertFailure "encodeSlotC returned Nothing for Inline tag"
+            Just (kind, w) -> do
+              kind @?= St.KPointer
+              -- low 3 bits must be 011 (nullary discriminant)
+              (w .&. 0x7) @?= 0x3
+              -- bit 2 must be 0 (not the inline-string code 111)
+              (w .&. 0x4) @?= 0
+              St.decodeSlotC kind w @?= val
+
+      , testCase "no cross-talk: Inline and InlineStr in same slot position differ by bit 2" $ do
+          -- Both use the 11 low-2-bit class; Inline has bit2=0, InlineStr has bit2=1.
+          let inlineVal   = St.RVBox (St.Inline 0)
+              inlineStrVal = St.RVBox (St.InlineStr BS.empty)
+          case (St.encodeSlotC inlineVal, St.encodeSlotC inlineStrVal) of
+            (Just (_, wi), Just (_, ws)) -> do
+              -- Discriminants must differ at bit 2
+              assertBool "Inline bit2 = 0" ((wi .&. 4) == 0)
+              assertBool "InlineStr bit2 = 1" ((ws .&. 4) /= 0)
+            _ -> assertFailure "encodeSlotC returned Nothing for one of the values"
+      ]
+
+    -- -----------------------------------------------------------------------
+    -- (B) Interpreter-level round-trip: constructor with short-string field
+    --   Duplicate removed: see rcCBackendTargeted / "String field is a pointer
+    --   cell (constructor with a String field is C-eligible)" for the canonical
+    --   test (exact cAllocs == 1 assertion, same fallback-lstr.wok program).
+    -- -----------------------------------------------------------------------
+
+  , testCase "constructor with short-string field AND nullary sibling round-trips on both backends" $ do
+      -- Pair "hi" True: "hi" = InlineStr (111 slot), True = Inline tid (011 slot).
+      -- Both field kinds must coexist correctly; no cross-talk between 011 and 111.
+      (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/inline-str-and-nullary.wok"
+      -- The interpreter renders String values via show, so "hi" appears as "\"hi\"".
+      assertEqual "result is the string field (rendered with quotes)" (T.pack "\"hi\"") txt
+      assertEqual "no value-CAF baseline" 0 bl
+      -- 1 cell: the Pair NCon only (both fields are slot-encoded; no extra cells).
+      assertParityBalanced "InlineStr + Inline fields coexist (E3 Task 2)" 1 absSt cSt bl
+      assertBool "Pair NCon routes to C heap" (cAllocs > 0)
   ]
 
 -- ---------------------------------------------------------------------------
@@ -12181,25 +12467,24 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
       -- silently all-falls-back to the abstract store.
       assertBool "C heap genuinely exercised (NCon routed to CAddr)" (cAllocs > 0)
 
-  , -- String field is a POINTER cell (Slice E1, Task 3): a 'Tagged' NCon with a
-    -- 'String' field. The string literal now allocates a counted 'NString' cell,
-    -- and the field stores its POINTER ('encodeSlotC' returns 'KPointer' for the
-    -- 'RVBox'), so the 'Tagged' cell is C-eligible. BOTH cells (the 'NString' and
-    -- the 'Tagged' NCon) route to the C heap; the result and heap accounting still
-    -- match the abstract reference. (Before Task 3 the inline 'LStr' field forced
-    -- the whole NCon onto the abstract heap; that fallback is now gone by design.)
+  , -- String field slot-encoded (Slice E3, Task 2): a 'Tagged' NCon with a
+    -- short 'String' field.  "hi" (2 bytes) is 'InlineStr'; with Task 2
+    -- 'encodeSlotC (RVBox (InlineStr bs))' packs it into a @111@ slot word,
+    -- so the 'Tagged' NCon is C-eligible again.  Only 1 cell is allocated
+    -- (the NCon itself; the InlineStr packs into a slot with no extra cell).
+    -- Both backends agree and the C heap records >= 1 alloc.
     testCase "String field is a pointer cell (constructor with a String field is C-eligible)" $ do
+      -- E3 Task 2: "hi" is InlineStr packed into a 111 slot; Tagged is C-eligible.
+      -- 1 cell: the Tagged NCon only (no separate string cell for a short string).
       (txt, absSt, cSt, bl, cAllocs) <- runBothBackends "test/rc-c-backend/fallback-lstr.wok"
       assertEqual "result is the U64 field (1)" (T.pack "1") txt
       assertEqual "no value-CAF baseline for this program" 0 bl
-      assertParityBalanced "String field pointer" 2 absSt cSt bl
-      -- Non-vacuity (C-eligibility proof): the program builds 'Tagged "hi" 1' ---
-      -- the 'NString "hi"' cell AND the 'Tagged' NCon (whose String field is now an
-      -- encodable pointer). BOTH route to the C heap, so the C heap's OWN allocation
-      -- counter is exactly 2 -- direct proof the String field no longer forces an
-      -- abstract-heap fallback.
-      assertEqual "String-bearing NCon is C-eligible; NString + Tagged both on C"
-        (2 :: Word64) cAllocs
+      assertParityBalanced "InlineStr field slot-encoded; Tagged is C-eligible (E3 Task 2)" 1 absSt cSt bl
+      -- Non-vacuity: exactly 1 C cell (the Tagged NCon); the InlineStr field packs
+      -- into a slot with no separate WokString cell.  A regression where the inline
+      -- field gets its own cell (cAllocs == 2) will fail this assertion.
+      assertEqual "E3 Task 2: exactly 1 C cell (NCon only; inline string field packed in-slot, no separate WokString cell)"
+        (1 :: Word64) cAllocs
 
   , -- Fallback: a 'Tagged' NCon whose first field is a U64 literal >= 2^63.
     -- 'encodeSlotC' calls 'toIntegralSized n :: Maybe Int64', which returns
@@ -12281,19 +12566,22 @@ rcCBackendTargeted = testGroup "rc-c-backend-targeted"
 -- 'encodeSlotC' packs an 'RCValue' into a @('SlotKind', 'Word64')@ pair when it is
 -- C-encodable; 'decodeSlotC' is its exact inverse on those shapes. The property
 -- pins that inverse for the generable encodable values: an 'Int64'-range integer
--- literal, a char literal, unit, an abstract-heap box ('HAddr'), and a nullary
--- inline immediate ('Inline' tag). A 'CAddr' is a raw runtime pointer (not purely
--- generable) and is excluded.
+-- literal, a char literal, unit, an abstract-heap box ('HAddr'), a nullary inline
+-- immediate ('Inline' tag), and a short inline string ('InlineStr', 0..7 bytes).
+-- A 'CAddr' is a raw runtime pointer (not purely generable) and is excluded.
 --
--- The @KPointer@ class uses the low 2 bits to discriminate three pointer-classes:
+-- The @KPointer@ class uses the low 2 bits to discriminate pointer-classes, then
+-- sub-discriminates inside the @11@ class with bit 2 (four classes in all):
 --
 --   * @..0@ (bit0 = 0): 'CAddr' bare 8-aligned pointer.
 --   * @01@ (bits 1:0 = 01): 'HAddr' index, stored as @(i << 2) .|. 1@.  Uses 62
 --     bits for the index; the round-trip holds for indices with |i| < 2^61.
---   * @11@ (bits 1:0 = 11): 'Inline' tag, stored as @(tag << 2) .|. 3@.
+--   * @011@ (bits 2:0 = 011): 'Inline' nullary tag, stored as @(tag << 3) .|. 3@.
+--   * @111@ (bits 2:0 = 111): 'InlineStr' short string ('packInlineStr').
 --
 -- The property also asserts mutual exclusivity: a 'CAddr' round-trips to 'CAddr',
--- an 'HAddr' to 'HAddr', an 'Inline' to 'Inline' --- never crossing class.
+-- an 'HAddr' to 'HAddr', an 'Inline' to 'Inline', an 'InlineStr' to 'InlineStr'
+-- --- never crossing class.
 
 -- | An 'RCValue' restricted to the C-encodable shapes the property round-trips.
 newtype EncodableRCValue = EncodableRCValue St.RCValue
@@ -12317,19 +12605,25 @@ instance QC.Arbitrary EncodableRCValue where
       -- exercise the sign-extension on the arithmetic >> 2 decode path.
     , St.RVBox . St.HAddr . fromIntegral
         <$> QC.choose (negate maxHAddrIdx, maxHAddrIdx)
-      -- 'Inline' is encoded as @(tag << 2) .|. 3@; the tag is an arbitrary Word32.
+      -- 'Inline' is encoded as @(tag << 3) .|. 3@; the tag is an arbitrary Word32.
     , St.RVBox . St.Inline <$> QC.arbitrary
+      -- 'InlineStr' is encoded by 'packInlineStr' (bits 2:0 = 111, length in 5:3,
+      -- bytes little-endian above). Draw 0..7 arbitrary bytes to fuzz the packing.
+    , do n     <- QC.choose (0, 7 :: Int)
+         bytes <- QC.vectorOf n (QC.arbitrary :: Gen Word8)
+         pure (St.RVBox (St.InlineStr (BS.pack bytes)))
     ]
 
 -- | Classify a decoded 'RCValue' by its pointer-class for mutual-exclusivity check.
-data PointerClass = PCCAddr | PCHAddr | PCInline | PCOther
+data PointerClass = PCCAddr | PCHAddr | PCInline | PCInlineStr | PCOther
   deriving (Eq, Show)
 
 pointerClass :: St.RCValue -> PointerClass
-pointerClass (St.RVBox (St.CAddr _))  = PCCAddr
-pointerClass (St.RVBox (St.HAddr _))  = PCHAddr
-pointerClass (St.RVBox (St.Inline _)) = PCInline
-pointerClass _                         = PCOther
+pointerClass (St.RVBox (St.CAddr _))     = PCCAddr
+pointerClass (St.RVBox (St.HAddr _))     = PCHAddr
+pointerClass (St.RVBox (St.Inline _))    = PCInline
+pointerClass (St.RVBox (St.InlineStr _)) = PCInlineStr
+pointerClass _                            = PCOther
 
 rcCBackendSlotProperty :: TestTree
 rcCBackendSlotProperty = testGroup "rc-c-backend-slot"
@@ -18745,27 +19039,49 @@ rcStringPrimTests = testGroup "rc string prims"
   -- ---------------------------------------------------------------
   -- append
   -- ---------------------------------------------------------------
-  , testCase "append: concatenates two strings, +1 alloc, drops both inputs" $ do
+  , testCase "append: concatenates two strings; short result (<=7B) is InlineStr, 0 new allocs (E3)" $ do
+      -- "ab" (2B) ++ "cd" (2B) = "abcd" (4B) which is <= maxInlineStr (7).
+      -- E3: the result is InlineStr (0 new allocs); the two counted inputs (sa,sb)
+      -- are dropped by the prim. sa and sb are allocated via allocPure (HAddr, counted).
       pAppend <- lookupStrPrim (T.pack "append")
       let s0       = St.emptyStore
           baseline = St.stLive (St.stStats s0)
           (sa, s1) = St.allocPure (St.NString (BS.pack [97, 98])) s0  -- "ab"
           (sb, s2) = St.allocPure (St.NString (BS.pack [99, 100])) s1  -- "cd"
       (result, s3) <- callPrim pAppend [St.RVBox sa, St.RVBox sb] s2
-      -- One new NString "abcd" allocated; sa and sb freed. Net: 0 live delta.
+      -- "abcd" (4B) <= maxInlineStr: 0 new allocs; sa and sb dropped (frees += 2).
+      St.stAllocs (St.stStats s3) - St.stAllocs (St.stStats s2) @?= 0
+      -- stLive returns to baseline (sa and sb freed; no new cell).
+      St.stLive (St.stStats s3) @?= baseline
+      -- Result is InlineStr carrying the concatenated bytes.
+      case result of
+        St.RVBox (St.InlineStr bs) -> bs @?= BS.pack [97, 98, 99, 100]
+        other -> assertFailure ("expected RVBox (InlineStr ...), got: " <> show other)
+      -- dropResult on InlineStr is a no-op; stLive stays at baseline.
+      s4 <- dropResult result s3
+      St.stLive (St.stStats s4) @?= baseline
+
+  , testCase "append: long result (>7B) still allocates one WokString cell" $ do
+      -- "abcdefgh" (8B) > maxInlineStr: 1 alloc on the heap.
+      pAppend <- lookupStrPrim (T.pack "append")
+      let s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (sa, s1) = St.allocPure (St.NString (BS.pack [97, 98, 99, 100])) s0  -- "abcd"
+          (sb, s2) = St.allocPure (St.NString (BS.pack [101, 102, 103, 104])) s1  -- "efgh"
+      (result, s3) <- callPrim pAppend [St.RVBox sa, St.RVBox sb] s2
+      -- "abcdefgh" (8B) > maxInlineStr: 1 new alloc; sa and sb freed.
       St.stAllocs (St.stStats s3) - St.stAllocs (St.stStats s2) @?= 1
       St.stLive (St.stStats s3) @?= baseline + 1
-      -- Verify rendered bytes
+      -- Verify bytes.
       case result of
         St.RVBox na -> do
           c <- runExceptT (St.deref na s3)
           case c of
             Right cell -> case St.cNode cell of
-              St.NString bs -> bs @?= BS.pack [97, 98, 99, 100]
+              St.NString bs -> bs @?= BS.pack [97, 98, 99, 100, 101, 102, 103, 104]
               other -> assertFailure ("expected NString, got: " <> show other)
             Left e -> assertFailure ("deref failed: " <> show e)
-        other -> assertFailure ("expected RVBox, got: " <> show other)
-      -- Drop result to return to baseline
+        other -> assertFailure ("expected RVBox for 8B result, got: " <> show other)
       s4 <- dropResult result s3
       St.stLive (St.stStats s4) @?= baseline
 
@@ -19474,6 +19790,502 @@ rcStringPropertyTests =
           in Data.List.nub hs @?= hs
       ]
 
+-- ---------------------------------------------------------------------------
+-- Suite E3: inline-string (SSO) QuickCheck properties
+--
+-- These properties target the E3 invariants that CANNOT be expressed as unit
+-- tests: they cover RANDOM byte content spanning the boundary, mixed inline /
+-- heap representations, and the allocation-count contract generalised beyond
+-- the two fixed-length cases in Task 1.
+--
+-- Structure (all on <=7B inline inputs unless noted):
+--   PE1  byte round-trip: alloc then derefPure re-yields the same bytes
+--   PE2  allocation count: <=7B -> 0 allocs, >7B -> 1 alloc (random length)
+--   PE3  eqString across MIXED inline/heap representations (3 pairings)
+--   PE4  append: result bytes are the concatenation; inline iff result <=7B
+--   PE5  codepoint/byte ops vs Text/BS reference: length, byteLength,
+--        index (codepoint), byteAt (byte) -- byteAt exercises the InlineStr
+--        FALL-THROUGH past the CAddr O(1) fast-path
+--   PE6  search/distance ops vs BS.breakSubstring / pure-Levenshtein:
+--        indexOfFromRaw (found + absent), contains, count, editDistance
+--   PE7  hash: cross-backend identity == SZ.szHash (P13 golden is the anchor)
+--
+-- Generator:
+--   'genShortText': valid UTF-8 text whose encoding is <=7 bytes (uses the
+--   same weighted character generator as E2, restricted by rejection sampling).
+--   'genUtf8Text': reused from E2 (mixed length, includes multi-byte).
+--
+-- THREE-WAY differential: every property body runs via 'onBothBackends', so
+-- AbstractHeap and CHeap must agree and the CHeap run must be leak-clean.
+-- The reference oracle is always 'BS.*' / 'Data.Text.*' (independent
+-- implementations), never a re-derivation of the prim's own logic.  The sole
+-- exception is PE7's 'SZ.szHash', which (like E2's P12) is a cross-backend
+-- identity check -- szHash has no independent pure equivalent; the P13 golden
+-- corpus in 'rcStringPropertyTests' pins the concrete values.
+-- ---------------------------------------------------------------------------
+
+-- | Generator: a 'T.Text' whose UTF-8 encoding is at most 'maxInlineStr' (7)
+-- bytes.  Characters are drawn from 'genUtf8Char' (the E2 generator, which
+-- includes multi-byte scalars); we rejection-sample until the result fits.
+-- At larger QuickCheck sizes a single draw often overshoots 7 bytes (multi-byte
+-- scalars are 2-4 bytes each), so ~10-50 retries are typical; 'suchThat's
+-- built-in 100-retry cap is comfortably sufficient.
+genShortText :: QC.Gen T.Text
+genShortText =
+  QC.suchThat genUtf8Text
+    (\t -> BS.length (TxEnc.encodeUtf8 t) <= St.maxInlineStr)
+
+-- | Allocate an 'NString' cell on the given backend's HEAP, bypassing the
+-- 'InlineStr' shortcut so that a short (<=7B) string gets a real counted cell.
+-- Backend-aware:
+--   AbstractHeap: returns an 'HAddr' via 'allocPure' (HAddr, abstract store).
+--   CHeap:        calls 'Heap.wokStringAlloc' + 'Heap.wokStringData' + 'copyBytes'
+--                 to allocate a real 'CAddr' cell, then charges 'stStats' to mirror
+--                 what 'allocNString' would do ('wouldBeCBytes (NString bs)' bytes).
+-- PE3 uses this to exercise (CAddr, InlineStr) and (InlineStr, CAddr) pairings
+-- on the CHeap backend, and (HAddr, InlineStr) on AbstractHeap.  The forced cell
+-- is owned by the store; 'eqString' drops it via 'dropAddr' (which calls
+-- 'wok_dec'), so the 'stLive == baseline' check and 'withCHeapBalanced' hold.
+allocStringHeapForced :: BS.ByteString -> St.Store -> IO (St.Addr, St.Store)
+allocStringHeapForced bs s = case St.stBackend s of
+  St.AbstractHeap ->
+    pure (St.allocPure (St.NString bs) s)
+  St.CHeap hp -> do
+    let byteLen = fromIntegral (BS.length bs) :: Word64
+        bytes   = St.wouldBeCBytes (St.NString bs)
+        live    = St.stLive     (St.stStats s) + 1
+        cur     = St.stCurBytes (St.stStats s) + bytes
+        stats'  = (St.stStats s)
+          { St.stAllocs    = St.stAllocs    (St.stStats s) + 1
+          , St.stLive      = live
+          , St.stPeak      = max (St.stPeak     (St.stStats s)) live
+          , St.stCurBytes  = cur
+          , St.stPeakBytes = max (St.stPeakBytes (St.stStats s)) cur
+          }
+    p    <- Heap.wokStringAlloc hp byteLen
+    dest <- Heap.wokStringData p
+    BS.useAsCStringLen bs (\(src, len) ->
+      copyBytes dest (castPtr src) len)
+    pure (St.CAddr p, s { St.stStats = stats' })
+
+-- PE1: for any text whose UTF-8 encoding has <=7 bytes, allocating it on the
+-- RC store (which makes it InlineStr) and then derefPure-ing the address back
+-- yields an NString with the identical bytes.
+-- THREE-WAY: the derefPure is backend-agnostic (InlineStr is not on any heap);
+-- the property uses 'onBothBackends' to exercise the full alloc dispatch on each.
+prop_inlineStrByteRoundTrip :: Property
+prop_inlineStrByteRoundTrip =
+  QC.forAll genShortText $ \t ->
+    QC.ioProperty $ onBothBackends "PE1" $ \backend -> do
+      let bs = TxEnc.encodeUtf8 t
+          s0 = emptyStoreOn backend
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e -> assertFailure ("PE1: alloc failed: " <> show e) >>
+          pure (QC.counterexample "PE1: alloc failed" False)
+        Right (a, s1) -> do
+          let isIL = case a of St.InlineStr _ -> True; _ -> False
+          case St.derefPure a s1 of
+            Left e2 ->
+              pure (QC.counterexample ("PE1: derefPure failed: " <> show e2) False)
+            Right cell -> do
+              let roundTripped = case St.cNode cell of
+                                   St.NString b -> b == bs
+                                   _            -> False
+              pure $ QC.conjoin
+                [ QC.counterexample
+                    ("PE1 byte round-trip: bs=" <> show bs)
+                    roundTripped
+                , QC.counterexample
+                    ("PE1 must be InlineStr for <=7 bytes (len="
+                      <> show (BS.length bs) <> ")")
+                    isIL
+                ]
+
+-- PE2: a string with <=maxInlineStr bytes allocates 0 cells; a string with
+-- more than maxInlineStr bytes allocates exactly 1 cell.  Both backends.
+-- This generalises the two fixed-length cases in Task 1 to a random distribution.
+-- It is also where the EXACT 0-cell contract for the short-string corpus files
+-- (20-22, 24-25, 27-28) is carried: 'rcStatsHarness' on those files only checks
+-- alloc/free BALANCE, not the exact-0 count, so this property (plus the Task 1
+-- units) is what pins "a <=7B string costs no cell" end to end.
+prop_inlineStrAllocCount :: Property
+prop_inlineStrAllocCount =
+  QC.forAll genUtf8Text $ \t ->
+    QC.ioProperty $ onBothBackends "PE2" $ \backend -> do
+      let bs    = TxEnc.encodeUtf8 t
+          n     = BS.length bs
+          s0    = emptyStoreOn backend
+          base  = St.stAllocs (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NString bs) s0)
+      case r of
+        Left e -> assertFailure ("PE2: alloc failed: " <> show e) >>
+          pure (QC.counterexample "PE2: alloc failed" False)
+        Right (a, s1) -> do
+          let delta    = St.stAllocs (St.stStats s1) - base
+              expected = if n <= St.maxInlineStr then 0 else 1
+              isIL     = case a of St.InlineStr _ -> True; _ -> False
+          -- Drop the allocated address so the CHeap run stays leak-clean.
+          _ <- dropResult (St.RVBox a) s1
+          pure $ QC.conjoin
+            [ QC.counterexample
+                ("PE2 alloc count: n=" <> show n
+                  <> " expected=" <> show expected <> " got=" <> show delta)
+                (delta == expected)
+            , QC.counterexample
+                ("PE2 IsInlineStr iff <=maxInlineStr: n=" <> show n
+                  <> " isIL=" <> show isIL)
+                (isIL == (n <= St.maxInlineStr))
+            ]
+
+-- PE3: eqString agrees with byte equality across ALL THREE pairings of
+-- inline and heap representations for short strings.
+--   (inline, inline): both allocated via 'alloc' (InlineStr on both backends)
+--   (heap, inline):   left forced via 'allocStringHeapForced' (CAddr on CHeap,
+--                     HAddr on AbstractHeap), right via 'alloc' (InlineStr)
+--   (inline, heap):   left via 'alloc' (InlineStr), right forced (CAddr/HAddr)
+-- For non-short strings both sides land on the heap regardless.
+-- The oracle is bsA == bsB.
+prop_inlineStrEqMixed :: Property
+prop_inlineStrEqMixed =
+  QC.forAll genShortText $ \strA ->
+  QC.forAll genShortText $ \strB ->
+    QC.ioProperty $ onBothBackends "PE3" $ \backend -> do
+      pEq <- lookupBasePrim (T.pack "eqString")
+      let bsA      = TxEnc.encodeUtf8 strA
+          bsB      = TxEnc.encodeUtf8 strB
+          oracleEq = bsA == bsB
+          -- Helper: render an eqString result value as Bool
+          asBool v s = case St.renderRCValue s v of
+                         Right rendered -> rendered == T.pack "True"
+                         Left _         -> False
+          -- Each pairing starts from a fresh store; baseline is the empty-store
+          -- live count.  eqString CONSUMES both arguments (drops the inline
+          -- args and the heap-forced HAddr cell), and its Bool result is a
+          -- nullary immediate (0 counted cells in E3).  So after dropping the
+          -- result (a no-op for the immediate Bool) the store MUST be back at
+          -- baseline -- a CHeap/abstract counting bug in eqString's drop path
+          -- (e.g. forgetting to free the heap-forced cell) would surface here.
+          baseline = St.stLive (St.stStats (emptyStoreOn backend))
+      -- Pairing 1 (inline, inline): both via 'alloc' -> both InlineStr
+      let s0a = emptyStoreOn backend
+      (iaA, s1a) <- allocStringOn strA s0a
+      (ibB, s2a) <- allocStringOn strB s1a
+      (iiVal, s3a) <- callStrPrim pEq [St.RVBox iaA, St.RVBox ibB] s2a
+      let rcII = asBool iiVal s3a
+      s4a <- dropResult iiVal s3a
+      St.stLive (St.stStats s4a) @?= baseline
+      -- Pairing 2 (heap, inline): left forced via allocStringHeapForced, right via alloc
+      let s0b = emptyStoreOn backend
+      (haA, s1b) <- allocStringHeapForced bsA s0b
+      (ibB2, s2b) <- allocStringOn strB s1b
+      (hiVal, s3b) <- callStrPrim pEq [St.RVBox haA, St.RVBox ibB2] s2b
+      let rcHI = asBool hiVal s3b
+      s4b <- dropResult hiVal s3b
+      St.stLive (St.stStats s4b) @?= baseline
+      -- Pairing 3 (inline, heap): left via alloc, right forced via allocStringHeapForced
+      let s0c = emptyStoreOn backend
+      (haB, s1c) <- allocStringHeapForced bsB s0c
+      (iaA2, s2c) <- allocStringOn strA s1c
+      (ihVal, s3c) <- callStrPrim pEq [St.RVBox iaA2, St.RVBox haB] s2c
+      let rcIH = asBool ihVal s3c
+      s4c <- dropResult ihVal s3c
+      St.stLive (St.stStats s4c) @?= baseline
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PE3 (inline,inline): oracle=" <> show oracleEq
+              <> " got=" <> show rcII
+              <> " a=" <> show bsA <> " b=" <> show bsB)
+            (rcII == oracleEq)
+        , QC.counterexample
+            ("PE3 (heap,inline): oracle=" <> show oracleEq
+              <> " got=" <> show rcHI
+              <> " a=" <> show bsA <> " b=" <> show bsB)
+            (rcHI == oracleEq)
+        , QC.counterexample
+            ("PE3 (inline,heap): oracle=" <> show oracleEq
+              <> " got=" <> show rcIH
+              <> " a=" <> show bsA <> " b=" <> show bsB)
+            (rcIH == oracleEq)
+        ]
+
+-- PE4: append bytes and inline-status.
+-- For ANY two texts a and b: append a b has bytes (bsA <> bsB), and
+-- the result is InlineStr iff len(bsA <> bsB) <= maxInlineStr.
+-- THREE-WAY: AbstractHeap and CHeap must agree on both the bytes AND
+-- the inline-vs-heap classification of the result.
+prop_inlineStrAppend :: Property
+prop_inlineStrAppend =
+  QC.forAll genUtf8Text $ \strA ->
+  QC.forAll genUtf8Text $ \strB ->
+    QC.ioProperty $ onBothBackends "PE4" $ \backend -> do
+      pAppend <- lookupStrPrim (T.pack "append")
+      let bsA         = TxEnc.encodeUtf8 strA
+          bsB         = TxEnc.encodeUtf8 strB
+          oracleBytes = bsA <> bsB
+          oracleLen   = BS.length oracleBytes
+          oracleIL    = oracleLen <= St.maxInlineStr
+          s0          = emptyStoreOn backend
+          baseline    = St.stLive (St.stStats s0)
+      (sa, s1) <- allocStringOn strA s0
+      (sb, s2) <- allocStringOn strB s1
+      (cat, s3) <- callStrPrim pAppend [St.RVBox sa, St.RVBox sb] s2
+      let resultIsIL = case cat of
+                         St.RVBox (St.InlineStr _) -> True
+                         _                         -> False
+      -- Extract bytes from result via deref (monadic, handles both HAddr and CAddr).
+      -- InlineStr: deref synthesises Cell (NString bs) directly (no heap lookup).
+      -- HAddr/CAddr: deref reads the live cell from the respective heap.
+      resultBytes <- case cat of
+        St.RVBox a -> do
+          r2 <- runExceptT (St.deref a s3)
+          case r2 of
+            Right cell -> case St.cNode cell of
+              St.NString b -> pure b
+              _            -> assertFailure "PE4: result is not NString" >> error "unreachable"
+            Left e -> assertFailure ("PE4: deref failed: " <> show e) >> error "unreachable"
+        _ -> assertFailure "PE4: result is not RVBox" >> error "unreachable"
+      s4 <- dropResult cat s3
+      St.stLive (St.stStats s4) @?= baseline
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PE4 bytes: RC=" <> show resultBytes <> " oracle=" <> show oracleBytes)
+            (resultBytes == oracleBytes)
+        , QC.counterexample
+            ("PE4 inline iff <=7B: len=" <> show oracleLen
+              <> " oracleIL=" <> show oracleIL
+              <> " gotIL=" <> show resultIsIL)
+            (resultIsIL == oracleIL)
+        ]
+
+-- PE5: codepoint/byte ops on InlineStr inputs match independent references.
+-- Covers the E1 ops 'length'/'byteLength'/'index'/'byteAt' on random short
+-- (<=7B) inline strings.  'index'/'byteAt' are the load-bearing additions:
+-- 'byteAt' has a CAddr O(1) fast-path that an InlineStr must FALL THROUGH (to
+-- the deref-then-'BS.index' path), and 'index' decodes UTF-8 codepoints from
+-- the synthesised cell.  References are 'Data.Text.length'/'.index' and
+-- 'BS.length'/'.index' -- independent of the prim's own arithmetic.
+-- Empty strings skip the index/byteAt checks (no valid in-range index exists).
+prop_inlineStrCodepointOps :: Property
+prop_inlineStrCodepointOps =
+  QC.forAll genShortText $ \t ->
+    let bs = TxEnc.encodeUtf8 t in
+    QC.ioProperty $ onBothBackends "PE5" $ \backend -> do
+      pLength     <- lookupStrPrim (T.pack "length")
+      pByteLength <- lookupStrPrim (T.pack "byteLength")
+      pIndex      <- lookupStrPrim (T.pack "index")
+      pByteAt     <- lookupStrPrim (T.pack "byteAt")
+      let s0            = emptyStoreOn backend
+          baseline      = St.stLive (St.stStats s0)
+          oracleLen     = toInteger (T.length t)
+          oracleByteLen = toInteger (BS.length bs)
+          nonEmpty      = not (BS.null bs)
+          -- For non-empty strings, probe the last codepoint and the last byte.
+          cpIdx         = T.length t - 1
+          byteIdx       = BS.length bs - 1
+      (sa, s1) <- allocStringOn t s0
+      (sb, s2) <- allocStringOn t s1
+      (lenVal, s3)  <- callStrPrim pLength     [St.RVBox sa] s2
+      (byteVal, s4) <- callStrPrim pByteLength [St.RVBox sb] s3
+      rcLen     <- asInt "PE5 length"     lenVal
+      rcByteLen <- asInt "PE5 byteLength" byteVal
+      -- index / byteAt only for non-empty strings (need a valid in-range index).
+      indexChecks <-
+        if not nonEmpty
+          then pure []
+          else do
+            (sc, s5) <- allocStringOn t s4
+            (sd, s6) <- allocStringOn t s5
+            (cpVal, s7)   <- callStrPrim pIndex  [St.RVBox sc, St.RVLit (Anf.LInt (fromIntegral cpIdx))]   s6
+            (byVal, s8)   <- callStrPrim pByteAt [St.RVBox sd, St.RVLit (Anf.LInt (fromIntegral byteIdx))] s7
+            rcCP   <- asChar "PE5 index"  cpVal
+            rcByte <- asInt  "PE5 byteAt" byVal
+            St.stLive (St.stStats s8) @?= baseline
+            let oracleCP   = T.index t cpIdx
+                oracleByte = toInteger (BS.index bs byteIdx)
+            pure
+              [ QC.counterexample
+                  ("PE5 index at " <> show cpIdx <> ": RC=" <> show rcCP
+                    <> " oracle=" <> show oracleCP <> " t=" <> T.unpack t)
+                  (rcCP == oracleCP)
+              , QC.counterexample
+                  ("PE5 byteAt at " <> show byteIdx <> ": RC=" <> show rcByte
+                    <> " oracle=" <> show oracleByte <> " t=" <> T.unpack t)
+                  (rcByte == oracleByte)
+              ]
+      -- The non-empty branch already asserts baseline at its last store (s8);
+      -- for the empty branch (no index/byteAt allocs) assert it here at s4.
+      Control.Monad.unless nonEmpty (St.stLive (St.stStats s4) @?= baseline)
+      pure $ QC.conjoin $
+        [ QC.counterexample
+            ("PE5 length: RC=" <> show rcLen <> " oracle=" <> show oracleLen
+              <> " t=" <> T.unpack t)
+            (rcLen == oracleLen)
+        , QC.counterexample
+            ("PE5 byteLength: RC=" <> show rcByteLen <> " oracle=" <> show oracleByteLen
+              <> " t=" <> T.unpack t)
+            (rcByteLen == oracleByteLen)
+        ] ++ indexChecks
+
+-- PE6: search/distance ops on InlineStr inputs match independent references.
+-- Covers, on random short (<=7B) inline strings, the search prim
+-- 'indexOfFromRaw' (the sole RC search primitive; 'indexOf'/'contains'/'count'
+-- are dogfooded over it in 'Std.String') and 'editDistance', against the same
+-- 'BS.breakSubstring' / pure-Levenshtein references the E2 properties (P8-P11)
+-- use.  Each op deref's the InlineStr to raw bytes; a bug in the inline byte
+-- view would surface as a wrong offset/count/distance.  Specifically checked:
+--   * indexOfFromRaw (found)   -- offset of an occurring needle
+--   * indexOfFromRaw (absent)  -- UINT64_MAX sentinel for an absent needle
+--   * contains (found/absent)  -- derived: offset /= sentinel, vs breakSubstring
+--   * count                    -- replicated via the same repeated-indexOf loop
+--                                 the library uses, vs 'refCount'
+--   * editDistance             -- vs 'refLevenshteinSpec'
+-- The needle is DERIVED from the haystack: a 1-byte prefix (guaranteed to occur
+-- when non-empty) and a sentinel byte 0x00 (guaranteed absent -- NUL never
+-- appears in genUtf8Char output) exercise both the found and not-found paths.
+prop_inlineStrSearchOps :: Property
+prop_inlineStrSearchOps =
+  QC.forAll genShortText $ \t ->
+  QC.forAll genShortText $ \u ->
+    let bs = TxEnc.encodeUtf8 t
+        bu = TxEnc.encodeUtf8 u
+    in QC.ioProperty $ onBothBackends "PE6" $ \backend -> do
+      pIndexOfFromRaw <- lookupStrPrim (T.pack "indexOfFromRaw")
+      pEditDistance   <- lookupStrPrim (T.pack "editDistance")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          -- A needle that DOES occur: a 1-byte prefix of the haystack (or empty
+          -- if the haystack is empty).  A needle that does NOT occur: a single
+          -- NUL byte, which valid UTF-8 text from genUtf8Char never contains.
+          occursNeedle = BS.take 1 bs
+          absentNeedle = BS.pack [0]
+          oracleOccurs = refFindFromSpec bs occursNeedle 0
+          oracleAbsent = refFindFromSpec bs absentNeedle 0
+          oracleContainsOccurs = oracleOccurs /= maxBound
+          oracleContainsAbsent = oracleAbsent /= maxBound
+          oracleCount  = refCount bs occursNeedle 0
+          oracleDist   = toInteger (refLevenshteinSpec bs bu)
+          needleByteLen = BS.length occursNeedle
+      -- indexOfFromRaw (occurs)
+      (sh1, s1) <- allocStringOn t s0
+      (sn1, s2) <- allocStringHelper occursNeedle s1
+      (occVal, s3) <- callStrPrim pIndexOfFromRaw
+                        [St.RVBox sh1, St.RVBox sn1, St.RVLit (Anf.LInt 0)] s2
+      rcOccurs <- asInt "PE6 indexOfFromRaw occurs" occVal
+      -- indexOfFromRaw (absent)
+      (sh2, s4) <- allocStringOn t s3
+      (sn2, s5) <- allocStringHelper absentNeedle s4
+      (absVal, s6) <- callStrPrim pIndexOfFromRaw
+                        [St.RVBox sh2, St.RVBox sn2, St.RVLit (Anf.LInt 0)] s5
+      rcAbsent <- asInt "PE6 indexOfFromRaw absent" absVal
+      -- count (occurs): replicate the dogfooded loop -- repeatedly indexOfFromRaw
+      -- from the position after each match (empty needle short-circuits to 0).
+      let countLoop :: Int -> Int -> St.Store -> IO (Int, St.Store)
+          countLoop from acc st
+            | BS.null occursNeedle = pure (acc, st)
+            | otherwise = do
+                (sh, st1) <- allocStringOn t st
+                (sn, st2) <- allocStringHelper occursNeedle st1
+                (rv, st3) <- callStrPrim pIndexOfFromRaw
+                               [St.RVBox sh, St.RVBox sn, St.RVLit (Anf.LInt (toInteger from))] st2
+                pos <- asInt "PE6 count loop" rv
+                if pos == notFoundSentinel
+                  then pure (acc, st3)
+                  else countLoop (fromInteger pos + needleByteLen) (acc + 1) st3
+      (rcCount, s7) <- countLoop 0 0 s6
+      -- editDistance (two short inline strings)
+      (sa, s8) <- allocStringOn t s7
+      (sb, s9) <- allocStringOn u s8
+      (distVal, s10) <- callStrPrim pEditDistance [St.RVBox sa, St.RVBox sb] s9
+      rcDist <- asInt "PE6 editDistance" distVal
+      St.stLive (St.stStats s10) @?= baseline
+      let rcContainsOccurs = rcOccurs /= notFoundSentinel
+          rcContainsAbsent = rcAbsent /= notFoundSentinel
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("PE6 indexOfFromRaw (occurs): RC=" <> show rcOccurs
+              <> " oracle=" <> show (toInteger oracleOccurs)
+              <> " t=" <> T.unpack t)
+            (rcOccurs == toInteger oracleOccurs)
+        , QC.counterexample
+            ("PE6 indexOfFromRaw (absent NUL): RC=" <> show rcAbsent
+              <> " oracle=" <> show (toInteger oracleAbsent)
+              <> " (sentinel=" <> show notFoundSentinel <> ") t=" <> T.unpack t)
+            (rcAbsent == toInteger oracleAbsent && rcAbsent == notFoundSentinel)
+        , QC.counterexample
+            ("PE6 contains (occurs): RC=" <> show rcContainsOccurs
+              <> " oracle=" <> show oracleContainsOccurs <> " t=" <> T.unpack t)
+            (rcContainsOccurs == oracleContainsOccurs)
+        , QC.counterexample
+            ("PE6 contains (absent NUL): RC=" <> show rcContainsAbsent
+              <> " oracle=" <> show oracleContainsAbsent <> " t=" <> T.unpack t)
+            (rcContainsAbsent == oracleContainsAbsent && not rcContainsAbsent)
+        , QC.counterexample
+            ("PE6 count: RC=" <> show rcCount <> " oracle=" <> show oracleCount
+              <> " t=" <> T.unpack t)
+            (rcCount == oracleCount)
+        , QC.counterexample
+            ("PE6 editDistance: RC=" <> show rcDist <> " oracle=" <> show oracleDist
+              <> " t=" <> T.unpack t <> " u=" <> T.unpack u)
+            (rcDist == oracleDist)
+        ]
+
+-- PE7: hash on an InlineStr input agrees across BOTH backends and equals the
+-- 'SZ.szHash' value.  This mirrors E2's P12 (a szHash-vs-szHash cross-backend
+-- identity check; the P13 golden is the independent anchor) but specifically
+-- on inline (<=7B) inputs, confirming the InlineStr byte view feeds szHash the
+-- same bytes a heap cell would.
+prop_inlineStrHash :: Property
+prop_inlineStrHash =
+  QC.forAll genShortText $ \t ->
+    let bs = TxEnc.encodeUtf8 t in
+    QC.ioProperty $ onBothBackends "PE7" $ \backend -> do
+      pHash <- lookupStrPrim (T.pack "hash")
+      let s0       = emptyStoreOn backend
+          baseline = St.stLive (St.stStats s0)
+          oracle   = toInteger (SZ.szHash bs)
+      (sa, s1) <- allocStringOn t s0
+      (res, s2) <- callStrPrim pHash [St.RVBox sa] s1
+      rcHash <- asInt "PE7 hash" res
+      St.stLive (St.stStats s2) @?= baseline
+      pure $ QC.counterexample
+        ("PE7 hash: RC=" <> show rcHash <> " oracle=" <> show oracle
+          <> " t=" <> T.unpack t)
+        (rcHash == oracle)
+
+-- | Allocate an arbitrary 'ByteString' (NOT necessarily valid UTF-8) as a
+-- string on the given backend.  Used by PE6 for the NUL-byte absent needle,
+-- which is not producible via the valid-UTF-8 'genUtf8Char' generator.  Like
+-- 'allocStringOn', short results become 'InlineStr' (the search prims deref
+-- both haystack and needle to raw bytes regardless of representation).
+allocStringHelper :: BS.ByteString -> St.Store -> IO (St.Addr, St.Store)
+allocStringHelper bs s = do
+  r <- runExceptT (St.alloc (St.NString bs) s)
+  case r of
+    Right x -> pure x
+    Left e  -> assertFailure ("allocStringHelper failed: " <> show e)
+                 >> error "unreachable"
+
+rcInlineStringPropertyTests :: TestTree
+rcInlineStringPropertyTests =
+  localOption (QuickCheckTests 200) $
+    testGroup "rc inline string properties (Suite E3: SSO invariants)"
+      [ testProperty "PE1: byte round-trip for <=7-byte strings (always InlineStr)"
+          prop_inlineStrByteRoundTrip
+      , testProperty "PE2: alloc count: <=7B -> 0 cells, >7B -> 1 cell (both backends)"
+          prop_inlineStrAllocCount
+      , testProperty "PE3: eqString agrees with byte equality across inline/heap pairings"
+          prop_inlineStrEqMixed
+      , testProperty "PE4: append bytes are concat; inline iff result <=7B"
+          prop_inlineStrAppend
+      , testProperty "PE5: length/byteLength/index/byteAt on InlineStr match Text/BS reference"
+          prop_inlineStrCodepointOps
+      , testProperty "PE6: indexOfFromRaw/contains/count/editDistance on InlineStr match BS reference"
+          prop_inlineStrSearchOps
+      , testProperty "PE7: hash on InlineStr agrees across backends (== szHash)"
+          prop_inlineStrHash
+      ]
+
 rcArrayPropertyTests :: TestTree
 rcArrayPropertyTests =
   localOption (QuickCheckTests 100) $
@@ -19907,15 +20719,11 @@ rcRegionCorpusTests = testGroup "rc-region-corpus"
       rcRegionParityHarness "test/rc-region/05-letrec-head-capture-escape.wok"
 
   , -- -----------------------------------------------------------------------
-    -- 06-string-literal-discard (Slice E1, Task 3): a string literal now
-    -- allocates a counted NString cell (was inline).  "hi" (2 ASCII bytes) is
-    -- bound and DISCARDED, so Perceus inserts a __rc_drop on the boxed binder.
-    -- Expected on BOTH backends:
-    --   * the string allocates exactly ONE cell, freed exactly once
-    --     (allocs == frees, stLive == baseline at end);
-    --   * peak_bytes charges the rounded cell size 16 + 8*ceil(2/8) == 24;
-    --   * String is ALWAYS Heap, never arena (arena_peak == 0).
-    testCase "06-string-literal-discard: literal allocates a counted cell (allocs==frees, peak_bytes==24, no arena)" $ do
+    -- 06-string-literal-discard (Slice E1, Task 3 -> updated for E3 Task 1):
+    -- "hi" (2 ASCII bytes) is bound and DISCARDED. Under E3, "hi" is InlineStr
+    -- (0 allocs, 0 peak_bytes). The Perceus __rc_drop on the binder is a no-op
+    -- (InlineStr is uncounted). Both backends: allocs == frees == 0 beyond baseline.
+    testCase "06-string-literal-discard: InlineStr immediate, 0 allocs, 0 peak_bytes (E3)" $ do
       (absR, cR, _cAllocs, cPeakBytes, _cArenaBytes, cArenaPeak) <-
         withBothBackendsArena "test/rc-region/06-string-literal-discard.wok"
       case (absR, cR) of
@@ -19924,11 +20732,10 @@ rcRegionCorpusTests = testGroup "rc-region-corpus"
               cSt = RCM.rcStats c
           assertEqual "output is 5" (T.pack "5") (RCM.rcOutput c)
           assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
-          -- The literal allocated a real cell: at least one counted alloc beyond
-          -- the baseline (the NString cell).
-          assertEqual "string allocated exactly one cell (allocs - baseline == 1)"
-            (RCM.rcBaseline c + 1) (St.stAllocs cSt)
-          -- Balanced: allocs == frees + baseline, stLive back to baseline.
+          -- E3: "hi" is InlineStr (0 counted allocs beyond baseline).
+          assertEqual "E3: string is InlineStr (allocs == baseline)"
+            (RCM.rcBaseline c) (St.stAllocs cSt)
+          -- Balanced: no leak.
           assertEqual "no counted leak (C): stLive == baseline"
             (RCM.rcBaseline c) (St.stLive cSt)
           assertEqual "no counted leak (C): allocs - frees == baseline"
@@ -19937,15 +20744,15 @@ rcRegionCorpusTests = testGroup "rc-region-corpus"
             (RCM.rcBaseline a) (St.stLive aSt)
           assertEqual "no counted leak (abstract): allocs - frees == baseline"
             (RCM.rcBaseline a) (St.stAllocs aSt - St.stFrees aSt)
-          -- peak_bytes charges the rounded WokString cell size for 2 bytes: 24.
-          assertEqual "C peak_bytes == 24 (16 + 8*ceil(2/8))"
-            (24 :: Word64) cPeakBytes
-          assertEqual "abstract peak_bytes == 24"
-            (24 :: Word64) (fromIntegral (St.stPeakBytes aSt))
-          -- String is NEVER arena-routed.
-          assertEqual "abstract arena_peak == 0 (String is always Heap)"
+          -- E3: InlineStr has no cell; peak_bytes == 0.
+          assertEqual "E3: C peak_bytes == 0 (InlineStr has no cell)"
+            (0 :: Word64) cPeakBytes
+          assertEqual "E3: abstract peak_bytes == 0"
+            (0 :: Word64) (fromIntegral (St.stPeakBytes aSt))
+          -- InlineStr is never arena-routed.
+          assertEqual "abstract arena_peak == 0 (InlineStr is not arena-routed)"
             (0 :: Int) (St.stArenaPeak aSt)
-          assertEqual "C arena_peak == 0 (String is always Heap)"
+          assertEqual "C arena_peak == 0 (InlineStr is not arena-routed)"
             (0 :: Word64) cArenaPeak
         (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
         (_, Left e) -> assertFailure ("C FAILED: " <> show e)

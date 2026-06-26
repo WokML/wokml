@@ -84,12 +84,15 @@ module Wok.Interp.RC.Value
   , SlotKind (..)
   , encodeSlotC
   , decodeSlotC
+  , packInlineStr
+  , unpackInlineStr
     -- * Array C-cell support
   , wokArrayTag
   , slotKindToElemKind
   , elemKindToSlotKind
     -- * String C-cell support
   , wokStringTag
+  , maxInlineStr
     -- * Array in-place mutation helpers (Slice C)
   , atIndex
   , setAt
@@ -156,7 +159,7 @@ liftRC = except
 -- cell may hold an 'HAddr' child via the @HBOX@ slot tag, and an abstract cell
 -- may hold a 'CAddr' child via 'RVBox'); the drop cascade routes each child by
 -- its 'Addr' kind, so the two heaps interoperate.
-data Addr = HAddr Int | CAddr (Ptr WokObj) | Inline Word32
+data Addr = HAddr Int | CAddr (Ptr WokObj) | Inline Word32 | InlineStr !ByteString
   deriving (Eq, Ord, Show)
 
 -- | Runtime values in the RC interpreter. Either an unboxed literal, a
@@ -551,7 +554,8 @@ continuationReservations k0 reserved = dedup (go k0)
 --   * 'Inline': an immediate is never reserved (uncounted, never a donor), so this
 --     is a no-op for totality.
 freeReservation :: (Addr, Int) -> Store -> RC Store
-freeReservation (Inline _, _) s = pure s  -- immediate: never reserved (uncounted donor), no-op for totality
+freeReservation (Inline _, _)    s = pure s  -- immediate: never reserved (uncounted donor), no-op for totality
+freeReservation (InlineStr _, _) s = pure s  -- inline string: never reserved, no-op for totality
 freeReservation (a, _) s
   -- UNIFORM double-reclaim guard (applies to BOTH HAddr and CAddr arms): a legit
   -- reclaim always has @a ∈ stReserved@ ('continuationReservations' only yields
@@ -596,9 +600,10 @@ moveOutCont a s = liftRC (moveOutContPure a s)
 -- not an 'NCon'), so it always lives on the abstract heap; a 'CAddr' here is an
 -- internal routing error.
 moveOutContPure :: Addr -> Store -> Either RuntimeError (RCKont, (Handler, Int, RCScope), Store)
-moveOutContPure (CAddr _)   _ = Left (PrimError (Tx.pack "resume: continuation cannot live on the C heap"))
-moveOutContPure (Inline _)  _ = Left (PrimError (Tx.pack "resume: inline immediate is not a continuation"))
-moveOutContPure a@(HAddr i) s = do
+moveOutContPure (CAddr _)    _ = Left (PrimError (Tx.pack "resume: continuation cannot live on the C heap"))
+moveOutContPure (Inline _)   _ = Left (PrimError (Tx.pack "resume: inline immediate is not a continuation"))
+moveOutContPure (InlineStr _) _ = Left (PrimError (Tx.pack "resume: inline string is not a continuation"))
+moveOutContPure a@(HAddr i)  s = do
   c <- derefPure a s
   case cNode c of
     NCont prefix hinfo
@@ -982,6 +987,14 @@ wokArrayTag = 0xFFFF
 wokStringTag :: Word32
 wokStringTag = 0xFFFE
 
+-- | Max UTF-8 byte length stored inline in the one-word value (slice E3).
+-- The KPointer slot word has 58 data bits above the 3-bit @111@ discriminant and
+-- the 3-bit length, i.e. floor(58/8) = 7 whole bytes. Fixed, not tunable; a
+-- longer string keeps its WokString cell. (The bit-packing is Task 2; this
+-- constant only gates the alloc chokepoint.)
+maxInlineStr :: Int
+maxInlineStr = 7
+
 -- | The kind of a single raw slot word in a compact C cell.
 data SlotKind = KLitInt | KLitChar | KLitUnit | KPointer
   deriving (Eq, Show)
@@ -1021,15 +1034,16 @@ elemKindToSlotKind w = error ("elemKindToSlotKind: unknown elemkind byte " <> sh
 -- encodable shapes, driven by the 'SlotKind' from the stored descriptor.
 
 -- | Pack an 'RCValue' into a raw slot @('SlotKind', 'Word64')@, or 'Nothing' if
--- the value is not C-encodable (a string literal, a bignum 'LInt' too wide for
--- 'Int64', a closure-member handle, or an instance handle).
+-- the value is not C-encodable (a bignum 'LInt' too wide for 'Int64', a
+-- closure-member handle, or an instance handle).
 --
 -- The 'Int64'-fit check on 'LInt' is load-bearing: a high-bit 'U64' (a natural
 -- number >= 2^63) returns 'Nothing' via 'toIntegralSized', causing the whole
 -- 'NCon' to fall back to the abstract heap.  This preserves the encoding
 -- semantics exactly: NO value is promoted or widened.
 --
--- The @KPointer@ class uses the low 2 bits to discriminate three pointer-classes:
+-- The @KPointer@ class uses the low 2 bits to discriminate pointer-classes,
+-- then sub-discriminates inside the @11@ class with bit 2:
 --
 --   * @..0@ (bit0 = 0): 'CAddr' bare 8-aligned pointer.  'CAddr' pointers are
 --     aligned to at least 8 bytes so their low three bits are always 0; no shift
@@ -1037,11 +1051,14 @@ elemKindToSlotKind w = error ("elemKindToSlotKind: unknown elemkind byte " <> sh
 --   * @01@ (bits 1:0 = 01): 'HAddr' abstract index, stored as
 --     @(i << 2) .|. 1@.  Negative static indices round-trip correctly because
 --     the arithmetic right-shift in 'decodeSlotC' sign-extends the high bit.
---   * @11@ (bits 1:0 = 11): 'Inline' nullary constructor tag, stored as
---     @(tag << 2) .|. 3@.  The slot round-trips the full 'Word32' tag (62 bits of
---     headroom after the 2-bit shift). (The @tid >= 65536@ fallback in 'allocNCon'
---     is a SEPARATE constraint on the C PARENT cell's @uint16@ header tag, not on an
---     'Inline' slot child.)
+--   * @011@ (bits 2:0 = 011): 'Inline' nullary constructor tag, stored as
+--     @(tag << 3) .|. 3@.  Bit 2 = 0 within the @11@ class marks nullary.
+--     The full 'Word32' tag fits after @<< 3@ (61 bits of headroom).
+--     (The @tid >= 65536@ fallback in 'allocNCon' is a SEPARATE constraint on
+--     the C PARENT cell's @uint16@ header tag, not on an 'Inline' slot child.)
+--   * @111@ (bits 2:0 = 111): 'InlineStr' short string.  Bit 2 = 1 within the
+--     @11@ class marks inline-string.  Bits 5:3 hold the byte length (0..7);
+--     bits 63:6 hold the bytes little-endian.  See 'packInlineStr'.
 encodeSlotC :: RCValue -> Maybe (SlotKind, Word64)
 encodeSlotC (RVLit (LInt n))    = (\w -> (KLitInt, fromIntegral (w :: Int64))) <$> toIntegralSized n
 encodeSlotC (RVLit (LChar c))   = Just (KLitChar, fromIntegral (fromEnum c))
@@ -1050,10 +1067,35 @@ encodeSlotC (RVBox (CAddr p))   = Just (KPointer, fromIntegral (ptrToWordPtr p))
 -- HAddr round-trip: low 2 bits = 01.  Negative static indices are sign-preserved
 -- because we use Int64 arithmetic shift right on decode.
 encodeSlotC (RVBox (HAddr i))   = Just (KPointer, fromIntegral ((i `shiftL` 2) .|. 1))
--- Inline round-trip: low 2 bits = 11.  The full Word32 tag fits after << 2 (62 bits
--- of headroom); even Word32 maxBound (0xFFFFFFFF << 2) stays well within 64 bits.
-encodeSlotC (RVBox (Inline t))  = Just (KPointer, (fromIntegral t `shiftL` 2) .|. 3)
-encodeSlotC _                   = Nothing
+-- Inline round-trip: low 3 bits = 011 (bit2 = 0 within the 11 class).
+-- The full Word32 tag fits after << 3 (61 bits of headroom); even Word32 maxBound
+-- (0xFFFFFFFF << 3) stays well within 64 bits.
+encodeSlotC (RVBox (Inline t))     = Just (KPointer, (fromIntegral t `shiftL` 3) .|. 0x3)
+-- InlineStr round-trip: low 3 bits = 111 (bit2 = 1 within the 11 class).
+-- The <=7-byte invariant is enforced at alloc time (maxInlineStr = 7).
+encodeSlotC (RVBox (InlineStr bs)) = Just (KPointer, packInlineStr bs)
+encodeSlotC _                      = Nothing
+
+-- | Pack a <=7-byte 'ByteString' into a 'KPointer' slot word.
+--
+-- Layout: bits 2:0 = @111@ (inline-string marker), bits 5:3 = length (0..7),
+-- bits 63:6 = bytes little-endian (byte 0 in bits 13:6, byte 1 in 21:14, etc.).
+-- Inverse of 'unpackInlineStr'.
+packInlineStr :: ByteString -> Word64
+packInlineStr bs =
+  let len    = BS.length bs
+      bytesW = BS.foldr (\b acc -> (acc `shiftL` 8) .|. fromIntegral b) 0 bs :: Word64
+  in 0x7 .|. (fromIntegral len `shiftL` 3) .|. (bytesW `shiftL` 6)
+
+-- | Inverse of 'packInlineStr': recover the 'ByteString' from a slot word.
+--
+-- Reads the 3-bit length from bits 5:3, then extracts that many bytes from
+-- bits 63:6 in little-endian order (byte 0 from bits 13:6, etc.).
+unpackInlineStr :: Word64 -> ByteString
+unpackInlineStr w =
+  let len    = fromIntegral ((w `shiftR` 3) .&. 0x7) :: Int
+      bytesW = w `shiftR` 6
+  in BS.pack [ fromIntegral (bytesW `shiftR` (8 * i)) | i <- [0 .. len - 1] ]
 
 -- | The exact inverse of 'encodeSlotC' on the encodable shapes, driven by the
 -- 'SlotKind' from the stored per-constructor descriptor.
@@ -1062,15 +1104,17 @@ encodeSlotC _                   = Nothing
 --
 --   * @..0@ (bit0 = 0): 'CAddr' bare pointer (read as-is).
 --   * @01@ (bits 1:0 = 01): 'HAddr' index (arithmetic @>> 2@, sign-extends).
---   * @11@ (bits 1:0 = 11): 'Inline' tag (@>> 2@, unsigned).
+--   * @011@ (bits 2:0 = 011, bit2 = 0): 'Inline' tag (@>> 3@, unsigned).
+--   * @111@ (bits 2:0 = 111, bit2 = 1): 'InlineStr' ('unpackInlineStr').
 decodeSlotC :: SlotKind -> Word64 -> RCValue
 decodeSlotC KLitInt  w = RVLit (LInt (fromIntegral (fromIntegral w :: Int64)))
 decodeSlotC KLitChar w = RVLit (LChar (decodeChar w))
 decodeSlotC KLitUnit _ = RVLit LUnit
 decodeSlotC KPointer w
-  | w .&. 1 == 0 = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral w))))                   -- 00
+  | w .&. 1 == 0 = RVBox (CAddr (wordPtrToPtr (WordPtr (fromIntegral w))))                   -- ..0
   | w .&. 2 == 0 = RVBox (HAddr (fromIntegral ((fromIntegral w :: Int64) `shiftR` 2)))        -- 01
-  | otherwise    = RVBox (Inline (fromIntegral (w `shiftR` 2)))                               -- 11
+  | w .&. 4 == 0 = RVBox (Inline (fromIntegral (w `shiftR` 3)))                              -- 011 nullary
+  | otherwise    = RVBox (InlineStr (unpackInlineStr w))                                      -- 111 inline string
 
 -- | Guard the codepoint so an out-of-range payload yields a clear invariant error.
 -- The encoder never emits an out-of-range char, so this can't happen on real data.
@@ -1084,14 +1128,17 @@ decodeChar w
 -- abstract heap uses non-negative addresses. A C-heap cell ('CAddr') is always
 -- dynamic (the C runtime has no static region), so it is never static.
 isStaticAddr :: Addr -> Bool
-isStaticAddr (HAddr i) = i < 0
-isStaticAddr (CAddr _) = False
-isStaticAddr (Inline _) = False
+isStaticAddr (HAddr i)    = i < 0
+isStaticAddr (CAddr _)    = False
+isStaticAddr (Inline _)   = False
+isStaticAddr (InlineStr _) = False
 
--- | True for an inline immediate (a nullary constructor with no cell).
+-- | True for an inline immediate (a nullary constructor with no cell, or a
+-- short string packed inline in the value word).
 isInline :: Addr -> Bool
-isInline (Inline _) = True
-isInline _          = False
+isInline (Inline _)    = True
+isInline (InlineStr _) = True
+isInline _             = False
 
 -- | True for an address that owns no counted cell: a static (immortal) address
 -- OR an inline immediate. The single filter the counted-ref / owned-set / CAF
@@ -1113,8 +1160,8 @@ isUncounted a = isStaticAddr a || isInline a
 -- | True for an 'HAddr' currently recorded in ANY open arena frame (Region Slice
 -- R1, spec §3.2). The store-aware half of "uncounted": an arena cell, like a
 -- static cell or an inline immediate, owns no counted books, so 'incref'/
--- 'dropAddr'/'dropReuse' treat it as inert. A 'CAddr'/'Inline' is never an arena
--- cell (the abstract mirror records only 'HAddr' indices). A FLATTENED membership
+-- 'dropAddr'/'dropReuse' treat it as inert. A 'CAddr', 'Inline', or 'InlineStr'
+-- is never an arena cell (the abstract mirror records only 'HAddr' indices). A FLATTENED membership
 -- check across the whole frame stack is correct (an address lives in exactly one
 -- frame; closing pops that frame, after which the address is no longer arena).
 isArenaAddr :: Addr -> Store -> Bool
@@ -1123,7 +1170,8 @@ isArenaAddr (HAddr i) s = any (IS.member i) (stArena s)
 -- backend only). Recognising it here is what makes 'incref'/'dropAddr' inert on a
 -- C-eligible arena cell -- the C analogue of the 'stArena' HAddr membership test.
 isArenaAddr (CAddr p) s = any (Set.member p) (stArenaC s)
-isArenaAddr (Inline _) _ = False
+isArenaAddr (Inline _)    _ = False
+isArenaAddr (InlineStr _) _ = False
 
 -- ---------------------------------------------------------------------------
 -- Uncounted arena tier (Region Slice R1): the abstract-heap mirror of the C
@@ -1424,9 +1472,11 @@ alloc (NCon con vs) s = allocNCon con vs s
 alloc (NArray vs)   s = case stBackend s of
   CHeap hp     -> allocNArray hp vs s
   AbstractHeap -> pure (allocPure (NArray vs) s)
-alloc (NString bs)  s = case stBackend s of
-  CHeap hp     -> allocNString hp bs s
-  AbstractHeap -> pure (allocPure (NString bs) s)
+alloc (NString bs)  s
+  | BS.length bs <= maxInlineStr = pure (InlineStr bs, s)  -- inline: no cell, no recordAlloc, both backends
+  | otherwise = case stBackend s of
+      CHeap hp     -> allocNString hp bs s
+      AbstractHeap -> pure (allocPure (NString bs) s)
 alloc n             s = pure (allocPure n s)
 
 -- | A nullary constructor becomes an inline immediate carrying the interned
@@ -1668,9 +1718,10 @@ allocStatic n s =
 -- (non-negative) address; doing so silently overwrites a counted cell, so the
 -- caller ('runModuleRC') only ever passes reserved static addresses.
 writeStatic :: Addr -> Node -> Store -> Store
-writeStatic (HAddr i) n s = s { stCells = IM.insert i (Cell 1 n 0) (stCells s) }
-writeStatic (CAddr _) _ _ = error "writeStatic: a C-heap address is never static"
-writeStatic (Inline _) _ _ = error "writeStatic: an inline immediate has no cell to overwrite"
+writeStatic (HAddr i)    n s = s { stCells = IM.insert i (Cell 1 n 0) (stCells s) }
+writeStatic (CAddr _)    _ _ = error "writeStatic: a C-heap address is never static"
+writeStatic (Inline _)   _ _ = error "writeStatic: an inline immediate has no cell to overwrite"
+writeStatic (InlineStr _) _ _ = error "writeStatic: an inline string has no cell to overwrite"
 
 -- | Overwrite the NODE payload of an existing cell while PRESERVING its reference
 -- count (and statistics). Used by the M3 continuation-cell move primitives
@@ -1686,9 +1737,10 @@ writeNode a n s = liftRC (writeNodePure a n s)
 -- continuation-cell ('NContCell') moves it serves are never C-eligible (an
 -- 'NContCell' is not an 'NCon'), so a 'CAddr' here is an internal error.
 writeNodePure :: Addr -> Node -> Store -> Either RuntimeError Store
-writeNodePure (CAddr _)   _ _ = Left (PrimError (Tx.pack "writeNode: unexpected C-heap address"))
-writeNodePure (Inline _)  _ _ = Left (PrimError (Tx.pack "writeNode: inline immediate has no cell"))
-writeNodePure a@(HAddr i) n s = do
+writeNodePure (CAddr _)    _ _ = Left (PrimError (Tx.pack "writeNode: unexpected C-heap address"))
+writeNodePure (Inline _)   _ _ = Left (PrimError (Tx.pack "writeNode: inline immediate has no cell"))
+writeNodePure (InlineStr _) _ _ = Left (PrimError (Tx.pack "writeNode: inline string has no cell"))
+writeNodePure a@(HAddr i)  n s = do
   c <- derefPure a s
   Right s { stCells = IM.insert i c { cNode = n } (stCells s) }
 
@@ -1736,9 +1788,10 @@ closureOwnedBoxed _ = []
 -- 'derefPure' is the abstract-heap pure core used by the store-aware renderers
 -- and the store-algebra unit tests.
 deref :: Addr -> Store -> RC Cell
-deref (CAddr p)    s = liftIO (readCCell p s)
-deref a@(HAddr _)  s = liftRC (derefPure a s)
-deref (Inline tid) s = pure (Cell 0 (NCon (tagName tid s) []) 0)
+deref (CAddr p)      s = liftIO (readCCell p s)
+deref a@(HAddr _)    s = liftRC (derefPure a s)
+deref (Inline tid)   s = pure (Cell 0 (NCon (tagName tid s) []) 0)
+deref (InlineStr bs) _ = pure (Cell 0 (NString bs) 0)
 
 -- | Reconstruct the 'Cell' of a C-heap cell from its header. Dispatches on the
 -- tag field: 'wokArrayTag' (0xFFFF) produces an 'NArray'; any other tag produces
@@ -1833,9 +1886,10 @@ readCWords p = do
 -- 'increfPure'/'dropAddrStepPure' on an 'Inline'), and the IO 'deref' produces
 -- the identical cell. This is why the renderers need no inline special-case.
 derefPure :: Addr -> Store -> Either RuntimeError Cell
-derefPure (CAddr _)   _ = Left (PrimError (Tx.pack "deref: C-heap address has no pure reconstruction"))
-derefPure (Inline tid) s = Right (Cell 0 (NCon (tagName tid s) []) 0)
-derefPure (HAddr i)  s
+derefPure (CAddr _)     _ = Left (PrimError (Tx.pack "deref: C-heap address has no pure reconstruction"))
+derefPure (Inline tid)  s = Right (Cell 0 (NCon (tagName tid s) []) 0)
+derefPure (InlineStr bs) _ = Right (Cell 0 (NString bs) 0)
+derefPure (HAddr i)     s
   | IS.member i (stDead s) =
       Left (PrimError (Tx.pack ("use-after-free: addr " <> show i)))
   | otherwise =
@@ -1869,15 +1923,17 @@ incref a@(CAddr p) s
 incref a@(HAddr _) s
   | isArenaAddr a s = pure s
   | otherwise       = liftRC (increfPure a s)
-incref (Inline _)  s = pure s
+incref (Inline _)    s = pure s
+incref (InlineStr _) s = pure s
 
 -- | The pure core of 'incref' over the ABSTRACT heap. A 'CAddr' is increfed by
 -- the IO 'incref' wrapper (a direct @wok_dup@); reaching this pure core with one
 -- is an internal routing error.
 increfPure :: Addr -> Store -> Either RuntimeError Store
-increfPure (CAddr _)  _ = Left (PrimError (Tx.pack "incref: C-heap address has no pure incref"))
-increfPure (Inline _) s = Right s
-increfPure a@(HAddr i) s
+increfPure (CAddr _)    _ = Left (PrimError (Tx.pack "incref: C-heap address has no pure incref"))
+increfPure (Inline _)   s = Right s
+increfPure (InlineStr _) s = Right s
+increfPure a@(HAddr i)  s
   | isStaticAddr a = Right s
   | otherwise = do
       c <- derefPure a s
@@ -1900,7 +1956,8 @@ dropAddr :: Addr -> Store -> RC Store
 dropAddr a0 s0 = go [a0] s0
   where
     go [] s = pure s
-    go (Inline _ : rest) s = go rest s
+    go (Inline _ : rest)    s = go rest s
+    go (InlineStr _ : rest) s = go rest s
     -- A C-arena cell ('CAddr' in 'stArenaC') is UNCOUNTED (Region Slice R1): a drop
     -- is an inert no-op WITH NO CASCADE, mirroring the HAddr arena case below and
     -- the C runtime's reclamation by 'wok_arena_close' (not by an rc reaching zero).
@@ -2023,9 +2080,10 @@ heapPtr s = case stBackend s of
 -- 'dropAddrPure'; the unified 'dropAddr' loop and the pure 'dropAddrPure' loop
 -- both drive it.
 dropAddrStepPure :: Addr -> Store -> Either RuntimeError (Maybe [Addr], Store)
-dropAddrStepPure (CAddr _)   _ = Left (PrimError (Tx.pack "dropAddrStepPure: C-heap address is not an abstract step"))
-dropAddrStepPure (Inline _)  s = Right (Nothing, s)
-dropAddrStepPure a@(HAddr i) s
+dropAddrStepPure (CAddr _)    _ = Left (PrimError (Tx.pack "dropAddrStepPure: C-heap address is not an abstract step"))
+dropAddrStepPure (Inline _)   s = Right (Nothing, s)
+dropAddrStepPure (InlineStr _) s = Right (Nothing, s)
+dropAddrStepPure a@(HAddr i)  s
   -- Static (immortal) cells are uncounted: a drop of a global handle, or of a
   -- dynamic field that points at a global, is inert. Skip it (no cascade).
   | isStaticAddr a = Right (Nothing, s)
@@ -2133,7 +2191,8 @@ cascadeChildren other            = countedRefs (nodeValues other)
 -- array, so the 'CAddr' arm here NEVER sees a 'WokArray' (WOK_ARRAY_TAG).
 -- No WOK_ARRAY_TAG branch is needed; the existing 'readCConValues' path is NCon-only.
 dropReuse :: Addr -> Store -> RC (RCValue, Store)
-dropReuse (Inline _) s = pure (RVReuse Nothing, s)              -- uncounted: never a donor
+dropReuse (Inline _)    s = pure (RVReuse Nothing, s)             -- uncounted: never a donor
+dropReuse (InlineStr _) s = pure (RVReuse Nothing, s)             -- uncounted: never a donor
 -- A C-arena cell is FBIP-excluded (Region Slice R1, spec §5.5): uncounted, never a
 -- donor, never reserved -- the NULL-token path, mirroring the HAddr arena guard
 -- below and the static/Inline cases. Checked before the @wok_dec@.
@@ -2234,7 +2293,8 @@ allocAt (RVReuse (Just (ReuseSlot a ar oldElig origBytes))) newNode s0 =
              hp <- heapPtr s
              liftIO (H.wokFree hp p)
              alloc newNode (bumpFreeStats origBytes s)
-       Inline _ -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline immediate")))
+       Inline _    -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline immediate")))
+       InlineStr _ -> liftRC (Left (PrimError (Tx.pack "alloc_at: reuse token shell is an inline string")))
 allocAt v _ _ =
   liftRC (Left (PrimError (Tx.pack ("alloc_at: expected a reuse token, got " <> show v))))
 
@@ -2523,7 +2583,8 @@ arrayUnique :: Addr -> Store -> RC Bool
 arrayUnique a _ | isUncounted a = pure False
 arrayUnique (CAddr p) _         = (== 1) <$> liftIO (H.wokRc p)
 arrayUnique a@(HAddr _) s       = (== 1) . cRc <$> liftRC (derefPure a s)
-arrayUnique (Inline _) _        = pure False   -- isUncounted already covers Inline; kept for exhaustiveness
+arrayUnique (Inline _)    _ = pure False   -- isUncounted already covers Inline; kept for exhaustiveness
+arrayUnique (InlineStr _) _ = pure False   -- isUncounted already covers InlineStr; kept for exhaustiveness
 
 -- | Overwrite slot @i@ of the array at @a@ with @v@, in place, returning the OLD
 -- element for the caller to drop. 0 alloc / 0 free; rc / length / cBytes unchanged.
@@ -2563,5 +2624,7 @@ arraySetSlotInPlace _ (HAddr idx) i v s
             in pure (oldEl, s { stCells = IM.insert idx c' (stCells s) })
           Nothing -> liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: index out of range")))
         _ -> liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: address is not an array")))
-arraySetSlotInPlace _ (Inline _) _ _ _ =
+arraySetSlotInPlace _ (Inline _)    _ _ _ =
   liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: inline handle is not an array")))
+arraySetSlotInPlace _ (InlineStr _) _ _ _ =
+  liftRC (Left (PrimError (Tx.pack "arraySetSlotInPlace: inline string is not an array")))

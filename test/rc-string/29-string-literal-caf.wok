@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 Task 4: Short string-literal CAF allocation test
+-- Tests that a top-level binding 'foo = "/" ' allocates 0 cells
+-- (the CAF body evaluates through resolveRCAtomAlloc -> alloc (NString) -> InlineStr)
+
+foo : String
+foo = "/"
+
+main : String
+main = foo

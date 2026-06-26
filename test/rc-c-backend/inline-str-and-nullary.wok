@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+
+-- E3 Task 2: co-exercise the 011 (Inline nullary) and 111 (InlineStr) slot
+-- sub-tags in the same constructor.  'Pair "hi" True' packs "hi" into a 111
+-- slot and True into a 011 slot; the Pair NCon is C-eligible and both fields
+-- round-trip without cross-talk.
+
+data Pair = Pair String Bool
+
+fstP : Pair -> String
+fstP p = case p of Pair s _ -> s
+
+main = fstP (Pair "hi" True)

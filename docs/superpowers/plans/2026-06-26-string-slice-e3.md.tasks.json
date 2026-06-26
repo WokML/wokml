@@ -1,0 +1,33 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-26-string-slice-e3.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: The inline short-string value model",
+      "status": "completed",
+      "description": "**Goal:** Short strings (<=7 bytes) become uncounted inline `Addr` values with zero allocation; `deref` synthesizes them back so all string operations keep working; dup/drop are no-ops.\n\n**Files:** Modify `src/Wok/Interp/RC/Value.hs` (Addr :159; alloc(NString) :1427; deref/derefPure :1741/:1837; isInline/isStaticAddr/isArenaAddr/isUncounted; no-op/error arms); Test `test/Spec.hs` (rcInlineStringTests).\n\n**Verify:** `cabal test 2>&1 | tail -20`\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"InlineStr added to Addr\", \"alloc(NString) inline-gates at maxInlineStr=7 both backends no recordAlloc\", \"deref/derefPure synthesize NString\", \"isInline/isUncounted cover InlineStr; dup/drop no-op\", \"compiles under -Werror exhaustively\", \"<=7B = 0 cells, 8B = 1 cell both backends\", \"full suite green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Slot encoding for inline-string constructor fields",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** A short string stored as a field of a C-heap constructor packs into one 64-bit slot via a sub-tag inside the existing `11` `Inline` slot class.\n\n**Files:** Modify `src/Wok/Interp/RC/Value.hs` (encodeSlotC :1045, decodeSlotC :1066); Test `test/Spec.hs` (rcInlineStringSlotTests).\n\n**Verify:** `cabal test 2>&1 | tail -20`\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"nullary Inline re-encoded <<3|0b011 with matching decode\", \"inline-string packed 0b111|len<<3|bytes<<6\", \"decodeSlotC 11-class splits on bit 2\", \"constructor with short-string + nullary sibling field round-trips on CHeap no cross-talk\", \"decodeSlotC total over 4 KPointer cases\", \"full suite green + oracle agrees\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Oracle corpus + QuickCheck properties",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Pin the inline savings and cross-representation correctness with corpus programs and QuickCheck properties across all three backends.\n\n**Files:** Modify `test/Spec.hs` (rcInlineStringPropertyTests); Create/Modify `test/rc-string/` corpus entries.\n\n**Verify:** `cabal test 2>&1 | tail -20 && scripts/asan-runtime.sh 2>&1 | tail -5`\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\", \"test/rc-string\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20 && scripts/asan-runtime.sh 2>&1 | tail -5\", \"acceptanceCriteria\": [\"corpus empty/slash/7B/8B/field/append-boundary/mixed-eq/inline-scrutinee on 3 backends\", \"round-trip property for <=7B\", \"0-cell vs 1-cell allocation property both backends\", \"inline-field round-trip property\", \"eqString == byte equality cross-representation\", \"append bytes+inline-iff property; all E1/E2 ops on inline match reference\", \"ASan/LSan clean + physical invariant\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4 (optional): Static seeding of short-literal CAFs",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** A top-level string-literal CAF of <=7 bytes seeds as a static inline immediate instead of allocating on first evaluation.\n\n**Files:** Modify `src/Wok/Interp/RC/Machine.hs` (reserveStatic :1087/:1092, eval mirror :1146); Test `test/Spec.hs`.\n\n**Verify:** `cabal test 2>&1 | tail -20`\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Machine.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -20\", \"acceptanceCriteria\": [\"reserveStatic relaxed to isHeapLStr (only LStr > maxInlineStr excluded)\", \"foo = slash CAF allocates 0 cells both backends\", \"longer-literal-CAF behavior unchanged\", \"full suite green\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-26T00:00:00Z"
+}

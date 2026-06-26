@@ -1,0 +1,30 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: a data constructor carrying a short (<=7B) string field.
+-- The short-string field packs into the constructor slot as an InlineStr
+-- (no separate NString cell).  Verifies end-to-end correctness when
+-- a constructor field is an inline string.
+--
+-- data Tagged = Tagged String U64
+-- let t = Tagged "hi" 42 in ...
+-- We extract the U64 field (42) and add byteLength of the string field.
+-- byteLength "hi" = 2 (<=7), so "hi" is InlineStr.
+-- Result: 42 + 2 = 44
+
+data Tag = Tag String U64
+
+getN : Tag -> U64
+getN (Tag _ n) = n
+
+getS : Tag -> String
+getS (Tag s _) = s
+
+main : U64
+main =
+  let t = Tag "hi" 42 in
+  let n = getN t in
+  let s = getS t in
+  let bl = byteLength s in
+  n + bl

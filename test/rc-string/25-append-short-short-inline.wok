@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: append of two short strings producing an inline result.
+-- "abc" (3B) ++ "cd" (2B) = "abccd" (5B <= 7B) -> result is InlineStr.
+-- "ab" (2B) ++ "" (0B)   = "ab"    (2B <= 7B) -> result is InlineStr.
+-- "" ++ "" = "" (0B) -> InlineStr.
+--
+--   byteLength (append "abc" "cd")  -> 5
+--   byteLength (append "ab" "")     -> 2
+--   byteLength (append "" "")       -> 0
+--   eqString (append "a" "b") "ab"  -> True -> 1
+-- Result: 5 + 2 + 0 + 1 = 8
+
+main : U64
+main =
+  let s1 = append "abc" "cd" in
+  let bl1 = byteLength s1 in
+  let s2 = append "ab" "" in
+  let bl2 = byteLength s2 in
+  let s3 = append "" "" in
+  let bl3 = byteLength s3 in
+  let r  = if eqString (append "a" "b") "ab" then 1 else 0 in
+  bl1 + bl2 + bl3 + r

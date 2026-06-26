@@ -1,0 +1,36 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: case-match on an inline-backed string VARIABLE
+-- (not a literal scrutinee).  The string "hi" (2B) is InlineStr; this test
+-- ensures the NString-scrutinee match path handles InlineStr correctly via
+-- the existing B1 fix (deref synthesises Cell (NString bs) for InlineStr).
+--
+-- The scrutinee 's' is explicitly bound to a variable before matching,
+-- forcing the boxed-scrutinee code path (not a trivial constant-fold).
+--
+--   classify "hi"    -> 10
+--   classify "bye"   -> 20
+--   classify ""      -> 30
+--   classify "other" -> 0
+-- Result: 10 + 20 + 30 + 0 = 60
+
+classify : String -> U64
+classify s = case s of
+  "hi"  -> 10
+  "bye" -> 20
+  ""    -> 30
+  _     -> 0
+
+main : U64
+main =
+  let s1 = "hi" in
+  let s2 = "bye" in
+  let s3 = "" in
+  let s4 = "other" in
+  let r1 = classify s1 in
+  let r2 = classify s2 in
+  let r3 = classify s3 in
+  let r4 = classify s4 in
+  r1 + r2 + r3 + r4

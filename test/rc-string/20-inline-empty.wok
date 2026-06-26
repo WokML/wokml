@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: empty string ("", 0 bytes <= maxInlineStr = 7).
+-- Exercises the InlineStr path for the degenerate case.
+--   byteLength "" -> 0
+--   length "" -> 0
+--   eqString "" "" -> True -> 1
+-- Result: 0 + 0 + 1 = 1
+
+main : U64
+main =
+  let bl = byteLength "" in
+  let n  = length "" in
+  let r  = if eqString "" "" then 1 else 0 in
+  bl + n + r

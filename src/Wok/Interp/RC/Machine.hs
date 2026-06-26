@@ -1082,8 +1082,11 @@ runModuleRCUncheckedWith backend cm@(CoreModule binds) = runExceptT $ do
 -- directly to @RVLit l@ in 'knotEnv'. Function closures capture 'knotEnv', so
 -- they see the real literal instead of a placeholder 'NCon'; 'installBinds'
 -- skips evaluation for these binds (nothing to force). String literals (@LStr@)
--- are excluded: a string-literal CAF allocates a counted 'NString' cell, which
--- needs the normal boxed-CAF install path.
+-- are excluded from this fast path and take the normal boxed-CAF install route:
+-- a LONG string-literal CAF allocates a counted 'NString' cell there. (A SHORT
+-- string literal, <= 'maxInlineStr' bytes, allocates 0 cells regardless: the
+-- alloc chokepoint hands back an uncounted 'InlineStr' immediate (slice E3), so
+-- short string-literal CAFs are already cell-free without static seeding.)
 reserveStatic :: [TopBind] -> (REnv, [Addr], Store)
 reserveStatic = go (initSentinel emptyStore) Map.empty []
   where

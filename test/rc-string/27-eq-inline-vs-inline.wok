@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: eqString between inline strings (both <=7B).
+-- Both sides are inline, verifying that byte comparison works across
+-- the InlineStr representation.
+--   eqString "hi" "hi"    -> True  -> 1
+--   eqString "hi" "bye"   -> False -> 0
+--   eqString "" ""         -> True  -> 1
+--   eqString "a" ""        -> False -> 0
+--   eqString "abc" "abcd"  -> False -> 0  (different lengths)
+-- Result: 1 + 0 + 1 + 0 + 0 = 2
+
+main : U64
+main =
+  let r1 = if eqString "hi" "hi"   then 1 else 0 in
+  let r2 = if eqString "hi" "bye"  then 1 else 0 in
+  let r3 = if eqString "" ""        then 1 else 0 in
+  let r4 = if eqString "a" ""       then 1 else 0 in
+  let r5 = if eqString "abc" "abcd" then 1 else 0 in
+  r1 + r2 + r3 + r4 + r5

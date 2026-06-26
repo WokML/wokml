@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: append of two short strings producing a heap result.
+-- "abcd" (4B) ++ "efgh" (4B) = "abcdefgh" (8B > 7B) -> result lands on the heap
+-- (one WokString cell).  This crosses the inline/heap boundary end-to-end.
+--   byteLength (append "abcd" "efgh") -> 8
+--   eqString (append "abcd" "efgh") "abcdefgh" -> True -> 1
+--   eqString (append "abcdef" "g") "abcdefg"   -> True -> 1  (7B, still inline)
+--   eqString (append "abcdef" "gh") "abcdefgh"  -> True -> 1  (8B, heap)
+-- Result: 8 + 1 + 1 + 1 = 11
+
+main : U64
+main =
+  let s1  = append "abcd" "efgh" in
+  let bl  = byteLength s1 in
+  let r1  = if eqString s1 "abcdefgh" then 1 else 0 in
+  let r2  = if eqString (append "abcdef" "g") "abcdefg" then 1 else 0 in
+  let r3  = if eqString (append "abcdef" "gh") "abcdefgh" then 1 else 0 in
+  bl + r1 + r2 + r3

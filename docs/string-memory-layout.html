@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok string memory layout (right now)</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --warn:#c0392b; --pad:#b9c2cc; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:820px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.85rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.18rem;margin:46px 0 2px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:190px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin:6px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:14px}
+  .card h3{margin:0 0 6px;font-size:.95rem}
+  .label{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:20px 0}
+  .note b{color:var(--accent)}
+  .note.warn{border-left-color:var(--warn)} .note.warn b{color:var(--warn)}
+
+  /* word: 8 cells of 8 bits */
+  .word{display:flex;margin:14px auto 2px;width:max-content;border:1px solid var(--ink);border-radius:6px;overflow:hidden}
+  .word .by{width:54px;padding:8px 0;text-align:center;font-family:ui-monospace,monospace;font-size:.8rem;border-right:1px solid var(--line)}
+  .word .by:last-child{border-right:0}
+  .word .by small{display:block;color:var(--mut);font-size:.68rem}
+  .by.ptr{background:#eef4fb}
+  .by.tagbits{background:#fdecea;color:var(--warn);font-weight:700}
+  /* brace under a span of the word, showing it is ONE field */
+  .brace{display:flex;width:max-content;margin:0 auto}
+  .brace .span{font-family:ui-monospace,monospace;font-size:.7rem;color:var(--accent);text-align:center;
+    border:1px solid var(--accent);border-top:0;border-radius:0 0 6px 6px;padding:3px 0}
+  .brace .span.tag{color:var(--warn);border-color:var(--warn)}
+
+  /* byte map of a cell: stacked rows, width ~ proportional to size */
+  .map{border:1px solid var(--ink);border-radius:8px;overflow:hidden;margin:14px 0;font-family:ui-monospace,monospace;font-size:.82rem}
+  .seg{display:flex;align-items:center;border-bottom:1px solid var(--line);padding:8px 12px;gap:12px}
+  .seg:last-child{border-bottom:0}
+  .seg .off{color:var(--mut);width:74px;flex:none}
+  .seg .nm{font-weight:700;width:96px;flex:none}
+  .seg .dz{color:var(--mut);width:54px;flex:none;text-align:right}
+  .seg .ds{flex:1;color:var(--ink)}
+  .seg.head{background:#eef4fb}
+  .seg.body{background:var(--soft)}
+  .seg.pad .ds{color:var(--pad)}
+
+  .bytes{display:flex;gap:3px;flex-wrap:wrap}
+  .b{width:26px;height:26px;display:grid;place-items:center;border-radius:4px;background:#eef4fb;border:1px solid #cfe0f1;font-family:ui-monospace,monospace;font-size:.74rem}
+  .b.p{background:#f0f2f4;border-color:#e1e5ea;color:var(--pad)}
+  .total{font-family:ui-monospace,monospace;font-size:.82rem;color:var(--mut);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>How a wok <span class="mono">String</span> sits in memory &mdash; right now</h1>
+  <p class="sub">After slice E2 (merged). Short string or long string: <b>same machinery, both live in a heap cell</b>. There is no small-string optimisation yet &mdash; that is what E3 is about.</p>
+
+  <!-- 1. the value word -->
+  <h2>1 &middot; A string value is one 64-bit word &mdash; a <em>reference</em>, not the text</h2>
+  <p>Everywhere a string is held (a local, a function argument, a field inside another object) it occupies exactly one machine word. The eight cells below are the <b>eight bytes of that one word</b> &mdash; not eight things, one thing. Read together they are a single number. For a string that number is a <b>pointer to a cell</b> elsewhere on the heap; only the lowest 2 bits are carved off as a tag saying what kind of reference it is.</p>
+  <div class="word">
+    <div class="by ptr">&middot;&middot;<small>byte 7</small></div>
+    <div class="by ptr">&middot;&middot;<small>6</small></div>
+    <div class="by ptr">&middot;&middot;<small>5</small></div>
+    <div class="by ptr">&middot;&middot;<small>4</small></div>
+    <div class="by ptr">&middot;&middot;<small>3</small></div>
+    <div class="by ptr">&middot;&middot;<small>2</small></div>
+    <div class="by ptr">&middot;&middot;<small>1</small></div>
+    <div class="by tagbits">&middot;&middot;<small>byte 0</small></div>
+  </div>
+  <div class="brace">
+    <div class="span" style="width:378px">one pointer / heap index &rarr; identifies <b>one</b> cell &nbsp;(62 bits)</div>
+    <div class="span tag" style="width:54px">tag<br><code>..00</code></div>
+  </div>
+  <p class="cap">fig 1 &mdash; the single 64-bit value word. All 8 bytes are one number: a pointer (low 2 bits <code>00</code> = a C-heap cell, <code>01</code> = an abstract-heap index). <b>The letters are not here.</b></p>
+
+  <div class="flow">
+    <div class="box hi">String value<small>1 word, in a local / arg / field</small></div>
+    <div class="arrow">&darr; &nbsp;follow the pointer</div>
+    <div class="box">WokString cell<small>where the bytes actually live</small></div>
+  </div>
+
+  <!-- 2. the cell layout -->
+  <h2>2 &middot; The <span class="mono">WokString</span> cell &mdash; 16-byte header, then the packed bytes</h2>
+  <p>Every string &mdash; including <code>""</code> and <code>"Hi"</code> &mdash; allocates one of these. The header is a fixed 16 bytes (a reference count, a type tag, a byte length); the UTF-8 text follows, padded up to a whole number of 8-byte words.</p>
+  <div class="map">
+    <div class="seg head"><span class="off">offset 0</span><span class="nm">rc</span><span class="ds">reference count &mdash; how many holders share this string</span><span class="dz">4 B</span></div>
+    <div class="seg head"><span class="off">offset 4</span><span class="nm">tag</span><span class="ds"><code>0xFFFE</code> &mdash; "this cell is a string"</span><span class="dz">2 B</span></div>
+    <div class="seg head"><span class="off">offset 6</span><span class="nm">reserved</span><span class="ds">0 (unused)</span><span class="dz">1 B</span></div>
+    <div class="seg head"><span class="off">offset 7</span><span class="nm">scan</span><span class="ds">0 &mdash; bytes hold no pointers, so freeing it needs no child-walk</span><span class="dz">1 B</span></div>
+    <div class="seg body"><span class="off">offset 8</span><span class="nm">byte_len</span><span class="ds">how many UTF-8 bytes follow</span><span class="dz">8 B</span></div>
+    <div class="seg body"><span class="off">offset 16</span><span class="nm">bytes[]</span><span class="ds">the packed UTF-8 text, 1 byte each, padded to an 8-byte boundary</span><span class="dz">&hellip;</span></div>
+  </div>
+  <p class="cap">fig 2 &mdash; <code>runtime/wok_rc.h:96&ndash;103</code>. Header = 16 bytes fixed; total cell = <code>16 + 8&times;ceil(byte_len/8)</code>.</p>
+
+  <!-- 3. small vs long: same shape -->
+  <h2>3 &middot; Small vs long: identical shape today</h2>
+  <p>The only difference between a 2-byte string and a 19-byte string is how many body words follow the header. The small one is almost entirely overhead.</p>
+  <div class="grid">
+    <div class="card">
+      <span class="label">small string</span>
+      <h3 class="mono">"Hi" &mdash; 2 bytes of text</h3>
+      <div class="bytes">
+        <span class="b">H</span><span class="b">i</span>
+        <span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span>
+      </div>
+      <p class="total">1 body word: 2 real + <span style="color:var(--pad)">6 padding</span><br>cell = 16 + 8 = <b>24 bytes</b> &nbsp;(+ a heap allocation, + the 8-byte pointer word)</p>
+    </div>
+    <div class="card">
+      <span class="label">long string</span>
+      <h3 class="mono">"the quick brown fox" &mdash; 19 bytes</h3>
+      <div class="bytes">
+        <span class="b">t</span><span class="b">h</span><span class="b">e</span><span class="b">&middot;</span><span class="b">q</span><span class="b">u</span><span class="b">i</span><span class="b">c</span>
+        <span class="b">k</span><span class="b">&middot;</span><span class="b">b</span><span class="b">r</span><span class="b">o</span><span class="b">w</span><span class="b">n</span><span class="b">&middot;</span>
+        <span class="b">f</span><span class="b">o</span><span class="b">x</span><span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span><span class="b p">&middot;</span>
+      </div>
+      <p class="total">3 body words: 19 real + <span style="color:var(--pad)">5 padding</span><br>cell = 16 + 24 = <b>40 bytes</b></p>
+    </div>
+  </div>
+  <p class="cap">fig 3 &mdash; same header, same pointer, same allocation; only the body-word count differs</p>
+
+  <div class="note warn"><b>The cost being paid:</b> a 2-byte string spends a 24-byte heap cell, a malloc, and a reference count to carry 2 letters &mdash; and even the empty string <code>""</code> costs a full 16-byte cell. Short strings (single characters, keys, punctuation, <code>""</code>, <code>"/"</code>) are common, and right now each one pays the full cell tax.</p>
+
+  <!-- 4. what E3 proposes -->
+  <h2>4 &middot; What E3 would change (the proposal, not current state)</h2>
+  <p>The value word is already 8 bytes and currently just holds a pointer. If a string is short enough, its bytes could live <em>inside that word</em> &mdash; no cell, no allocation, no refcount. Long strings keep today's cell. After the 2-bit tag, one word leaves room for about <b>7 bytes</b> of text; going wider would mean making a string value bigger than one word, which is a separate, much larger change.</p>
+  <div class="grid">
+    <div class="card">
+      <span class="label">today</span>
+      <h3>Always a cell</h3>
+      <p>Every string is a pointer word &rarr; a 16+ byte heap cell, however short.</p>
+    </div>
+    <div class="card">
+      <span class="label">E3 proposal</span>
+      <h3>Short &rArr; bytes in the word</h3>
+      <p>&le; ~7 bytes packed into the value word itself (tagged), zero allocations. Longer strings unchanged.</p>
+    </div>
+  </div>
+  <div class="word">
+    <div class="by hi" style="background:#eef4fb">i<small>byte 7</small></div>
+    <div class="by hi" style="background:#eef4fb">H<small>6</small></div>
+    <div class="by hi" style="background:#eef4fb">&middot;<small>5</small></div>
+    <div class="by hi" style="background:#eef4fb">&middot;<small>4</small></div>
+    <div class="by hi" style="background:#eef4fb">&middot;<small>3</small></div>
+    <div class="by hi" style="background:#eef4fb">&middot;<small>2</small></div>
+    <div class="by" style="background:#fff7e6;color:#b8860b">len<small>1</small></div>
+    <div class="by tagbits">&middot;&middot;<small>byte 0</small></div>
+  </div>
+  <div class="brace">
+    <div class="span" style="width:324px">the string's own bytes live <b>here, in the word</b></div>
+    <div class="span" style="width:54px;color:#b8860b;border-color:#b8860b">len</div>
+    <div class="span tag" style="width:54px">tag<br><code>..11</code></div>
+  </div>
+  <p class="cap">fig 4 &mdash; a sketch of the E3 inline word: the text bytes (here <code>"Hi"</code>), a small length, and a tag marking "the string is in here" &mdash; no cell at all. Same one word as fig 1, but now it <em>is</em> the string instead of pointing at one.</p>
+
+  <!-- 5. the sz_string_t-by-value option -->
+  <h2>5 &middot; What if we used StringZilla's own <span class="mono">sz_string_t</span> by value?</h2>
+  <p>StringZilla's container gets 22 inline bytes by making the string value <b>4 words (32 bytes) wide</b>, stored by value. To get that capacity, a <code>String</code> field could no longer be a one-word pointer &mdash; the field itself would have to <em>be</em> a 32-byte struct:</p>
+  <div class="grid">
+    <div class="card">
+      <span class="label">short (&le; 22 bytes)</span>
+      <h3 class="mono">internal / on-stack</h3>
+      <div class="map" style="margin:8px 0">
+        <div class="seg head"><span class="off">word 0</span><span class="ds"><span class="mono">start</span> &rarr; points at its <em>own</em> byte 9 (self-referential!)</span></div>
+        <div class="seg body"><span class="off">word 1</span><span class="ds"><span class="mono">len</span> (1 byte) + first 7 text bytes</span></div>
+        <div class="seg body"><span class="off">word 2&ndash;3</span><span class="ds">15 more text bytes + NUL &nbsp;(22 usable)</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <span class="label">long (&gt; 22 bytes)</span>
+      <h3 class="mono">external / on-heap</h3>
+      <div class="map" style="margin:8px 0">
+        <div class="seg head"><span class="off">word 0</span><span class="ds"><span class="mono">start</span> &rarr; malloc'd buffer</span></div>
+        <div class="seg body"><span class="off">word 1</span><span class="ds"><span class="mono">length</span></span></div>
+        <div class="seg body"><span class="off">word 2</span><span class="ds"><span class="mono">space</span> (capacity)</span></div>
+        <div class="seg body"><span class="off">word 3</span><span class="ds"><span class="mono">padding</span></span></div>
+      </div>
+    </div>
+  </div>
+  <p class="cap">fig 5 &mdash; <code>sz_string_t</code> (header lines 378&ndash;414): one 32-byte slot, two interpretations, told apart by whether <code>start</code> points back into itself</p>
+  <div class="note warn"><b>Three walls if we adopt it:</b> (1) <b>slot width</b> &mdash; wok slots are uniform 8-byte words (<code>uint64 slots[]</code>, <code>encodeSlotC</code> yields one word); a 32-byte field makes slots variable-width across the whole machine. (2) <b>self-pointer</b> &mdash; an on-stack <code>start</code> points at itself, so the struct can't be <code>memcpy</code>'d; every move must fix it up, yet wok moves values constantly. (3) <b>refcount clash</b> &mdash; wok shares strings cheaply by bumping a cell's <code>rc</code>; a by-value struct can't be rc-shared, so long strings would deep-copy on every share or need a refcount bolted back onto the spill buffer (re-introducing the cell). That is a value-model epic, not E3.</div>
+
+  <div class="note"><b>The point:</b> today there is no small/long distinction &mdash; both are a one-word pointer to a <code>WokString</code> cell (16-byte header + padded bytes). E3 (one word, ~7 bytes inline) is a contained continuation of the existing mechanism. StringZilla's 22-byte SSO is real but only pays off <em>by value</em> at 4&times; the width &mdash; a separate epic that fights wok's uniform slot and its refcount sharing.</div>
+
+</div>
+</body>
+</html>

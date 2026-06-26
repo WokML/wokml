@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: 7-byte string "abcdefg" (exactly maxInlineStr = 7).
+-- This is the last string that is stored inline (no cell allocation).
+--   byteLength "abcdefg" -> 7
+--   length "abcdefg"     -> 7
+--   byteAt "abcdefg" 0   -> 97  ('a')
+--   byteAt "abcdefg" 6   -> 103 ('g')
+--   eqString "abcdefg" "abcdefg" -> True -> 1
+-- Result: 7 + 7 + 97 + 103 + 1 = 215
+
+main : U64
+main =
+  let s  = "abcdefg" in
+  let bl = byteLength s in
+  let n  = length s in
+  let b0 = byteAt "abcdefg" 0 in
+  let b6 = byteAt "abcdefg" 6 in
+  let r  = if eqString "abcdefg" "abcdefg" then 1 else 0 in
+  bl + n + b0 + b6 + r

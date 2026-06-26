@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: 8-byte string "abcdefgh" (exactly maxInlineStr + 1 = 8).
+-- This is the first string that lands on the heap (one cell allocation).
+-- Verifies the boundary: 7B inline, 8B heap.
+--   byteLength "abcdefgh" -> 8
+--   length "abcdefgh"     -> 8
+--   byteAt "abcdefgh" 7   -> 104 ('h')
+--   eqString "abcdefgh" "abcdefgh" -> True -> 1
+--   eqString "abcdefg" "abcdefgh"  -> False -> 0
+-- Result: 8 + 8 + 104 + 1 + 0 = 121
+
+main : U64
+main =
+  let s  = "abcdefgh" in
+  let bl = byteLength s in
+  let n  = length s in
+  let b7 = byteAt "abcdefgh" 7 in
+  let r1 = if eqString "abcdefgh" "abcdefgh" then 1 else 0 in
+  let r2 = if eqString "abcdefg" "abcdefgh" then 1 else 0 in
+  bl + n + b7 + r1 + r2

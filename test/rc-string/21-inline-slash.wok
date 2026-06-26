@@ -1,0 +1,19 @@
+module Main
+import Std.Base
+import Std.String
+
+-- E3 inline-string corpus: single-byte string "/" (1 byte <= maxInlineStr = 7).
+-- Chosen as a non-alpha byte to stress-test the byte-content round-trip.
+--   byteLength "/" -> 1
+--   byteAt "/" 0   -> 47  (ASCII '/')
+--   eqString "/" "/" -> True -> 1
+--   eqString "/" "." -> False -> 0
+-- Result: 1 + 47 + 1 + 0 = 49
+
+main : U64
+main =
+  let bl = byteLength "/" in
+  let b0 = byteAt "/" 0 in
+  let r1 = if eqString "/" "/" then 1 else 0 in
+  let r2 = if eqString "/" "." then 1 else 0 in
+  bl + b0 + r1 + r2
