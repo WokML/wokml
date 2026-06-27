@@ -13,6 +13,7 @@ import Wok.IR.Anf (Lit (..))
 import qualified Wok.IR.PrimNames as PN
 import Wok.Interp.Value
   ( Prim (..), PrimResult (..), PrimTable, RuntimeError (..), Value (..), renderValue )
+import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Runtime.StringZilla (szHash)
 
 
@@ -85,6 +86,9 @@ stringPrims =
   , stringEditDistanceP
   , stringSliceP
   , stringByteSliceP
+  , decodeCharAtP
+  , charWidthAtP
+  , singletonP
   ]
 
 -- | `__coro_susp x k` packs the yielded value `x` and
@@ -608,3 +612,44 @@ stringByteSliceP = mkPrim PN.stringByteSliceName 3 $ \args -> case args of
              in Right (PRDone (VLit (LStr (TxEnc.decodeUtf8 wb))))
   [v, _, _] -> Left (PrimError (Tx.pack "String.byteSlice: not a string: " <> renderValue v))
   _         -> Left (ArityError PN.stringByteSliceName)
+
+-- ---------------------------------------------------------------------------
+-- E5 iterator-support prims (String Slice E5, Task 2)
+-- ---------------------------------------------------------------------------
+
+-- | @decodeCharAt s i@: decode the UTF-8 codepoint at byte offset @i@.
+-- Returns the 'Char' (byte width discarded). Reference: pure 'Either'.
+decodeCharAtP :: Prim
+decodeCharAtP = mkPrim PN.decodeCharAtName 2 $ \args -> case args of
+  [VLit (LStr t), iv] -> do
+    i <- asU64Index iv
+    let bs = TxEnc.encodeUtf8 t
+    if i >= BS.length bs
+      then Left (PrimError (Tx.pack "String.decodeCharAt: out of bounds"))
+      else do
+        (c, _w) <- Utf8.decodeCharAt bs i
+        Right (PRDone (VLit (LChar c)))
+  [v, _] -> Left (PrimError (Tx.pack "String.decodeCharAt: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.decodeCharAtName)
+
+-- | @charWidthAt s i@: UTF-8 byte width of the codepoint at byte offset @i@
+-- (1-4); returns U64. Reference: pure 'Either'.
+charWidthAtP :: Prim
+charWidthAtP = mkPrim PN.charWidthAtName 2 $ \args -> case args of
+  [VLit (LStr t), iv] -> do
+    i <- asU64Index iv
+    let bs = TxEnc.encodeUtf8 t
+    if i >= BS.length bs
+      then Left (PrimError (Tx.pack "String.charWidthAt: out of bounds"))
+      else do
+        w <- Utf8.utf8Width (BS.index bs i)
+        Right (PRDone (VLit (LInt (fromIntegral w))))
+  [v, _] -> Left (PrimError (Tx.pack "String.charWidthAt: not a string: " <> renderValue v))
+  _      -> Left (ArityError PN.charWidthAtName)
+
+-- | @singleton c@: single-codepoint string from a 'Char'. Reference:
+-- 'Tx.singleton' (no allocation needed in the pure machine).
+singletonP :: Prim
+singletonP = mkPrim PN.singletonName 1 $ \args -> case args of
+  [VLit (LChar c)] -> Right (PRDone (VLit (LStr (Tx.singleton c))))
+  _                -> Left (ArityError PN.singletonName)

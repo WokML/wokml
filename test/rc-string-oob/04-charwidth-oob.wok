@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Out-of-bounds charWidthAt: exercises the offset >= byteLength guard in
+-- utf8Width. "abc" has byteLength 3; offset 9 is past the end, so both
+-- the reference and RC interpreters must raise a PrimError.
+main : U64
+main = charWidthAt "abc" 9

@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+import Std.String
+
+-- Effect-soundness death-test (E5 Task 5): the fold closure performs `emit` on
+-- EACH codepoint. The handler resumes one-shot and PREPENDS each emitted char to
+-- the resumed result, so the collected string == the original IFF every iteration
+-- ran after the first (non-final) effect. A lost-iterations bug would yield a
+-- truncated string. This proves foldChars (a plain wok loop over decode prims) is
+-- effect-sound via the EXISTING continuation machinery -- no special frame.
+effect Emit = { emit : Char -> () }
+
+-- the fold closure calls emit on each char via the ambient Emit effect.
+step : () -> Char -> () with Emit
+step u c = Emit.emit c
+
+-- collect: one-shot resume; result = c0 ++ (c1 ++ ( ... ++ "")) = the original.
+collect : String -> String
+collect s =
+  with Emit { emit ch k -> append (singleton ch) (k ()) ; v -> "" }
+  foldChars step () s
+
+main : String
+main = collect "café"

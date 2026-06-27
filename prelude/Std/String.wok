@@ -28,6 +28,11 @@ extern editDistance   : String -> String -> U64          -- byte-level unit-cost
 extern slice     : String -> U64 -> U64 -> String   -- codepoint window [start, start+len), saturating
 extern byteSlice : String -> U64 -> U64 -> String   -- byte window [start, start+len), saturating; PrimError if split
 
+-- Codepoint iteration (Slice E5). Offsets are BYTE offsets into the UTF-8 buffer.
+extern decodeCharAt : String -> U64 -> Char   -- codepoint starting at byte offset; PrimError if not a boundary
+extern charWidthAt  : String -> U64 -> U64    -- byte width (1..4) of that codepoint; PrimError if not a boundary
+extern singleton    : Char -> String          -- one codepoint as a string
+
 -- "not found" sentinel returned by indexOfFromRaw (== C WOK_SZ_NOT_FOUND == UINT64_MAX).
 notFound : U64
 notFound = 18446744073709551615
@@ -64,3 +69,14 @@ countFrom : String -> String -> U64 -> U64 -> U64
 countFrom s n from acc = case indexOfFrom s n from of
   None   -> acc
   Some i -> countFrom s n (i + byteLength n) (acc + 1)
+
+-- foldChars: left fold over codepoints, single pass (O(n)). Effect-polymorphic:
+-- the closure may perform effects; foldChars performs exactly those effects.
+foldChars : (s -> Char -> s with eff e) -> s -> String -> s with eff e
+foldChars f acc str = foldCharsGo f acc str 0 (byteLength str)
+
+foldCharsGo : (s -> Char -> s with eff e) -> s -> String -> U64 -> U64 -> s with eff e
+foldCharsGo f acc str off end =
+  case eqU64 off end of
+    True  -> acc
+    False -> foldCharsGo f (f acc (decodeCharAt str off)) str (off + charWidthAt str off) end

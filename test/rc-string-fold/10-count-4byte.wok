@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.String
+
+-- 4-byte UTF-8 path via foldChars: "a𠀀b" = ASCII(1) + 4-byte(4) + ASCII(1)
+-- = 6 bytes total, 3 codepoints. foldChars must count all three correctly.
+inc : U64 -> Char -> U64
+inc n c = n + 1
+
+main : U64
+main = foldChars inc 0 "a𠀀b"

@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.String
+
+-- 4-byte UTF-8 path: U+20000 (𠀀, CJK Extension B ideograph) encodes as
+-- F0 A0 80 80. charWidthAt must return 4 at offset 0.
+main : U64
+main = charWidthAt "𠀀" 0

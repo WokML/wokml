@@ -71,6 +71,9 @@ module Wok.IR.PrimNames
   , stringEditDistanceName
   , stringSliceName
   , stringByteSliceName
+  , decodeCharAtName
+  , charWidthAtName
+  , singletonName
   ) where
 
 import Data.Set (Set)
@@ -245,3 +248,17 @@ stringSliceName = Tx.pack "slice"
 -- PrimError if a boundary splits a multibyte codepoint.
 stringByteSliceName :: Text
 stringByteSliceName = Tx.pack "byteSlice"
+
+-- | @decodeCharAt s i@: decode the UTF-8 codepoint starting at byte offset i;
+-- returns the Char (byte width is discarded at the prim level).
+decodeCharAtName :: Text
+decodeCharAtName = Tx.pack "decodeCharAt"
+
+-- | @charWidthAt s i@: UTF-8 byte width of the codepoint starting at byte offset i
+-- (1-4); returns U64.
+charWidthAtName :: Text
+charWidthAtName = Tx.pack "charWidthAt"
+
+-- | @singleton c@: allocate a single-codepoint string from a Char.
+singletonName :: Text
+singletonName = Tx.pack "singleton"

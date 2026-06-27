@@ -24,6 +24,7 @@ import Wok.Interp.RC.Value
   , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC
   , maxInlineStr, allocNStringView, wokStringTag )
 import Wok.Interp.Value (RuntimeError (..))
+import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
 
 -- | The RC primitive table. Mirrors the reference 'Wok.Interp.Prim.primTable'
@@ -109,6 +110,9 @@ rcStringPrims =
   , stringEditDistance
   , stringSlice
   , stringByteSlice
+  , decodeCharAtRC
+  , charWidthAtRC
+  , singletonRC
   ]
 
 -- ---------------------------------------------------------------------------
@@ -988,3 +992,47 @@ stringByteSlice = RCPrim PN.stringByteSliceName 3 [] $ \args s -> case args of
           let wb = BS.take (end' - start') (BS.drop start' pb)
           buildSlice sv start' wb s
   _ -> throwE (ArityError (Tx.pack "String.byteSlice"))
+
+-- ---------------------------------------------------------------------------
+-- E5 iterator-support prims (String Slice E5, Task 2)
+-- ---------------------------------------------------------------------------
+
+-- | @decodeCharAt s i@: decode the UTF-8 codepoint at byte offset @i@.
+-- Returns the 'Char' (byte width discarded). Consumes 's'. RC: 0 alloc.
+decodeCharAtRC :: RCPrim
+decodeCharAtRC = RCPrim PN.decodeCharAtName 2 [] $ \args s -> case args of
+  [sv@(RVBox a), iv] -> do
+    bs <- stringBytes sv s
+    i  <- asStringIndex iv
+    if i >= BS.length bs
+      then throwE (PrimError (Tx.pack "String.decodeCharAt: out of bounds"))
+      else do
+        (c, _w) <- liftRC (Utf8.decodeCharAt bs i)
+        s1      <- dropAddr a s
+        pure (PRDone (RVLit (LChar c)), s1)
+  _ -> throwE (ArityError PN.decodeCharAtName)
+
+-- | @charWidthAt s i@: UTF-8 byte width of the codepoint at byte offset @i@
+-- (1-4); returns U64. Consumes 's'. RC: 0 alloc.
+charWidthAtRC :: RCPrim
+charWidthAtRC = RCPrim PN.charWidthAtName 2 [] $ \args s -> case args of
+  [sv@(RVBox a), iv] -> do
+    bs <- stringBytes sv s
+    i  <- asStringIndex iv
+    if i >= BS.length bs
+      then throwE (PrimError (Tx.pack "String.charWidthAt: out of bounds"))
+      else do
+        w  <- liftRC (Utf8.utf8Width (BS.index bs i))
+        s1 <- dropAddr a s
+        pure (PRDone (RVLit (LInt (toInteger w))), s1)
+  _ -> throwE (ArityError PN.charWidthAtName)
+
+-- | @singleton c@: allocate a single-codepoint string from a 'Char'.
+-- The 'Char' argument is an immediate ('RVLit'); result is boxed. RC: +1 alloc.
+singletonRC :: RCPrim
+singletonRC = RCPrim PN.singletonName 1 [] $ \args s -> case args of
+  [RVLit (LChar c)] -> do
+    let bs = TxEnc.encodeUtf8 (Tx.singleton c)
+    (na, s1) <- alloc (NString bs) s
+    pure (PRDone (RVBox na), s1)
+  _ -> throwE (ArityError PN.singletonName)

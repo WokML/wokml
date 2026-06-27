@@ -107,6 +107,7 @@ library
         Wok.Interp
         Wok.Interp.Value
         Wok.Interp.Prim
+        Wok.Interp.Utf8
         Wok.Interp.Sched
         Wok.Interp.Machine
         Wok.Interp.RC.Heap

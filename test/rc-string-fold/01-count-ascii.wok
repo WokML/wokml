@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.String
+
+inc : U64 -> Char -> U64
+inc n c = n + 1
+
+main : U64
+main = foldChars inc 0 "hello"

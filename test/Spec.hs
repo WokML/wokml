@@ -152,6 +152,9 @@ main = do
   -- String OOB error corpus: programs that intentionally trigger a PrimError.
   -- Wired to rcDifferential only (both-fail = agreement).
   rcStringOobFiles <- findByExtension [".wok"] "test/rc-string-oob"
+  -- String Slice E5 (Task 4): foldChars/decodeCharAt/charWidthAt/singleton corpus.
+  -- Wired to rc differential + rc stats + rcCBackendParity + run-golden groups.
+  rcStringFoldFiles <- findByExtension [".wok"] "test/rc-string-fold"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -290,7 +293,7 @@ main = do
         ]
     , testGroup "run golden"
         [ goldenVsString (takeBaseName f) (runGoldenFor f) (runProgramHarness f)
-        | f <- runFiles
+        | f <- runFiles ++ rcStringFoldFiles
         ]
     , testGroup "multiplicity golden"
         [ goldenVsString (takeBaseName f) (multGoldenFor f) (multDumpHarness f)
@@ -316,11 +319,11 @@ main = do
     , testGroup "rc differential"
         [ testCase (takeBaseName f) (rcDifferentialHarness f)
         | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ++ rcRegionFiles
-            ++ rcStringFiles ++ rcStringOobFiles ]
+            ++ rcStringFiles ++ rcStringOobFiles ++ rcStringFoldFiles ]
     , testGroup "rc stats"
         [ testGroup "heap accounting"
             [ testCase (takeBaseName f) (rcStatsHarness f)
-            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ++ rcStringFiles ]
+            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ++ rcStringFiles ++ rcStringFoldFiles ]
         , testGroup "golden"
             [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
             | f <- perceusFiles ]
@@ -332,7 +335,7 @@ main = do
     -- parity; plus targeted cross-heap/fallback/deep tests and the slot
     -- encode/decode round-trip property.
     , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles ++ rcRegionFiles
-        ++ rcStringFiles)
+        ++ rcStringFiles ++ rcStringFoldFiles)
     , rcCBackendTargeted
     , rcFbipTargeted
     , rcFbipFaultInjection
@@ -4714,7 +4717,8 @@ interpPrimTests = testGroup "InterpPrim"
                   ["new","fromList","toList","index","length","set","resize"]
               ++ map (T.pack "Std.String",)
                   ["length","index","byteLength","byteAt","append"
-                  ,"indexOfFromRaw","hash","editDistance","slice","byteSlice"]
+                  ,"indexOfFromRaw","hash","editDistance","slice","byteSlice"
+                  ,"decodeCharAt","charWidthAt","singleton"]
               )
   , testCase "addition" $
       case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
