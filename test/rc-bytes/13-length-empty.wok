@@ -1,0 +1,7 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- length of empty buffer is 0
+main : U64
+main = length (fromList [])

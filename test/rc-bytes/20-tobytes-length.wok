@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- toBytes on a known string produces a buffer whose byte-length we can check.
+-- "hello" is 5 ASCII bytes; toBytes then length should return 5.
+-- This confirms the byte count passes through the conversion correctly.
+main : U64
+main = length (toBytes "hello")

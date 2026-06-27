@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- toBytes on a String always produces valid UTF-8 (it is a reinterpretation of
+-- the internal UTF-8 storage).  fromBytes should therefore return Some.
+-- This exercises the RVBox path on the RC/C backend (the Task 7 critical fix).
+main : U64
+main =
+  let s = "hello" in
+  case fromBytes (toBytes s) of
+    Some _ -> 1
+    None   -> 0

@@ -49,6 +49,7 @@ import qualified Wok.IR.Elaborate as Elab
 import qualified Wok.Interp.Value as IV
 import qualified Wok.Interp.Prim as IP
 import qualified Wok.Interp.Machine as IM
+import qualified Wok.Interp.Utf8 as Utf8
 import qualified Wok.Interp.RC.Value as St
 import qualified Wok.Interp.RC.Prim as RCP
 import qualified Wok.Interp.RC.Machine as RCM
@@ -87,6 +88,7 @@ import Data.Ord (comparing)
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
 import Foreign.Ptr (castPtr)
 import Foreign.Marshal.Utils (copyBytes)
+import qualified Data.ByteString.Unsafe as BSU
 
 main :: IO ()
 main = do
@@ -155,6 +157,14 @@ main = do
   -- String Slice E5 (Task 4): foldChars/decodeCharAt/charWidthAt/singleton corpus.
   -- Wired to rc differential + rc stats + rcCBackendParity + run-golden groups.
   rcStringFoldFiles <- findByExtension [".wok"] "test/rc-string-fold"
+  -- Bytes Slice E6: the differential-oracle corpus for the six Bytes ops plus
+  -- eqBytes.  Programs are handler-free.  Wired to rc differential + rc stats +
+  -- rcCBackendParity groups, matching the String corpus pattern.
+  rcBytesFiles    <- findByExtension [".wok"] "test/rc-bytes"
+  -- Bytes OOB/error corpus: programs that intentionally trigger a PrimError
+  -- (index out of bounds, fromList value > 255).  Wired to rcDifferential only
+  -- (both-fail = agreement), matching the Array/String OOB pattern.
+  rcBytesOobFiles <- findByExtension [".wok"] "test/rc-bytes-oob"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -218,6 +228,7 @@ main = do
     , anfTests
     , interpValueTests
     , interpPrimTests
+    , utf8Tests
     , interpCafTests
     , interpMachineTests
     , interpEffectTests
@@ -319,11 +330,13 @@ main = do
     , testGroup "rc differential"
         [ testCase (takeBaseName f) (rcDifferentialHarness f)
         | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcArrayOobFiles ++ rcRegionFiles
-            ++ rcStringFiles ++ rcStringOobFiles ++ rcStringFoldFiles ]
+            ++ rcStringFiles ++ rcStringOobFiles ++ rcStringFoldFiles
+            ++ rcBytesFiles ++ rcBytesOobFiles ]
     , testGroup "rc stats"
         [ testGroup "heap accounting"
             [ testCase (takeBaseName f) (rcStatsHarness f)
-            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ++ rcStringFiles ++ rcStringFoldFiles ]
+            | f <- perceusFiles ++ rcM2bFiles ++ rcArrayFiles ++ rcRegionFiles ++ rcStringFiles ++ rcStringFoldFiles
+                ++ rcBytesFiles ]
         , testGroup "golden"
             [ goldenVsString (takeBaseName f) (rcStatsGoldenFor f) (rcStatsDumpHarness f)
             | f <- perceusFiles ]
@@ -335,7 +348,7 @@ main = do
     -- parity; plus targeted cross-heap/fallback/deep tests and the slot
     -- encode/decode round-trip property.
     , rcCBackendParity (perceusFiles ++ rcM2bFiles ++ rcFbipFiles ++ rcArrayFiles ++ rcRegionFiles
-        ++ rcStringFiles ++ rcStringFoldFiles)
+        ++ rcStringFiles ++ rcStringFoldFiles ++ rcBytesFiles)
     , rcCBackendTargeted
     , rcFbipTargeted
     , rcFbipFaultInjection
@@ -347,6 +360,8 @@ main = do
     , rcStringPropertyTests
     , rcInlineStringPropertyTests
     , rcStringViewPropertyTests
+    , rcBytesPropertyTests
+    , bytesValidatorAgreementTests
     , rcArraySliceCTests
     -- M3 SOUNDNESS RED-CHECK INVENTORY (five independent floors post-H1/H2
     -- hardening; each test group verifies the floor bites when disabled):
@@ -3249,7 +3264,8 @@ loaderTests = testGroup "loader"
           Data.List.sort names @?=
             Data.List.sort
               [ T.pack "Std.Base", T.pack "Std.Control"
-              , T.pack "Std.Array", T.pack "Std.String", T.pack "Main" ]
+              , T.pack "Std.Array", T.pack "Std.String"
+              , T.pack "Std.Bytes", T.pack "Main" ]
         Left err -> assertFailure ("unexpected error: " ++ show err)
 
   , testCase "rejects file missing a module header" $ do
@@ -4708,7 +4724,7 @@ interpPrimTests = testGroup "InterpPrim"
       Data.List.sort (Map.keys IP.primTable)
         @?= Data.List.sort
               ( map (T.pack "Std.Base",)
-                  ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","eqString"]
+                  ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","eqString","eqBytes"]
               ++ map (T.pack "Std.Control",)
                   ["__coro_susp","__coro_unwrap","__coro_resume","__coro_done"
                   ,"__coro_cancel","__coerce","__drive_conc"
@@ -4719,6 +4735,8 @@ interpPrimTests = testGroup "InterpPrim"
                   ["length","index","byteLength","byteAt","append"
                   ,"indexOfFromRaw","hash","editDistance","slice","byteSlice"
                   ,"decodeCharAt","charWidthAt","singleton"]
+              ++ map (T.pack "Std.Bytes",)
+                  ["fromList","toList","length","index","fromBytes","toBytes"]
               )
   , testCase "addition" $
       case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
@@ -4804,6 +4822,28 @@ interpPrimTests = testGroup "InterpPrim"
   where
     show2 (Left e)  = "Left " <> show e
     show2 (Right _) = "Right <prim-result>"
+
+-- ---------------------------------------------------------------------------
+-- UTF-8 validation
+
+utf8Tests :: TestTree
+utf8Tests = testGroup "Wok.Interp.Utf8.validateUtf8"
+  [ it "accepts valid UTF-8 (incl. empty)" $ do
+      Utf8.validateUtf8 (BS.pack [])                     `shouldBe` True
+      Utf8.validateUtf8 (BS.pack [0x41])                 `shouldBe` True
+      Utf8.validateUtf8 (BS.pack [0xC3,0xA9])            `shouldBe` True   -- é
+      Utf8.validateUtf8 (BS.pack [0xE2,0x82,0xAC])       `shouldBe` True   -- €
+      Utf8.validateUtf8 (BS.pack [0xF0,0x9F,0x98,0x80])  `shouldBe` True   -- emoji
+  , it "rejects the four ill-formedness classes + truncated" $ do
+      Utf8.validateUtf8 (BS.pack [0xC0,0x80])            `shouldBe` False  -- overlong
+      Utf8.validateUtf8 (BS.pack [0x80])                 `shouldBe` False  -- lone continuation
+      Utf8.validateUtf8 (BS.pack [0xF7,0xBF,0xBF,0xBF])  `shouldBe` False  -- > U+10FFFF
+      Utf8.validateUtf8 (BS.pack [0xED,0xA0,0x80])       `shouldBe` False  -- lone surrogate
+      Utf8.validateUtf8 (BS.pack [0xE2,0x82])            `shouldBe` False  -- truncated
+  ]
+  where
+    it = testCase
+    shouldBe = (@?=)
 
 -- ---------------------------------------------------------------------------
 -- CAF (0-arity top-level bind) evaluation
@@ -23258,3 +23298,235 @@ rcRegionNegativeControl = testGroup "rc-region-negative-control"
           assertEqual "pure cohort: broken and correct closes AGREE on stLive"
             (St.stLive (St.stStats sBroken)) (St.stLive (St.stStats sGood))
   ]
+
+-- ---------------------------------------------------------------------------
+-- Bytes Slice E6: QuickCheck properties
+--
+-- These properties run on the ABSTRACT backend only (the differential corpus
+-- covers the CHeap path).  They verify:
+--   PB1  toList . fromList is identity on byte lists in 0..255
+--   PB2  length (fromList xs) == length xs
+--   PB3  index (fromList xs) i == xs !! i  for valid i
+--   PB4  eqBytes reflexive: fromList xs == fromList xs
+--   PB5  eqBytes antisymmetric: xs /= ys => not (eqBytes xs ys)
+--   PB6  fromBytes (toBytes s) == Some s'  content-equal: covered by corpus files
+--          26-frombytes-tobytes-ascii-content.wok (ASCII) and
+--          27-frombytes-tobytes-multibyte-content.wok (multibyte), both exercised
+--          on the abstract and C-heap backends via the differential/C-parity oracles.
+--   PB7  validators agree on arbitrary [Word8]: Utf8.validateUtf8 == wokValidateUtf8
+-- ---------------------------------------------------------------------------
+
+-- | Look up a Bytes prim by name under Std.Bytes.
+lookupBytesPrim :: Text -> IO St.RCPrim
+lookupBytesPrim = lookupPrimQ (T.pack "Std.Bytes")
+
+-- | Look up eqBytes under Std.Base.
+lookupEqBytesPrim :: IO St.RCPrim
+lookupEqBytesPrim = lookupPrimQ (T.pack "Std.Base") (T.pack "eqBytes")
+
+-- | Build a Cons/Nil spine of RVLit (LInt n) values from a list of integers,
+-- using the abstract heap only.
+buildNilSpine :: [Integer] -> St.Store -> IO (St.RCValue, St.Store)
+buildNilSpine ns s0 = do
+  nilRes <- runExceptT (St.alloc (St.NCon (T.pack "Nil") []) s0)
+  (nilAddr, sn) <- case nilRes of
+    Right r -> pure r
+    Left e  -> assertFailure ("buildNilSpine: nil alloc: " <> show e)
+  let nilVal = St.RVBox nilAddr
+      go []       (tl, st) = pure (tl, st)
+      go (v : vs) (tl, st) = do
+        (rest, st1) <- go vs (tl, st)
+        let (ca, st2) = St.allocPure (St.NCon (T.pack "Cons") [St.RVLit (Anf.LInt v), rest]) st1
+        pure (St.RVBox ca, st2)
+  go ns (nilVal, sn)
+
+-- PB1: toList (fromList xs) is identity on byte lists 0..255
+prop_bytesToListFromList :: Property
+prop_bytesToListFromList =
+  QC.forAll (QC.listOf (QC.choose (0, 255) :: QC.Gen Integer)) $ \ns ->
+    QC.ioProperty $ do
+      pFromList <- lookupBytesPrim (T.pack "fromList")
+      pToList   <- lookupBytesPrim (T.pack "toList")
+      let s0 = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      (spine, s1) <- buildNilSpine ns s0
+      (bytesVal, s2) <- callPrim pFromList [spine] s1
+      (listVal, s3)  <- callPrim pToList   [bytesVal] s2
+      case St.renderRCValue s3 listVal of
+        Left e  -> do
+          _ <- dropResult listVal s3
+          assertFailure ("PB1 render failed: " <> show e)
+        Right rendered -> do
+          s4 <- dropResult listVal s3
+          assertEqual "PB1: heap must return to baseline" baseline (St.stLive (St.stStats s4))
+          let expected = T.pack ("[" <> intercalateComma (map show ns) <> "]")
+          pure (rendered == expected)
+  where
+    intercalateComma []     = ""
+    intercalateComma [x]    = x
+    intercalateComma (x:xs) = x <> ", " <> intercalateComma xs
+
+-- PB2: length (fromList xs) == length xs
+prop_bytesLength :: Property
+prop_bytesLength =
+  QC.forAll (QC.listOf (QC.choose (0, 255) :: QC.Gen Integer)) $ \ns ->
+    QC.ioProperty $ do
+      pFromList <- lookupBytesPrim (T.pack "fromList")
+      pLength   <- lookupBytesPrim (T.pack "length")
+      let s0 = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      (spine, s1) <- buildNilSpine ns s0
+      (bytesVal, s2) <- callPrim pFromList [spine] s1
+      (lenVal, s3)   <- callPrim pLength   [bytesVal] s2
+      case lenVal of
+        St.RVLit (Anf.LInt got) -> do
+          assertEqual "PB2: heap must return to baseline" baseline (St.stLive (St.stStats s3))
+          pure (got == toInteger (length ns))
+        other -> assertFailure ("PB2: expected RVLit (LInt _), got: " <> show other)
+
+-- PB3: index (fromList xs) i == xs !! i  for a valid i
+prop_bytesIndex :: Property
+prop_bytesIndex =
+  QC.forAll (QC.choose (1, 20) :: QC.Gen Int) $ \n ->
+  QC.forAll (QC.vectorOf n (QC.choose (0, 255) :: QC.Gen Integer)) $ \ns ->
+  QC.forAll (QC.choose (0, n - 1) :: QC.Gen Int) $ \i ->
+    QC.ioProperty $ do
+      pFromList <- lookupBytesPrim (T.pack "fromList")
+      pIndex    <- lookupBytesPrim (T.pack "index")
+      let s0 = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      (spine, s1)    <- buildNilSpine ns s0
+      (bytesVal, s2) <- callPrim pFromList [spine] s1
+      (el, s3)       <- callPrim pIndex [bytesVal, St.RVLit (Anf.LInt (fromIntegral i))] s2
+      case el of
+        St.RVLit (Anf.LInt got) -> do
+          assertEqual "PB3: heap must return to baseline" baseline (St.stLive (St.stStats s3))
+          pure (got == ns !! i)
+        other -> assertFailure ("PB3: expected RVLit (LInt _), got: " <> show other)
+
+-- PB4: eqBytes reflexive -- fromList xs == fromList xs
+prop_bytesEqReflexive :: Property
+prop_bytesEqReflexive =
+  QC.forAll (QC.listOf (QC.choose (0, 255) :: QC.Gen Integer)) $ \ns ->
+    QC.ioProperty $ do
+      pFromList <- lookupBytesPrim (T.pack "fromList")
+      pEqBytes  <- lookupEqBytesPrim
+      let s0 = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      (spine1, s1) <- buildNilSpine ns s0
+      (spine2, s2) <- buildNilSpine ns s1
+      (bv1, s3) <- callPrim pFromList [spine1] s2
+      (bv2, s4) <- callPrim pFromList [spine2] s3
+      (eqVal, s5) <- callPrim pEqBytes [bv1, bv2] s4
+      case St.renderRCValue s5 eqVal of
+        Left e  -> assertFailure ("PB4: render failed: " <> show e)
+        Right rendered -> do
+          s6 <- dropResult eqVal s5
+          assertEqual "PB4: heap must return to baseline" baseline (St.stLive (St.stStats s6))
+          pure (rendered == T.pack "True")
+
+-- PB5: eqBytes antisymmetric -- when lists differ, eqBytes returns False
+prop_bytesEqAntisymmetric :: Property
+prop_bytesEqAntisymmetric =
+  QC.forAll (QC.listOf (QC.choose (0, 255) :: QC.Gen Integer)) $ \xs ->
+  QC.forAll (QC.listOf (QC.choose (0, 255) :: QC.Gen Integer) `QC.suchThat` (/= xs)) $ \ys ->
+    QC.ioProperty $ do
+      pFromList <- lookupBytesPrim (T.pack "fromList")
+      pEqBytes  <- lookupEqBytesPrim
+      let s0 = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+      (spine1, s1) <- buildNilSpine xs s0
+      (spine2, s2) <- buildNilSpine ys s1
+      (bv1, s3) <- callPrim pFromList [spine1] s2
+      (bv2, s4) <- callPrim pFromList [spine2] s3
+      (eqVal, s5) <- callPrim pEqBytes [bv1, bv2] s4
+      case St.renderRCValue s5 eqVal of
+        Left e  -> assertFailure ("PB5: render failed: " <> show e)
+        Right rendered -> do
+          s6 <- dropResult eqVal s5
+          assertEqual "PB5: heap must return to baseline" baseline (St.stLive (St.stStats s6))
+          pure (rendered == T.pack "False")
+
+rcBytesPropertyTests :: TestTree
+rcBytesPropertyTests =
+  localOption (QuickCheckTests 100) $
+    testGroup "rc bytes properties (Suite E6: Bytes semantics)"
+      [ testProperty "PB1: toList (fromList xs) == xs for bytes in 0..255"
+          prop_bytesToListFromList
+      , testProperty "PB2: length (fromList xs) == length xs"
+          prop_bytesLength
+      , testProperty "PB3: index (fromList xs) i == xs !! i for valid i"
+          prop_bytesIndex
+      , testProperty "PB4: eqBytes reflexive -- fromList xs == fromList xs"
+          prop_bytesEqReflexive
+      , testProperty "PB5: eqBytes antisymmetric -- xs /= ys => not (eqBytes xs ys)"
+          prop_bytesEqAntisymmetric
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Bytes Slice E6: Haskell <-> C validator agreement tests
+--
+-- Assert that 'Wok.Interp.Utf8.validateUtf8' (the Haskell pure oracle) agrees
+-- with 'wok_validate_utf8' (the Hoehrmann DFA in C) on every input.  The C DFA
+-- is called via FFI through 'Data.ByteString.Unsafe.unsafeUseAsCStringLen' to
+-- pass a raw pointer without copying.
+-- ---------------------------------------------------------------------------
+
+-- | Call the C DFA validator on a ByteString via FFI.
+-- Returns True iff the C side returns 1 (valid UTF-8).
+cValidateUtf8 :: BS.ByteString -> IO Bool
+cValidateUtf8 bs =
+  BSU.unsafeUseAsCStringLen bs $ \(p, len) ->
+    (== 1) <$> Heap.wokValidateUtf8 (castPtr p) (fromIntegral len)
+
+-- | QuickCheck property: Utf8.validateUtf8 and wok_validate_utf8 agree on
+-- arbitrary byte sequences drawn as lists of Word8.
+prop_validatorAgreement :: Property
+prop_validatorAgreement =
+  QC.forAll (QC.listOf (QC.arbitrary :: QC.Gen Word8)) $ \ws ->
+    QC.ioProperty $ do
+      let bs      = BS.pack ws
+          haskell = Utf8.validateUtf8 bs
+      c <- cValidateUtf8 bs
+      pure (haskell == c)
+
+bytesValidatorAgreementTests :: TestTree
+bytesValidatorAgreementTests =
+  localOption (QuickCheckTests 500) $
+    testGroup "Bytes E6: Haskell <-> C validator agreement"
+      [ testCase "valid: empty" $ do
+          c <- cValidateUtf8 (BS.pack [])
+          Utf8.validateUtf8 (BS.pack []) @?= c
+      , testCase "valid: ASCII 'A'" $ do
+          c <- cValidateUtf8 (BS.pack [0x41])
+          Utf8.validateUtf8 (BS.pack [0x41]) @?= c
+      , testCase "valid: 2-byte U+00E9 (e-acute)" $ do
+          c <- cValidateUtf8 (BS.pack [0xC3, 0xA9])
+          Utf8.validateUtf8 (BS.pack [0xC3, 0xA9]) @?= c
+      , testCase "valid: 3-byte U+20AC (euro sign)" $ do
+          c <- cValidateUtf8 (BS.pack [0xE2, 0x82, 0xAC])
+          Utf8.validateUtf8 (BS.pack [0xE2, 0x82, 0xAC]) @?= c
+      , testCase "valid: 4-byte U+1F600 (emoji)" $ do
+          c <- cValidateUtf8 (BS.pack [0xF0, 0x9F, 0x98, 0x80])
+          Utf8.validateUtf8 (BS.pack [0xF0, 0x9F, 0x98, 0x80]) @?= c
+      , testCase "valid: U+10FFFF (last valid scalar)" $ do
+          c <- cValidateUtf8 (BS.pack [0xF4, 0x8F, 0xBF, 0xBF])
+          Utf8.validateUtf8 (BS.pack [0xF4, 0x8F, 0xBF, 0xBF]) @?= c
+      , testCase "invalid: overlong NUL (0xC0, 0x80)" $ do
+          c <- cValidateUtf8 (BS.pack [0xC0, 0x80])
+          Utf8.validateUtf8 (BS.pack [0xC0, 0x80]) @?= c
+      , testCase "invalid: lone continuation byte (0x80)" $ do
+          c <- cValidateUtf8 (BS.pack [0x80])
+          Utf8.validateUtf8 (BS.pack [0x80]) @?= c
+      , testCase "invalid: above U+10FFFF (0xF7,0xBF,0xBF,0xBF)" $ do
+          c <- cValidateUtf8 (BS.pack [0xF7, 0xBF, 0xBF, 0xBF])
+          Utf8.validateUtf8 (BS.pack [0xF7, 0xBF, 0xBF, 0xBF]) @?= c
+      , testCase "invalid: lone surrogate U+D800 (0xED,0xA0,0x80)" $ do
+          c <- cValidateUtf8 (BS.pack [0xED, 0xA0, 0x80])
+          Utf8.validateUtf8 (BS.pack [0xED, 0xA0, 0x80]) @?= c
+      , testCase "invalid: truncated 3-byte (0xE2, 0x82)" $ do
+          c <- cValidateUtf8 (BS.pack [0xE2, 0x82])
+          Utf8.validateUtf8 (BS.pack [0xE2, 0x82]) @?= c
+      , testProperty "PV-agree: validateUtf8 == wok_validate_utf8 on arbitrary [Word8]"
+          prop_validatorAgreement
+      ]

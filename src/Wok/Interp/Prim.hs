@@ -30,6 +30,8 @@ taggedPrims =
   ++ map (PN.stdControlModule,) controlPrims
   ++ map (PN.stdArrayModule,)   arrayPrims
   ++ map (PN.stdStringModule,)  stringPrims
+  ++ map (PN.stdBytesModule,)   bytesPrims
+  ++ map (PN.stdBaseModule,)    bytesBasePrims
 
 basePrims :: [Prim]
 basePrims =
@@ -48,6 +50,10 @@ basePrims =
   , dollarP
   , eqStringP
   ]
+
+-- | Bytes prims that live under Std.Base (eqBytes mirrors eqString's keying).
+bytesBasePrims :: [Prim]
+bytesBasePrims = [ eqBytesP ]
 
 controlPrims :: [Prim]
 controlPrims =
@@ -653,3 +659,98 @@ singletonP :: Prim
 singletonP = mkPrim PN.singletonName 1 $ \args -> case args of
   [VLit (LChar c)] -> Right (PRDone (VLit (LStr (Tx.singleton c))))
   _                -> Left (ArityError PN.singletonName)
+
+-- ---------------------------------------------------------------------------
+-- Std.Bytes prims (reference interpreter side, Slice E6).
+--
+-- Bytes are represented as @VBytes ByteString@ in the reference machine.
+-- The 7 prims mirror the Std.Array / Std.String pattern above.
+-- 'renderValue (VBytes bs)' uses the format @Bytes[65,195,169]@ (decimal
+-- byte list) which Task 7 (RC interpreter) MUST reproduce exactly.
+
+bytesPrims :: [Prim]
+bytesPrims =
+  [ bytesLengthP
+  , bytesIndexP
+  , bytesFromListP
+  , bytesToListP
+  , bytesFromBytesP
+  , bytesToBytesP
+  ]
+
+-- | @length buf@: number of bytes. O(1).
+bytesLengthP :: Prim
+bytesLengthP = mkPrim PN.bytesLengthName 1 $ \args -> case args of
+  [VBytes bs] ->
+    Right (PRDone (VLit (LInt (fromIntegral (BS.length bs)))))
+  [v] -> Left (PrimError (Tx.pack "Bytes.length: not a Bytes: " <> renderValue v))
+  _   -> Left (ArityError PN.bytesLengthName)
+
+-- | @index buf i@: the i-th byte as a U64 (0-based, bounds-checked).
+-- OOB raises 'PrimError'.
+bytesIndexP :: Prim
+bytesIndexP = mkPrim PN.bytesIndexName 2 $ \args -> case args of
+  [VBytes bs, iv] -> do
+    i <- asU64Index iv
+    if i >= BS.length bs
+      then Left (PrimError (Tx.pack "Bytes.index: out of bounds"))
+      else Right (PRDone (VLit (LInt (fromIntegral (BS.index bs i)))))
+  [v, _] -> Left (PrimError (Tx.pack "Bytes.index: not a Bytes: " <> renderValue v))
+  _      -> Left (ArityError PN.bytesIndexName)
+
+-- | @fromList xs@: build a Bytes buffer from a Cons/Nil list of U64 byte
+-- values (0-255). Out-of-range element raises 'PrimError'.
+bytesFromListP :: Prim
+bytesFromListP = mkPrim PN.bytesFromListName 1 $ \args -> case args of
+  [xs] -> do
+    ws <- collectByteList xs
+    Right (PRDone (VBytes (BS.pack ws)))
+  _ -> Left (ArityError PN.bytesFromListName)
+  where
+    collectByteList (VCon t [])      | t == Tx.pack "Nil"  = Right []
+    collectByteList (VCon t [h, tl]) | t == Tx.pack "Cons" = do
+      w  <- asByteElem h
+      rest <- collectByteList tl
+      Right (w : rest)
+    collectByteList v =
+      Left (PrimError (Tx.pack "Bytes.fromList: not a list: " <> renderValue v))
+
+    asByteElem :: Value -> Either RuntimeError Word8
+    asByteElem (VLit (LInt n))
+      | n >= 0 && n <= 255 = Right (fromIntegral n)
+      | otherwise          = Left (PrimError (Tx.pack "Bytes.fromList: byte value out of range (0-255)"))
+    asByteElem v = Left (PrimError (Tx.pack "Bytes.fromList: expected U64 byte, got " <> renderValue v))
+
+-- | @toList buf@: convert a Bytes buffer to a Cons/Nil list of U64 byte values.
+bytesToListP :: Prim
+bytesToListP = mkPrim PN.bytesToListName 1 $ \args -> case args of
+  [VBytes bs] ->
+    Right (PRDone (foldr (\b acc -> VCon (Tx.pack "Cons") [VLit (LInt (fromIntegral b)), acc])
+                         (VCon (Tx.pack "Nil") [])
+                         (BS.unpack bs)))
+  [v] -> Left (PrimError (Tx.pack "Bytes.toList: not a Bytes: " <> renderValue v))
+  _   -> Left (ArityError PN.bytesToListName)
+
+-- | @fromBytes buf@: validate that the bytes are valid UTF-8; return
+-- @Some s@ on success, @None@ on failure.
+bytesFromBytesP :: Prim
+bytesFromBytesP = mkPrim PN.bytesFromBytesName 1 $ \args -> case args of
+  [VBytes bs] -> Right (PRDone (case TxEnc.decodeUtf8' bs of
+      Right t -> VCon (Tx.pack "Some") [VLit (LStr t)]
+      Left _  -> VCon (Tx.pack "None") []))
+  [v] -> Left (PrimError (Tx.pack "Bytes.fromBytes: not a Bytes: " <> renderValue v))
+  _   -> Left (ArityError PN.bytesFromBytesName)
+
+-- | @toBytes s@: reinterpret a String as a Bytes buffer (always valid UTF-8).
+bytesToBytesP :: Prim
+bytesToBytesP = mkPrim PN.bytesToBytesName 1 $ \args -> case args of
+  [VLit (LStr t)] -> Right (PRDone (VBytes (TxEnc.encodeUtf8 t)))
+  [v] -> Left (PrimError (Tx.pack "Bytes.toBytes: not a String: " <> renderValue v))
+  _   -> Left (ArityError PN.bytesToBytesName)
+
+-- | @eqBytes a b@: byte-equality of two Bytes buffers. Mirrors 'eqStringP'.
+eqBytesP :: Prim
+eqBytesP = mkPrim PN.eqBytesName 2 $ \args -> case args of
+  [VBytes a, VBytes b] -> Right (PRDone (boolVal (a == b)))
+  [v, _] -> Left (PrimError (Tx.pack "eqBytes: not a Bytes: " <> renderValue v))
+  _      -> Left (ArityError PN.eqBytesName)

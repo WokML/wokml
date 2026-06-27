@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- valid UTF-8: 3-byte sequence U+20AC euro sign (226, 130, 172)
+-- fromBytes returns Some
+main : U64
+main =
+  case fromBytes (fromList [226, 130, 172]) of
+    Some _ -> 1
+    None   -> 0

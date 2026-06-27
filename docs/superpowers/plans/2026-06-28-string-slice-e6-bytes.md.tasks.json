@@ -1,0 +1,72 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-28-string-slice-e6-bytes.md",
+  "specPath": "docs/superpowers/specs/2026-06-28-string-slice-e6-bytes-design.md",
+  "branch": "feat/string-slice-e6-bytes",
+  "nativeTaskIds": { "T1": 5, "T2": 6, "T3": 7, "T4": 8, "T5": 9, "T6": 10, "T7": 11, "T8": 12, "T9": 13 },
+  "tasks": [
+    {
+      "id": 5,
+      "subject": "Task 1: C runtime — WokBytes cell",
+      "status": "pending",
+      "blockedBy": [],
+      "description": "WokBytes C cell, tag 0xFFFC, layout-identical to WokString. wok_rc.h: tag + wok_bytes_alloc/len/data/byte_get decls + reserved-tag comment. wok_rc.c: accessors mirroring wok_string_*; explicit WOK_BYTES_TAG arm in wok_free.\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\"], \"verifyCommand\": \"cabal build 2>&1 | tail -5\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 2: C runtime — Hoehrmann DFA validator",
+      "status": "pending",
+      "blockedBy": [],
+      "description": "runtime/wok_utf8.c with Hoehrmann public-domain DFA wok_validate_utf8; header decl; wok.cabal c-sources; sanity cases in wok_rc_test.c.\n\n```json:metadata\n{\"files\": [\"runtime/wok_utf8.c\", \"runtime/wok_rc.h\", \"wok.cabal\", \"runtime/test/wok_rc_test.c\"], \"verifyCommand\": \"cabal build 2>&1 | tail -5\", \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 3: Haskell validateUtf8 (oracle anchor)",
+      "status": "pending",
+      "blockedBy": [],
+      "description": "src/Wok/Interp/Utf8.hs: add+export validateUtf8 :: ByteString -> Bool via Data.Text.Encoding.decodeUtf8'. hspec accept/reject corpus.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/Utf8.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | grep -iE 'validateUtf8|FAIL|passed' | tail -20\", \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 4: Type system — Bytes tycon",
+      "status": "pending",
+      "blockedBy": [],
+      "description": "Bytes builtin tycon + TcBytes across Builtins.hs/Types.hs/Infer.hs/Class.hs/Anf.hs; satisfy -Wincomplete-patterns.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Builtins.hs\", \"src/Wok/TypeChecking/Types.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Class.hs\", \"src/Wok/IR/Anf.hs\"], \"verifyCommand\": \"cabal build 2>&1 | tail -5\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 5: Prim names + Std.Bytes prelude wiring",
+      "status": "pending",
+      "blockedBy": [8],
+      "description": "PrimNames.hs stdBytesModule + name constants + eqBytesName; prelude/Std/Bytes.wok (6 externs); Base.wok eqBytes + instance Eq Bytes; Prelude.hs reader; Loader.hs wiring; wok.cabal data-files.\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/PrimNames.hs\", \"prelude/Std/Bytes.wok\", \"prelude/Std/Base.wok\", \"src/Wok/Prelude.hs\", \"src/Wok/Loader.hs\", \"wok.cabal\"], \"verifyCommand\": \"cabal build 2>&1 | tail -5\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 6: Reference interpreter — VBytes + prims",
+      "status": "pending",
+      "blockedBy": [7, 8, 9],
+      "description": "Interp/Value.hs VBytes ByteString + all match sites incl renderValue; Interp/Prim.hs 7 prims (fromList/toList/length/index/eqBytes/fromBytes/toBytes) + registration; fromBytes via validateUtf8; out-of-range/OOB -> PrimError.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/Value.hs\", \"src/Wok/Interp/Prim.hs\"], \"verifyCommand\": \"cabal build 2>&1 | tail -5\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 7: RC interpreter — NBytes + plumbing + prims",
+      "status": "pending",
+      "blockedBy": [5, 6, 7, 8, 9],
+      "description": "RC/Value.hs NBytes + wokBytesTag 0xFFFC + internTag skip + deref/derefPure arms + renderRCValue + free-cascade; RC/Heap.hs FFI (wok_bytes_* + wok_validate_utf8); RC/Prim.hs 7 prims (abstract + C-heap) + registration; RC drop discipline.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Value.hs\", \"src/Wok/Interp/RC/Heap.hs\", \"src/Wok/Interp/RC/Prim.hs\"], \"verifyCommand\": \"cabal build 2>&1 | tail -5\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "Task 8: Tests — corpus, harness, agreement, properties",
+      "status": "pending",
+      "blockedBy": [10, 11],
+      "description": "test/rc-bytes/ corpus (valid->Some, four-invalid->None, round-trips, OOB/out-of-range traps, eqBytes); Spec.hs harness wiring (differential/stats/C-parity/run-golden); interpPrimTests update; Haskell<->C validator agreement + QuickCheck properties.\n\n```json:metadata\n{\"files\": [\"test/rc-bytes/\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test 2>&1 | tail -25\", \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "Task 9: Phase 6 — hlint + Opus deep review + /code-review high",
+      "status": "pending",
+      "blockedBy": [12],
+      "description": "Whole-branch quality gate: hlint (ignore src-generated), Opus deep review (test soundness on Opus), /code-review high; fix findings; re-verify green. Coordinator-run after Tasks 1-8.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"hlint src --ignore-glob=src-generated 2>&1 | tail -5; cabal test 2>&1 | tail -15\", \"modelTier\": \"frontier\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-28"
+}

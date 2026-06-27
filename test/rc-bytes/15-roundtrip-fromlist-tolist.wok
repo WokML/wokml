@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- round-trip: length (fromList (toList b)) == length b
+-- fromList [5, 6, 7] -> toList -> fromList -> length 3
+main : U64
+main = length (fromList (toList (fromList [5, 6, 7])))

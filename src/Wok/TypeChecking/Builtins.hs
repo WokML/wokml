@@ -32,6 +32,7 @@ initialEnv = emptyEnv
       [ ("U64",    TyConInfo KStar 0 [] False [])
       , ("U32",    TyConInfo KStar 0 [] False [])
       , ("String", TyConInfo KStar 0 [] False [])
+      , ("Bytes",  TyConInfo KStar 0 [] False [])
       , ("Never",  TyConInfo KStar 0 [] False [])
       , ("Char",   TyConInfo KStar 0 [] False [])
       , ("()",     TyConInfo KStar 0 [] False [])

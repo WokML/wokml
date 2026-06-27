@@ -511,4 +511,5 @@ isStringBinder = isStringType . bndType
 
 isStringType :: CType -> Bool
 isStringType (CTCon TcString []) = True
+isStringType (CTCon TcBytes  []) = True  -- Bytes is a variable-length heap cell (WokBytes), like String: must go to the counted Heap, never the arena
 isStringType _                   = False

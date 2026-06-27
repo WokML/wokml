@@ -755,6 +755,7 @@ nodeTag (NCon t _)       = t
 nodeTag (NArray _)       = Tx.pack "<array>"
 nodeTag (NString _)      = Tx.pack "<string>"
 nodeTag (NStringView{})  = Tx.pack "<string-view>"
+nodeTag (NBytes _)       = Tx.pack "<bytes>"
 nodeTag (NRecord t _)    = t
 nodeTag NClosure{}       = Tx.pack "<closure>"
 nodeTag (NGroupCode _)   = Tx.pack "<closure>"

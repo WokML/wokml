@@ -174,6 +174,7 @@ dictName cls c = Tx.pack "dict$" <> cls <> Tx.pack "$" <> tyConKey c
 tyConKey :: TyCon -> Text
 tyConKey TcU64        = Tx.pack "U64"
 tyConKey TcU32        = Tx.pack "U32"
+tyConKey TcBytes      = Tx.pack "Bytes"
 tyConKey TcChar       = Tx.pack "Char"
 tyConKey TcString     = Tx.pack "String"
 tyConKey TcNever      = Tx.pack "Never"
@@ -294,6 +295,7 @@ resolveTyConName :: Text -> TyCon
 resolveTyConName name
   | name == Tx.pack "U64"    = TcU64
   | name == Tx.pack "U32"    = TcU32
+  | name == Tx.pack "Bytes"  = TcBytes
   | name == Tx.pack "Char"   = TcChar
   | name == Tx.pack "String" = TcString
   | name == Tx.pack "Never"  = TcNever

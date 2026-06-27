@@ -826,6 +826,7 @@ resolveTyCon :: Text -> TyCon
 resolveTyCon name
   | name == Tx.pack "U64"    = TcU64
   | name == Tx.pack "U32"    = TcU32
+  | name == Tx.pack "Bytes"  = TcBytes
   | name == Tx.pack "Char"   = TcChar
   | name == Tx.pack "String" = TcString
   | name == Tx.pack "Never"  = TcNever
@@ -3769,6 +3770,7 @@ prettyCType :: CType -> Text
 prettyCType (CTGen i) = varName i
 prettyCType (CTCon TcU64    []) = Tx.pack "U64"
 prettyCType (CTCon TcU32    []) = Tx.pack "U32"
+prettyCType (CTCon TcBytes  []) = Tx.pack "Bytes"
 prettyCType (CTCon TcChar   []) = Tx.pack "Char"
 prettyCType (CTCon TcString []) = Tx.pack "String"
 prettyCType (CTCon TcNever  []) = Tx.pack "Never"

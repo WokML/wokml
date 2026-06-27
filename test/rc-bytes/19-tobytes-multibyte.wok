@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- toBytes on a multibyte String (containing é, U+00E9, 2-byte UTF-8) always
+-- produces valid UTF-8 (it is a reinterpretation of the internal storage).
+-- The C-backend exercises the WokString -> WokBytes round-trip path.
+main : U64
+main =
+  let s = "héllo" in
+  case fromBytes (toBytes s) of
+    Some _ -> 1
+    None   -> 0

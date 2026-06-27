@@ -24,6 +24,7 @@ module Wok.Interp.Value
   ) where
 
 import Control.Exception (Exception)
+import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -67,6 +68,7 @@ data Value
                            -- The tag distinguishes two activations of the SAME
                            -- runner site that coexist (nested), so two same-typed
                            -- instances minted by one prelude runner route apart.
+  | VBytes BS.ByteString   -- a Bytes buffer: flat UTF-8-or-arbitrary bytes
 
 instance Show Value where
   show = Tx.unpack . renderValue
@@ -82,6 +84,7 @@ instance Eq Value where
   VCont{}      == VCont{}      = False
   VContP{}     == VContP{}     = False
   VInst a ta   == VInst b tb   = a == b && ta == tb
+  VBytes a     == VBytes b     = a == b
   _            == _            = False
 
 -- | A primitive: name (= hint), arity, args accumulated so far (for currying),
@@ -227,6 +230,7 @@ renderValue VPrim{}    = Tx.pack "<builtin>"
 renderValue VCont{}    = Tx.pack "<continuation>"
 renderValue VContP{}   = Tx.pack "<continuation>"
 renderValue (VInst _ _) = Tx.pack "<instance>"
+renderValue (VBytes bs) = Tx.pack ("Bytes" <> show (BS.unpack bs))
 
 renderLit :: Lit -> Text
 renderLit (LInt n)  = Tx.pack (show n)

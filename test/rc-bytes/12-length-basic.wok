@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- length of a 3-element byte buffer
+-- fromList [1, 2, 3] -> Bytes of length 3
+main : U64
+main = length (fromList [1, 2, 3])

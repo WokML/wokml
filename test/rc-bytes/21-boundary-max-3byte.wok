@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- valid UTF-8 boundary: U+FFFD replacement character (239, 191, 189)
+-- 3-byte sequence, valid Unicode scalar, fromBytes returns Some
+main : U64
+main =
+  case fromBytes (fromList [239, 191, 189]) of
+    Some _ -> 1
+    None   -> 0

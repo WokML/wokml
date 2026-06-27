@@ -125,6 +125,7 @@ isBoxedType (CTCon TcUnit   []) = False
 -- @__rc_dup@/@__rc_drop@ on String binders and Reachable tracks them as boxed
 -- locals, exactly like any other heap value.
 isBoxedType (CTCon TcString []) = True
+isBoxedType (CTCon TcBytes  []) = True
 isBoxedType (CTCon TcNever  []) = False
 -- Bool is BOXED: the RC interpreter has no scalar boolean -- it allocates a
 -- nullary constructor cell (NCon True/False, an RVBox) for every Bool (see

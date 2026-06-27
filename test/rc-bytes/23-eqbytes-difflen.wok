@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- eqBytes: buffers of different lengths are unequal even if one is a prefix
+-- of the other
+main : U64
+main =
+  if eqBytes (fromList [1, 2, 3]) (fromList [1, 2]) then 1 else 0

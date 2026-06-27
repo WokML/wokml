@@ -74,6 +74,15 @@ module Wok.IR.PrimNames
   , decodeCharAtName
   , charWidthAtName
   , singletonName
+    -- * Std.Bytes prim names
+  , stdBytesModule
+  , bytesFromListName
+  , bytesToListName
+  , bytesLengthName
+  , bytesIndexName
+  , bytesFromBytesName
+  , bytesToBytesName
+  , eqBytesName
   ) where
 
 import Data.Set (Set)
@@ -262,3 +271,38 @@ charWidthAtName = Tx.pack "charWidthAt"
 -- | @singleton c@: allocate a single-codepoint string from a Char.
 singletonName :: Text
 singletonName = Tx.pack "singleton"
+
+-- ---------------------------------------------------------------------------
+-- Std.Bytes prim names
+
+-- | The defining module of the Bytes prelude externs.
+stdBytesModule :: Text
+stdBytesModule = Tx.pack "Std.Bytes"
+
+-- | @fromList xs@: build a Bytes buffer from a list of U64 byte values.
+bytesFromListName :: Text
+bytesFromListName = Tx.pack "fromList"
+
+-- | @toList buf@: convert a Bytes buffer to a list of U64 byte values.
+bytesToListName :: Text
+bytesToListName = Tx.pack "toList"
+
+-- | @length buf@: return the number of bytes.
+bytesLengthName :: Text
+bytesLengthName = Tx.pack "length"
+
+-- | @index buf i@: look up the byte at index i (bounds-checked).
+bytesIndexName :: Text
+bytesIndexName = Tx.pack "index"
+
+-- | @fromBytes buf@: validate UTF-8 and return Some String on success.
+bytesFromBytesName :: Text
+bytesFromBytesName = Tx.pack "fromBytes"
+
+-- | @toBytes s@: convert a String to a raw Bytes buffer (always valid UTF-8).
+bytesToBytesName :: Text
+bytesToBytesName = Tx.pack "toBytes"
+
+-- | @eqBytes a b@: byte-equality comparison; defining module is 'Std.Base'.
+eqBytesName :: Text
+eqBytesName = Tx.pack "eqBytes"

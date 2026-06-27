@@ -4,7 +4,37 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+static void test_wok_bytes_cell(void);
+
+static void test_wok_validate_utf8(void) {
+    /* Valid: empty buffer */
+    assert(wok_validate_utf8((const uint8_t*)"", 0) == 1);
+
+    /* Valid: single ASCII byte */
+    assert(wok_validate_utf8((const uint8_t*)"A", 1) == 1);
+
+    /* Valid: two-byte UTF-8 sequence (é = U+00E9 = C3 A9) */
+    assert(wok_validate_utf8((const uint8_t*)"\xC3\xA9", 2) == 1);
+
+    /* Invalid: overlong encoding (U+0000 as 2-byte) */
+    assert(wok_validate_utf8((const uint8_t*)"\xC0\x80", 2) == 0);
+
+    /* Invalid: lone continuation byte */
+    assert(wok_validate_utf8((const uint8_t*)"\x80", 1) == 0);
+
+    /* Invalid: > U+10FFFF (0xF7BFBFBF encodes U+1FFFFF, outside valid range) */
+    assert(wok_validate_utf8((const uint8_t*)"\xF7\xBF\xBF\xBF", 4) == 0);
+
+    /* Invalid: lone surrogate (0xED A0 80 = U+D800, surrogate) */
+    assert(wok_validate_utf8((const uint8_t*)"\xED\xA0\x80", 3) == 0);
+
+    /* Invalid: truncated multibyte sequence (incomplete 3-byte) */
+    assert(wok_validate_utf8((const uint8_t*)"\xE2\x82", 2) == 0);
+}
+
 int main(void) {
+    /* --- UTF-8 validator sanity tests (Task 2, Slice E6) ----- */
+    test_wok_validate_utf8();
     /* --- existing round-trip + stats (must stay green under the arena) --- */
     {
         WokHeap* h = wok_heap_new();
@@ -414,6 +444,48 @@ int main(void) {
         wok_heap_free(h);
     }
 
+    /* --- WokBytes: alloc/len/data/byte_get lifecycle (Slice E6) ----------------------- */
+    test_wok_bytes_cell();
+
     printf("OK\n");
     return 0;
+}
+
+static void test_wok_bytes_cell(void) {
+    /* Basic lifecycle: alloc N=5, write bytes, read back, check len, free, stats. */
+    enum { N = 5 };
+    WokHeap* h = wok_heap_new();
+
+    WokObj* p = wok_bytes_alloc(h, (uint64_t)N);
+    assert(p != NULL);
+    assert(wok_tag(p)     == WOK_BYTES_TAG);
+    assert(wok_bytes_len(p) == (uint64_t)N);
+    assert(wok_rc(p)      == 1u);
+
+    /* Write N bytes via wok_bytes_data; include 255 to confirm no sign extension. */
+    uint8_t* body = wok_bytes_data(p);
+    body[0] = 10u;
+    body[1] = 20u;
+    body[2] = 30u;
+    body[3] = 40u;
+    body[4] = 255u;
+
+    /* Read back via wok_bytes_byte_get (zero-extended to uint64_t). */
+    assert(wok_bytes_byte_get(p, 0u) == 10u);
+    assert(wok_bytes_byte_get(p, 1u) == 20u);
+    assert(wok_bytes_byte_get(p, 2u) == 30u);
+    assert(wok_bytes_byte_get(p, 3u) == 40u);
+    assert(wok_bytes_byte_get(p, 4u) == 255u);
+
+    /* peak_bytes: same formula as WokString -- 16 + 8*ceil(N/8) */
+    uint64_t expected_bytes = 16u + 8u * (((uint64_t)N + 7u) / 8u);
+    assert(wok_stat_peak_bytes(h) == expected_bytes);
+
+    /* Decrement to zero and free; verify heap returns to baseline. */
+    assert(wok_dec(p) == 0u);
+    wok_free(h, p);
+    assert(wok_stat_live(h)   == 0);
+    assert(wok_stat_allocs(h) == wok_stat_frees(h));
+
+    wok_heap_free(h);
 }

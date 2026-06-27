@@ -281,6 +281,9 @@ void wok_free(WokHeap* h, WokObj* p) {
     } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_TAG)) {
         uint64_t byte_len = wok_string_read_byte_len(p);
         bytes = wok_string_cell_bytes(byte_len);
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_BYTES_TAG)) {
+        uint64_t byte_len = wok_string_read_byte_len(p);
+        bytes = wok_string_cell_bytes(byte_len);
     } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_VIEW_TAG)) {
         /* Fixed 32-byte cell: 8-byte header + parent ptr + offset + len. The parent is NOT
            dropped here (scan=0, Haskell-driven drop -- see D8 of the E4 spec). */
@@ -448,6 +451,22 @@ WokObj* wok_string_view_alloc(WokHeap* h, WokObj* parent, uint64_t off, uint64_t
     memcpy((char*)p + 8,  &parent_word, sizeof(uint64_t));
     memcpy((char*)p + 16, &off,         sizeof(uint64_t));
     memcpy((char*)p + 24, &len,         sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_PHYS_ADD(h, sz);   /* per-cell malloc grows physical */
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_bytes_alloc(WokHeap* h, uint64_t byte_len) {
+    size_t sz = wok_string_cell_bytes(byte_len);   /* aborts on size_t overflow */
+    WokObj* p = (WokObj*)malloc(sz);
+    if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    p->rc = 1u; p->tag = (uint16_t)WOK_BYTES_TAG; p->arity = 0u; p->scan = 0u;
+    /* Write byte_len at offset 8 (past the WokObj prefix). */
+    memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -681,6 +700,10 @@ void wok_free(WokHeap* h, WokObj* p) {
         uint64_t byte_len = wok_string_read_byte_len(p);
         bytes = wok_string_cell_bytes(byte_len);
         cls   = wok_string_class(byte_len);
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_BYTES_TAG)) {
+        uint64_t byte_len = wok_string_read_byte_len(p);
+        bytes = wok_string_cell_bytes(byte_len);
+        cls   = wok_string_class(byte_len);
     } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_STRING_VIEW_TAG)) {
         /* Fixed 32-byte cell, size class 3 (32/8-1 = 3, shared with NCon arity=3).
            The parent is NOT dropped here (scan=0, Haskell-driven drop -- D8). */
@@ -813,6 +836,40 @@ WokObj* wok_string_view_alloc(WokHeap* h, WokObj* parent, uint64_t off, uint64_t
     memcpy((char*)p + 8,  &parent_word, sizeof(uint64_t));
     memcpy((char*)p + 16, &off,         sizeof(uint64_t));
     memcpy((char*)p + 24, &len,         sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_bytes_alloc(WokHeap* h, uint64_t byte_len) {
+    size_t   sz  = wok_string_cell_bytes(byte_len);   /* aborts on size_t overflow */
+    /* Size class = 1+ceil(byte_len/8) (shared with NCon/WokArray/WokString of same byte size). */
+    size_t   cls = wok_string_class(byte_len);
+    WokObj*  p;
+    if (cls < WOK_NUM_CLASSES) {
+        WokObj* head = h->freelist[cls];
+        if (head != NULL) {                       /* reuse from shared free-list */
+            h->freelist[cls] = fl_next(head);
+            p = head;
+            h->reused += 1u;
+        } else {                                  /* bump */
+            if (h->bump_ptr == NULL || sz > (size_t)(h->bump_end - h->bump_ptr)) {
+                wok_new_slab(h);
+            }
+            p = (WokObj*)h->bump_ptr;
+            h->bump_ptr += sz;
+        }
+    } else {                                      /* large: direct malloc */
+        p = (WokObj*)malloc(sz);
+        if (WOK_UNLIKELY(p == NULL)) { abort(); }
+        WOK_PHYS_ADD(h, sz);   /* large bytes (byte_len >= 8*63) malloc grows physical */
+    }
+    p->rc = 1u; p->tag = (uint16_t)WOK_BYTES_TAG; p->arity = 0u; p->scan = 0u;
+    /* Write byte_len at offset 8 (past the WokObj prefix). */
+    memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -990,6 +1047,25 @@ uint8_t* wok_string_data(WokObj* p) {
 
 uint64_t wok_string_byte_get(const WokObj* p, uint64_t i) {
     assert((uint32_t)p->tag == WOK_STRING_TAG);
+    assert(i < wok_string_read_byte_len(p));
+    return (uint64_t)(((const uint8_t*)((const char*)p + 16))[i]);
+}
+
+/* ---- WokBytes accessors (shared, no allocator involvement) -------------------------- */
+
+uint64_t wok_bytes_len(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_BYTES_TAG);
+    return wok_string_read_byte_len(p);
+}
+
+uint8_t* wok_bytes_data(WokObj* p) {
+    assert((uint32_t)p->tag == WOK_BYTES_TAG);
+    /* Body starts at offset 16 (8-byte WokObj prefix + 8-byte byte_len field). */
+    return (uint8_t*)((char*)p + 16);
+}
+
+uint64_t wok_bytes_byte_get(const WokObj* p, uint64_t i) {
+    assert((uint32_t)p->tag == WOK_BYTES_TAG);
     assert(i < wok_string_read_byte_len(p));
     return (uint64_t)(((const uint8_t*)((const char*)p + 16))[i]);
 }

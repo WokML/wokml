@@ -44,6 +44,7 @@ newtype Level = Level Int
 data TyCon
   = TcU64
   | TcU32
+  | TcBytes
   | TcChar
   | TcString
   | TcNever

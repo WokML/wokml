@@ -1,14 +1,14 @@
 zipSum p.1 p.2 =
-  join j34(x, xs, y, ys) =
+  join j38(x, xs, y, ys) =
     let t.1 = +(x, y)
     let t.2 = zipSum(xs, ys)
     let t.3 = +(t.1, t.2)
     t.3
-  join j42() =
+  join j46() =
     0
   case p.1 of
     Cons f.1 f.2 ->
       case p.2 of
-        Cons f.3 f.4 -> jump j34(f.1, f.2, f.3, f.4)
-        _ -> jump j42()
-    _ -> jump j42()
+        Cons f.3 f.4 -> jump j38(f.1, f.2, f.3, f.4)
+        _ -> jump j46()
+    _ -> jump j46()

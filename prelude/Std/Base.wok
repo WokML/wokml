@@ -67,3 +67,8 @@ extern eqString : String -> String -> Bool
 
 instance Eq String where
   (==) = eqString
+
+extern eqBytes : Bytes -> Bytes -> Bool
+
+instance Eq Bytes where
+  (==) = eqBytes

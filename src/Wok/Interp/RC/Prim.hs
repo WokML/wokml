@@ -9,6 +9,7 @@ import Control.Monad.Trans.Except (throwE)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
+import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
@@ -22,7 +23,8 @@ import Wok.Interp.RC.Value
   , Node (..), Cell (..), Store (..), alloc, deref, incref, dropAddr, dropReuse, writeNode
   , continuationOwned, valueChildren
   , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC
-  , maxInlineStr, allocNStringView, wokStringTag )
+  , maxInlineStr, allocNStringView, wokStringTag
+  , wokBytesTag )
 import Wok.Interp.Value (RuntimeError (..))
 import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
@@ -53,6 +55,8 @@ taggedRcPrims =
   ++ map (PN.stdControlModule,) rcControlPrims
   ++ map (PN.stdArrayModule,)   rcArrayPrims
   ++ map (PN.stdStringModule,)  rcStringPrims
+  ++ map (PN.stdBytesModule,)   rcBytesPrims
+  ++ map (PN.stdBaseModule,)    rcBytesBasePrims
 
 rcBasePrims :: [RCPrim]
 rcBasePrims =
@@ -70,6 +74,10 @@ rcBasePrims =
   , dollarP
   , eqString
   ]
+
+-- | Bytes prims under Std.Base (eqBytes mirrors eqString's keying in Std.Base).
+rcBytesBasePrims :: [RCPrim]
+rcBytesBasePrims = [ eqBytesRC ]
 
 -- | Compiler-SYNTHESIZED RC intrinsics. These reach the machine via 'AVar'-with-hint
 -- (not 'APrim'), so the dispatch uses an empty-module sentinel as the table key.
@@ -113,6 +121,16 @@ rcStringPrims =
   , decodeCharAtRC
   , charWidthAtRC
   , singletonRC
+  ]
+
+rcBytesPrims :: [RCPrim]
+rcBytesPrims =
+  [ bytesLengthRC
+  , bytesIndexRC
+  , bytesFromListRC
+  , bytesToListRC
+  , bytesFromBytesRC
+  , bytesToBytesRC
   ]
 
 -- ---------------------------------------------------------------------------
@@ -1036,3 +1054,187 @@ singletonRC = RCPrim PN.singletonName 1 [] $ \args s -> case args of
     (na, s1) <- alloc (NString bs) s
     pure (PRDone (RVBox na), s1)
   _ -> throwE (ArityError PN.singletonName)
+
+-- ---------------------------------------------------------------------------
+-- Bytes primitives (Slice E6, spec §Bytes)
+--
+-- Bytes are represented as 'NBytes ByteString' cells on the RC heap.
+-- All prims CONSUME their 'RVBox' arguments (ownership moves in) and drop
+-- the consumed cell with 'dropAddr' after reading, following the String and
+-- Array convention. RC deltas per op:
+--   fromList / toBytes / fromBytes (success) : +1 alloc (new NBytes or NString cell)
+--   length / index / toList / eqBytes        : 0 or +N alloc
+--
+-- DROP DISCIPLINE: each prim drops each consumed boxed operand exactly once
+-- AFTER reading its bytes. No double-free; no leak.
+
+-- | Extract the 'ByteString' from an 'NBytes' boxed handle. Fails with
+-- 'PrimError' if the value is not a Bytes cell. On 'CHeap' with a genuine
+-- 'WokBytes' cell (tag == wokBytesTag), reads via the FFI fast path; any
+-- other 'CAddr' (impossible by construction) falls through to deref.
+bytesBytes :: RCValue -> Store -> RC BS.ByteString
+bytesBytes (RVBox a@(CAddr p)) s = case stBackend s of
+  CHeap _ -> do
+    tid <- liftIO (H.wokTag p)
+    if tid == wokBytesTag
+      then do
+        blen    <- liftIO (H.wokBytesLen p)
+        dataPtr <- liftIO (H.wokBytesData p)
+        liftIO (BS.packCStringLen (castPtr dataPtr, fromIntegral blen))
+      else bytesViaDeref (RVBox a) s
+  AbstractHeap -> bytesViaDeref (RVBox a) s
+bytesBytes v s = bytesViaDeref v s
+
+-- | Fallback: deref the handle and extract bytes from the node.
+bytesViaDeref :: RCValue -> Store -> RC BS.ByteString
+bytesViaDeref (RVBox a) s = do
+  c <- deref a s
+  case cNode c of
+    NBytes bs -> pure bs
+    _         -> throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
+bytesViaDeref _ _ = throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
+
+-- | @length buf@: byte count of the buffer. Consumes 'buf'. RC: 0 alloc.
+bytesLengthRC :: RCPrim
+bytesLengthRC = RCPrim PN.bytesLengthName 1 [] $ \args s -> case args of
+  [bv@(RVBox a)] -> do
+    bs <- bytesBytes bv s
+    let n = BS.length bs
+    s1 <- dropAddr a s
+    pure (PRDone (RVLit (LInt (toInteger n))), s1)
+  _ -> throwE (ArityError PN.bytesLengthName)
+
+-- | @index buf i@: the i-th byte as a U64 (0-based, bounds-checked).
+-- OOB raises 'PrimError'. Consumes 'buf'. RC: 0 alloc.
+-- On 'CHeap' with a genuine 'WokBytes' cell, bounds-checks via 'wokBytesLen'
+-- and reads one byte via 'wokBytesByteGet' (no full-body copy).
+bytesIndexRC :: RCPrim
+bytesIndexRC = RCPrim PN.bytesIndexName 2 [] $ \args s -> case args of
+  [RVBox (CAddr p), iv] -> case stBackend s of
+    CHeap _ -> do
+      tid <- liftIO (H.wokTag p)
+      if tid == wokBytesTag
+        then do
+          i    <- asStringIndex iv
+          blen <- liftIO (H.wokBytesLen p)
+          if i >= fromIntegral blen
+            then throwE (PrimError (Tx.pack "Bytes.index: out of bounds"))
+            else do
+              byte <- liftIO (H.wokBytesByteGet p (fromIntegral i))
+              s1   <- dropAddr (CAddr p) s
+              pure (PRDone (RVLit (LInt (toInteger byte))), s1)
+        else bytesIndexViaBytes (CAddr p) iv s
+    AbstractHeap -> bytesIndexViaBytes (CAddr p) iv s
+  [RVBox a, iv] -> bytesIndexViaBytes a iv s
+  _ -> throwE (ArityError PN.bytesIndexName)
+
+-- | Fallback: read all bytes and index into the ByteString.
+bytesIndexViaBytes :: Addr -> RCValue -> Store -> RC (RCPrimResult, Store)
+bytesIndexViaBytes a iv s = do
+  bs <- bytesBytes (RVBox a) s
+  i  <- asStringIndex iv
+  if i >= BS.length bs
+    then throwE (PrimError (Tx.pack "Bytes.index: out of bounds"))
+    else do
+      let byte = BS.index bs i
+      s1 <- dropAddr a s
+      pure (PRDone (RVLit (LInt (toInteger (byte :: Word8)))), s1)
+
+-- | @fromList xs@: build a Bytes buffer from a Cons/Nil list of U64 byte
+-- values (0-255). Out-of-range element raises 'PrimError'. RC: +1 alloc.
+-- DROP DISCIPLINE: 'collectList' increfs each head into the collected list;
+-- 'dropValue xs' drops the spine (each head is then owned by 'elems').
+-- The byte values are extracted from the elements, then the elements themselves
+-- are dropped as part of collecting (they are LInt literals, no boxed drop needed).
+bytesFromListRC :: RCPrim
+bytesFromListRC = RCPrim PN.bytesFromListName 1 [] $ \args s -> case args of
+  [xs] -> do
+    (elems, s1) <- collectList xs s
+    ws <- mapM asByteElem elems
+    s2 <- dropValue xs s1
+    (na, s3) <- alloc (NBytes (BS.pack ws)) s2
+    pure (PRDone (RVBox na), s3)
+  _ -> throwE (ArityError PN.bytesFromListName)
+  where
+    asByteElem :: RCValue -> RC Word8
+    asByteElem (RVLit (LInt n))
+      | n >= 0 && n <= 255 = pure (fromIntegral n)
+      | otherwise           = throwE (PrimError (Tx.pack "Bytes.fromList: byte value out of range (0-255)"))
+    asByteElem _ = throwE (PrimError (Tx.pack "Bytes.fromList: expected U64 byte"))
+
+-- | @toList buf@: convert a Bytes buffer to a Cons/Nil list of U64 byte values.
+-- Each byte becomes an 'RVLit (LInt b)' (immediate, no alloc). The list cons
+-- cells are allocated; the input is dropped. RC: +N alloc (N Cons cells).
+bytesToListRC :: RCPrim
+bytesToListRC = RCPrim PN.bytesToListName 1 [] $ \args s -> case args of
+  [bv@(RVBox a)] -> do
+    bs         <- bytesBytes bv s
+    let vs      = map (RVLit . LInt . fromIntegral) (BS.unpack bs)
+    (lst, s1)  <- buildList vs s
+    s2         <- dropAddr a s1
+    pure (PRDone lst, s2)
+  _ -> throwE (ArityError PN.bytesToListName)
+
+-- | @fromBytes buf@: validate that the bytes are valid UTF-8; return
+-- @Some s@ on success, @None@ on failure. Consumes 'buf'. RC: +1 alloc on
+-- success (new NString cell + Some NCon); 0 alloc on failure (None inline).
+-- On 'CHeap' validates via 'wokValidateUtf8' using the cell's data pointer
+-- directly. On 'AbstractHeap' uses the pure 'Utf8.validateUtf8'.
+bytesFromBytesRC :: RCPrim
+bytesFromBytesRC = RCPrim PN.bytesFromBytesName 1 [] $ \args s -> case args of
+  [bv@(RVBox a)] -> do
+    bs  <- bytesBytes bv s
+    ok  <- bytesValidateUtf8 a bs s
+    s1  <- dropAddr a s
+    if ok
+      then do
+        (na, s2)    <- alloc (NString bs) s1
+        (someA, s3) <- alloc (NCon (Tx.pack "Some") [RVBox na]) s2
+        pure (PRDone (RVBox someA), s3)
+      else do
+        (noneA, s2) <- alloc (NCon (Tx.pack "None") []) s1
+        pure (PRDone (RVBox noneA), s2)
+  _ -> throwE (ArityError PN.bytesFromBytesName)
+
+-- | Validate bytes as UTF-8. On 'CHeap' with a genuine 'WokBytes' cell, calls
+-- 'wokValidateUtf8' on the data pointer (no extra copy). Otherwise uses the
+-- pure Haskell 'Utf8.validateUtf8'. Called before the input is dropped.
+bytesValidateUtf8 :: Addr -> BS.ByteString -> Store -> RC Bool
+bytesValidateUtf8 (CAddr p) _ s = case stBackend s of
+  CHeap _ -> do
+    tid <- liftIO (H.wokTag p)
+    if tid == wokBytesTag
+      then do
+        blen    <- liftIO (H.wokBytesLen p)
+        dataPtr <- liftIO (H.wokBytesData p)
+        result  <- liftIO (H.wokValidateUtf8 dataPtr blen)
+        pure (result /= 0)
+      -- Non-bytes CAddr: unreachable (bytesBytes confirmed NBytes) -- fail loud.
+      else throwE (PrimError (Tx.pack "internal: bytesValidateUtf8: non-bytes CAddr under CHeap"))
+  AbstractHeap -> throwE (PrimError (Tx.pack "internal: bytesValidateUtf8: CAddr under AbstractHeap"))
+bytesValidateUtf8 _ bs _ = pure (Utf8.validateUtf8 bs)
+
+-- | @toBytes s@: reinterpret a String as a Bytes buffer (always valid UTF-8).
+-- Consumes the string. RC: +1 alloc (new NBytes cell).
+bytesToBytesRC :: RCPrim
+bytesToBytesRC = RCPrim PN.bytesToBytesName 1 [] $ \args s -> case args of
+  [sv@(RVBox a)] -> do
+    bs       <- stringBytes sv s        -- handles InlineStr / CAddr / HAddr uniformly
+    (na, s1) <- alloc (NBytes bs) s     -- alloc BEFORE drop (bs is already a Haskell copy)
+    s2       <- dropAddr a s1
+    pure (PRDone (RVBox na), s2)
+  _ -> throwE (ArityError PN.bytesToBytesName)
+
+-- | @eqBytes a b@: byte-equality of two Bytes buffers. Consumes both. RC: 0 alloc.
+-- Mirrors 'eqString'. Result is a freshly-allocated boxed Bool.
+eqBytesRC :: RCPrim
+eqBytesRC = RCPrim PN.eqBytesName 2 [] $ \args s -> case args of
+  [av@(RVBox aa), bv@(RVBox ba)] -> do
+    bsa <- bytesBytes av s
+    bsb <- bytesBytes bv s
+    let eq = bsa == bsb
+    s1         <- dropAddr aa s
+    s2         <- dropAddr ba s1
+    (boolV, s3) <- allocBool eq s2
+    pure (PRDone boolV, s3)
+  _ -> throwE (ArityError PN.eqBytesName)

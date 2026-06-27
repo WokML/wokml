@@ -289,6 +289,7 @@ containsCont VLit{}         = False
 containsCont VPrim{}        = False
 containsCont VClosure{}     = False
 containsCont VInst{}        = False
+containsCont VBytes{}       = False
 
 -- | Reject a value crossing the transport (a promise cell or a channel) if it
 -- carries a captured continuation; @where@ names the boundary for the error.

@@ -1,6 +1,7 @@
 module Wok.Interp.Utf8
   ( utf8Width
   , decodeCharAt
+  , validateUtf8
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL)
@@ -8,6 +9,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (chr)
 import qualified Data.Text as Tx
+import qualified Data.Text.Encoding as TxEnc
 import Data.Word (Word8)
 import Wok.Interp.Value (RuntimeError (PrimError))
 
@@ -39,3 +41,11 @@ decodeCharAt bs i = do
         _ -> (fromIntegral (b0 .&. 0x07) `shiftL` 18) .|. (cont 1 `shiftL` 12)
                                                       .|. (cont 2 `shiftL` 6)  .|. cont 3
   Right (chr cp, w)
+
+-- | True iff the bytes are well-formed UTF-8 (rejects overlong, lone
+-- continuation, > U+10FFFF, lone surrogate). The reference/abstract-heap gate
+-- for Std.Bytes.fromBytes, and the oracle anchor the C DFA must match.
+validateUtf8 :: ByteString -> Bool
+validateUtf8 bs = case TxEnc.decodeUtf8' bs of
+  Right _ -> True
+  Left  _ -> False

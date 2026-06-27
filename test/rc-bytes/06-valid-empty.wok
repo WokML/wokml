@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- valid UTF-8: empty byte buffer
+-- empty is trivially valid; fromBytes returns Some
+main : U64
+main =
+  case fromBytes (fromList []) of
+    Some _ -> 1
+    None   -> 0

@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- toBytes on a let-bound String variable (not just a literal) to exercise
+-- the RVBox path in the RC/C backend.  The result is valid UTF-8 so
+-- fromBytes returns Some.
+toBytesThenValidate : String -> U64
+toBytesThenValidate s =
+  case fromBytes (toBytes s) of
+    Some _ -> 1
+    None   -> 0
+
+main : U64
+main = toBytesThenValidate "hello world"

@@ -93,6 +93,7 @@ slotClassOf (CTCon TcU32    []) = KLitInt
 slotClassOf (CTCon TcChar   []) = KLitChar
 slotClassOf (CTCon TcUnit   []) = KLitUnit
 slotClassOf (CTCon TcString []) = KPointer
+slotClassOf (CTCon TcBytes  []) = KPointer
 slotClassOf _                   = KPointer
 
 -- | The per-field slot-kind signature of a constructor, given the 'CType' of each

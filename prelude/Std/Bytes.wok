@@ -1,0 +1,13 @@
+module Std.Bytes
+import Std.Base
+
+-- A raw, unverified byte buffer (not necessarily valid UTF-8).
+-- The tycon is pre-registered in the compiler's initial environment
+-- (kind *, arity 0); no extern type declaration is needed here.
+
+extern fromList  : [U64] -> Bytes
+extern toList    : Bytes -> [U64]
+extern length    : Bytes -> U64
+extern index     : Bytes -> U64 -> U64
+extern fromBytes : Bytes -> Option String
+extern toBytes   : String -> Bytes

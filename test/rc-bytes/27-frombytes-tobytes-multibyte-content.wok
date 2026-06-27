@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- PB6 content round-trip (multibyte): fromBytes (toBytes s) recovers a string
+-- content-equal to the original across a WokString->WokBytes->WokString trip.
+-- The string contains 2-byte UTF-8 sequences (e-acute U+00E9, o-umlaut U+00F6)
+-- and a 3-byte sequence (euro sign U+20AC), proving multibyte codepoints are
+-- preserved verbatim.  Expected result: 1.
+main : U64
+main =
+  case fromBytes (toBytes "héllo wörld €") of
+    Some r -> if eqString r "héllo wörld €" then 1 else 0
+    None   -> 0

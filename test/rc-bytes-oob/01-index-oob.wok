@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- Out-of-bounds index: both the reference interpreter and the RC interpreter
+-- must raise a PrimError.  fromList [1, 2] has length 2; index 5 is out of
+-- bounds.  The differential harness treats (Left, Left) as agreement.
+main : U64
+main = index (fromList [1, 2]) 5

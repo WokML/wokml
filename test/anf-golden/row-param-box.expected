@@ -1,8 +1,8 @@
 peek p =
-  join j34(n) =
+  join j38(n) =
     n
   case p of
-    Box f -> jump j34(f)
+    Box f -> jump j38(f)
 
 main =
   let t.1 = Box(5)

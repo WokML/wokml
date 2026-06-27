@@ -9,6 +9,8 @@ module Wok.Interp.RC.Heap
   , wokArrayAlloc, wokArrayLen, wokArrayElemKind, wokArraySlotGet, wokArraySlotSet
   , wokStringAlloc, wokStringLen, wokStringData, wokStringByteGet
   , wokStringViewAlloc, wokStringViewParent, wokStringViewOffset, wokStringViewLen
+  , wokBytesAlloc, wokBytesLen, wokBytesData, wokBytesByteGet
+  , wokValidateUtf8
   , wokArenaOpen, wokArenaAlloc, wokArenaClose, wokStatArenaBytes, wokStatArenaPeak
   ) where
 
@@ -50,6 +52,11 @@ foreign import ccall unsafe "wok_string_view_alloc"  wokStringViewAlloc  :: Ptr 
 foreign import ccall unsafe "wok_string_view_parent" wokStringViewParent :: Ptr WokObj -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_string_view_offset" wokStringViewOffset :: Ptr WokObj -> IO Word64
 foreign import ccall unsafe "wok_string_view_len"    wokStringViewLen    :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_bytes_alloc"    wokBytesAlloc    :: Ptr WokHeap -> Word64 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_bytes_len"      wokBytesLen      :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_bytes_data"     wokBytesData     :: Ptr WokObj -> IO (Ptr Word8)
+foreign import ccall unsafe "wok_bytes_byte_get" wokBytesByteGet  :: Ptr WokObj -> Word64 -> IO Word64
+foreign import ccall unsafe "wok_validate_utf8"  wokValidateUtf8  :: Ptr Word8 -> Word64 -> IO Int
 foreign import ccall unsafe "wok_arena_open"         wokArenaOpen        :: Ptr WokHeap -> IO Word32
 foreign import ccall unsafe "wok_arena_alloc"      wokArenaAlloc    :: Ptr WokHeap -> Word32 -> Word32 -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_arena_close"      wokArenaClose    :: Ptr WokHeap -> Word32 -> IO ()

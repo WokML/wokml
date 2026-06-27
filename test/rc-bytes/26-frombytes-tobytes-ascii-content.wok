@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- PB6 content round-trip (ASCII): fromBytes (toBytes s) recovers a string
+-- that is content-equal to the original.  The recovered string is compared
+-- via eqString, not just checked for Some.  Expected result: 1.
+main : U64
+main =
+  case fromBytes (toBytes "hello world") of
+    Some r -> if eqString r "hello world" then 1 else 0
+    None   -> 0

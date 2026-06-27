@@ -15,7 +15,7 @@ BASE="-std=c17 -O1 -g $WARN $PHYS -Iruntime"
 
 run() { # $1 = label, $2.. = extra defines
   local label="$1"; shift
-  $CC $BASE $SAN "$@" runtime/wok_rc.c runtime/test/wok_rc_test.c -o /tmp/wok_rc_test
+  $CC $BASE $SAN "$@" runtime/wok_rc.c runtime/wok_utf8.c runtime/test/wok_rc_test.c -o /tmp/wok_rc_test
   echo "== $label =="
   if [ "$(uname -s)" = "Darwin" ]; then
     /tmp/wok_rc_test                          # LSan unsupported on Apple's ASan runtime

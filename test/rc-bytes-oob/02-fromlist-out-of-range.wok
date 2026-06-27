@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- Out-of-range byte value: fromList with a value > 255 must raise a PrimError.
+-- 256 is not a valid byte value (0-255 is the allowed range).
+main : U64
+main = length (fromList [256])

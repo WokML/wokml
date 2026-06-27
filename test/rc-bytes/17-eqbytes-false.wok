@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- eqBytes: unequal buffers compare as False
+-- fromList [1, 2] /= fromList [1, 3]
+main : U64
+main =
+  if eqBytes (fromList [1, 2]) (fromList [1, 3]) then 1 else 0

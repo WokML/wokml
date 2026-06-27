@@ -12,6 +12,7 @@ data-files:         prelude/Std/Base.wok
                     prelude/Std/Control.wok
                     prelude/Std/Array.wok
                     prelude/Std/String.wok
+                    prelude/Std/Bytes.wok
 
 -- Plain -Wall, used by the generated parser sublibrary (BNFC/alex/happy
 -- output carries unavoidable warnings, so it must NOT be -Werror).
@@ -117,6 +118,7 @@ library
         Wok.Runtime.StringZilla
     c-sources:        runtime/wok_rc.c
                       runtime/wok_str_ops.c
+                      runtime/wok_utf8.c
     include-dirs:     runtime
                       runtime/vendor
     cc-options:       -std=c17 -O3 -fstrict-aliasing -Wstrict-aliasing=2 -fwrapv

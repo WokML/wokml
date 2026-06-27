@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- valid UTF-8: mixed ASCII + 2-byte sequence
+-- 65 = 'A', 195 169 = U+00E9 (e-acute)
+-- fromBytes returns Some
+main : U64
+main =
+  case fromBytes (fromList [65, 195, 169]) of
+    Some _ -> 1
+    None   -> 0

@@ -390,6 +390,7 @@ prettyCTypeLocal :: CType -> Text
 prettyCTypeLocal (CTGen i)            = Tx.pack "a" <> Tx.pack (show i)
 prettyCTypeLocal (CTCon TcU64    [])  = Tx.pack "U64"
 prettyCTypeLocal (CTCon TcU32    [])  = Tx.pack "U32"
+prettyCTypeLocal (CTCon TcBytes  [])  = Tx.pack "Bytes"
 prettyCTypeLocal (CTCon TcChar   [])  = Tx.pack "Char"
 prettyCTypeLocal (CTCon TcString [])  = Tx.pack "String"
 prettyCTypeLocal (CTCon TcNever  [])  = Tx.pack "Never"
