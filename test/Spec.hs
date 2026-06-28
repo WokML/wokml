@@ -165,6 +165,10 @@ main = do
   -- (index out of bounds, fromList value > 255).  Wired to rcDifferential only
   -- (both-fail = agreement), matching the Array/String OOB pattern.
   rcBytesOobFiles <- findByExtension [".wok"] "test/rc-bytes-oob"
+  -- FFI bytes-in Slice 1: deterministic producer corpus (__ffi_demo_copy /
+  -- __ffi_demo_adopt).  Programs are handler-free.  Wired to rc differential +
+  -- rc stats + C-backend parity, matching the rc-bytes pattern.
+  rcFfiBytesFiles <- findByExtension [".wok"] "test/rc-ffi-bytes"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -260,6 +264,7 @@ main = do
     , rcStringNodeTests
     , rcStringViewNodeTests
     , rcStringCCellTests
+    , rcForeignBytesStoreTests
     , rcInlineStringTests
     , rcInlineStringSlotTests
     , rcArrayPrimTests
@@ -411,6 +416,20 @@ main = do
     , rvRecMemberRepTests
     , rcM2b1FragmentTests
     , rcM2b2ContinuationOwnedTests
+    -- FFI bytes-in Slice 1: dedicated group so `-p "ffi bytes"` selects it.
+    -- Runs rc differential + rc stats + C-heap parity for rcFfiBytesFiles;
+    -- mirrors the rc-bytes corpus wiring.
+    , testGroup "ffi bytes"
+        [ testGroup "rc differential"
+            [ testCase (takeBaseName f) (rcDifferentialHarness f)
+            | f <- rcFfiBytesFiles ]
+        , testGroup "rc stats"
+            [ testCase (takeBaseName f) (rcStatsHarness f)
+            | f <- rcFfiBytesFiles ]
+        , rcCBackendParity rcFfiBytesFiles
+        , rcFfiBytesZeroCopySavingPin
+        , rcFfiBytesSoundness
+        ]
     ]
 
 goldenFor :: FilePath -> FilePath
@@ -4736,7 +4755,8 @@ interpPrimTests = testGroup "InterpPrim"
                   ,"indexOfFromRaw","hash","editDistance","slice","byteSlice"
                   ,"decodeCharAt","charWidthAt","singleton"]
               ++ map (T.pack "Std.Bytes",)
-                  ["fromList","toList","length","index","fromBytes","toBytes"]
+                  ["fromList","toList","length","index","fromBytes","toBytes"
+                  ,"__ffi_demo_copy","__ffi_demo_adopt"]
               )
   , testCase "addition" $
       case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
@@ -7964,6 +7984,219 @@ rcStringCCellTests = testGroup "rc string C-cell store algebra"
           cAllocs <- Heap.wokStatAllocs hp
           cAllocs @?= 0
           Heap.wokHeapFree hp
+  ]
+
+-- ---------------------------------------------------------------------------
+-- RC NForeignBytes store-level tests (FFI Slice 1, Task 2)
+--
+-- Tests the NForeignBytes constructor on BOTH the AbstractHeap and CHeap
+-- backends:
+--   * wouldBeCBytes always 24 regardless of buffer length.
+--   * nodeCEligible is False (own alloc path).
+--   * nodeValues returns [] (no child refs).
+--   * On AbstractHeap: allocPure charges 24B to stCurBytes/stPeakBytes; drop
+--     returns to baseline.
+--   * On CHeap: alloc allocates a real WokForeignBytes cell; bytesBytes reads
+--     back the correct bytes; dup-then-double-drop is balanced and crash-free
+--     with stLive/stCurBytes returning to baseline.
+-- ---------------------------------------------------------------------------
+
+rcForeignBytesStoreTests :: TestTree
+rcForeignBytesStoreTests = testGroup "foreign bytes store"
+  [ testCase "wouldBeCBytes (NForeignBytes _) == 24 for any buffer size" $ do
+      St.wouldBeCBytes (St.NForeignBytes BS.empty) @?= (24 :: Int)
+      St.wouldBeCBytes (St.NForeignBytes (BS.pack [0..4])) @?= (24 :: Int)
+      St.wouldBeCBytes (St.NForeignBytes (BS.pack (replicate 100 0))) @?= (24 :: Int)
+
+  , testCase "nodeCEligible (NForeignBytes _) == False (own alloc path)" $ do
+      St.nodeCEligible (St.NForeignBytes (BS.pack [0..4])) @?= False
+
+  , testCase "nodeValues (NForeignBytes _) == [] (no child refs)" $ do
+      St.nodeValues (St.NForeignBytes (BS.pack [0..4])) @?= []
+
+  , testCase "AbstractHeap: alloc charges 24B, read-back correct, drop to baseline" $ do
+      let bs       = BS.pack [0..4]  -- 5 bytes
+          s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (a, s1)  = St.allocPure (St.NForeignBytes bs) s0
+      -- Fixed 24B charge, not 16 + 8*ceil(5/8) = 24 (coincidence for this len,
+      -- but the test below confirms the constant regardless of length).
+      St.stCurBytes  (St.stStats s1) @?= 24
+      St.stPeakBytes (St.stStats s1) @?= 24
+      St.stLive (St.stStats s1) @?= baseline + 1
+      -- Read-back via derefPure.
+      case St.derefPure a s1 of
+        Left e  -> assertFailure ("derefPure NForeignBytes failed: " <> show e)
+        Right c -> St.cNode c @?= St.NForeignBytes bs
+      -- Drop: stLive returns to baseline, stCurBytes returns to 0.
+      case St.dropAddrPure a s1 of
+        Left e  -> assertFailure ("dropAddrPure NForeignBytes failed: " <> show e)
+        Right s2 -> do
+          St.stLive     (St.stStats s2) @?= baseline
+          St.stCurBytes (St.stStats s2) @?= 0
+          St.stFrees (St.stStats s2) - St.stFrees (St.stStats s1) @?= 1
+
+  , testCase "AbstractHeap: 100-byte buffer still charges 24B (fixed handle)" $ do
+      let bs      = BS.pack (replicate 100 0xAB)
+          s0      = St.emptyStore
+          (_, s1) = St.allocPure (St.NForeignBytes bs) s0
+      St.stCurBytes  (St.stStats s1) @?= 24
+      St.stPeakBytes (St.stStats s1) @?= 24
+
+  , testCase "AbstractHeap: dup then double-drop is balanced (no double-free)" $ do
+      let bs       = BS.pack [0..4]
+          s0       = St.emptyStore
+          baseline = St.stLive (St.stStats s0)
+          (a, s1)  = St.allocPure (St.NForeignBytes bs) s0
+      -- incref: rc goes to 2.
+      s2 <- case runExceptT (St.incref a s1) of
+        x -> x >>= \r -> case r of
+          Left e  -> assertFailure ("incref failed: " <> show e) >> pure s1
+          Right r' -> pure r'
+      -- First drop: rc goes to 1, cell still live.
+      case St.dropAddrPure a s2 of
+        Left e  -> assertFailure ("first dropAddrPure failed: " <> show e)
+        Right s3 -> do
+          St.stLive (St.stStats s3) @?= baseline + 1
+          -- Second drop: rc goes to 0, cell freed.
+          case St.dropAddrPure a s3 of
+            Left e  -> assertFailure ("second dropAddrPure failed: " <> show e)
+            Right s4 -> do
+              St.stLive     (St.stStats s4) @?= baseline
+              St.stCurBytes (St.stStats s4) @?= 0
+
+  , testCase "CHeap: alloc->read->drop balanced, live/cur_bytes return to baseline" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = BS.pack [0..4]  -- 5 bytes
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NForeignBytes bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NForeignBytes CHeap failed: " <> show e)
+                        >> error "unreachable" }
+        Right x -> pure x
+      -- Byte accounting: fixed 24B handle.
+      St.stCurBytes  (St.stStats s1) @?= 24
+      St.stPeakBytes (St.stStats s1) @?= 24
+      -- Read-back via alloc/deref.
+      r2 <- runExceptT (St.deref a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("deref NForeignBytes CHeap failed: " <> show e) }
+        Right c -> do
+          St.cNode c @?= St.NForeignBytes bs
+          -- Drop: live and cur_bytes return to baseline.
+          r3 <- runExceptT (St.dropAddr a s1)
+          case r3 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr NForeignBytes CHeap failed: " <> show e) }
+            Right s2 -> do
+              St.stLive     (St.stStats s2) @?= baseline
+              St.stCurBytes (St.stStats s2) @?= 0
+              cLive   <- Heap.wokStatLive   hp
+              cAllocs <- Heap.wokStatAllocs hp
+              cFrees  <- Heap.wokStatFrees  hp
+              assertEqual "C heap: live == 0 after drop" (0 :: Int64) cLive
+              assertEqual "C heap: allocs == frees" cAllocs cFrees
+              Heap.wokHeapFree hp
+
+  , testCase "CHeap: dup then double-drop balanced and crash-free" $ do
+      hp <- Heap.wokHeapNew
+      let bs       = BS.pack [0..4]
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NForeignBytes bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NForeignBytes CHeap failed: " <> show e)
+                        >> error "unreachable" }
+        Right x -> pure x
+      -- incref: rc goes to 2.
+      r2 <- runExceptT (St.incref a s1)
+      s2 <- case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("incref failed: " <> show e) >> error "unreachable" }
+        Right r' -> pure r'
+      -- First drop: rc goes to 1, no free yet.
+      r3 <- runExceptT (St.dropAddr a s2)
+      s3 <- case r3 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("first dropAddr CHeap failed: " <> show e)
+                        >> error "unreachable" }
+        Right r' -> pure r'
+      St.stLive (St.stStats s3) @?= baseline + 1
+      -- Second drop: rc goes to 0, foreign buffer freed, cell freed.
+      r4 <- runExceptT (St.dropAddr a s3)
+      case r4 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("second dropAddr CHeap failed: " <> show e) }
+        Right s4 -> do
+          St.stLive     (St.stStats s4) @?= baseline
+          St.stCurBytes (St.stStats s4) @?= 0
+          cLive   <- Heap.wokStatLive   hp
+          assertEqual "C heap: live == 0 after double-drop" (0 :: Int64) cLive
+          Heap.wokHeapFree hp
+
+  , testCase "CHeap: empty buffer alloc->read->drop balanced (malloc(0) sentinel)" $ do
+      -- The CHeap sentinel for the malloc(0)-may-return-NULL fix: an empty foreign
+      -- buffer must alloc a non-NULL pointer, read back as empty, and free cleanly.
+      hp <- Heap.wokHeapNew
+      let bs       = BS.empty
+          s0       = St.emptyStore { St.stBackend = St.CHeap hp }
+          baseline = St.stLive (St.stStats s0)
+      r <- runExceptT (St.alloc (St.NForeignBytes bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc empty NForeignBytes CHeap failed: " <> show e)
+                        >> error "unreachable" }
+        Right x -> pure x
+      St.stCurBytes (St.stStats s1) @?= 24  -- fixed handle, independent of buffer
+      -- Read back as the empty ByteString (packCStringLen with len 0).
+      r2 <- runExceptT (St.deref a s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("deref empty NForeignBytes CHeap failed: " <> show e) }
+        Right c -> do
+          St.cNode c @?= St.NForeignBytes BS.empty
+          r3 <- runExceptT (St.dropAddr a s1)
+          case r3 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr empty NForeignBytes CHeap failed: " <> show e) }
+            Right s2 -> do
+              St.stLive     (St.stStats s2) @?= baseline
+              St.stCurBytes (St.stStats s2) @?= 0
+              cLive   <- Heap.wokStatLive   hp
+              cAllocs <- Heap.wokStatAllocs hp
+              cFrees  <- Heap.wokStatFrees  hp
+              assertEqual "C heap: live == 0 after empty-buffer drop" (0 :: Int64) cLive
+              assertEqual "C heap: allocs == frees (empty buffer)" cAllocs cFrees
+              Heap.wokHeapFree hp
+
+  , testCase "CHeap: bytesBytes reads foreign cell via wokForeignBytesTag fast path" $ do
+      -- Directly exercise the bytesBytes fast path (the branch fromBytes/length/index
+      -- actually use) on a foreign-bytes CAddr, not the deref fallback.
+      hp <- Heap.wokHeapNew
+      let bs = BS.pack [0..4]  -- 5 bytes
+          s0 = St.emptyStore { St.stBackend = St.CHeap hp }
+      r <- runExceptT (St.alloc (St.NForeignBytes bs) s0)
+      (a, s1) <- case r of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("alloc NForeignBytes CHeap failed: " <> show e)
+                        >> error "unreachable" }
+        Right x -> pure x
+      r2 <- runExceptT (RCP.bytesBytes (St.RVBox a) s1)
+      case r2 of
+        Left e  -> do { Heap.wokHeapFree hp
+                      ; assertFailure ("bytesBytes on foreign cell failed: " <> show e) }
+        Right got -> do
+          got @?= bs
+          -- Clean up the cell so the heap teardown is leak-free.
+          r3 <- runExceptT (St.dropAddr a s1)
+          case r3 of
+            Left e  -> do { Heap.wokHeapFree hp
+                          ; assertFailure ("dropAddr after bytesBytes failed: " <> show e) }
+            Right _ -> Heap.wokHeapFree hp
   ]
 
 -- ---------------------------------------------------------------------------
@@ -23530,3 +23763,142 @@ bytesValidatorAgreementTests =
       , testProperty "PV-agree: validateUtf8 == wok_validate_utf8 on arbitrary [Word8]"
           prop_validatorAgreement
       ]
+
+-- ---------------------------------------------------------------------------
+-- FFI bytes-in Slice 1: zero-copy saving pin (Task 4)
+--
+-- Pins the oracle-checked charge of each byte-handling cell to a CONCRETE value
+-- at the STORE level (single alloc on a fresh AbstractHeap store; stCurBytes
+-- after one allocPure from baseline 0 IS that alloc's charge). For several n,
+-- using the same demoPattern the producers use:
+--   (1) adopt: chargeOf (NForeignBytes bs) == 24  (fixed WokForeignBytes handle,
+--       constant regardless of n; the buffer is off-heap so only the handle is
+--       counted).
+--   (2) copy : chargeOf (NBytes bs) == 16 + 8*ceil(n/8)  (header 16B + 8-byte-
+--       rounded inline body).
+--
+-- Both sides are pinned to literal arithmetic recomputed inline (NOT via
+-- 'wouldBeCBytes') so that a regression in either charge formula is caught --
+-- asserting only the difference would be a tautology (chargeCopy ==
+-- wouldBeCBytes (NBytes bs) by construction, so chargeCopy - chargeAdopt with
+-- expectedSaving = wouldBeCBytes (NBytes bs) - 24 reduces to X-24 == X-24).
+--
+-- The zero-copy win: adopt's fixed 24B beats copy's 16+8*ceil(n/8) once n>=9.
+-- For n<9 (e.g. n=0 -> 16, n=5 -> 24) the 24B handle dominates, so adoption is
+-- NOT smaller -- the pin is on the byte formula per n, not on the sign of a
+-- "saving". n=0/5 are kept as edge cases of the rounding formula.
+-- ---------------------------------------------------------------------------
+
+rcFfiBytesZeroCopySavingPin :: TestTree
+rcFfiBytesZeroCopySavingPin = testGroup "zero-copy saving pin" $
+  [ testCase ("n=" <> show n <> ": NForeignBytes charges 24B fixed") $ do
+      let bs      = Utf8.demoPattern n
+          s0      = St.emptyStore
+          (_, s1) = St.allocPure (St.NForeignBytes bs) s0
+      St.stCurBytes (St.stStats s1) @?= (24 :: Int)
+  | n <- [0, 5, 10, 64, 100]
+  ] ++
+  [ testCase ("n=" <> show n <> ": NBytes charges 16 + 8*ceil(n/8), adopt fixed 24B") $ do
+      let bs          = Utf8.demoPattern n
+          s0          = St.emptyStore
+          (_, sCopy)  = St.allocPure (St.NBytes bs) s0
+          (_, sAdopt) = St.allocPure (St.NForeignBytes bs) s0
+          chargeCopy  = St.stCurBytes (St.stStats sCopy)
+          chargeAdopt = St.stCurBytes (St.stStats sAdopt)
+      -- Pin BOTH sides to concrete values (formula recomputed inline as a
+      -- literal expression, NOT via wouldBeCBytes), so a regression in the
+      -- NBytes charge formula is caught.
+      chargeAdopt @?= (24 :: Int)
+      chargeCopy  @?= 16 + 8 * ((BS.length bs + 7) `div` 8)
+  | n <- [0, 5, 10, 64, 100]
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FFI bytes-in Slice 1: soundness death tests (Task 5)
+--
+-- Two targeted assertions that prove the adopt path is safe under sharing and
+-- under activation-escape, complementing the automatic corpus combinators.
+--
+-- (a) Dup/drop double-free guard.
+--     '07-soundness-dup-share.wok' binds ONE adopted Bytes to 'b' and uses it
+--     twice ('length b' and 'index b 0').  Both prims CONSUME their Bytes arg
+--     (each calls 'dropAddr' after reading).  Perceus therefore inserts a dup
+--     (rc 1->2) before the first use, then the two drops bring rc 2->1->0 and
+--     fire the foreign free exactly once.  If the free fired more than once the
+--     libc run would abort (heap corruption / SIGABRT).  The 'rc-c-backend-
+--     parity' combinator in the auto-run corpus is the live guard: it passes
+--     iff the CHeap run returns 'Right' and stats match the abstract run.
+--     This test adds an explicit assertion on the output ('8') so the mechanism
+--     is self-documenting; the parity oracle is what makes it a death test.
+--
+-- (b) Region-escape / early-free (UAF) regression guard.
+--     '08-soundness-escape-return.wok' builds an adopted Bytes in a helper
+--     ('makeIt') and returns it.  The value escapes the helper's activation.
+--     If it were ever freed early (e.g. at the helper's return), 'length' in
+--     'main' would be a use-after-free; on the CHeap / malloc-UAF-oracle
+--     backend that would corrupt or abort, breaking the three-backend output
+--     parity.  The meaningful assertion is therefore the output (== 8) across
+--     all three backends: the escaping adopted Bytes is read correctly after it
+--     has crossed the activation boundary, so it was not freed early.
+--
+--     NOTE: this test does NOT exercise the arena fence at runtime.  Adopted
+--     Bytes is produced by a prim call ('RApp'), never by an 'isAlloc' RHS, so
+--     the binder never reaches 'placeLet' / the 'isStringBinder' fence -- it is
+--     unconditionally counted-Heap regardless of the fence.  Asserting
+--     'arena_peak == 0' here would be vacuous (true with or without the fence),
+--     so it is deliberately omitted.  The TcBytes fence is defence-in-depth for
+--     a hypothetical future Bytes-producing alloc RHS (see Region.hs).
+--
+-- (c) Leak-balance.
+--     The 'rc stats' group (auto-run via 'findByExtension') calls
+--     'rcStatsHarness' on every '.wok' file in 'test/rc-ffi-bytes/'.
+--     'rcStatsHarness' asserts 'stLive == rcBaseline' (return to the immortal
+--     baseline, i.e. no leak) for the abstract-heap run.  The 'rc-c-backend-
+--     parity' group asserts 'stLive == rcBaseline' for the C-heap run too.
+--     Both new files are therefore automatically leak-balanced by the existing
+--     combinators; no additional assertion is needed here.
+-- ---------------------------------------------------------------------------
+
+rcFfiBytesSoundness :: TestTree
+rcFfiBytesSoundness = testGroup "ffi bytes soundness"
+  [ -- -----------------------------------------------------------------------
+    -- (a) Dup/drop double-free guard.
+    -- Asserts correct output (8) through BOTH backends.  The CHeap run is the
+    -- live double-free guard: a spurious free would crash libc before this
+    -- assertion could ever be reached.
+    testCase "07-soundness-dup-share: dup+drop gives correct output (double-free would abort)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes) <-
+        withBothBackends "test/rc-ffi-bytes/07-soundness-dup-share.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 8 (length + index)"
+            (T.pack "8") (RCM.rcOutput a)
+          assertEqual "C output == 8 (double-free-free on libc)"
+            (T.pack "8") (RCM.rcOutput c)
+          assertEqual "output parity"
+            (RCM.rcOutput a) (RCM.rcOutput c)
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (possible double-free): " <> show e)
+
+  , -- -----------------------------------------------------------------------
+    -- (b) Region-escape / early-free (UAF) regression guard.
+    -- The adopted Bytes escapes its defining activation (returned from makeIt).
+    -- The meaningful guard is the three-backend output parity (== 8): if the
+    -- escaping value were freed early, the CHeap / malloc-UAF-oracle run would
+    -- corrupt or abort and this parity would fail.  No arena assertion: the
+    -- adopt path is a prim call, never an isAlloc RHS, so it never reaches the
+    -- arena fence (arena_peak == 0 would be vacuous; see the (b) note above).
+    testCase "08-soundness-escape-return: escaping adopted Bytes read correctly (no early free)" $ do
+      (absR, cR, _cAllocs, _cPeakBytes) <-
+        withBothBackends "test/rc-ffi-bytes/08-soundness-escape-return.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 8 (escape UAF would corrupt)"
+            (T.pack "8") (RCM.rcOutput a)
+          assertEqual "C output == 8 (escape UAF would corrupt)"
+            (T.pack "8") (RCM.rcOutput c)
+          assertEqual "output parity"
+            (RCM.rcOutput a) (RCM.rcOutput c)
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (possible escape UAF): " <> show e)
+  ]

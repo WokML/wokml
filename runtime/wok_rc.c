@@ -288,6 +288,10 @@ void wok_free(WokHeap* h, WokObj* p) {
         /* Fixed 32-byte cell: 8-byte header + parent ptr + offset + len. The parent is NOT
            dropped here (scan=0, Haskell-driven drop -- see D8 of the E4 spec). */
         bytes = 32u;
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_FOREIGN_BYTES_TAG)) {
+        /* Fixed 24-byte handle. The foreign buffer at data_ptr is NOT freed here --
+           the Haskell host frees it (libc free) BEFORE calling wok_free. */
+        bytes = 24u;
     } else {
         bytes = wok_cell_bytes((uint32_t)p->arity);
     }
@@ -467,6 +471,25 @@ WokObj* wok_bytes_alloc(WokHeap* h, uint64_t byte_len) {
     p->rc = 1u; p->tag = (uint16_t)WOK_BYTES_TAG; p->arity = 0u; p->scan = 0u;
     /* Write byte_len at offset 8 (past the WokObj prefix). */
     memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_PHYS_ADD(h, sz);   /* per-cell malloc grows physical */
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_foreign_bytes_alloc(WokHeap* h, uint8_t* data_ptr, uint64_t byte_len) {
+    /* Fixed 24-byte handle. Charges its real 24B to cur_bytes; the foreign buffer is
+       off-heap and intentionally not counted. */
+    size_t sz = 24u;
+    WokObj* p = (WokObj*)malloc(sz);
+    if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    p->rc = 1u; p->tag = (uint16_t)WOK_FOREIGN_BYTES_TAG; p->arity = 0u; p->scan = 0u;
+    uintptr_t ptr_word = (uintptr_t)data_ptr;
+    memcpy((char*)p + 8,  &ptr_word, sizeof(uint64_t));
+    memcpy((char*)p + 16, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -709,6 +732,12 @@ void wok_free(WokHeap* h, WokObj* p) {
            The parent is NOT dropped here (scan=0, Haskell-driven drop -- D8). */
         bytes = 32u;
         cls   = 3u;
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_FOREIGN_BYTES_TAG)) {
+        /* Fixed 24-byte handle, size class 2 (24/8-1 = 2, shared with NCon arity=2).
+           The foreign buffer at data_ptr is NOT freed here -- the Haskell host frees it
+           (libc free) BEFORE calling wok_free, mirroring WokStringView (scan=0). */
+        bytes = 24u;
+        cls   = 2u;
     } else {
         uint32_t arity = (uint32_t)p->arity;
         bytes = wok_cell_bytes(arity);
@@ -870,6 +899,47 @@ WokObj* wok_bytes_alloc(WokHeap* h, uint64_t byte_len) {
     p->rc = 1u; p->tag = (uint16_t)WOK_BYTES_TAG; p->arity = 0u; p->scan = 0u;
     /* Write byte_len at offset 8 (past the WokObj prefix). */
     memcpy((char*)p + 8, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_foreign_bytes_alloc(WokHeap* h, uint8_t* data_ptr, uint64_t byte_len) {
+    /* Fixed 24-byte handle, size class 2 (24/8 - 1). Charges its real 24B to cur_bytes --
+       the foreign buffer is off-heap and intentionally not counted. */
+    size_t  sz  = 24u;
+    size_t  cls = 2u;   /* 24/8 - 1 = 2, always in range (< WOK_NUM_CLASSES = 64) */
+    WokObj* p;
+    /* Structurally identical to wok_string_view_alloc: the free-list/bump path is wrapped in
+       the same `if (cls < WOK_NUM_CLASSES)` guard so a future layout change cannot desync the
+       allocators. The large (cls >= WOK_NUM_CLASSES) path is UNREACHABLE for a fixed 24-byte
+       cell (cls is the constant 2); the else branch mirrors the sibling (and keeps `p` defined
+       on every path so the compiler is satisfied without an init-to-NULL). */
+    if (cls < WOK_NUM_CLASSES) {
+        WokObj* head = h->freelist[cls];
+        if (head != NULL) {                       /* reuse from shared class-2 free-list */
+            h->freelist[cls] = fl_next(head);
+            p = head;
+            h->reused += 1u;
+        } else {                                  /* bump */
+            if (h->bump_ptr == NULL || sz > (size_t)(h->bump_end - h->bump_ptr)) {
+                wok_new_slab(h);
+            }
+            p = (WokObj*)h->bump_ptr;
+            h->bump_ptr += sz;
+        }
+    } else {                                      /* large: direct malloc (unreachable for cls=2) */
+        p = (WokObj*)malloc(sz);
+        if (WOK_UNLIKELY(p == NULL)) { abort(); }
+        WOK_PHYS_ADD(h, sz);
+    }
+    p->rc = 1u; p->tag = (uint16_t)WOK_FOREIGN_BYTES_TAG; p->arity = 0u; p->scan = 0u;
+    uintptr_t ptr_word = (uintptr_t)data_ptr;
+    memcpy((char*)p + 8,  &ptr_word, sizeof(uint64_t));
+    memcpy((char*)p + 16, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
     if (h->live > h->peak) { h->peak = h->live; }
     h->cur_bytes += (uint64_t)sz;
@@ -1068,6 +1138,20 @@ uint64_t wok_bytes_byte_get(const WokObj* p, uint64_t i) {
     assert((uint32_t)p->tag == WOK_BYTES_TAG);
     assert(i < wok_string_read_byte_len(p));
     return (uint64_t)(((const uint8_t*)((const char*)p + 16))[i]);
+}
+
+/* ---- WokForeignBytes accessors (shared, no allocator involvement) -------------------- */
+
+uint8_t* wok_foreign_bytes_ptr(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_FOREIGN_BYTES_TAG);
+    uint64_t w; memcpy(&w, (const char*)p + 8, sizeof(uint64_t));
+    return (uint8_t*)(uintptr_t)w;
+}
+
+uint64_t wok_foreign_bytes_len(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_FOREIGN_BYTES_TAG);
+    uint64_t w; memcpy(&w, (const char*)p + 16, sizeof(uint64_t));
+    return w;
 }
 
 /* ---- WokArray accessors (shared, no allocator involvement) -------------------------- */

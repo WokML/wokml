@@ -83,6 +83,9 @@ module Wok.IR.PrimNames
   , bytesFromBytesName
   , bytesToBytesName
   , eqBytesName
+    -- * FFI bytes-in Slice 1: host-blessed deterministic producers
+  , ffiDemoCopyName
+  , ffiDemoAdoptName
   ) where
 
 import Data.Set (Set)
@@ -306,3 +309,18 @@ bytesToBytesName = Tx.pack "toBytes"
 -- | @eqBytes a b@: byte-equality comparison; defining module is 'Std.Base'.
 eqBytesName :: Text
 eqBytesName = Tx.pack "eqBytes"
+
+-- ---------------------------------------------------------------------------
+-- FFI bytes-in Slice 1: host-blessed deterministic producers
+
+-- | @__ffi_demo_copy n@: copy @n@ deterministic bytes (pattern @i mod 256@)
+-- into a wok-owned cell (Tier 1, @NBytes@). Transitional fixture; superseded
+-- by the real FFI surface (Slice 2).
+ffiDemoCopyName :: Text
+ffiDemoCopyName = Tx.pack "__ffi_demo_copy"
+
+-- | @__ffi_demo_adopt n@: adopt @n@ deterministic bytes (pattern @i mod 256@)
+-- into an @NForeignBytes@ cell (Tier 2, foreign-buffer path). Transitional
+-- fixture; superseded by the real FFI surface (Slice 2).
+ffiDemoAdoptName :: Text
+ffiDemoAdoptName = Tx.pack "__ffi_demo_adopt"

@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- __ffi_demo_copy 10 yields bytes 0..9 (valid UTF-8 control chars).
+-- fromBytes returns Some; length of the raw Bytes buffer is 10.
+main : U64
+main =
+  case fromBytes (__ffi_demo_copy 10) of
+    Some _ -> length (__ffi_demo_copy 10)
+    None   -> 0

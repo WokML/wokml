@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 static void test_wok_bytes_cell(void);
+static void test_foreign_bytes_cell(void);
 
 static void test_wok_validate_utf8(void) {
     /* Valid: empty buffer */
@@ -447,6 +448,9 @@ int main(void) {
     /* --- WokBytes: alloc/len/data/byte_get lifecycle (Slice E6) ----------------------- */
     test_wok_bytes_cell();
 
+    /* --- WokForeignBytes: adopted foreign buffer lifecycle (FFI Slice 1) -------------- */
+    test_foreign_bytes_cell();
+
     printf("OK\n");
     return 0;
 }
@@ -488,4 +492,44 @@ static void test_wok_bytes_cell(void) {
     assert(wok_stat_allocs(h) == wok_stat_frees(h));
 
     wok_heap_free(h);
+}
+
+/* ---- WokForeignBytes: adopted foreign buffer lifecycle (FFI Slice 1) ----------------
+   Lifecycle: malloc a genuinely foreign buffer, adopt into a WokForeignBytes cell, verify
+   tag/ptr/len/cur_bytes, then execute the host-driven drop protocol (libc free FIRST, then
+   wok_free to recycle the 24B handle). Checks wok_stat_live returns to 0.
+   Negative control: omit the libc free and LSan reports a leak. Gated under
+   WOK_FOREIGN_BYTES_LEAK_TEST so the default suite stays leak-free; scripts/asan-runtime.sh
+   runs a separate invocation with -DWOK_FOREIGN_BYTES_LEAK_TEST to verify LSan fires.
+   On Darwin, LSan is unsupported by Apple's ASan runtime, so the negative control is
+   documented but not mechanically verified in CI (same policy as WOK_RC_PHYSICAL_TEST_HOOK). */
+static void test_foreign_bytes_cell(void) {
+    WokHeap* h = wok_heap_new();
+    uint64_t base_peak = wok_stat_peak_bytes(h);
+
+    /* genuinely foreign: libc malloc, outside wok allocator */
+    uint8_t* buf = (uint8_t*)malloc(5);
+    assert(buf != NULL);
+    for (int i = 0; i < 5; i++) buf[i] = (uint8_t)i;
+
+    WokObj* p = wok_foreign_bytes_alloc(h, buf, 5);
+    assert(p != NULL);
+    assert(wok_tag(p)               == WOK_FOREIGN_BYTES_TAG);
+    assert(wok_rc(p)                == 1u);
+    assert(wok_foreign_bytes_ptr(p) == buf);
+    assert(wok_foreign_bytes_len(p) == 5u);
+    /* the 24B handle is charged; the foreign buffer is NOT counted */
+    assert(wok_stat_peak_bytes(h) >= base_peak + 24u);
+
+#ifndef WOK_FOREIGN_BYTES_LEAK_TEST
+    free(buf);   /* host-driven foreign free FIRST (libc) */
+#endif
+    /* host decremented rc to 0; now recycle the 24B handle */
+    assert(wok_dec(p) == 0u);
+    wok_free(h, p);
+    assert(wok_stat_live(h) == 0);
+    assert(wok_stat_allocs(h) == wok_stat_frees(h));
+
+    wok_heap_free(h);
+    printf("ok test_foreign_bytes_cell\n");
 }

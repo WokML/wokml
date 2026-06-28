@@ -1,6 +1,7 @@
 module Wok.Interp.RC.Prim
   ( rcPrimTable
   , stringBytes
+  , bytesBytes
   ) where
 
 import Control.Monad (foldM)
@@ -10,6 +11,7 @@ import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
 import Foreign.Ptr (castPtr)
+import Foreign.Storable (peekElemOff)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Tx
@@ -24,7 +26,7 @@ import Wok.Interp.RC.Value
   , continuationOwned, valueChildren
   , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC
   , maxInlineStr, allocNStringView, wokStringTag
-  , wokBytesTag )
+  , wokBytesTag, wokForeignBytesTag )
 import Wok.Interp.Value (RuntimeError (..))
 import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
@@ -131,6 +133,8 @@ rcBytesPrims =
   , bytesToListRC
   , bytesFromBytesRC
   , bytesToBytesRC
+  , ffiDemoCopyRC
+  , ffiDemoAdoptRC
   ]
 
 -- ---------------------------------------------------------------------------
@@ -1081,7 +1085,12 @@ bytesBytes (RVBox a@(CAddr p)) s = case stBackend s of
         blen    <- liftIO (H.wokBytesLen p)
         dataPtr <- liftIO (H.wokBytesData p)
         liftIO (BS.packCStringLen (castPtr dataPtr, fromIntegral blen))
-      else bytesViaDeref (RVBox a) s
+      else if tid == wokForeignBytesTag
+        then do
+          blen    <- liftIO (H.wokForeignBytesLen p)
+          dataPtr <- liftIO (H.wokForeignBytesPtr p)
+          liftIO (BS.packCStringLen (castPtr dataPtr, fromIntegral blen))
+        else bytesViaDeref (RVBox a) s
   AbstractHeap -> bytesViaDeref (RVBox a) s
 bytesBytes v s = bytesViaDeref v s
 
@@ -1090,8 +1099,9 @@ bytesViaDeref :: RCValue -> Store -> RC BS.ByteString
 bytesViaDeref (RVBox a) s = do
   c <- deref a s
   case cNode c of
-    NBytes bs -> pure bs
-    _         -> throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
+    NBytes bs        -> pure bs
+    NForeignBytes bs -> pure bs
+    _                -> throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
 bytesViaDeref _ _ = throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
 
 -- | @length buf@: byte count of the buffer. Consumes 'buf'. RC: 0 alloc.
@@ -1123,7 +1133,18 @@ bytesIndexRC = RCPrim PN.bytesIndexName 2 [] $ \args s -> case args of
               byte <- liftIO (H.wokBytesByteGet p (fromIntegral i))
               s1   <- dropAddr (CAddr p) s
               pure (PRDone (RVLit (LInt (toInteger byte))), s1)
-        else bytesIndexViaBytes (CAddr p) iv s
+        else if tid == wokForeignBytesTag
+          then do
+            i       <- asStringIndex iv
+            blen    <- liftIO (H.wokForeignBytesLen p)
+            if i >= fromIntegral blen
+              then throwE (PrimError (Tx.pack "Bytes.index: out of bounds"))
+              else do
+                dataPtr <- liftIO (H.wokForeignBytesPtr p)
+                w       <- liftIO (peekElemOff dataPtr (fromIntegral i))
+                s1      <- dropAddr (CAddr p) s
+                pure (PRDone (RVLit (LInt (toInteger (w :: Word8)))), s1)
+          else bytesIndexViaBytes (CAddr p) iv s
     AbstractHeap -> bytesIndexViaBytes (CAddr p) iv s
   [RVBox a, iv] -> bytesIndexViaBytes a iv s
   _ -> throwE (ArityError PN.bytesIndexName)
@@ -1196,9 +1217,10 @@ bytesFromBytesRC = RCPrim PN.bytesFromBytesName 1 [] $ \args s -> case args of
         pure (PRDone (RVBox noneA), s2)
   _ -> throwE (ArityError PN.bytesFromBytesName)
 
--- | Validate bytes as UTF-8. On 'CHeap' with a genuine 'WokBytes' cell, calls
--- 'wokValidateUtf8' on the data pointer (no extra copy). Otherwise uses the
--- pure Haskell 'Utf8.validateUtf8'. Called before the input is dropped.
+-- | Validate bytes as UTF-8. On 'CHeap' with a genuine 'WokBytes' or
+-- 'WokForeignBytes' cell, calls 'wokValidateUtf8' on the data pointer (no
+-- extra copy). Otherwise uses the pure Haskell 'Utf8.validateUtf8'. Called
+-- before the input is dropped.
 bytesValidateUtf8 :: Addr -> BS.ByteString -> Store -> RC Bool
 bytesValidateUtf8 (CAddr p) _ s = case stBackend s of
   CHeap _ -> do
@@ -1209,8 +1231,14 @@ bytesValidateUtf8 (CAddr p) _ s = case stBackend s of
         dataPtr <- liftIO (H.wokBytesData p)
         result  <- liftIO (H.wokValidateUtf8 dataPtr blen)
         pure (result /= 0)
-      -- Non-bytes CAddr: unreachable (bytesBytes confirmed NBytes) -- fail loud.
-      else throwE (PrimError (Tx.pack "internal: bytesValidateUtf8: non-bytes CAddr under CHeap"))
+      else if tid == wokForeignBytesTag
+        then do
+          blen    <- liftIO (H.wokForeignBytesLen p)
+          dataPtr <- liftIO (H.wokForeignBytesPtr p)
+          result  <- liftIO (H.wokValidateUtf8 dataPtr blen)
+          pure (result /= 0)
+        -- Non-bytes CAddr: unreachable (bytesBytes confirmed a bytes cell) -- fail loud.
+        else throwE (PrimError (Tx.pack "internal: bytesValidateUtf8: non-bytes CAddr under CHeap"))
   AbstractHeap -> throwE (PrimError (Tx.pack "internal: bytesValidateUtf8: CAddr under AbstractHeap"))
 bytesValidateUtf8 _ bs _ = pure (Utf8.validateUtf8 bs)
 
@@ -1238,3 +1266,27 @@ eqBytesRC = RCPrim PN.eqBytesName 2 [] $ \args s -> case args of
     (boolV, s3) <- allocBool eq s2
     pure (PRDone boolV, s3)
   _ -> throwE (ArityError PN.eqBytesName)
+
+-- ---------------------------------------------------------------------------
+-- FFI bytes-in Slice 1: host-blessed deterministic producers
+
+-- | @__ffi_demo_copy n@: produce @n@ deterministic bytes (Tier 1) by allocating
+-- a wok-owned 'NBytes' cell. Mirrors 'ffiDemoCopyP' on the reference machine.
+-- RC: +1 alloc ('NBytes').
+ffiDemoCopyRC :: RCPrim
+ffiDemoCopyRC = RCPrim PN.ffiDemoCopyName 1 [] $ \args s -> case args of
+  [RVLit (LInt n)] -> do
+    (a, s1) <- alloc (NBytes (Utf8.demoPattern (fromIntegral n))) s
+    pure (PRDone (RVBox a), s1)
+  _ -> throwE (ArityError PN.ffiDemoCopyName)
+
+-- | @__ffi_demo_adopt n@: produce @n@ deterministic bytes (Tier 2) by adopting
+-- into an 'NForeignBytes' cell (foreign-buffer ownership path). The buffer is
+-- freed at refcount-zero exactly as a real adopted foreign buffer would be.
+-- Mirrors 'ffiDemoAdoptP' on the reference machine. RC: +1 alloc ('NForeignBytes').
+ffiDemoAdoptRC :: RCPrim
+ffiDemoAdoptRC = RCPrim PN.ffiDemoAdoptName 1 [] $ \args s -> case args of
+  [RVLit (LInt n)] -> do
+    (a, s1) <- alloc (NForeignBytes (Utf8.demoPattern (fromIntegral n))) s
+    pure (PRDone (RVBox a), s1)
+  _ -> throwE (ArityError PN.ffiDemoAdoptName)

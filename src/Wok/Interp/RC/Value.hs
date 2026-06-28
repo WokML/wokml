@@ -101,7 +101,9 @@ module Wok.Interp.RC.Value
   , allocNStringView
     -- * Bytes C-cell support
   , wokBytesTag
+  , wokForeignBytesTag
   , allocNBytes
+  , allocForeignBytes
     -- * Array in-place mutation helpers (Slice C)
   , atIndex
   , setAt
@@ -129,6 +131,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
 import Data.Word (Word8, Word32, Word64)
+import Foreign.Marshal.Alloc (mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr, wordPtrToPtr, WordPtr (..))
 import Wok.Interp.RC.Heap (WokObj, WokHeap)
@@ -699,6 +702,13 @@ data Node
   -- 'CHeap' calls 'wokBytesAlloc' then memcpys the bytes via 'wokBytesData'; on
   -- 'AbstractHeap' it uses 'allocPure'. 'nodeCEligible (NBytes _) = False': own
   -- dedicated alloc path, not the generic NCon slot encoding.
+  | NForeignBytes ByteString
+  -- ^ An ADOPTED foreign byte buffer (FFI Slice 1). On 'CHeap' a 'WokForeignBytes'
+  -- cell (tag 0xFFFB) pointing at a libc-malloc'd buffer that wok frees (libc free)
+  -- at refcount-zero. On 'AbstractHeap' it holds the bytes for op/output faithfulness
+  -- but charges a FIXED 24 B handle ('wouldBeCBytes'), modeling that the buffer is
+  -- off-heap -- so the oracle pins the zero-copy saving vs a copy-in 'NBytes'. No child
+  -- refs ('nodeValues' = []), like 'NBytes'.
   | NRecord Text (Map Text RCValue)
   | NClosure REnv [Binder] Expr CaptureMode
   -- ^ The 'REnv' captures live RC values. Compare 'VClosure' in
@@ -1027,14 +1037,16 @@ internTag con s = case Map.lookup con (stTagFwd s) of
         -- cell discriminator. Apply bumps in ASCENDING order of the reserved
         -- values (lowest-reserved-tag first) so each bump shifts the running
         -- value past the next reserved slot.
-        --   0xFFFC = WOK_BYTES_TAG       (E6 bytes cell)
-        --   0xFFFD = WOK_STRING_VIEW_TAG (E4 string-view cell)
-        --   0xFFFE = WOK_STRING_TAG      (E1 string cell)
-        --   0xFFFF = WOK_ARRAY_TAG       (array cell)
-        w0  = if raw >= wokBytesTag      then raw + 1 else raw
-        w1  = if w0  >= wokStringViewTag then w0  + 1 else w0
-        w2  = if w1  >= wokStringTag     then w1  + 1 else w1
-        w   = if w2  >= wokArrayTag      then w2  + 1 else w2
+        --   0xFFFB = WOK_FOREIGN_BYTES_TAG (FFI Slice 1 adopted foreign buffer)
+        --   0xFFFC = WOK_BYTES_TAG         (E6 bytes cell)
+        --   0xFFFD = WOK_STRING_VIEW_TAG   (E4 string-view cell)
+        --   0xFFFE = WOK_STRING_TAG        (E1 string cell)
+        --   0xFFFF = WOK_ARRAY_TAG         (array cell)
+        wF  = if raw >= wokForeignBytesTag then raw + 1 else raw
+        w0  = if wF  >= wokBytesTag        then wF  + 1 else wF
+        w1  = if w0  >= wokStringViewTag   then w0  + 1 else w0
+        w2  = if w1  >= wokStringTag       then w1  + 1 else w1
+        w   = if w2  >= wokArrayTag        then w2  + 1 else w2
     in ( w
        , s { stTagFwd  = Map.insert con w (stTagFwd s)
            , stTagRev  = IM.insert (fromIntegral w) con (stTagRev s)
@@ -1073,6 +1085,11 @@ wokStringTag = 0xFFFE
 -- never assign this value (or 'wokStringTag' / 'wokArrayTag') to a constructor.
 wokStringViewTag :: Word32
 wokStringViewTag = 0xFFFD
+
+-- | The reserved C tag value for adopted foreign-bytes cells (WOK_FOREIGN_BYTES_TAG).
+-- 'internTag' never assigns this to a constructor.
+wokForeignBytesTag :: Word32
+wokForeignBytesTag = 0xFFFB
 
 -- | The reserved C tag value for bytes cells (WOK_BYTES_TAG). A 'CAddr' cell
 -- with this tag is always a 'WokBytes' (flat byte buffer: header + byte_len).
@@ -1630,9 +1647,12 @@ alloc (NString bs)  s
   | otherwise = case stBackend s of
       CHeap hp     -> allocNString hp bs s
       AbstractHeap -> pure (allocPure (NString bs) s)
-alloc (NBytes bs)   s = case stBackend s of
+alloc (NBytes bs)        s = case stBackend s of
   CHeap hp     -> allocNBytes hp bs s
   AbstractHeap -> pure (allocPure (NBytes bs) s)
+alloc (NForeignBytes bs) s = case stBackend s of
+  CHeap hp     -> allocForeignBytes hp bs s
+  AbstractHeap -> pure (allocPure (NForeignBytes bs) s)
 alloc n             s = pure (allocPure n s)
 
 -- | A nullary constructor becomes an inline immediate carrying the interned
@@ -1789,6 +1809,21 @@ allocNBytes hp bs s = do
              copyBytes dest (castPtr src) len)
   pure (CAddr p, s { stStats = recordAlloc charged (stStats s) })
 
+-- | Adopt a foreign byte buffer into a 'WokForeignBytes' cell. The buffer is
+-- libc-malloc'd HERE (off the wok heap) to model a genuine C->RC handoff; the cell
+-- stores the raw pointer and wok frees it (libc free) at refcount-zero in 'dropAddr'.
+-- Charges the fixed 24 B handle, NOT the buffer (foreign memory).
+allocForeignBytes :: Ptr WokHeap -> ByteString -> Store -> RC (Addr, Store)
+allocForeignBytes hp bs s = do
+  let byteLen = fromIntegral (BS.length bs) :: Word64
+  -- malloc(0) may return NULL; allocate >=1 so the adopted ptr is never NULL and
+  -- the read/free are well-defined. byte_len (0) is still stored, so only 0 bytes
+  -- are ever read.
+  dptr <- liftIO (mallocBytes (max 1 (BS.length bs)))
+  liftIO $ BS.useAsCStringLen bs (\(src, len) -> copyBytes dptr (castPtr src) len)
+  p    <- liftIO (H.wokForeignBytesAlloc hp (castPtr dptr) byteLen)
+  pure (CAddr p, s { stStats = recordAlloc 24 (stStats s) })
+
 -- | Allocate an 'NStringView' node: a counted window into a parent string buffer.
 -- The parent is increffed (the view owns one counted ref) then the view cell is
 -- allocated -- on the abstract 'IntMap' heap ('AbstractHeap') or as a 32-byte
@@ -1868,10 +1903,11 @@ allocPureFallback n s =
 -- natural does not).
 nodeCEligible :: Node -> Bool
 nodeCEligible (NCon _ vs)    = length vs <= 255 && all (isJust . encodeSlotC) vs
-nodeCEligible (NString _)    = False  -- has its own dedicated alloc path (not NCon slot encoding)
-nodeCEligible (NStringView{}) = False  -- has its own dedicated alloc path
-nodeCEligible (NBytes _)     = False  -- has its own dedicated alloc path (not NCon slot encoding)
-nodeCEligible _              = False
+nodeCEligible (NString _)        = False  -- has its own dedicated alloc path (not NCon slot encoding)
+nodeCEligible (NStringView{})    = False  -- has its own dedicated alloc path
+nodeCEligible (NBytes _)         = False  -- has its own dedicated alloc path (not NCon slot encoding)
+nodeCEligible (NForeignBytes _)  = False  -- has its own dedicated alloc path (adopted foreign buffer)
+nodeCEligible _                  = False
 
 -- | The field count of a node (FBIP placement match). Only an 'NCon' has a
 -- meaningful physical arity for reuse; every other node kind reports 0 (it is
@@ -1905,8 +1941,11 @@ wouldBeCBytes (NString bs)    = 16 + 8 * ((BS.length bs + 7) `div` 8)
 wouldBeCBytes (NStringView{}) = 32
 -- Bytes cell byte size = 16 + 8*ceil(byte_len/8). Same layout as NString:
 -- header 16B + 8-byte-rounded body. Matches wok_bytes_alloc charge exactly.
-wouldBeCBytes (NBytes bs)     = 16 + 8 * ((BS.length bs + 7) `div` 8)
-wouldBeCBytes _               = 0
+wouldBeCBytes (NBytes bs)        = 16 + 8 * ((BS.length bs + 7) `div` 8)
+-- Foreign-bytes handle: fixed 24 B (header 8 + data_ptr 8 + byte_len 8). The buffer
+-- itself is off-heap (libc-malloc'd), so only the cell handle is counted.
+wouldBeCBytes (NForeignBytes _)  = 24
+wouldBeCBytes _                  = 0
 
 -- | Allocate a node into the STATIC immortal region. Returns a NEGATIVE 'Addr'
 -- and the updated 'Store'. Unlike 'alloc', this does NOT touch 'stStats': a
@@ -2043,9 +2082,13 @@ readCCell p s = do
           then do
             bs <- readCBytesBytes p
             pure (Cell 0 (NBytes bs) 0)
-          else do
-            vs <- readCConValues p s
-            pure (Cell 0 (NCon (tagName tid s) vs) 0)
+          else if tid == wokForeignBytesTag
+            then do
+              bs <- readCForeignBytesBytes p
+              pure (Cell 0 (NForeignBytes bs) 0)
+            else do
+              vs <- readCConValues p s
+              pure (Cell 0 (NCon (tagName tid s) vs) 0)
 
 -- | Decode a C array cell's slots back to @[RCValue]@, reading the header
 -- @elemkind@ once. Delegates to 'readCArraySlots' with the decoded kind. Used by
@@ -2086,6 +2129,14 @@ readCBytesBytes :: Ptr WokObj -> IO ByteString
 readCBytesBytes p = do
   len     <- H.wokBytesLen p
   dataPtr <- H.wokBytesData p
+  BS.packCStringLen (castPtr dataPtr, fromIntegral len)
+
+-- | Read all bytes of a 'WokForeignBytes' C cell back into a 'ByteString'. Used by
+-- 'readCCell' (deref) to reconstruct the node faithfully.
+readCForeignBytesBytes :: Ptr WokObj -> IO ByteString
+readCForeignBytesBytes p = do
+  len     <- H.wokForeignBytesLen p
+  dataPtr <- H.wokForeignBytesPtr p
   BS.packCStringLen (castPtr dataPtr, fromIntegral len)
 
 -- | Decode a C cell's slots back to @[RCValue]@ via its per-constructor
@@ -2229,6 +2280,7 @@ dropAddr a0 s0 = go [a0] s0
           -- Strings = 16 + 8*ceil(byte_len/8) (8-rounded body);
           -- StringViews = 32 (fixed, header + parent ptr + offset + len);
           -- Bytes = 16 + 8*ceil(byte_len/8) (same layout as WokString body);
+          -- ForeignBytes = 24 (fixed handle: header 8 + ptr 8 + len 8);
           -- NCons = 8 + 8*arity (both C-eligible, same layout as wok_alloc /
           -- wok_array_alloc / wok_string_alloc / wok_string_view_alloc charge).
           bytes <- if tid == wokArrayTag
@@ -2246,9 +2298,12 @@ dropAddr a0 s0 = go [a0] s0
                            then do
                              blen <- liftIO (H.wokBytesLen p)
                              pure (16 + 8 * fromIntegral ((blen + 7) `div` 8 :: Word64))
-                           else do
-                             ar <- liftIO (H.wokArity p)
-                             pure (8 + 8 * fromIntegral (ar :: Word32))
+                           else if tid == wokForeignBytesTag
+                             -- Fixed 24-byte handle (header 8 + data_ptr 8 + byte_len 8).
+                             then pure 24
+                             else do
+                               ar <- liftIO (H.wokArity p)
+                               pure (8 + 8 * fromIntegral (ar :: Word32))
           -- Collect child refs for the cascade (read ALL fields before wok_free).
           -- StringViews: the parent pointer is the ONE counted child (D8).
           -- Read it BEFORE wok_free; add it to the worklist so dropAddr recurses.
@@ -2276,7 +2331,14 @@ dropAddr a0 s0 = go [a0] s0
                         -- Bytes are opaque: no child refs, no cascade.
                         else if tid == wokBytesTag
                           then pure []
-                          else countedRefs <$> liftIO (readCConValues p s)
+                          -- Foreign bytes: free the off-heap buffer (libc free) BEFORE
+                          -- wok_free recycles the 24-byte cell. No cascade children.
+                          else if tid == wokForeignBytesTag
+                            then do
+                              dptr <- liftIO (H.wokForeignBytesPtr p)  -- read BEFORE wok_free
+                              liftIO (free dptr)                        -- libc free of the foreign buffer
+                              pure []
+                            else countedRefs <$> liftIO (readCConValues p s)
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats bytes s)
@@ -2393,6 +2455,9 @@ nodeValues (NString _)          = []
 -- Bytes are opaque (no child refs). Drop cascade is empty: 'dropAddr' on an
 -- 'NBytes' frees only the cell itself, with no child iteration (like 'NString').
 nodeValues (NBytes _)           = []
+-- Foreign bytes are opaque (no child refs). The foreign buffer is freed by libc
+-- in 'dropAddr' (CHeap path), not via an RC cascade. Like 'NBytes'.
+nodeValues (NForeignBytes _)    = []
 nodeValues (NRecord _ m)        = Map.elems m
 nodeValues (NClosure env _ _ _) = Map.elems env
 nodeValues (NGroupCode _)       = []
@@ -2764,6 +2829,10 @@ renderValueWith drf = goVal
     -- Render a Bytes buffer byte-identically to 'Wok.Interp.Value.renderValue (VBytes bs)':
     -- @Bytes[65,195,169]@. MUST match the reference exactly for the differential oracle.
     goNode _ (NBytes bs) =
+      pure (Tx.pack ("Bytes" <> show (BS.unpack bs)))
+    -- Render an adopted foreign-bytes buffer the same way as 'NBytes': the content
+    -- is identical from the Wok side, so the differential oracle sees the same output.
+    goNode _ (NForeignBytes bs) =
       pure (Tx.pack ("Bytes" <> show (BS.unpack bs)))
 
     -- Render a proper Cons/Nil list as @[a, b, c]@. An improper tail renders the

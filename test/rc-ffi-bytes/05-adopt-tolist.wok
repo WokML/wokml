@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- Sum a list of U64 by structural recursion.
+sumU64 : [U64] -> U64
+sumU64 xs = case xs of
+  []       -> 0
+  x :: rest -> x + sumU64 rest
+
+-- __ffi_demo_adopt 4 yields bytes 0,1,2,3.
+-- toList gives [0,1,2,3]; sum = 0+1+2+3 = 6.
+main : U64
+main = sumU64 (toList (__ffi_demo_adopt 4))

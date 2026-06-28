@@ -1,0 +1,42 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-28-ffi-bytes-in.md",
+  "specPath": "docs/superpowers/specs/2026-06-28-ffi-bytes-in-design.md",
+  "branch": "feat/ffi-bytes-in",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: C runtime — WokForeignBytes cell + C lifecycle test",
+      "status": "completed",
+      "description": "Fixed-24B WokForeignBytes C cell (tag 0xFFFB) holding a foreign pointer + length: wok_foreign_bytes_alloc/_ptr/_len, a wok_free arm before the arity fallback (24B class 2, never touches the foreign ptr), and an ASan-clean C lifecycle test + negative control (skip free -> LSan leak). Full code in the plan Task 1.\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\", \"runtime/test/wok_rc_test.c\", \"scripts/asan-runtime.sh\"], \"verifyCommand\": \"bash scripts/asan-runtime.sh\", \"acceptanceCriteria\": [\"wok_foreign_bytes_alloc returns 24B 0xFFFB cell charging 24\", \"ptr/len accessors round-trip\", \"wok_free 0xFFFB arm before arity fallback recycles 24B class 2\", \"C lifecycle test ASan/LSan clean cur_bytes 24->0\", \"negative control leaks under LSan\"], \"modelTier\": \"standard\", \"planRef\": \"docs/superpowers/plans/2026-06-28-ffi-bytes-in.md#task-1\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: RC interpreter — NForeignBytes node, adopt alloc, foreign-free drop",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "NForeignBytes node (charges fixed 24B handle; nodeValues=[]; nodeCEligible=False; all -Werror matcher arms), wokForeignBytesTag=0xFFFB + internTag skip (0xFFFB first), allocForeignBytes (libc mallocBytes+copy+wok_foreign_bytes_alloc, charge 24), dropAddr arms (bytes=24; kids: read ptr, libc free, return []), bytesBytes/bytesViaDeref tag dispatch, + store-level unit test both backends. Full code in the plan Task 2.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Heap.hs\", \"src/Wok/Interp/RC/Value.hs\", \"src/Wok/Interp/RC/Prim.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal build && cabal test wok-tests --test-options='-p \\\"foreign bytes store\\\"'\", \"acceptanceCriteria\": [\"NForeignBytes node + all -Werror matcher arms\", \"0xFFFB in internTag skip + wokForeignBytesTag\", \"allocForeignBytes libc-malloc+copy+adopt charging 24\", \"bytesBytes/bytesViaDeref handle 0xFFFB/NForeignBytes\", \"dropAddr libc-frees buffer before wok_free, balanced dup/drop\", \"store-level unit test both backends\"], \"modelTier\": \"standard\", \"planRef\": \"docs/superpowers/plans/2026-06-28-ffi-bytes-in.md#task-2\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Host-blessed producer prims + prelude + registration",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "__ffi_demo_copy (Tier 1 via alloc NBytes) and __ffi_demo_adopt (Tier 2 via alloc NForeignBytes) in both interpreters, deterministic pattern i mod 256; PrimNames + dispatch tables per the E6 fromBytes/toBytes pattern; two extern decls in Std.Bytes.wok; smoke wok program. Full code in the plan Task 3.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Prim.hs\", \"src/Wok/Interp/Prim.hs\", \"src/Wok/IR/PrimNames.hs\", \"prelude/Std/Bytes.wok\", \"test/rc-ffi-bytes/00-smoke.wok\"], \"verifyCommand\": \"cabal build && cabal test wok-tests --test-options='-p \\\"ffi bytes smoke\\\"'\", \"acceptanceCriteria\": [\"both producers yield deterministic i-mod-256 bytes on 3 backends\", \"copy->NBytes, adopt->NForeignBytes\", \"compose with fromBytes/length/index/toList\", \"registered per E6 pattern, no regressions\"], \"modelTier\": \"standard\", \"planRef\": \"docs/superpowers/plans/2026-06-28-ffi-bytes-in.md#task-3\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Differential-oracle corpus, properties, zero-copy-saving pin",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "test/rc-ffi-bytes/ corpus run through the 3-way differential oracle (output + stats + C-heap parity, mirroring rcBytesFiles), plus the property that adopt's peak_bytes == copy's - (wouldBeCBytes(NBytes pattern) - 24). Covers valid/invalid UTF-8, index/toList on adopted, eqBytes across copy/adopt/fromList. Full detail in the plan Task 4.\n\n```json:metadata\n{\"files\": [\"test/rc-ffi-bytes\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"rc ffi bytes\\\"'\", \"acceptanceCriteria\": [\"corpus identical output on 3 backends\", \"peak_bytes abstract==CHeap per program\", \"adopt saves exactly wouldBeCBytes(n)-24 vs copy on both RC backends\", \"corpus covers valid/invalid/index/toList/eq\"], \"modelTier\": \"standard\", \"planRef\": \"docs/superpowers/plans/2026-06-28-ffi-bytes-in.md#task-4\"}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Soundness — leak/double-free death test + region-escape adversarial",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "Dup-then-drop balance (buffer freed exactly once, no double-free, baseline restored), region-escape adversarial (adopted Bytes escaping its activation stays counted-Heap not arena; Region.isStringType TcBytes=True), corpus leak-balance sweep (live==0 both RC backends). Review test soundness hardest at the whole-branch Opus deep review. Full detail in the plan Task 5.\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\", \"test/rc-ffi-bytes\", \"src/Wok/IR/Region.hs\"], \"verifyCommand\": \"cabal test wok-tests --test-options='-p \\\"ffi bytes soundness\\\"' && bash scripts/asan-runtime.sh\", \"acceptanceCriteria\": [\"dup/drop balance, buffer freed exactly once, no double-free\", \"adopted Bytes escaping activation stays counted-Heap not arena\", \"whole corpus leak-balanced live==0 both RC backends\"], \"modelTier\": \"standard\", \"planRef\": \"docs/superpowers/plans/2026-06-28-ffi-bytes-in.md#task-5\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-29"
+}

@@ -2,6 +2,7 @@ module Wok.Interp.Utf8
   ( utf8Width
   , decodeCharAt
   , validateUtf8
+  , demoPattern
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL)
@@ -49,3 +50,10 @@ validateUtf8 :: ByteString -> Bool
 validateUtf8 bs = case TxEnc.decodeUtf8' bs of
   Right _ -> True
   Left  _ -> False
+
+-- | Build a 'ByteString' of length @n@ with pattern @byte[i] = i mod 256@.
+-- Shared by the FFI bytes-in Slice 1 producers ('__ffi_demo_copy' /
+-- '__ffi_demo_adopt') in both the reference and RC interpreters; deterministic
+-- so the differential oracle can compare across all three backends.
+demoPattern :: Int -> ByteString
+demoPattern n = BS.pack [ fromIntegral (i `mod` 256) | i <- [0 .. n - 1] ]

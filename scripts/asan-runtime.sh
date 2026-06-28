@@ -61,3 +61,19 @@ run "poison-on-free"              -DWOK_RC_POISON
 run_arena "arena (default)"
 run_arena "malloc backend (UAF oracle)" -DWOK_RC_MALLOC
 run_arena "poison-on-free"              -DWOK_RC_POISON
+
+# WokForeignBytes negative control: omit the host-side libc free and confirm LSan detects it.
+# Only meaningful on Linux (Apple's ASan runtime does not support LSan); skip on Darwin.
+# A clean exit from this binary would be a regression (it means the leak is undetected).
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "== WokForeignBytes leak negative control (WOK_FOREIGN_BYTES_LEAK_TEST) =="
+  $CC $BASE $SAN -DWOK_FOREIGN_BYTES_LEAK_TEST runtime/wok_rc.c runtime/wok_utf8.c runtime/test/wok_rc_test.c -o /tmp/wok_foreign_bytes_leak_test
+  if ASAN_OPTIONS=detect_leaks=1 /tmp/wok_foreign_bytes_leak_test >/dev/null 2>&1; then
+    echo "FAIL: WokForeignBytes leak negative control did NOT report a leak (LSan inert?)" >&2
+    exit 1
+  else
+    echo "ok: WokForeignBytes leak detected as expected (LSan fired)"
+  fi
+else
+  echo "== WokForeignBytes leak negative control: SKIPPED on Darwin (LSan unsupported) =="
+fi

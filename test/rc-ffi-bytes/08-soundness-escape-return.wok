@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- The adopted Bytes is built in a helper and RETURNED, escaping the helper's
+-- activation. If it were wrongly routed to the helper's arena, it would be
+-- freed on the helper's return and `length` in main would be a use-after-free
+-- (caught by the CHeap libc run). It must stay on the counted Heap.
+-- Region.isStringType (CTCon TcBytes []) = True fences it to Heap; arena_peak
+-- must be 0 on both backends. Expected: 8.
+makeIt : U64 -> Bytes
+makeIt n = __ffi_demo_adopt n
+
+main : U64
+main =
+  let b = makeIt 8 in
+  length b

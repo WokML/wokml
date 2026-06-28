@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- __ffi_demo_copy 6 and __ffi_demo_adopt 6 both yield bytes 0,1,2,3,4,5.
+-- Both equal fromList [0,1,2,3,4,5]. All three must compare equal.
+main : U64
+main =
+  if eqBytes (__ffi_demo_copy 6) (__ffi_demo_adopt 6)
+    then if eqBytes (__ffi_demo_adopt 6) (fromList [0, 1, 2, 3, 4, 5]) then 1 else 0
+    else 0

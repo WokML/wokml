@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Bytes
+
+-- Shares ONE adopted Bytes across two consuming uses, forcing a Perceus dup
+-- (rc 1->2) then two drops (2->1->0, foreign free at rc=0).
+-- If the foreign free fired at the dup or twice, the CHeap (libc) run would
+-- double-free and abort. The rc-c-backend-parity combinator is the live guard.
+-- Expected: length 8 + index 0 = 8 + 0 = 8.
+main : U64
+main =
+  let b = __ffi_demo_adopt 8 in
+  length b + index b 0

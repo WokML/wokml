@@ -511,5 +511,9 @@ isStringBinder = isStringType . bndType
 
 isStringType :: CType -> Bool
 isStringType (CTCon TcString []) = True
-isStringType (CTCon TcBytes  []) = True  -- Bytes is a variable-length heap cell (WokBytes), like String: must go to the counted Heap, never the arena
+isStringType (CTCon TcBytes  []) = True
+  -- Defence-in-depth: Bytes values reach here only via prim calls (RApp), not
+  -- isAlloc RHSs, so this arm is not exercised today. Keep it: a future
+  -- Bytes-producing alloc RHS (RCon/RLam typed TcBytes) must not route an
+  -- escaping WokBytes/WokForeignBytes cell into an arena -- that would be a UAF.
 isStringType _                   = False

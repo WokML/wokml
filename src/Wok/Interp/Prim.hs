@@ -676,6 +676,8 @@ bytesPrims =
   , bytesToListP
   , bytesFromBytesP
   , bytesToBytesP
+  , ffiDemoCopyP
+  , ffiDemoAdoptP
   ]
 
 -- | @length buf@: number of bytes. O(1).
@@ -754,3 +756,22 @@ eqBytesP = mkPrim PN.eqBytesName 2 $ \args -> case args of
   [VBytes a, VBytes b] -> Right (PRDone (boolVal (a == b)))
   [v, _] -> Left (PrimError (Tx.pack "eqBytes: not a Bytes: " <> renderValue v))
   _      -> Left (ArityError PN.eqBytesName)
+
+-- ---------------------------------------------------------------------------
+-- FFI bytes-in Slice 1: host-blessed deterministic producers
+
+-- | @__ffi_demo_copy n@: produce @n@ deterministic bytes (pattern @i mod 256@)
+-- in a wok-owned buffer (Tier 1). In the reference machine there is no
+-- ownership distinction; both producers return a plain 'VBytes'.
+ffiDemoCopyP :: Prim
+ffiDemoCopyP = mkPrim PN.ffiDemoCopyName 1 $ \args -> case args of
+  [VLit (LInt n)] -> Right (PRDone (VBytes (Utf8.demoPattern (fromIntegral n))))
+  _               -> Left (ArityError PN.ffiDemoCopyName)
+
+-- | @__ffi_demo_adopt n@: produce @n@ deterministic bytes (pattern @i mod 256@)
+-- via the adopt path (Tier 2). In the reference machine the adoption is
+-- unobservable; the result is an identical 'VBytes'.
+ffiDemoAdoptP :: Prim
+ffiDemoAdoptP = mkPrim PN.ffiDemoAdoptName 1 $ \args -> case args of
+  [VLit (LInt n)] -> Right (PRDone (VBytes (Utf8.demoPattern (fromIntegral n))))
+  _               -> Left (ArityError PN.ffiDemoAdoptName)
