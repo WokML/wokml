@@ -8,6 +8,7 @@ module Wok.TypeChecking.Infer
   , translateSig
   , processDataDecls
   , processEffectDecls
+  , processForeignDecls
   , inferPat
   , inferExpr
   , inferExprW
@@ -23,7 +24,7 @@ module Wok.TypeChecking.Infer
 import qualified Control.Monad.ST
 import Control.Monad (foldM, forM, forM_, msum, unless, when)
 import Control.Monad.Except (throwError)
-import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isNothing, listToMaybe, mapMaybe)
 import Data.List (foldl')
 import qualified Data.List
 import qualified Data.Map.Strict as Map
@@ -36,10 +37,14 @@ import GeneratedParser.Wok.Abs (BNFC'Position)
 import Wok.SourceOrigin (Origin (..))
 import qualified Wok.TypeChecking.Builtins as Builtins
 import Wok.TypeChecking.Env
-  ( ConInfo (..), Env, EffectInfo (..), RecordConInfo (..), TyConInfo (..)
+  ( ConInfo (..), Env, EffectInfo (..), ForeignMemberInfo (..)
+  , ForeignModuleInfo (..), RecordConInfo (..), TyConInfo (..)
   , envTyCons
-  , extendCon, extendEffect, extendRecordCon, extendTyCon, extendVar
-  , lookupCon, lookupEffect, lookupRecordCon, lookupTyCon, lookupVar )
+  , extendCon, extendEffect, extendForeignModule
+  , extendRecordCon, extendTyCon, extendVar
+  , lookupCon, lookupEffect, lookupForeignModule
+  , lookupRecordCon, lookupTyCon, lookupVar )
+import qualified Wok.FFI.Blessed as Blessed
 import Wok.TypeChecking.Error (SourceSpan, TypeError (..), Warning (..))
 import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
 import Wok.TypeChecking.Unify (force, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
@@ -771,6 +776,19 @@ collectApp :: Abs.Type -> Abs.Type -> (Abs.Type, [Abs.Type])
 collectApp (Abs.TApp f x) y = let (h, xs) = collectApp f x in (h, xs ++ [y])
 collectApp other y = (other, [y])
 
+-- | Peel the left-recursive 'EApp' spine of an expression, returning the
+-- innermost non-EApp head and the list of arguments in left-to-right order.
+-- For @EApp (EApp (EApp h a1) a2) a3@ this returns @(h, [a1, a2, a3])@.
+collectExprSpine :: Abs.Exp -> (Abs.Exp, [Abs.Exp])
+collectExprSpine (Abs.EApp f x) =
+  let (h, xs) = collectExprSpine f in (h, xs ++ [x])
+collectExprSpine other = (other, [])
+
+-- | Strip one or more layers of 'EParen' from an expression.
+stripEParen :: Abs.Exp -> Abs.Exp
+stripEParen (Abs.EParen e) = stripEParen e
+stripEParen other          = other
+
 -- | The KIND of a surface type argument, syntax-directed (slice B). A `(row e)`
 -- argument is KEffect; every other type is KStar. Used to kind-check tycon
 -- applications against 'tcParamKinds' at translation time, so an ill-kinded
@@ -1179,8 +1197,15 @@ translateConArg env paramMap pks ty = do
 -- Effect declaration processing
 -- ---------------------------------------------------------------------------
 
+-- | The ground IO: the effect named @IO@ with no declared operations (seeded
+-- in 'Builtins.initialEnv'). It is discharged by running the program, never by
+-- a handler, and so cannot be handled and may be overridden once by a user
+-- @effect IO = { ... }@ declaration. A user-declared IO carries ops, so this
+-- predicate is False for it and the special-casing does not fire.
+isGroundIO :: Text -> EffectInfo -> Bool
+isGroundIO n ei = n == Tx.pack "IO" && Map.null (eiOps ei)
+
 -- | Register @effect@ declarations into the env's effect namespace.
---
 -- @effect E p1..pn = { op1 : T1, ... }@ becomes an 'EffectInfo' whose
 -- operations are schemes quantified over the effect's type parameters. An
 -- operation's type is translated like a record-field type ('translateConArg'),
@@ -1193,8 +1218,16 @@ processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
 
     registerEffect env (Abs.DEffect (Abs.ConId (pos, name)) params fields) =
       case lookupEffect name env of
-        Just _  -> throwError (DuplicateTyCon (Just pos) name)
-        Nothing -> do
+        -- The ground IO may be overridden ONCE by a user `effect IO = { ... }`.
+        -- Any other already-present effect (a prelude effect inherited via
+        -- imports, a same-pass duplicate, or an already-overridden IO that now
+        -- has ops) is a duplicate.
+        Just ei
+          | isGroundIO name ei -> register
+          | otherwise          -> throwError (DuplicateTyCon (Just pos) name)
+        Nothing -> register
+      where
+        register = do
           let paramNames  = [ n | Abs.VarId (_, n) <- params ]
               paramMap    = Map.fromList (zip paramNames [0 ..])
               paramCount  = length paramNames
@@ -1212,6 +1245,102 @@ processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
         Nothing -> do
           ct <- translateConArg env paramMap (map snd quantifiers) ty
           pure (Map.insert opName (mkScheme quantifiers ct) acc)
+
+-- ---------------------------------------------------------------------------
+-- Foreign module declaration processing
+-- ---------------------------------------------------------------------------
+
+-- | Register @foreign module@ declarations into the env's foreign-module
+-- namespace.  For each member the declared type is checked via 'translateSig'
+-- (same path as a top-level signature), so @with IO@ in a member type resolves
+-- to the CRExtend row.  The blessed allow-list honesty check gates every
+-- (lib, C-symbol) pair; unknown pairs produce 'ForeignSymbolNotBlessed'.
+processForeignDecls :: Env -> [Abs.Decl] -> TC s Env
+processForeignDecls env0 decls = foldM registerForeign env0 foreignDecls
+  where
+    foreignDecls = [ d | d@(Abs.DForeign{}) <- decls ]
+
+    registerForeign env (Abs.DForeign (Abs.ConId (pos, name)) lib ffree mems) = do
+      -- Ambiguity check: reject a ConId that is already a declared effect.
+      case lookupEffect name env of
+        Just _  -> throwError (AmbiguousProjectionHead (Just pos) name)
+        Nothing -> pure ()
+      -- Duplicate check: reject a ConId that is already a declared foreign module.
+      case lookupForeignModule name env of
+        Just _  -> throwError (DuplicateForeignModule (Just pos) name)
+        Nothing -> pure ()
+      -- Parse the free-function symbol, if any.
+      let mFreeSymbol = case ffree of
+            Abs.FFNone   -> Nothing
+            Abs.FFSym fs -> Just (Tx.pack fs)
+          libText = Tx.pack lib
+      -- Register each member, checking the blessed table.
+      memberMap <- foldM (registerMember env name libText mFreeSymbol)
+                         Map.empty mems
+      let info = ForeignModuleInfo
+                   { fmLib     = libText
+                   , fmFree    = mFreeSymbol
+                   , fmMembers = memberMap
+                   }
+      pure (extendForeignModule name info env)
+    registerForeign _ _ =
+      error "processForeignDecls: non-DForeign reached (input should be pre-filtered)"
+
+    registerMember env modName libText mFreeSymbol acc mem = do
+      let (varId, fsym, ty, isOwned) = case mem of
+            Abs.FMPlain  v s t -> (v, s, t, False)
+            Abs.FMOwned  v s t -> (v, s, t, True)
+          Abs.VarId (mpos, memberName) = varId
+          memberPos = Just mpos
+          -- C symbol: FSName override, else the member name.
+          cSymbol = case fsym of
+            Abs.FSNone     -> memberName
+            Abs.FSName str -> Tx.pack str
+      -- Honesty check: (lib, C-symbol) must be in the blessed table.
+      bsig <- case Blessed.lookupBlessed libText cSymbol of
+        Nothing   -> throwError (ForeignSymbolNotBlessed memberPos libText cSymbol)
+        Just bsig -> pure bsig
+      -- owned members require a free clause.
+      when (isOwned && isNothing mFreeSymbol) $
+        throwError (ForeignOwnedNeedsFree memberPos modName memberName)
+      -- Disposition coherence: `owned` must agree with the blessed ReturnDisp.
+      -- DispAdopt  <=> owned must be True  (caller takes ownership, needs free).
+      -- DispScalar <=> owned must be False (plain scalar, no heap transfer).
+      -- DispCopy   <=> owned must be False (transfer-none copy; wok manages it).
+      let expectedOwned = Blessed.bsReturn bsig == Blessed.DispAdopt
+      when (isOwned /= expectedOwned) $
+        let msg = if expectedOwned
+                    then "foreign member '" <> memberName <>
+                         "' returns an owned buffer; declare it `owned` and" <>
+                         " give the module a `free` clause"
+                    else case Blessed.bsReturn bsig of
+                           Blessed.DispCopy   -> "foreign member '" <> memberName <>
+                                                 "' returns a copy-managed buffer; remove `owned`"
+                           _                  -> "foreign member '" <> memberName <>
+                                                 "' returns a scalar; remove `owned`"
+        in throwError (ForeignDispositionMismatch memberPos memberName msg)
+      -- Free-symbol coherence for DispAdopt: the RC runtime hardwires libc
+      -- 'free' as the destructor for the 0xFFFB adopt cell. Any other free
+      -- symbol would type-check but crash at runtime. Reject non-"free"
+      -- destructors at compile time with a clear diagnostic.
+      when (Blessed.bsReturn bsig == Blessed.DispAdopt
+            && mFreeSymbol /= Just (Tx.pack "free")) $
+        let sym = case mFreeSymbol of
+                    Just s  -> "\"" <> s <> "\""
+                    Nothing -> "<none>"
+            msg = "foreign member '" <> memberName <>
+                  "' is adopt-return; the module's `free` clause must be" <>
+                  " \"free\" (the only supported destructor), got " <> sym
+        in throwError (ForeignDispositionMismatch memberPos memberName msg)
+      -- Translate the declared type as a full top-level signature (supporting
+      -- `with E` rows and polymorphism).
+      scheme <- translateSig env ty
+      let minfo = ForeignMemberInfo
+                    { fmiScheme = scheme
+                    , fmiSymbol = cSymbol
+                    , fmiOwned  = isOwned
+                    }
+      pure (Map.insert memberName minfo acc)
 
 -- ---------------------------------------------------------------------------
 -- Pattern inference
@@ -1684,27 +1813,46 @@ inferExprW mono (Abs.EApp f x) = do
         Just _  -> throwError (RecordConstructorNeedsBraces (Just pos) name)
         Nothing -> pure ()
     _ -> pure ()
-  (fT, fNode) <- inferExprW mono f
-  (xT, xNode) <- inferExprW mono x
-  rT <- freshTVar KStar
-  effRow <- freshRVar
-  -- The applied arrow may carry an effect row; unify with a fresh row var so we
-  -- can read whatever effects the callee performs, then fold those concrete
-  -- effects into the enclosing equation's ambient row. Pure callees add
-  -- nothing. Afterwards CLOSE this per-application row: under (A) the call site
-  -- commits to the effects observed here, so the row variable does not escape
-  -- into the inferred type (an inferred higher-order function stays pure unless
-  -- its sig says `with eff e`).
-  unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
-  emitRow Nothing effRow
-  closeRow effRow
-  -- Flatten the curried application spine: nested EApp on the left becomes a
-  -- single TApp head [args]. The head node's annotation is the type at that
-  -- point in the spine (which matches what inferExprW computed for it).
-  let node = case fNode of
-        Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
-        _                          -> Ty.TApp fNode [xNode]
-  pure (rT, Ty.Texp rT node)
+  -- Collect the full application spine from this EApp.  Strip any surrounding
+  -- EParen from the head.  If the head is a foreign-module projection, apply
+  -- the saturation discipline HERE (at the outermost application node):
+  --
+  --   * under-saturated (length args < arity) => ForeignMemberPartialApp
+  --     (compile error instead of a runtime crash).
+  --   * exactly saturated (length args == arity) => type-check all args
+  --     directly against the member's parameter types and return the result
+  --     type + TProjCon node, bypassing per-step recursive descent so that
+  --     intermediate EApp nodes are never passed to inferExprW individually
+  --     (which would falsely re-trigger the arity check at each step).
+  --   * over-applied (length args > arity) => fall through to the normal
+  --     step-by-step path; the member's result type is never a function, so
+  --     the surplus application becomes a unification type error.
+  --
+  -- For paren-wrapped heads like @(Libc.memchr) buf 65 3@, 'stripEParen'
+  -- normalises the head before the pattern match.
+  let (rawHead, allArgs) = collectExprSpine (Abs.EApp f x)
+      strippedHead       = stripEParen rawHead
+  case strippedHead of
+    Abs.EProj (Abs.ECon (Abs.ConId (_, modName))) (Abs.VarId (mpos, label)) -> do
+      env <- currentEnv
+      case lookupForeignModule modName env of
+        Just fmi ->
+          case Map.lookup label (fmMembers fmi) of
+            Nothing -> throwError (ForeignModuleMemberUnknown (Just mpos) modName label)
+            Just minfo -> do
+              memberTy <- instantiate (fmiScheme minfo)
+              arity    <- arrowArity memberTy
+              let nArgs = length allArgs
+              case compare nArgs arity of
+                LT -> throwError (ForeignMemberPartialApp (Just mpos) modName label)
+                EQ -> inferForeignSaturatedCall mono modName label memberTy allArgs
+                GT ->
+                  -- Over-applied: fall through to the normal per-step logic.
+                  -- The member's return type is never a function, so the extra
+                  -- application will produce a normal unification type error.
+                  inferNormalApp mono f x
+        Nothing -> inferNormalApp mono f x
+    _ -> inferNormalApp mono f x
 inferExprW mono (Abs.EIf c a b) = do
   (cT, cNode) <- inferExprW mono c
   (aT, aNode) <- inferExprW mono a
@@ -1772,6 +1920,10 @@ inferExprW mono (Abs.EExpr head_ tails) = do
 -- declared effect and @op@ is one of its operations, this is an operation
 -- reference, not record-field access. Its type is the operation's scheme; it
 -- contributes the effect @E@ to the enclosing equation's ambient row.
+-- Foreign-module member access `M.mem` resolves via the foreign-module table
+-- when the head is a declared foreign module (checked AFTER the effect arm so
+-- effects take priority for unambiguous names; the ambiguity gate in
+-- 'processForeignDecls' ensures a ConId cannot be both).
 inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (pos, label))) = do
   env <- currentEnv
   case lookupEffect ename env of
@@ -1792,7 +1944,22 @@ inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (p
           emitEffect (Just pos) ename labelTy
           pure (opTy, Ty.Texp opTy (Ty.TProjCon ename label))
       | otherwise -> throwError (UnknownOperation (Just pos) ename label)
-    Nothing -> inferProjection mono headE pos label
+    Nothing ->
+      -- Not an effect: check the foreign-module table before falling through to
+      -- the generic projection (record-field / named-perform) path.
+      --
+      -- NOTE: a bare foreign-member projection (not the direct function of an
+      -- EApp) is REJECTED here. Foreign members are not closures; they must be
+      -- used as the direct head of a saturated call. The EApp arm above
+      -- intercepts `M.mem arg` and resolves the member type inline, bypassing
+      -- this arm. Any other use (bare reference, let-binding, passing as an
+      -- argument) reaches this arm and produces a clean typecheck error.
+      case lookupForeignModule ename env of
+        Just fmi ->
+          case Map.lookup label (fmMembers fmi) of
+            Nothing -> throwError (ForeignModuleMemberUnknown (Just pos) ename label)
+            Just _  -> throwError (ForeignMemberPartialApp (Just pos) ename label)
+        Nothing -> inferProjection mono headE pos label
 inferExprW mono (Abs.EProj e (Abs.VarId (pos, label))) =
   inferProjection mono e pos label
 inferExprW _ (Abs.EProjC _ (Abs.ConId (pos, _))) =
@@ -2009,6 +2176,54 @@ inferExprW mono (Abs.EWithNamed (Abs.VarId (npos, name)) fVar wargs body) = do
 inferExprW mono (Abs.EWithNamedH selfV effCon arms body) =
   inferNamedHandler mono selfV effCon arms body
 
+-- | Type-check a single-step application @f x@ using the standard arrow
+-- unification path. Extracted from 'inferExprW (EApp f x)' so that the
+-- foreign-call spine intercept can delegate here for non-foreign heads and
+-- over-applied foreign heads.
+inferNormalApp :: Map.Map Text (Type s) -> Abs.Exp -> Abs.Exp -> TC s (Type s, TExprS s)
+inferNormalApp mono f x = do
+  (fT, fNode) <- inferExprW mono f
+  (xT, xNode) <- inferExprW mono x
+  rT     <- freshTVar KStar
+  effRow <- freshRVar
+  unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
+  emitRow Nothing effRow
+  closeRow effRow
+  let node = case fNode of
+        Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
+        _                          -> Ty.TApp fNode [xNode]
+  pure (rT, Ty.Texp rT node)
+
+-- | Type-check a foreign member call where the full arg list is exactly
+-- saturated (length args == arity of the member type). Each arg is inferred
+-- and unified against the corresponding parameter type; the effect row of
+-- each arrow slot is emitted into the ambient row (so @with IO@ propagates).
+-- Returns the member's result type and a @TApp (TProjCon modName label) argNodes@
+-- typed node, matching the shape the elaborator's 'elabRhsF (TApp hd args)' arm
+-- expects.
+inferForeignSaturatedCall
+  :: Map.Map Text (Type s)
+  -> Text -> Text
+  -> Type s
+  -> [Abs.Exp]
+  -> TC s (Type s, TExprS s)
+inferForeignSaturatedCall mono modName label memberTy args = do
+  let headNode = Ty.Texp memberTy (Ty.TProjCon modName label)
+  (resultTy, argNodes) <- go memberTy args
+  let appNode = Ty.Texp resultTy (Ty.TApp headNode argNodes)
+  pure (resultTy, appNode)
+  where
+    go ty [] = pure (ty, [])
+    go ty (arg : rest) = do
+      (argT, argNode) <- inferExprW mono arg
+      rT     <- freshTVar KStar
+      effRow <- freshRVar
+      unify (expPos arg) ty (TArr argT effRow rT)
+      emitRow Nothing effRow
+      closeRow effRow
+      (finalTy, restNodes) <- go rT rest
+      pure (finalTy, argNode : restNodes)
+
 -- | Classification of a single handler arm against the (possibly empty) header.
 -- An unqualified arm is resolved to either an operation arm (when its head names
 -- an operation of a header effect) or a value/return arm (when it has no
@@ -2161,6 +2376,8 @@ inferHandler mono header headerPos e arms = do
         let armPos = case opArms of ((_, _, _, _, p) : _) -> Just p; [] -> Nothing
         throwError (MissingEffectDecl (maybe armPos Just headerPos) en)
       Just eInfo -> do
+        when (isGroundIO en eInfo) $
+          throwError (IOEffectNotHandleable headerPos)
         let declaredOps = Map.keys (eiOps eInfo)
             handledOps  = [ op | (en', op, _, _, _) <- opArms, en' == en ]
             missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
@@ -2304,6 +2521,8 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
   eInfo <- case lookupEffect effName env of
     Nothing -> throwError (MissingEffectDecl (Just epos) effName)
     Just i  -> pure i
+  when (isGroundIO effName eInfo) $
+    throwError (IOEffectNotHandleable (Just epos))
   -- Classify each arm against the single-effect header.
   classified <- mapM (classifyArm env [effName]) arms
   let opArms    = [ (en, op, ps, b, pos) | OpArmC en op ps b pos <- classified ]
@@ -3299,6 +3518,10 @@ inferProgramTC seedEnv origin decls = do
   -- or just Builtins.initialEnv for the back-compat path).
   env1  <- processDataDecls seedEnv (decls ++ dictData)
   env1e <- processEffectDecls env1 decls
+  -- Register foreign module declarations. Runs after effects so that `with IO`
+  -- in a member's declared type resolves correctly (IO is in the env from the
+  -- effect pass or the seed env).
+  env1f <- processForeignDecls env1e decls
   -- Register class then instance declarations (pure registrars from the Class
   -- module). Classes inject each method's constrained scheme into envVars, so
   -- equation bodies that use `==` resolve it; instances populate the solver's
@@ -3306,7 +3529,7 @@ inferProgramTC seedEnv origin decls = do
   -- references its class. class/instance decls are NOT value bindings
   -- (toLocalDecl drops them), so they never enter localDecls.
   env1c <- either throwError pure
-             (foldM Class.processClassDecl env1e [ d | d@Abs.DClass{} <- decls ])
+             (foldM Class.processClassDecl env1f [ d | d@Abs.DClass{} <- decls ])
   env1i <- either throwError pure
              (foldM Class.processInstanceDecl env1c [ d | d@Abs.DInstance{} <- decls ])
   -- Desugar each instance into synthetic typed top-level bindings (its method

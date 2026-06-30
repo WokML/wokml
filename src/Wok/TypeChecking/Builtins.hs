@@ -8,6 +8,10 @@
 --   * (,), (,,), ... (16-tuple) -- parens aren't a ConId
 --
 -- No constructors, no operator schemes, no helpers.
+--
+-- The built-in ground effect:
+--
+--   * IO -- the ground effect: no ops, never handled, discharged by the runtime.
 module Wok.TypeChecking.Builtins
   ( initialEnv
   ) where
@@ -15,13 +19,14 @@ module Wok.TypeChecking.Builtins
 import qualified Data.Map.Strict as Map
 import qualified Data.Text
 import Data.Text (Text)
-import Wok.TypeChecking.Env (Env (..), TyConInfo (..), ConInfo, emptyEnv)
+import Wok.TypeChecking.Env (Env (..), TyConInfo (..), ConInfo, EffectInfo (..), emptyEnv)
 import Wok.TypeChecking.Types (Kind (..))
 
 initialEnv :: Env
 initialEnv = emptyEnv
-  { envTyCons = Map.fromList tyConEntries
-  , envCons   = Map.fromList conEntries
+  { envTyCons   = Map.fromList tyConEntries
+  , envCons     = Map.fromList conEntries
+  , envEffects  = Map.fromList effectEntries
   }
   where
     listKind :: Kind
@@ -42,6 +47,12 @@ initialEnv = emptyEnv
 
     conEntries :: [(Text, ConInfo)]
     conEntries = []
+
+    -- IO -- the ground effect: no ops, never handled, discharged by the runtime.
+    effectEntries :: [(Text, EffectInfo)]
+    effectEntries =
+      [ ("IO", EffectInfo { eiParams = [], eiOps = Map.empty })
+      ]
 
     tupleName :: Int -> Text
     tupleName n = "(" <> Data.Text.replicate (n - 1) "," <> ")"

@@ -212,6 +212,7 @@ rhsMaxU (ROp m _ _ as)   = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
 rhsMaxU (RRecord _ flds) = foldr (max . atomMaxU . snd) (-1) flds
 rhsMaxU (RProj _ a)      = atomMaxU a
 rhsMaxU (RReuseCon tok _ as) = foldr (max . atomMaxU) (atomMaxU tok) as
+rhsMaxU (RForeignCall _ _ _ _ as) = foldr (max . atomMaxU) (-1) as
 
 atomMaxU :: Atom -> Int
 atomMaxU (AVar n) = uOf n
@@ -1124,6 +1125,10 @@ ownedOccs ctx delta rhs = case rhs of
          , u `Set.member` delta
          , u `Set.notMember` ctxExempt ctx, u `Set.notMember` ctxBorrow ctx ]
   ROp _ _ _ as   -> count as
+  -- Foreign call: treat args as owned moves (like 'RApp' arguments). No call-head
+  -- borrow because the callee is identified by (lib, sym) text, not an 'Atom'.
+  -- Task 6 will refine per-argument borrow semantics; for now, all args are moves.
+  RForeignCall _ _ _ _ as -> count as
   where
     -- A BORROWED operand (a 'LetRec' member / borrowed capture, in 'ctxBorrow') is
     -- NEVER an owned move --- even when its 'Unique' also names the shared env's
@@ -1162,6 +1167,7 @@ moveOperandUniques rhs = case rhs of
   RLam ps e      ->
     Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps))
   ROp _ _ _ as   -> atomUs as
+  RForeignCall _ _ _ _ as -> atomUs as
   where
     atomUs atoms = [ nameUniq n | AVar n <- atoms ]
 
@@ -1984,11 +1990,13 @@ moveAtoms resume rhs = case rhs of
   RCon _ as      -> as
   RRecord _ flds -> map snd flds
   RProj _ _      -> []   -- borrow
-  RReuseCon{}    -> error "RReuseCon: produced only by reusePairing post-pass (after insertRC/balanceLint)"
+  RReuseCon{}              -> error "RReuseCon: produced only by reusePairing post-pass (after insertRC/balanceLint)"
   RLam ps e ->
     [ AVar (Name (Tx.pack "") u)
     | u <- Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps)) ]
-  ROp _ _ _ as   -> as
+  ROp _ _ _ as             -> as
+  -- All args are consuming moves (no call-head exemption; callee is (lib,sym) text).
+  RForeignCall _ _ _ _ as  -> as
   where
     resumeHead (AVar n) | nameUniq n `Set.member` resume = [AVar n]
     resumeHead _ = []

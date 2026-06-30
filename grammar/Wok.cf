@@ -107,6 +107,22 @@ DFixity.  Decl ::= "fixity" FixName FixAssoc [FixRel] ;
 DClass.    Decl ::= "class" ConId [VarId] "where" "{" [ClassEntry] "}" ;
 DInstance. Decl ::= "instance" InstHead "where" "{" [InstEntry] "}" ;
 
+-- Foreign module: a namespaced group of FFI bindings to a C library (Slice 2).
+-- `where "{" ... "}"` is layout-virtual (where is a layout keyword, see :87 and
+-- the DClass note at :105-106). The library string selects the host binding set;
+-- `free String` (optional) names the deallocator for `owned` (transfer-full)
+-- members. A member's C symbol defaults to its name; an optional leading string
+-- overrides it. `owned` on a member = transfer full (adopt + free at rc-zero);
+-- its absence = copy (transfer none).
+DForeign.   Decl ::= "foreign" "module" ConId String ForeignFree "where" "{" [ForeignMember] "}" ;
+FFNone.     ForeignFree ::= ;
+FFSym.      ForeignFree ::= "free" String ;
+FMPlain.    ForeignMember ::= VarId ForeignSym ":" Type ;
+FMOwned.    ForeignMember ::= "owned" VarId ForeignSym ":" Type ;
+FSNone.     ForeignSym ::= ;
+FSName.     ForeignSym ::= String ;
+separator   ForeignMember ";" ;
+
 IHPlain.   InstHead ::= ConId [Type2] ;
 IHCtx.     InstHead ::= "(" [Constraint] ")" "=>" ConId [Type2] ;
 

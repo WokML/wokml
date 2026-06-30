@@ -7,6 +7,8 @@ module Wok.TypeChecking.Env
   , EffectInfo (..)
   , ClassInfo (..)
   , InstanceInfo (..)
+  , ForeignModuleInfo (..)
+  , ForeignMemberInfo (..)
   , EnvNs (..)
   , emptyEnv
   , overlayEnvs
@@ -18,6 +20,7 @@ module Wok.TypeChecking.Env
   , lookupClass
   , lookupInstances
   , classOfMethod
+  , lookupForeignModule
   , extendVar
   , extendCon
   , extendTyCon
@@ -25,6 +28,7 @@ module Wok.TypeChecking.Env
   , extendEffect
   , extendClass
   , extendInstance
+  , extendForeignModule
   ) where
 
 import Data.List (nub)
@@ -101,14 +105,35 @@ data InstanceInfo = InstanceInfo
   }
   deriving (Eq, Show)
 
+-- | One declared member of a foreign module.
+-- The 'fmiScheme' is translated from the member's declared type just as
+-- a top-level signature is ('translateSig'), so it may carry an effect row
+-- (e.g. @U64 -> U64 with IO@ becomes @CTArr CTU64 (CRExtend "IO" ...) CTU64@).
+data ForeignMemberInfo = ForeignMemberInfo
+  { fmiScheme :: Scheme   -- ^ The member's declared type scheme.
+  , fmiSymbol :: Text     -- ^ The C symbol name (FSName override or the member name).
+  , fmiOwned  :: Bool     -- ^ True iff declared with the @owned@ keyword.
+  }
+  deriving (Eq, Show)
+
+-- | A declared @foreign module@ binding: a C library mapped to a wok namespace.
+data ForeignModuleInfo = ForeignModuleInfo
+  { fmLib     :: Text                    -- ^ Library tag (e.g. @"c"@).
+  , fmFree    :: Maybe Text              -- ^ Optional free-function symbol (e.g. @"free"@).
+  , fmMembers :: Map Text ForeignMemberInfo  -- ^ Member name -> member info.
+  }
+  deriving (Eq, Show)
+
 data Env = Env
-  { envVars       :: Map Text Scheme
-  , envCons       :: Map Text ConInfo
-  , envTyCons     :: Map Text TyConInfo
-  , envRecordCons :: Map Text RecordConInfo
-  , envEffects    :: Map Text EffectInfo
-  , envClasses    :: Map Text ClassInfo
-  , envInstances  :: [InstanceInfo]
+  { envVars           :: Map Text Scheme
+  , envCons           :: Map Text ConInfo
+  , envTyCons         :: Map Text TyConInfo
+  , envRecordCons     :: Map Text RecordConInfo
+  , envEffects        :: Map Text EffectInfo
+  , envClasses        :: Map Text ClassInfo
+  , envInstances      :: [InstanceInfo]
+  , envForeignModules :: Map Text ForeignModuleInfo
+    -- ^ Foreign-module namespace: ConId -> ForeignModuleInfo.
   , -- | Binding provenance for the VAR namespace: var name -> defining
     -- module name. Populated by the pipeline (each new var gets its
     -- defining module's name) and unioned through 'overlayEnvs'. Lets
@@ -122,11 +147,12 @@ data Env = Env
   deriving (Eq, Show)
 
 emptyEnv :: Env
-emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty Map.empty [] Map.empty
+emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty Map.empty [] Map.empty Map.empty
 
--- | Tag for which of the six Env namespaces a name lives in.
+-- | Tag for which of the Env namespaces a name lives in.
 -- Used by 'overlayEnvs' to attribute collisions.
 data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect | NsClass
+           | NsForeignModule
   deriving (Eq, Ord, Show)
 
 -- | Left-biased union of two 'Env's. On a name collision in any of
@@ -164,7 +190,8 @@ data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect | NsClass
 -- level since we reject any actual differing overlap rather than silently
 -- picking a side.
 overlayEnvs :: Env -> Env -> Either [(EnvNs, Text)] Env
-overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 o1) (Env v2 c2 tc2 rc2 ef2 cl2 ii2 o2) =
+overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 fm1 o1)
+            (Env v2 c2 tc2 rc2 ef2 cl2 ii2 fm2 o2) =
   let differing m1 m2 =
         Map.keys (Map.filter id (Map.intersectionWith (/=) m1 m2))
       -- A shared var clashes when its origins are known and differ (a
@@ -183,16 +210,19 @@ overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 o1) (Env v2 c2 tc2 rc2 ef2 cl2 ii2 o2
       rcClash  = differing rc1 rc2
       efClash  = differing ef1 ef2
       clClash  = differing cl1 cl2
-      clashes  =  [ (NsVar,       k) | k <- varClash ]
-               ++ [ (NsCon,       k) | k <- conClash ]
-               ++ [ (NsTyCon,     k) | k <- tcClash  ]
-               ++ [ (NsRecordCon, k) | k <- rcClash  ]
-               ++ [ (NsEffect,    k) | k <- efClash  ]
-               ++ [ (NsClass,     k) | k <- clClash  ]
+      fmClash  = differing fm1 fm2
+      clashes  =  [ (NsVar,           k) | k <- varClash ]
+               ++ [ (NsCon,           k) | k <- conClash ]
+               ++ [ (NsTyCon,         k) | k <- tcClash  ]
+               ++ [ (NsRecordCon,     k) | k <- rcClash  ]
+               ++ [ (NsEffect,        k) | k <- efClash  ]
+               ++ [ (NsClass,         k) | k <- clClash  ]
+               ++ [ (NsForeignModule, k) | k <- fmClash  ]
   in case clashes of
        [] -> Right (Env (Map.union v1 v2) (Map.union c1 c2) (Map.union tc1 tc2)
                         (Map.union rc1 rc2) (Map.union ef1 ef2)
                         (Map.union cl1 cl2) (nub (ii1 ++ ii2))
+                        (Map.union fm1 fm2)
                         (Map.union o1 o2))
        _  -> Left clashes
 
@@ -244,3 +274,9 @@ extendClass k v e = e { envClasses = Map.insert k v (envClasses e) }
 
 extendInstance :: InstanceInfo -> Env -> Env
 extendInstance i e = e { envInstances = i : envInstances e }
+
+lookupForeignModule :: Text -> Env -> Maybe ForeignModuleInfo
+lookupForeignModule k = Map.lookup k . envForeignModules
+
+extendForeignModule :: Text -> ForeignModuleInfo -> Env -> Env
+extendForeignModule k v e = e { envForeignModules = Map.insert k v (envForeignModules e) }

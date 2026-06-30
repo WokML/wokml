@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 module Wok.Interp.RC.Machine
   ( RCConfig (..)
   , RCStep (..)
@@ -13,7 +14,8 @@ module Wok.Interp.RC.Machine
   , renderRcStats
   ) where
 
-import Control.Monad (foldM)
+import Control.Monad (foldM, when)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT (..), throwE, runExceptT)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -29,10 +31,19 @@ import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import qualified Wok.IR.PrimNames as PN
 import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.IR.Region (Placement (..), RegionPlan (..), SliceRep (..), planRegions)
+import Wok.FFI.Blessed (ReturnDisp (..))
+import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup)
 import Wok.Interp.RC.Prim (rcPrimTable)
 import Wok.Interp.RC.Value
+import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.Value (RuntimeError (..))
+import qualified Data.ByteString as BS
+import Data.Bits ((.&.))
+import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
+import Data.Word (Word8, Word64)
+import Foreign.C.Types (CInt, CSize)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, minusPtr)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -348,6 +359,13 @@ evalRhsRC env b rhs body sc k s = case rhs of
     (vs, s1) <- resolveRCAtomsAlloc sc as s
     mTarget  <- liftRC (resolveInstRC sc minst)
     rcDispatchOp mTarget lbl op vs (KLetRC b body sc k) s1
+  -- Foreign call on the RC machine: dispatches to either the pure Haskell model
+  -- (AbstractHeap) or real ccall (CHeap), using 'disp' to determine how to wrap
+  -- the return value and 'mfree' to name the free function for DispAdopt.
+  -- Args are owned positions, resolved via 'resolveRCAtomsAlloc'. Task 6.
+  RForeignCall lib sym disp mfree as -> do
+    (vs, s1) <- resolveRCAtomsAlloc sc as s
+    rcForeignDispatch lib sym disp mfree vs s1 cont
   where
     cont v s' = pure (REval body sc { rscEnv = bindRCBinder b v (rscEnv sc) } k s')
     -- Route this allocation by the region plan (Region Slice R1, spec §4.2): an
@@ -358,6 +376,197 @@ evalRhsRC env b rhs body sc k s = case rhs of
     allocRouted bd node st = case Map.lookup (binderUnique bd) (rcePlacement env) of
       Just Arena -> arenaAlloc node st
       _          -> alloc node st
+
+-- | Dispatch a foreign-module call in the RC machine.
+--
+-- ABSTRACT HEAP: uses the pure Haskell models from 'Wok.Interp.ForeignModels',
+-- which are shared with the reference interpreter. 'DispAdopt' results allocate
+-- 'NForeignBytes' (fixed 24 B handle) to match the C-heap accounting. 'DispScalar'
+-- results are returned as 'RVLit'. 'DispCopy' results allocate 'NBytes'.
+--
+-- C HEAP: executes REAL libc calls via ccall imports in 'Wok.Interp.RC.Heap'.
+-- BORROW-OUT: the Bytes argument's data pointer is passed to C for the duration
+-- of the synchronous call. Wok never transfers ownership of the arg cell to C.
+-- C reads from the pointer but does NOT free it. The cell's RC lifetime is managed
+-- entirely by Perceus (a dup/drop before and after the call site), exactly as for
+-- any other use of the cell. The borrow is sound because all blessed functions are:
+--   - synchronous (return before Haskell resumes, so the pointer is valid for the
+--     entire duration of the call),
+--   - length-bounded (we pass the cell's exact byte_len, no overread),
+--   - non-retaining (C neither stores the pointer nor schedules a later free).
+--
+-- 'strndup': the malloc'd C result is adopted via 'wokForeignBytesAlloc' directly
+-- (no copy), with libc 'free' called at refcount-zero by 'dropAddr' (Value.hs).
+-- Only 'Just "free"' is accepted as the free clause for DispAdopt this slice; any
+-- other value is a clear runtime error (should not be reachable from elaboration).
+rcForeignDispatch
+  :: Text -> Text -> ReturnDisp -> Maybe Text -> [RCValue] -> Store
+  -> (RCValue -> Store -> RC RCConfig) -> RC RCConfig
+rcForeignDispatch lib sym disp mfree vs s cont
+  | lib == libC, sym == symMemchr =
+      case vs of
+        [RVBox bAddr, RVLit (LInt byte), RVLit (LInt n)] ->
+          case stBackend s of
+            AbstractHeap -> do
+              bs <- rcReadBytes bAddr s
+              let r = foreignMemchr bs (fromIntegral byte) (fromIntegral n)
+              -- DROP the arg: Perceus treats foreign call args as owned moves; the
+              -- callee (us) is responsible for releasing the boxed Bytes arg.
+              s1 <- dropAddr bAddr s
+              cont (RVLit (LInt (toInteger r))) s1
+            CHeap _ -> do
+              -- Read the data pointer BEFORE dropping (drop may free the cell).
+              (argPtr, argLen) <- rcBorrowCHeapPtr bAddr
+              p <- liftIO $
+                H.c_memchr argPtr
+                           (fromIntegral (byte .&. 0xFF :: Integer) :: CInt)
+                           (fromIntegral (min (fromIntegral n) argLen) :: CSize)
+              let offset :: Word64
+                  offset = if p == nullPtr
+                    then min (fromIntegral n) argLen
+                    else fromIntegral (p `minusPtr` argPtr)
+              -- DROP after the synchronous C call completes (pointer no longer used).
+              s1 <- dropAddr bAddr s
+              cont (RVLit (LInt (fromIntegral offset))) s1
+        _ -> throwE (PrimError (Tx.pack "memchr (RC): expected (Bytes, U64, U64)"))
+  | lib == libC, sym == symStrndup =
+      case vs of
+        [RVBox bAddr, RVLit (LInt n)] ->
+          case stBackend s of
+            AbstractHeap -> do
+              bs <- rcReadBytes bAddr s
+              -- DROP before allocating the result (result is the new owner).
+              s1 <- dropAddr bAddr s
+              let result = foreignStrndup bs (fromIntegral n)
+              allocResult disp result s1 cont
+            CHeap hp -> do
+              -- Read the data pointer BEFORE dropping.
+#ifdef WOK_FFI_NOCLAMP_NEGCTRL
+              (argPtr, _argLen) <- rcBorrowCHeapPtr bAddr
+#else
+              (argPtr, argLen) <- rcBorrowCHeapPtr bAddr
+#endif
+              -- DESTRUCTOR GUARD: a 'DispAdopt' return adopts the C-malloc'd buffer
+              -- into a 0xFFFB cell whose rc-zero destructor is HARDWIRED to libc
+              -- 'free'. The only blessed destructor is therefore "free". A
+              -- well-typed program always supplies it (typecheck forbids an owned
+              -- return without a free clause), so this is a contract assertion, not
+              -- a reachable user error.
+              case mfree of
+                Just freeClause | freeClause == Tx.pack "free" -> pure ()
+                _ -> do
+                  -- Drop the borrowed arg before throwing: even on error the
+                  -- borrowed cell must be released to avoid a refcount leak.
+                  _ <- dropAddr bAddr s
+                  throwE (PrimError
+                       (Tx.pack "strndup (RC CHeap): unsupported foreign destructor"
+                         <> Tx.pack " (only libc free is blessed): "
+                         <> fromMaybe (Tx.pack "<none>") mfree))
+              -- CLAMP the scan length to the borrowed buffer length. Real
+              -- 'c_strndup' reads up to n bytes searching for a NUL; if n exceeds
+              -- the buffer and the buffer has no NUL, an UNCLAMPED call would read
+              -- PAST the wok buffer (heap overread) and could return MORE than
+              -- 'argLen' bytes -- diverging from the model 'foreignStrndup', which
+              -- clamps via 'BS.take n' (never reads past the buffer end). Clamping
+              -- to 'min n argLen' bounds the scan to the buffer; strndup still
+              -- NUL-terminates and 'c_strlen' gives the true result length
+              -- (<= min n argLen), matching the model.
+#ifdef WOK_FFI_NOCLAMP_NEGCTRL
+              -- NEGATIVE CONTROL ONLY (asan-runtime.sh `interp` gate): deliberately
+              -- drop the scan clamp so a too-large n overreads the borrowed buffer,
+              -- proving the ASan gate has teeth. NEVER enabled in a normal build
+              -- (flag ffi-noclamp-negctrl default is False).
+              let scanN = fromIntegral n :: Word64
+#else
+              let scanN = min (fromIntegral n) argLen :: Word64
+#endif
+              -- Real strndup: C allocates and fills a NUL-terminated copy.
+              -- SAFETY: argPtr is valid during c_strndup because:
+              --   (1) the C call is synchronous,
+              --   (2) we drop bAddr only AFTER the call returns,
+              --   (3) the scan is clamped to argLen (no overread).
+              p <- liftIO $
+                H.c_strndup argPtr (fromIntegral scanN :: CSize)
+              -- BOUNDARY CHECK: strndup mallocs and returns NULL on OOM. The FFI
+              -- boundary is a system boundary; a C allocation failure must not
+              -- become a null-deref in 'c_strlen' / 'adoptCHeapPtr'.
+              when (p == nullPtr) $ do
+                -- Drop the borrowed arg before throwing; the OOM path must not
+                -- leak the input cell's refcount.
+                _ <- dropAddr bAddr s
+                throwE (PrimError (Tx.pack "strndup (RC CHeap): C allocation failed (NULL)"))
+              -- strlen gives the TRUE length (bytes before NUL); NUL excluded.
+              rawLen <- liftIO (H.c_strlen p)
+              let len = fromIntegral rawLen :: Word64
+              -- DROP after the C calls complete; the adopted pointer p is our result.
+              s1 <- dropAddr bAddr s
+              -- Adopt the C-malloc'd pointer into a WokForeignBytes cell.
+              -- wok_foreign_bytes_alloc stores the raw pointer; dropAddr calls
+              -- free() on it at refcount-zero (Value.hs drop cascade).
+              (a, s2) <- adoptCHeapPtr hp (castPtr p) len s1
+              cont (RVBox a) s2
+        _ -> throwE (PrimError (Tx.pack "strndup (RC): expected (Bytes, U64)"))
+  | otherwise =
+      throwE (PrimError
+        (Tx.pack "foreign symbol not available in the RC interpreter: "
+          <> lib <> Tx.pack "." <> sym))
+  where
+    libC       = Tx.pack "c"
+    symMemchr  = Tx.pack "memchr"
+    symStrndup = Tx.pack "strndup"
+
+-- | Allocate the result of a DispAdopt/DispCopy/DispScalar return on AbstractHeap.
+-- DispAdopt => 'NForeignBytes' (24 B handle); DispCopy => 'NBytes'; DispScalar
+-- is not a buffer type and this helper is never called for it.
+allocResult :: ReturnDisp -> BS.ByteString -> Store
+            -> (RCValue -> Store -> RC RCConfig) -> RC RCConfig
+allocResult DispAdopt bs s cont = do
+  (a, s') <- alloc (NForeignBytes bs) s
+  cont (RVBox a) s'
+allocResult DispCopy bs s cont = do
+  (a, s') <- alloc (NBytes bs) s
+  cont (RVBox a) s'
+allocResult DispScalar _ _ _ =
+  throwE (PrimError (Tx.pack "allocResult: DispScalar has no buffer to allocate"))
+
+-- | BORROW-OUT (CHeap only): extract the raw data pointer and byte length from a
+-- CHeap Bytes cell (WokBytes tag 0xFFFC or WokForeignBytes tag 0xFFFB).
+-- The caller passes this pointer to a synchronous C call. Ownership of the cell
+-- is NOT transferred; C reads the bytes but never frees the pointer.
+-- This is sound because all blessed functions are synchronous, length-bounded,
+-- and non-retaining. Perceus manages the cell's RC lifecycle independently.
+rcBorrowCHeapPtr :: Addr -> RC (Ptr Word8, Word64)
+rcBorrowCHeapPtr addr = case addr of
+  CAddr p -> do
+    tid <- liftIO (H.wokTag p)
+    if tid == wokBytesTag
+      then do
+        dptr <- liftIO (H.wokBytesData p)
+        blen <- liftIO (H.wokBytesLen p)
+        pure (dptr, blen)
+      else if tid == wokForeignBytesTag
+        then do
+          dptr <- liftIO (H.wokForeignBytesPtr p)
+          blen <- liftIO (H.wokForeignBytesLen p)
+          pure (dptr, blen)
+        else throwE (PrimError
+               (Tx.pack "rcBorrowCHeapPtr: unexpected cell tag for Bytes arg"))
+  _ -> throwE (PrimError
+         (Tx.pack "rcBorrowCHeapPtr: expected CAddr on CHeap"))
+
+-- | Read a 'ByteString' from a heap address holding an 'NBytes' or 'NForeignBytes'
+-- node. Used by the abstract-heap dispatch paths (the CHeap path uses
+-- 'rcBorrowBytesPtr' instead). Both 'NBytes' and 'NForeignBytes' carry a
+-- 'ByteString' on the abstract heap (the faithful model of the foreign buffer).
+rcReadBytes :: Addr -> Store -> RC BS.ByteString
+rcReadBytes addr s = do
+  c <- deref addr s
+  case cNode c of
+    NBytes bs        -> pure bs
+    NForeignBytes bs -> pure bs
+    other            -> throwE (PrimError
+      (Tx.pack "foreign call: expected Bytes argument, got node: "
+        <> Tx.pack (show other)))
 
 -- | Resolve a list of atoms in OWNING positions, threading the store left-to-right
 -- (a string literal among them allocates a fresh counted 'NString' cell; every

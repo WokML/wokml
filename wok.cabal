@@ -14,6 +14,24 @@ data-files:         prelude/Std/Base.wok
                     prelude/Std/String.wok
                     prelude/Std/Bytes.wok
 
+-- Enable AddressSanitizer for the C runtime and the wok executable.
+-- WOK_RC_MALLOC forces the slab pool to fall back to plain malloc, giving
+-- ASan real redzones around every allocation so overreads are visible.
+-- Default: False (normal build is byte-identical without this flag).
+flag asan
+  description: Build with AddressSanitizer (ASan). Requires clang + ASan runtime.
+  default:     False
+  manual:      True
+
+-- Negative-control flag: drop the strndup scan clamp in the RC interpreter so
+-- a too-large n overreads the borrowed buffer. Combined with -fasan this MUST
+-- abort under ASan, proving the clamp gate has teeth.
+-- Default: False (never enabled in a normal build).
+flag ffi-noclamp-negctrl
+  description: Drop the strndup scan clamp (ASan negative control only). NEVER use in production.
+  default:     False
+  manual:      True
+
 -- Plain -Wall, used by the generated parser sublibrary (BNFC/alex/happy
 -- output carries unavoidable warnings, so it must NOT be -Werror).
 common warnings
@@ -94,6 +112,7 @@ library
         Wok.TypeChecking.Solve
         Wok.TypeChecking.Typed
         Wok.TypeChecking.Carrier
+        Wok.FFI.Blessed
         Wok.IR.Name
         Wok.IR.PrimNames
         Wok.IR.Anf
@@ -110,6 +129,7 @@ library
         Wok.Interp.Prim
         Wok.Interp.Utf8
         Wok.Interp.Sched
+        Wok.Interp.ForeignModels
         Wok.Interp.Machine
         Wok.Interp.RC.Heap
         Wok.Interp.RC.Value
@@ -124,6 +144,10 @@ library
     cc-options:       -std=c17 -O3 -fstrict-aliasing -Wstrict-aliasing=2 -fwrapv
                       -Werror -Wall -Wextra -Wpedantic -Wconversion
                       -Wdouble-promotion -Wstrict-prototypes -Wformat-security
+    if flag(asan)
+      cc-options:     -fsanitize=address -fno-omit-frame-pointer -DWOK_RC_MALLOC
+    if flag(ffi-noclamp-negctrl)
+      cpp-options:    -DWOK_FFI_NOCLAMP_NEGCTRL
     autogen-modules:
         Paths_wok
     other-modules:
@@ -148,6 +172,8 @@ executable wok
         containers,
         text
     hs-source-dirs:   app
+    if flag(asan)
+      ghc-options:    -optl-fsanitize=address
 
 test-suite wok-tests
     import:           strict

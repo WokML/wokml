@@ -1,25 +1,25 @@
 headCons xs =
-  join j104(r) =
+  join j121(r) =
     let h = r
     let t = Cell(h, xs)
     t
-  join j106() =
-    jump j104(0)
-  join j107(y.1) =
-    jump j104(y.1)
-  join j109(y.2) =
-    jump j104(y.2)
+  join j123() =
+    jump j121(0)
+  join j124(y.1) =
+    jump j121(y.1)
+  join j126(y.2) =
+    jump j121(y.2)
   case xs of
-    Nil -> jump j106()
+    Nil -> jump j123()
     Cons f.1 f.2 ->
       let _dup = __rc_dup(f.2)
       case f.2 of
         Nil ->
           let _drop.1 = __rc_drop(f.2)
-          jump j107(f.1)
+          jump j124(f.1)
         Cons f.3 f.4 ->
           let _drop.2 = __rc_drop(f.2)
-          jump j109(f.1)
+          jump j126(f.1)
 
 main =
   let t.3 = Nil
@@ -129,6 +129,18 @@ dict$Eq$String$m1 x y =
 
 dict$Eq$String =
   let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
+
+dict$Eq$Bytes$m0 =
+  eqBytes
+
+dict$Eq$Bytes$m1 x y =
+  let t.1 = dict$Eq$Bytes$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$Bytes =
+  let t = Eq$Dict(dict$Eq$Bytes$m0, dict$Eq$Bytes$m1)
   t
 
 reader e c =
@@ -586,3 +598,28 @@ countFrom s n from acc =
       let t.4 = +(acc, 1)
       let t.5 = countFrom(s, n, t.3, t.4)
       t.5
+
+foldChars f acc str =
+  let _dup = __rc_dup(str)
+  let t.1 = byteLength(str)
+  let t.2 = foldCharsGo(f, acc, str, 0, t.1)
+  t.2
+
+foldCharsGo f acc str off end =
+  let t.1 = eqU64(off, end)
+  case t.1 of
+    True ->
+      let _drop.1 = __rc_drop(t.1)
+      let _drop.2 = __rc_drop(f)
+      let _drop.3 = __rc_drop(str)
+      acc
+    False ->
+      let _drop.4 = __rc_drop(t.1)
+      let _dup.1 = __rc_dup(str)
+      let t.2 = decodeCharAt(str, off)
+      let t.3 = f(acc, t.2)
+      let _dup.2 = __rc_dup(str)
+      let t.4 = charWidthAt(str, off)
+      let t.5 = +(off, t.4)
+      let t.6 = foldCharsGo(f, t.3, str, t.5, end)
+      t.6

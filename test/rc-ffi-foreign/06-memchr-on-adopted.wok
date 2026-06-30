@@ -1,0 +1,10 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+  memchr : Bytes -> U64 -> U64 -> U64 with IO
+-- strndup produces an adopted (NForeignBytes) value; pass it to memchr.
+-- Input [1,2,3,4], strndup n=4 => [1,2,3,4], memchr for 3 => index 2.
+main =
+  let b = Libc.strndup (fromList [1, 2, 3, 4]) 4
+  in Libc.memchr b 3 4

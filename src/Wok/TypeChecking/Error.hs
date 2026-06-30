@@ -174,6 +174,12 @@ data TypeError
     -- could consume twice is rejected (sound over-approximation). Args: position
     -- (the enclosing binding, since the typed AST carries no per-node span), the
     -- offending future binding's name.
+  | IOEffectNotHandleable SourceSpan
+    -- ^ A @with@-handler block targets @IO@, which is the ground effect.
+    -- @IO@ has no operations and is discharged by running the program, never
+    -- by a handler. Args: position (the handler site).
+    -- Message: "IO is a ground effect and cannot be handled; it is discharged
+    -- by running the program."
   | ExternNotAllowed SourceSpan Text
     -- ^ A UserFile module contains an @extern@ declaration. @extern@ marks a
     -- compiler-hole primitive bound to a host prim by name, and it is the trust
@@ -194,6 +200,51 @@ data TypeError
     -- check fires only on a concretely function-typed payload, walking into
     -- data-type arguments to catch nested arrows. Args: position (the carrier
     -- tycon's source span) and the offending payload type, rendered.
+  | ForeignSymbolNotBlessed SourceSpan Text Text
+    -- ^ A @foreign module@ member's (lib, C-symbol) pair is not in the
+    -- blessed allow-list. Only statically-known deterministic symbols are
+    -- accepted in the interpreter era; everything else is a clean error.
+    -- Args: position (the @foreign module@ header), library tag, C symbol name.
+    -- Message: "foreign symbol (lib, sym) is not in the blessed allow-list."
+  | ForeignModuleMemberUnknown SourceSpan Text Text
+    -- ^ A dotted access @M.op@ where @M@ is a declared foreign module but
+    -- @op@ is not one of its declared members. Args: position, module name,
+    -- member name.
+    -- Message: "foreign module M has no member op."
+  | AmbiguousProjectionHead SourceSpan Text
+    -- ^ A ConId is registered both as an algebraic effect AND as a foreign
+    -- module, making @ConId.op@ ambiguous. Args: position, the ConId.
+    -- Message: "ConId is both an effect and a foreign module; rename one."
+  | ForeignOwnedNeedsFree SourceSpan Text Text
+    -- ^ A @foreign module@ member is declared @owned@ but the module header
+    -- carries no @free@ clause. Without a free function the runtime cannot
+    -- reclaim the adopted pointer. Args: position, module name, member name.
+    -- Message: "owned member mem in foreign module M requires a free clause."
+  | ForeignDispositionMismatch SourceSpan Text Text
+    -- ^ A @foreign module@ member's @owned@ keyword disagrees with the blessed
+    -- symbol's return disposition. The blessed table is the ground truth for how
+    -- the callee's return value must be handled; any mismatch would produce
+    -- backend divergence (one backend errors, another silently leaks or
+    -- double-frees). Args: position, member name, guidance message.
+    --
+    -- For @DispAdopt@: "foreign member 'mem' returns an owned buffer; declare
+    -- it @owned@ and give the module a @free@ clause."
+    -- For @DispScalar@ or @DispCopy@: "foreign member 'mem' returns a scalar;
+    -- remove @owned@."
+  | DuplicateForeignModule SourceSpan Text
+    -- ^ A @foreign module@ declaration uses a name that is already registered
+    -- as a foreign module in the same file (or via an import). The second
+    -- declaration would silently overwrite the first's member set, losing
+    -- members with no error. Args: position (the duplicate header), module name.
+    -- Message: "foreign module M is already declared; rename one."
+  | ForeignMemberPartialApp SourceSpan Text Text
+    -- ^ A foreign-module member was used as a first-class value (partial
+    -- application or bare reference) rather than being fully applied at the
+    -- call site. Foreign members are not closures and cannot be passed around;
+    -- they must be used as the direct head of a saturated call. Args: position,
+    -- module name, member name.
+    -- Message: "foreign member M.f must be fully applied; it cannot be used as
+    -- a first-class value."
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint

@@ -159,11 +159,32 @@ instance Print GeneratedParser.Wok.Abs.Decl where
     GeneratedParser.Wok.Abs.DFixity fixname fixassoc fixrels -> prPrec i 0 (concatD [doc (showString "fixity"), prt 0 fixname, prt 0 fixassoc, prt 0 fixrels])
     GeneratedParser.Wok.Abs.DClass conid varids classentrys -> prPrec i 0 (concatD [doc (showString "class"), prt 0 conid, prt 0 varids, doc (showString "where"), doc (showString "{"), prt 0 classentrys, doc (showString "}")])
     GeneratedParser.Wok.Abs.DInstance insthead instentrys -> prPrec i 0 (concatD [doc (showString "instance"), prt 0 insthead, doc (showString "where"), doc (showString "{"), prt 0 instentrys, doc (showString "}")])
+    GeneratedParser.Wok.Abs.DForeign conid str foreignfree foreignmembers -> prPrec i 0 (concatD [doc (showString "foreign"), doc (showString "module"), prt 0 conid, printString str, prt 0 foreignfree, doc (showString "where"), doc (showString "{"), prt 0 foreignmembers, doc (showString "}")])
     GeneratedParser.Wok.Abs.DModule modpath -> prPrec i 0 (concatD [doc (showString "module"), prt 0 modpath])
     GeneratedParser.Wok.Abs.DImport modpath -> prPrec i 0 (concatD [doc (showString "import"), prt 0 modpath])
     GeneratedParser.Wok.Abs.DUse modpath -> prPrec i 0 (concatD [doc (showString "use"), prt 0 modpath])
     GeneratedParser.Wok.Abs.DLocal decl -> prPrec i 0 (concatD [doc (showString "local"), prt 0 decl])
     GeneratedParser.Wok.Abs.DReserved reservedkw -> prPrec i 0 (concatD [prt 0 reservedkw])
+
+instance Print GeneratedParser.Wok.Abs.ForeignFree where
+  prt i = \case
+    GeneratedParser.Wok.Abs.FFNone -> prPrec i 0 (concatD [])
+    GeneratedParser.Wok.Abs.FFSym str -> prPrec i 0 (concatD [doc (showString "free"), printString str])
+
+instance Print GeneratedParser.Wok.Abs.ForeignMember where
+  prt i = \case
+    GeneratedParser.Wok.Abs.FMPlain varid foreignsym type_ -> prPrec i 0 (concatD [prt 0 varid, prt 0 foreignsym, doc (showString ":"), prt 0 type_])
+    GeneratedParser.Wok.Abs.FMOwned varid foreignsym type_ -> prPrec i 0 (concatD [doc (showString "owned"), prt 0 varid, prt 0 foreignsym, doc (showString ":"), prt 0 type_])
+
+instance Print GeneratedParser.Wok.Abs.ForeignSym where
+  prt i = \case
+    GeneratedParser.Wok.Abs.FSNone -> prPrec i 0 (concatD [])
+    GeneratedParser.Wok.Abs.FSName str -> prPrec i 0 (concatD [printString str])
+
+instance Print [GeneratedParser.Wok.Abs.ForeignMember] where
+  prt _ [] = concatD []
+  prt _ [x] = concatD [prt 0 x]
+  prt _ (x:xs) = concatD [prt 0 x, doc (showString ";"), prt 0 xs]
 
 instance Print GeneratedParser.Wok.Abs.InstHead where
   prt i = \case

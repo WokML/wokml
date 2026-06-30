@@ -229,6 +229,7 @@ reorderDecl _ d@(DExternType{}) = Right d  -- marked opaque carrier; no exprs to
 reorderDecl _ d@(DEffect{})   = Right d  -- operation types contain no exprs to reorder
 reorderDecl _ d@(DClass{})    = Right d  -- fully typechecked + desugared downstream; passed through here
 reorderDecl _ d@(DInstance{}) = Right d  -- fully typechecked + desugared downstream; passed through here
+reorderDecl _ d@(DForeign{})  = Right d  -- FFI module decl; no exprs to reorder
 reorderDecl _ d@(DFixity{})   = Right d
 reorderDecl _ d@(DModule{})   = Right d
 reorderDecl _ d@(DImport{})   = Right d

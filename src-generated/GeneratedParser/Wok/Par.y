@@ -54,30 +54,33 @@ import qualified Data.Text
   'extern'   { PT _ (TS _ 28)    }
   'fixity'   { PT _ (TS _ 29)    }
   'forall'   { PT _ (TS _ 30)    }
-  'fun'      { PT _ (TS _ 31)    }
-  'if'       { PT _ (TS _ 32)    }
-  'import'   { PT _ (TS _ 33)    }
-  'in'       { PT _ (TS _ 34)    }
-  'instance' { PT _ (TS _ 35)    }
-  'left'     { PT _ (TS _ 36)    }
-  'let'      { PT _ (TS _ 37)    }
-  'local'    { PT _ (TS _ 38)    }
-  'looser'   { PT _ (TS _ 39)    }
-  'module'   { PT _ (TS _ 40)    }
-  'of'       { PT _ (TS _ 41)    }
-  'record'   { PT _ (TS _ 42)    }
-  'right'    { PT _ (TS _ 43)    }
-  'row'      { PT _ (TS _ 44)    }
-  'than'     { PT _ (TS _ 45)    }
-  'then'     { PT _ (TS _ 46)    }
-  'tighter'  { PT _ (TS _ 47)    }
-  'type'     { PT _ (TS _ 48)    }
-  'use'      { PT _ (TS _ 49)    }
-  'where'    { PT _ (TS _ 50)    }
-  'with'     { PT _ (TS _ 51)    }
-  '{'        { PT _ (TS _ 52)    }
-  '|'        { PT _ (TS _ 53)    }
-  '}'        { PT _ (TS _ 54)    }
+  'foreign'  { PT _ (TS _ 31)    }
+  'free'     { PT _ (TS _ 32)    }
+  'fun'      { PT _ (TS _ 33)    }
+  'if'       { PT _ (TS _ 34)    }
+  'import'   { PT _ (TS _ 35)    }
+  'in'       { PT _ (TS _ 36)    }
+  'instance' { PT _ (TS _ 37)    }
+  'left'     { PT _ (TS _ 38)    }
+  'let'      { PT _ (TS _ 39)    }
+  'local'    { PT _ (TS _ 40)    }
+  'looser'   { PT _ (TS _ 41)    }
+  'module'   { PT _ (TS _ 42)    }
+  'of'       { PT _ (TS _ 43)    }
+  'owned'    { PT _ (TS _ 44)    }
+  'record'   { PT _ (TS _ 45)    }
+  'right'    { PT _ (TS _ 46)    }
+  'row'      { PT _ (TS _ 47)    }
+  'than'     { PT _ (TS _ 48)    }
+  'then'     { PT _ (TS _ 49)    }
+  'tighter'  { PT _ (TS _ 50)    }
+  'type'     { PT _ (TS _ 51)    }
+  'use'      { PT _ (TS _ 52)    }
+  'where'    { PT _ (TS _ 53)    }
+  'with'     { PT _ (TS _ 54)    }
+  '{'        { PT _ (TS _ 55)    }
+  '|'        { PT _ (TS _ 56)    }
+  '}'        { PT _ (TS _ 57)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -120,11 +123,33 @@ Decl
   | 'fixity' FixName FixAssoc ListFixRel { GeneratedParser.Wok.Abs.DFixity $2 $3 $4 }
   | 'class' ConId ListVarId 'where' '{' ListClassEntry '}' { GeneratedParser.Wok.Abs.DClass $2 $3 $6 }
   | 'instance' InstHead 'where' '{' ListInstEntry '}' { GeneratedParser.Wok.Abs.DInstance $2 $5 }
+  | 'foreign' 'module' ConId String ForeignFree 'where' '{' ListForeignMember '}' { GeneratedParser.Wok.Abs.DForeign $3 $4 $5 $8 }
   | 'module' ModPath { GeneratedParser.Wok.Abs.DModule $2 }
   | 'import' ModPath { GeneratedParser.Wok.Abs.DImport $2 }
   | 'use' ModPath { GeneratedParser.Wok.Abs.DUse $2 }
   | 'local' Decl { GeneratedParser.Wok.Abs.DLocal $2 }
   | ReservedKw { GeneratedParser.Wok.Abs.DReserved $1 }
+
+ForeignFree :: { GeneratedParser.Wok.Abs.ForeignFree }
+ForeignFree
+  : {- empty -} { GeneratedParser.Wok.Abs.FFNone }
+  | 'free' String { GeneratedParser.Wok.Abs.FFSym $2 }
+
+ForeignMember :: { GeneratedParser.Wok.Abs.ForeignMember }
+ForeignMember
+  : VarId ForeignSym ':' Type { GeneratedParser.Wok.Abs.FMPlain $1 $2 $4 }
+  | 'owned' VarId ForeignSym ':' Type { GeneratedParser.Wok.Abs.FMOwned $2 $3 $5 }
+
+ForeignSym :: { GeneratedParser.Wok.Abs.ForeignSym }
+ForeignSym
+  : {- empty -} { GeneratedParser.Wok.Abs.FSNone }
+  | String { GeneratedParser.Wok.Abs.FSName $1 }
+
+ListForeignMember :: { [GeneratedParser.Wok.Abs.ForeignMember] }
+ListForeignMember
+  : {- empty -} { [] }
+  | ForeignMember { (:[]) $1 }
+  | ForeignMember ';' ListForeignMember { (:) $1 $3 }
 
 InstHead :: { GeneratedParser.Wok.Abs.InstHead }
 InstHead

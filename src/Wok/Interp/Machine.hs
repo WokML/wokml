@@ -14,8 +14,9 @@ import qualified Data.Text as Tx
 import System.IO.Unsafe (unsafePerformIO)
 import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
-  , OpArm (..), Rhs (..), TopBind (..) )
+  , Lit (..), OpArm (..), Rhs (..), TopBind (..) )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
+import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup)
 import Wok.Interp.Prim (primTable)
 import qualified Wok.Interp.Sched as Sched
 import Wok.Interp.Value
@@ -129,8 +130,37 @@ evalRhs prims sup b rhs body sc k = case rhs of
       Just other         -> Left (PrimError (Tx.pack ("internal: instance handle not a VInst: " <> show other)))
     cfg <- dispatchOp mTarget lbl op vs (KLet b body sc k)
     Right (cfg, sup)
+  -- Foreign call: evaluate all args, dispatch to a pure Haskell model.
+  -- No ownership transfer in the reference interpreter (it models bytes as VBytes).
+  -- Dispatch is purely by (lib, sym); the 'ReturnDisp' field is consumed in Task 6
+  -- at the return-allocation site, not here. Task 6 also adds real C calls.
+  RForeignCall lib sym _disp _mfree as -> do
+    vs <- mapM (resolveAtom prims sc) as
+    v  <- evalForeignCall lib sym vs
+    cont v
   where
     cont v = Right (Eval body sc { scEnv = bindBinder b v (scEnv sc) } k, sup)
+
+-- | Dispatch a foreign-module call to a faithful pure Haskell model. Dispatch is
+-- purely by (lib, sym). Only the blessed pairs are implemented; any other
+-- combination reaches here only if the typechecker's honesty gate is bypassed (a
+-- compiler bug), so we raise a clear runtime error.
+evalForeignCall :: Text -> Text -> [Value] -> Either RuntimeError Value
+evalForeignCall lib sym args
+  | lib == Tx.pack "c", sym == Tx.pack "memchr" =
+      case args of
+        [VBytes buf, VLit (LInt byte), VLit (LInt n)] ->
+          Right (VLit (LInt (toInteger (foreignMemchr buf (fromIntegral byte) (fromIntegral n)))))
+        _ -> Left (PrimError (Tx.pack "memchr: expected (Bytes, U64, U64)"))
+  | lib == Tx.pack "c", sym == Tx.pack "strndup" =
+      case args of
+        [VBytes buf, VLit (LInt n)] ->
+          Right (VBytes (foreignStrndup buf (fromIntegral n)))
+        _ -> Left (PrimError (Tx.pack "strndup: expected (Bytes, U64)"))
+  | otherwise =
+      Left (PrimError
+        (Tx.pack "foreign symbol not available in the interpreter: "
+          <> lib <> Tx.pack "." <> sym))
 
 -- | Apply a value to args, continuing with k. Handles currying for closures
 -- and accumulation for prims; over-application chains via KApp.

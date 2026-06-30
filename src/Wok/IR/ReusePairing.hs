@@ -198,7 +198,8 @@ rhsMaxU (RLam ps e)          = maximum (exprMaxU e : map (uOf . bndName) ps)
 rhsMaxU (ROp m _ _ as)       = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
 rhsMaxU (RRecord _ flds)     = foldr (max . atomMaxU . snd) (-1) flds
 rhsMaxU (RProj _ a)          = atomMaxU a
-rhsMaxU (RReuseCon tok _ as) = foldr (max . atomMaxU) (atomMaxU tok) as
+rhsMaxU (RReuseCon tok _ as)      = foldr (max . atomMaxU) (atomMaxU tok) as
+rhsMaxU (RForeignCall _ _ _ _ as) = foldr (max . atomMaxU) (-1) as
 
 atomMaxU :: Atom -> Int
 atomMaxU (AVar n)  = uOf n

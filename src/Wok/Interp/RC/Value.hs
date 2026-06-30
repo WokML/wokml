@@ -104,6 +104,7 @@ module Wok.Interp.RC.Value
   , wokForeignBytesTag
   , allocNBytes
   , allocForeignBytes
+  , adoptCHeapPtr
     -- * Array in-place mutation helpers (Slice C)
   , atIndex
   , setAt
@@ -1823,6 +1824,18 @@ allocForeignBytes hp bs s = do
   liftIO $ BS.useAsCStringLen bs (\(src, len) -> copyBytes dptr (castPtr src) len)
   p    <- liftIO (H.wokForeignBytesAlloc hp (castPtr dptr) byteLen)
   pure (CAddr p, s { stStats = recordAlloc 24 (stStats s) })
+
+-- | Adopt an ALREADY-malloc'd C pointer as a 'WokForeignBytes' cell on the
+-- real C heap. Charges the fixed 24 B handle. The caller is responsible for
+-- ensuring the pointer was allocated by libc 'malloc' (or equivalent), because
+-- 'dropAddr' will call libc 'free' on it at refcount-zero.
+--
+-- Use case: real libc 'strndup' returns an already-malloc'd buffer; this helper
+-- adopts it directly without any copy, giving zero-copy borrow-out semantics.
+adoptCHeapPtr :: Ptr WokHeap -> Ptr Word8 -> Word64 -> Store -> RC (Addr, Store)
+adoptCHeapPtr hp p len s = do
+  cell <- liftIO (H.wokForeignBytesAlloc hp p len)
+  pure (CAddr cell, s { stStats = recordAlloc 24 (stStats s) })
 
 -- | Allocate an 'NStringView' node: a counted window into a parent string buffer.
 -- The parent is increffed (the view owns one counted ref) then the view cell is

@@ -28,11 +28,22 @@ data Decl
     | DFixity FixName FixAssoc [FixRel]
     | DClass ConId [VarId] [ClassEntry]
     | DInstance InstHead [InstEntry]
+    | DForeign ConId String ForeignFree [ForeignMember]
     | DModule ModPath
     | DImport ModPath
     | DUse ModPath
     | DLocal Decl
     | DReserved ReservedKw
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ForeignFree = FFNone | FFSym String
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ForeignMember
+    = FMPlain VarId ForeignSym Type | FMOwned VarId ForeignSym Type
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ForeignSym = FSNone | FSName String
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InstHead

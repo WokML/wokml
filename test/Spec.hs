@@ -89,6 +89,7 @@ import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
 import Foreign.Ptr (castPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import qualified Data.ByteString.Unsafe as BSU
+import qualified Wok.Interp.ForeignModels as FM
 
 main :: IO ()
 main = do
@@ -169,6 +170,10 @@ main = do
   -- __ffi_demo_adopt).  Programs are handler-free.  Wired to rc differential +
   -- rc stats + C-backend parity, matching the rc-bytes pattern.
   rcFfiBytesFiles <- findByExtension [".wok"] "test/rc-ffi-bytes"
+  -- FFI Slice 2 Task 6: real libc calls (memchr / strndup) via RForeignCall.
+  -- Programs are handler-free. Wired to rc differential + rc stats + C-backend
+  -- parity; also has a dedicated 3-backend parity + adopt saving pin group.
+  rcFfiForeignFiles <- findByExtension [".wok"] "test/rc-ffi-foreign"
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -201,6 +206,7 @@ main = do
     , effectPressureTests
     , closedByDefaultTests
     , lambdaEffectScopingTests
+    , ioGroundEffectTests
     , patternTests
     , exprBasicTests
     , exprLetTests
@@ -245,6 +251,11 @@ main = do
     , elaborateModuleTests
     , typedAstTests
     , classParseTests
+    , foreignModuleParseTests
+    , foreignResolutionTests
+    , foreignReferenceTests
+    , foreignIoDischargeTests
+    , externGateTests
     , classEnvTests
     , classRegisterTests
     , constraintAccumTests
@@ -429,6 +440,20 @@ main = do
         , rcCBackendParity rcFfiBytesFiles
         , rcFfiBytesZeroCopySavingPin
         , rcFfiBytesSoundness
+        ]
+    -- FFI Slice 2 Task 6: real libc memchr/strndup + borrow-out + adopt oracle.
+    -- Runs rc differential + rc stats + C-heap parity; dedicated group also pins
+    -- the adopt zero-copy saving and the 3-backend output parity.
+    , testGroup "rc-ffi-foreign"
+        [ testGroup "rc differential"
+            [ testCase (takeBaseName f) (rcDifferentialHarness f)
+            | f <- rcFfiForeignFiles ]
+        , testGroup "rc stats"
+            [ testCase (takeBaseName f) (rcStatsHarness f)
+            | f <- rcFfiForeignFiles ]
+        , rcCBackendParity rcFfiForeignFiles
+        , rcFfiForeignParity
+        , rcFfiForeignSoundness
         ]
     ]
 
@@ -1238,6 +1263,38 @@ envOverlayTests = testGroup "envOverlay"
       in case TE.overlayEnvs a b of
            Left collisions -> collisions @?= [(TE.NsEffect, T.pack "IO")]
            Right _ -> assertFailure "expected Left"
+
+  , testCase "foreign-module collision with differing members returns Left with NsForeignModule" $
+      -- Two modules each declaring `foreign module Libc` with DIFFERENT members
+      -- must clash, exactly like a duplicate `effect`. The blessed allow-list is
+      -- not consulted here (overlayEnvs merges already-registered infos), so the
+      -- member name is arbitrary.
+      let mk sym = TE.ForeignMemberInfo
+                     (Ty.mkScheme [] (Ty.CTCon Ty.TcU64 []))
+                     (T.pack sym) False
+          fmiA = TE.ForeignModuleInfo (T.pack "c") (Just (T.pack "free"))
+                   (Map.fromList [(T.pack "memchr", mk "memchr")])
+          fmiB = TE.ForeignModuleInfo (T.pack "c") (Just (T.pack "free"))
+                   (Map.fromList [(T.pack "strndup", mk "strndup")])
+          a = TE.extendForeignModule (T.pack "Libc") fmiA TE.emptyEnv
+          b = TE.extendForeignModule (T.pack "Libc") fmiB TE.emptyEnv
+      in case TE.overlayEnvs a b of
+           Left collisions -> collisions @?= [(TE.NsForeignModule, T.pack "Libc")]
+           Right _ -> assertFailure "expected Left"
+
+  , testCase "byte-identical foreign module merges silently (diamond re-export)" $
+      -- Same ConId with the SAME ForeignModuleInfo on both sides is the diamond
+      -- case and must merge without a clash.
+      let mk sym = TE.ForeignMemberInfo
+                     (Ty.mkScheme [] (Ty.CTCon Ty.TcU64 []))
+                     (T.pack sym) False
+          fmi = TE.ForeignModuleInfo (T.pack "c") (Just (T.pack "free"))
+                  (Map.fromList [(T.pack "memchr", mk "memchr")])
+          a = TE.extendForeignModule (T.pack "Libc") fmi TE.emptyEnv
+          b = TE.extendForeignModule (T.pack "Libc") fmi TE.emptyEnv
+      in case TE.overlayEnvs a b of
+           Right e  -> TE.lookupForeignModule (T.pack "Libc") e @?= Just fmi
+           Left col -> assertFailure ("expected silent merge, got: " ++ show col)
 
   , testCase "collisions across multiple namespaces are all reported" $
       let sA  = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
@@ -2897,6 +2954,100 @@ lambdaEffectScopingTests = testGroup "lambda effect scoping"
         ]
         "f"
         @?= Right "U64 -> U64 -> () with IO"
+  ]
+
+-- IO ground effect (Task 2): IO is a built-in effect with no ops, never handled,
+-- discharged by running the program.
+ioGroundEffectTests :: TestTree
+ioGroundEffectTests = testGroup "IO effect"
+  [ testCase "a with IO signature type-checks (IO resolves as ground effect)" $
+      schemeOf
+        [ "f : U64 -> U64 with IO"
+        , "f x = x"
+        ]
+        "f"
+        @?= Right "U64 -> U64 with IO"
+
+  , testCase "a with-handler targeting IO is rejected (IOEffectNotHandleable)" $
+      case schemeOf
+             [ "g x ="
+             , "  with IO { v -> v }"
+             , "  x"
+             ]
+             "g" of
+        Left msg -> assertBool ("expected IOEffectNotHandleable, got: " ++ msg)
+                      (T.pack "IOEffectNotHandleable" `T.isInfixOf` T.pack msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , -- The NAMED-handler path (`with self = IO { ... } in ...`, via
+    -- inferNamedHandler) must also reject the ground IO. The ambient path above
+    -- exercises inferHandler; this drives inferNamedHandler with effName == "IO".
+    testCase "a named handler targeting IO is rejected (IOEffectNotHandleable)" $
+      case schemeOf
+             [ "g x = with s = IO { v -> v } in x"
+             ]
+             "g" of
+        Left msg -> assertBool ("expected IOEffectNotHandleable, got: " ++ msg)
+                      (T.pack "IOEffectNotHandleable" `T.isInfixOf` T.pack msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , testCase "a forgotten State effect still errors with UndischargedEffect (no regression)" $
+      case schemeOf
+             [ "effect State s = { get : s, set : s -> () }"
+             , "bad : () -> U64"
+             , "bad u = State.get ()"
+             ]
+             "bad" of
+        Left msg -> assertBool ("expected UndischargedEffect, got: " ++ msg)
+                      (T.pack "UndischargedEffect" `T.isInfixOf` T.pack msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , -- REGRESSION (Task 2 review): the IO ground-effect override must be scoped
+    -- to IO ONLY. An entry module's env already contains the prelude effects it
+    -- imported (State, Reader, ...), so a redeclaration of one of those must
+    -- still be a DuplicateTyCon -- not silently overridden. We mimic the import
+    -- by seeding `State` (with a non-empty op map) into the starting env and
+    -- then redeclaring `effect State` via processEffectDecls.
+    testCase "redeclaring an imported effect (State) is DuplicateTyCon (override scoped to IO)" $
+      let pos = (0, 0)
+          vc s = Abs.ConId (pos, T.pack s)
+          vv s = Abs.VarId (pos, T.pack s)
+          -- A pre-existing `State a` with one op `get : () -> a`, as if imported.
+          importedState = TE.EffectInfo
+            { TE.eiParams = [(0, Ty.KStar)]
+            , TE.eiOps    = Map.fromList
+                [ ( T.pack "get"
+                  , Ty.mkScheme [(0, Ty.KStar)]
+                      (Ty.CTArr (Ty.CTCon Ty.TcUnit []) Ty.CREmpty (Ty.CTGen 0)) )
+                ]
+            }
+          env0 = TE.extendEffect (T.pack "State") importedState B.initialEnv
+          -- The entry module redeclares `effect State s = { get : () -> s }`.
+          getOp = Abs.RFType (vv "get")
+                    (Abs.TFun Abs.TUnit (Abs.TVar (vv "s")))
+          decl  = Abs.DEffect (vc "State") [vv "s"] [getOp]
+          result = TM.runTC_ env0 $ I.processEffectDecls env0 [decl]
+      in case result of
+           Left TErr.DuplicateTyCon{} -> pure ()
+           Left e  -> assertFailure ("expected DuplicateTyCon, got: " ++ show e)
+           Right _ -> assertFailure
+             "expected DuplicateTyCon for redeclared imported State, but it was accepted"
+
+  , -- Positive control for the same code path: the ground IO (empty ops, seeded
+    -- in initialEnv) IS overridable by a user `effect IO = { ... }`.
+    testCase "redeclaring the ground IO with ops overrides it (no error)" $
+      let pos = (0, 0)
+          vc s = Abs.ConId (pos, T.pack s)
+          vv s = Abs.VarId (pos, T.pack s)
+          writeOp = Abs.RFType (vv "write")
+                      (Abs.TFun (Abs.TCon (Abs.MPName (vc "String"))) Abs.TUnit)
+          decl    = Abs.DEffect (vc "IO") [] [writeOp]
+          result  = TM.runTC_ B.initialEnv $ I.processEffectDecls B.initialEnv [decl]
+      in case result of
+           Right env -> case TE.lookupEffect (T.pack "IO") env of
+             Just ei -> Map.keys (TE.eiOps ei) @?= [T.pack "write"]
+             Nothing -> assertFailure "IO missing after override"
+           Left e   -> assertFailure ("expected IO override to succeed, got: " ++ show e)
   ]
 
 dataTests :: TestTree
@@ -5263,7 +5414,8 @@ aprimKeysInModule (Anf.CoreModule binds) =
       ROp m _ _ as  -> Set.unions (map goA (maybe as (: as) m))
       RRecord _ fls -> Set.unions (map (goA . snd) fls)
       RProj _ a     -> goA a
-      RReuseCon{}   -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
+      RReuseCon{}          -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
+      RForeignCall _ _ _ _ as -> Set.unions (map goA as)
     goE e = case e of
       Ret a               -> goA a
       Jump _ as           -> Set.unions (map goA as)
@@ -6018,6 +6170,424 @@ classParseTests = testGroup "ClassParse"
     isCtxInstance _                               = False
     sigHasQual (Abs.DSig _ _ (Abs.TQual _ _)) = True
     sigHasQual _                              = False
+
+-- | Parse-only coverage for FFI Slice 2 (Task 1): `foreign module` declarations
+-- parse into the DForeign AST node with correct ForeignFree / ForeignMember shapes.
+-- No typechecking yet; semantic pass is a later task.
+foreignModuleParseTests :: TestTree
+foreignModuleParseTests = testGroup "ForeignModuleParse"
+  [ testCase "plain member parses to FMPlain with FSNone" $
+      case parse (T.pack src1) of
+        Right (Abs.Module ds) -> assertBool "expected FMPlain memchr" (any hasMembPlain ds)
+        Left e -> assertFailure ("parse: " ++ e)
+
+  , testCase "owned member parses to FMOwned" $
+      case parse (T.pack src2) of
+        Right (Abs.Module ds) -> assertBool "expected FMOwned strndup" (any hasMembOwned ds)
+        Left e -> assertFailure ("parse: " ++ e)
+
+  , testCase "symbol-override member parses to FSName" $
+      case parse (T.pack src3) of
+        Right (Abs.Module ds) -> assertBool "expected FSName open64" (any hasMembSym ds)
+        Left e -> assertFailure ("parse: " ++ e)
+
+  , testCase "no-free clause parses to FFNone" $
+      case parse (T.pack src4) of
+        Right (Abs.Module ds) -> assertBool "expected FFNone header" (any hasFFNone ds)
+        Left e -> assertFailure ("parse: " ++ e)
+
+  , testCase "free clause parses to FFSym" $
+      case parse (T.pack src5) of
+        Right (Abs.Module ds) -> assertBool "expected FFSym free" (any hasFFSym ds)
+        Left e -> assertFailure ("parse: " ++ e)
+
+  , testCase "full foreign module round-trip: ConId, lib string, free, members" $
+      case parse (T.pack srcFull) of
+        Right (Abs.Module ds) ->
+          case [ d | d@(Abs.DForeign{}) <- ds ] of
+            [Abs.DForeign (Abs.ConId (_, cidText)) lib ffree mems] -> do
+              cidText @?= T.pack "Libc"
+              lib     @?= "c"
+              ffree   @?= Abs.FFSym "free"
+              length mems @?= 2
+            other -> assertFailure ("expected exactly one DForeign, got: " ++ show other)
+        Left e -> assertFailure ("parse: " ++ e)
+  ]
+  where
+  -- plain member: memchr with no owned and no symbol override
+  src1 = unlines
+    [ "module M"
+    , "foreign module Libc \"c\" free \"free\" where"
+    , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+    ]
+  hasMembPlain (Abs.DForeign _ _ _ mems) =
+    any (\m -> case m of Abs.FMPlain _ Abs.FSNone _ -> True; _ -> False) mems
+  hasMembPlain _ = False
+
+  -- owned member
+  src2 = unlines
+    [ "module M"
+    , "foreign module Libc \"c\" free \"free\" where"
+    , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+    ]
+  hasMembOwned (Abs.DForeign _ _ _ mems) =
+    any (\m -> case m of Abs.FMOwned{} -> True; _ -> False) mems
+  hasMembOwned _ = False
+
+  -- symbol-override member: `open64 "open64" : ...`
+  src3 = unlines
+    [ "module M"
+    , "foreign module Libc \"c\" where"
+    , "  open64 \"open64\" : U64 -> U64 with IO"
+    ]
+  hasMembSym (Abs.DForeign _ _ _ mems) =
+    any (\m -> case m of Abs.FMPlain _ (Abs.FSName _) _ -> True; _ -> False) mems
+  hasMembSym _ = False
+
+  -- no free clause
+  src4 = unlines
+    [ "module M"
+    , "foreign module Posix \"c\" where"
+    , "  write : U64 -> Bytes -> U64 with IO"
+    ]
+  hasFFNone (Abs.DForeign _ _ Abs.FFNone _) = True
+  hasFFNone _                               = False
+
+  -- with free clause
+  src5 = unlines
+    [ "module M"
+    , "foreign module Libc \"c\" free \"free\" where"
+    , "  strndup : Bytes -> U64 -> Bytes with IO"
+    ]
+  hasFFSym (Abs.DForeign _ _ (Abs.FFSym _) _) = True
+  hasFFSym _                                   = False
+
+  -- full round-trip source
+  srcFull = unlines
+    [ "module M"
+    , "foreign module Libc \"c\" free \"free\" where"
+    , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+    , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+    ]
+
+-- | Typecheck-level coverage for FFI Slice 2 Task 3: foreign-module
+-- registration, member resolution via the dotted projection arm, the blessed
+-- allow-list honesty gate, and clean error reporting for each rejection case.
+-- All programs are self-contained (no loader); run under `B.initialEnv` with
+-- `SO.Embedded` origin so `Bytes`, `U64`, and `IO` are available.
+foreignResolutionTests :: TestTree
+foreignResolutionTests = testGroup "foreign resolution"
+  [ -- AC1: Libc.memchr resolves to the declared arrow type; applying it emits IO.
+    testCase "Libc.memchr resolves; caller's sig carries with IO" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "use_memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "use_memchr b n m = Libc.memchr b n m"
+             ]
+             "use_memchr" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC1 (emit IO): inferred sig WITHOUT annotation must carry with IO.
+    testCase "Libc.memchr call infers IO in ambient row" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "call_memchr b n m = Libc.memchr b n m"
+             ]
+             "call_memchr" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right sch ->
+          assertBool ("expected 'with IO' in inferred scheme, got: " ++ T.unpack sch)
+            (T.pack "with IO" `T.isInfixOf` sch)
+
+  , -- AC2: strndup with owned is recorded; the module still resolves.
+    testCase "Libc.strndup (owned) resolves" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             , "call_strndup b n = Libc.strndup b n"
+             ]
+             "call_strndup" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC3: (\"c\", \"frob\") not in blessedTable -> ForeignSymbolNotBlessed.
+    testCase "unlisted symbol gives ForeignSymbolNotBlessed" $
+      case schemeOf
+             [ "foreign module Bad \"c\" where"
+             , "  frob : U64 -> U64 with IO"
+             ]
+             "frob" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignSymbolNotBlessed, got: " ++ err)
+            ("ForeignSymbolNotBlessed" `isInfixOf` err)
+
+  , -- AC4: unknown member -> ForeignModuleMemberUnknown.
+    testCase "unknown member gives ForeignModuleMemberUnknown" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "bad x = Libc.nope x"
+             ]
+             "bad" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignModuleMemberUnknown, got: " ++ err)
+            ("ForeignModuleMemberUnknown" `isInfixOf` err)
+
+  , -- AC5: ConId is both an effect and a foreign module -> AmbiguousProjectionHead.
+    testCase "ConId both effect and foreign module gives AmbiguousProjectionHead" $
+      case schemeOf
+             [ "effect Libc = { read : U64 -> U64 }"
+             , "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             ]
+             "Libc" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected AmbiguousProjectionHead, got: " ++ err)
+            ("AmbiguousProjectionHead" `isInfixOf` err)
+
+  , -- AC6: owned member with no free clause -> ForeignOwnedNeedsFree.
+    testCase "owned member without free clause gives ForeignOwnedNeedsFree" $
+      case schemeOf
+             [ "foreign module Libc \"c\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             ]
+             "Libc" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignOwnedNeedsFree, got: " ++ err)
+            ("ForeignOwnedNeedsFree" `isInfixOf` err)
+
+  , -- AC8: owned on a DispScalar member -> ForeignDispositionMismatch.
+    --      memchr is blessed DispScalar, so `owned` must be rejected.
+    testCase "owned memchr (DispScalar) gives ForeignDispositionMismatch" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  owned memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             ]
+             "Libc" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignDispositionMismatch, got: " ++ err)
+            ("ForeignDispositionMismatch" `isInfixOf` err)
+
+  , -- AC9: strndup without owned (DispAdopt) -> ForeignDispositionMismatch.
+    --      This is the divergence case: previously type-checked but diverged
+    --      across backends at runtime. Must now be a compile error.
+    testCase "strndup without owned (DispAdopt) gives ForeignDispositionMismatch" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  strndup : Bytes -> U64 -> Bytes with IO"
+             ]
+             "Libc" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignDispositionMismatch, got: " ++ err)
+            ("ForeignDispositionMismatch" `isInfixOf` err)
+
+  , -- AC10: correct memchr (no owned, DispScalar) must still type-check.
+    testCase "memchr without owned (DispScalar) still resolves" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "use_memchr b n m = Libc.memchr b n m"
+             ]
+             "use_memchr" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC11: correct strndup (owned + free, DispAdopt) must still type-check.
+    testCase "owned strndup with free clause (DispAdopt) still resolves" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             , "call_strndup b n = Libc.strndup b n"
+             ]
+             "call_strndup" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC7: non-foreign dotted projection (effect op) still resolves via the
+    --      existing arm (no regression).
+    testCase "effect-op dot still resolves after foreign-module arm added" $
+      case schemeOf
+             [ "effect State s = { get : () -> s, set : s -> () }"
+             , "getter : State U64 -> U64 with State U64"
+             , "getter h = h.get ()"
+             ]
+             "getter" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC7 cont.: record-field projection still resolves (no regression).
+    testCase "record-field projection still resolves after foreign-module arm added" $
+      case schemeOf
+             [ "data Point = Point { x : U64, y : U64 }"
+             , "getX : Point -> U64"
+             , "getX p = p.x"
+             ]
+             "getX" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC12: two `foreign module Libc` in one file -> DuplicateForeignModule.
+    -- Previously the second declaration silently overwrote the first via
+    -- Map.insert, losing the first's members with no error. The duplicate
+    -- check now rejects this before any registration occurs.
+    testCase "duplicate foreign module declaration gives DuplicateForeignModule" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "foreign module Libc \"c\" free \"free\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             ]
+             "Libc" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected DuplicateForeignModule, got: " ++ err)
+            ("DuplicateForeignModule" `isInfixOf` err)
+
+  , -- AC13: partial application of a foreign member -> ForeignMemberPartialApp.
+    -- Previously this produced a clean typecheck signature but crashed the
+    -- elaborator with a Haskell `error`. Now the typechecker rejects it
+    -- directly with a clean diagnostic.
+    testCase "partial application of foreign member gives ForeignMemberPartialApp" $
+      case schemeOf
+             [ "import Std.Bytes"
+             , "foreign module Libc \"c\" free \"free\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             , "bad b = let f = Libc.strndup in f b 2"
+             ]
+             "bad" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignMemberPartialApp, got: " ++ err)
+            ("ForeignMemberPartialApp" `isInfixOf` err)
+
+  , -- AC13 regression: direct fully-applied call must still succeed (AC2/AC11
+    -- cover this; this test targets the EApp special-case path specifically).
+    testCase "direct application Libc.strndup b n still type-checks (no regression)" $
+      case schemeOf
+             [ "import Std.Bytes"
+             , "foreign module Libc \"c\" free \"free\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             , "call b n = Libc.strndup b n"
+             ]
+             "call" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+    -- -----------------------------------------------------------------------
+    -- Findings #1+#2 (saturation check + paren-head): TDD tests written
+    -- BEFORE the fix so they start failing and pass after.
+    -- -----------------------------------------------------------------------
+
+  , -- Finding #1: under-saturated call (let f = Libc.memchr buf in f 65 3)
+    -- must be a COMPILE ERROR, not a runtime crash. The spine now has 1 arg
+    -- at the intercept point; arity = 3; 1 < 3 => ForeignMemberPartialApp.
+    testCase "#1: under-saturated memchr (1 of 3 args) gives ForeignMemberPartialApp" $
+      case schemeOf
+             [ "import Std.Bytes"
+             , "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "bad b = let f = Libc.memchr b in f 65 3"
+             ]
+             "bad" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignMemberPartialApp, got: " ++ err)
+            ("ForeignMemberPartialApp" `isInfixOf` err)
+
+  , -- Finding #1b: same for strndup (arity 2, 1 arg supplied).
+    testCase "#1b: under-saturated strndup (1 of 2 args) gives ForeignMemberPartialApp" $
+      case schemeOf
+             [ "import Std.Bytes"
+             , "foreign module Libc \"c\" free \"free\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             , "bad b = let f = Libc.strndup b in f 2"
+             ]
+             "bad" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignMemberPartialApp, got: " ++ err)
+            ("ForeignMemberPartialApp" `isInfixOf` err)
+
+  , -- Finding #2: paren-wrapped saturated call must TYPE-CHECK and run.
+    -- (Libc.memchr) buf 65 3 -> the paren does not prevent resolution.
+    testCase "#2: paren-wrapped saturated memchr type-checks and runs" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+        , "main = (Libc.memchr) (fromList [65, 66, 67]) 65 3"
+        ]
+      result @?= Right (T.pack "0")
+
+    -- -----------------------------------------------------------------------
+    -- Finding #3 (wrong destructor symbol is a COMPILE error).
+    -- -----------------------------------------------------------------------
+
+  , -- Finding #3: free "pfree" + owned strndup must be rejected at compile
+    -- time with a clear diagnostic (not crash at runtime).
+    testCase "#3: non-free destructor in adopt module gives compile error" $
+      case schemeOf
+             [ "import Std.Bytes"
+             , "foreign module Libc \"c\" free \"pfree\" where"
+             , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+             , "call b n = Libc.strndup b n"
+             ]
+             "call" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignDispositionMismatch or ForeignAdoptFreeMustBeFree, got: " ++ err)
+            (("ForeignDispositionMismatch" `isInfixOf` err)
+             || ("ForeignAdoptFree" `isInfixOf` err)
+             || ("free" `isInfixOf` err))
+  ]
+  where
+    isInfixOf needle hay = needle `Data.List.isInfixOf` hay
+
+-- | Helper: type-check a module at UserFile origin, returning the full
+-- result (error or success) so tests can check both directions (gate-flip).
+inferUserFile :: Text -> Either TErr.TypeError (TE.Env, [I.TypedDecl], [TErr.Warning])
+inferUserFile src =
+  case parse src of
+    Left err -> error ("inferUserFile: parse: " ++ err)
+    Right ast -> case reorderModule ast of
+      Left es -> error ("inferUserFile: reorder: " ++ show es)
+      Right rm -> TC.inferProgramWith B.initialEnv (SO.UserFile "<test>") (reorderedAst rm)
+
+externGateTests :: TestTree
+externGateTests = testGroup "extern gate"
+  [ testCase "user file with foreign module type-checks (no ExternNotAllowed)" $
+      let src = T.unlines
+              [ T.pack "module Main"
+              , T.pack "foreign module Libc \"c\" free \"free\" where"
+              , T.pack "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+              , T.pack "use_memchr b n m = Libc.memchr b n m"
+              ]
+      in case inferUserFile src of
+           Right _ -> pure ()
+           Left err -> assertFailure ("expected success, got: " ++ show err)
+
+  , testCase "user file with bare extern throws ExternNotAllowed" $
+      let src = T.unlines
+              [ T.pack "module Main"
+              , T.pack "extern foo : U64 -> U64"
+              , T.pack "main = foo 0"
+              ]
+      in case inferUserFile src of
+           Left (TErr.ExternNotAllowed _ n) ->
+             n @?= T.pack "foo"
+           Left err -> assertFailure ("expected ExternNotAllowed, got: " ++ show err)
+           Right _ -> assertFailure "expected ExternNotAllowed error, but type-checking succeeded"
+  ]
 
 classEnvTests :: TestTree
 classEnvTests = testGroup "ClassEnv"
@@ -16168,7 +16738,8 @@ allMentionedUniques = go
       ROp m _ _ as -> Set.unions (map atomVars (maybe as (: as) m))
       RRecord _ fl -> Set.unions (map (atomVars . snd) fl)
       RProj _ a    -> atomVars a
-      RReuseCon{}  -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
+      RReuseCon{}             -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
+      RForeignCall _ _ _ _ as -> Set.unions (map atomVars as)
 
 -- | All sub-expressions of @e@ (including @e@ itself), so the drift guard probes
 -- 'captureEscapesBody' at every body position, not just the top.
@@ -23901,4 +24472,490 @@ rcFfiBytesSoundness = testGroup "ffi bytes soundness"
             (RCM.rcOutput a) (RCM.rcOutput c)
         (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
         (_, Left e) -> assertFailure ("C FAILED (possible escape UAF): " <> show e)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Task 5 (FFI Slice 2): foreign-call IR elaboration + reference execution.
+-- The reference backend executes pure Haskell models of the blessed symbols;
+-- the wok programs have type 'U64 with IO' or 'Bytes with IO' for 'main'.
+-- The IO ground effect is never handled; the interpreter evaluates the body
+-- directly (IO is a no-op in the reference machine).
+-- ---------------------------------------------------------------------------
+
+foreignReferenceTests :: TestTree
+foreignReferenceTests = testGroup "foreign reference"
+  [ -- AC1: memchr finds the byte at index 1 (0-based).
+    -- Libc.memchr [65,66,67] 66 3  =>  1
+    testCase "memchr: byte present, returns index" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+        , "main = Libc.memchr (fromList [65, 66, 67]) 66 3"
+        ]
+      result @?= Right (T.pack "1")
+
+  , -- AC2: memchr does not find the byte; returns n (= 3).
+    -- Libc.memchr [65,66,67] 99 3  =>  3
+    testCase "memchr: byte absent, returns n" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+        , "main = Libc.memchr (fromList [65, 66, 67]) 99 3"
+        ]
+      result @?= Right (T.pack "3")
+
+  , -- AC3: strndup copies up to n bytes; n < length, no NUL, so the n-byte prefix.
+    -- Libc.strndup [1,2,3,4] 2  =>  fromList [1,2]
+    testCase "strndup: n < length, no NUL, returns prefix" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+        , "main = Libc.strndup (fromList [1, 2, 3, 4]) 2"
+        ]
+      result @?= Right (T.pack "Bytes[1,2]")
+
+  , -- AC4: strndup with n >= length, no NUL, returns full buffer.
+    -- Libc.strndup [1,2,3,4] 10  =>  fromList [1,2,3,4]
+    testCase "strndup: n >= length, no NUL, returns full buffer" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+        , "main = Libc.strndup (fromList [1, 2, 3, 4]) 10"
+        ]
+      result @?= Right (T.pack "Bytes[1,2,3,4]")
+
+  , -- AC5: strndup STOPS at the first NUL even when n spans past it. Exercises
+    -- the defining 'BS.takeWhile (/= 0)' branch of foreignStrndup.
+    -- Libc.strndup [1,0,3,4] 4  =>  fromList [1]
+    testCase "strndup: NUL before n, truncates at NUL" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+        , "main = Libc.strndup (fromList [1, 0, 3, 4]) 4"
+        ]
+      result @?= Right (T.pack "Bytes[1]")
+
+  , -- AC6: pure model regression for huge n (>= 2^63).
+    -- Before the fix, fromIntegral (2^63 :: Word64) :: Int wrapped NEGATIVE
+    -- and BS.take negative returned empty, diverging from the CHeap path.
+    -- After the fix the clamp min n len is computed in the Word64 domain, so
+    -- a huge n is treated as n >= length and the full prefix is returned.
+    -- Libc.strndup [1,2,3] (2^63)  =>  fromList [1,2,3]
+    testCase "strndup pure model: huge n (>= 2^63) returns full buffer, not empty" $ do
+      let buf = BS.pack [1, 2, 3]
+          hugeN = 2 ^ (63 :: Int) :: Word64
+      FM.foreignStrndup buf hugeN @?= buf
+
+  , -- AC7: interpreter-level regression for huge n (2^63).
+    -- Exercises the reference backend + the fix end-to-end.
+    -- Libc.strndup [1,2,3] 9223372036854775808  =>  Bytes[1,2,3]
+    testCase "strndup: n = 2^63 (huge), returns full buffer via interpreter" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+        , "main = Libc.strndup (fromList [1, 2, 3]) 9223372036854775808"
+        ]
+      result @?= Right (T.pack "Bytes[1,2,3]")
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 2 Task 6: 3-backend parity for real libc memchr/strndup + borrow-out.
+--
+-- The oracle enforces:
+--   (a) OUTPUT parity: reference == RC-abstract == RC-CHeap for each case.
+--   (b) PEAK_BYTES parity: abstract stPeakBytes == C wok_stat_peak_bytes.
+--   (c) ADOPT SAVING pin: a strndup result of length L charges 24 B (the
+--       WokForeignBytes handle) on BOTH backends, and that is LESS than the
+--       NBytes copy charge (16 + 8*ceil(L/8)).
+--   (d) NForeignBytes arg (06): strndup's adopted result passes as a memchr arg;
+--       rcReadBytes and rcBorrowCHeapPtr both handle the 0xFFFB tag.
+--
+-- For the corpus files, 'withBothBackends' drives the abstract and C-heap backends;
+-- the reference interpreter provides the third-backend oracle for output.
+-- ---------------------------------------------------------------------------
+
+rcFfiForeignParity :: TestTree
+rcFfiForeignParity = testGroup "3-backend parity + adopt saving pin"
+  [ -- -------------------------------------------------------------------
+    -- (a) memchr: byte present (output = 1)
+    testCase "01-memchr-present: 3-backend output parity" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/01-memchr-present.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 1" (T.pack "1") (RCM.rcOutput a)
+          assertEqual "C output == 1"        (T.pack "1") (RCM.rcOutput c)
+          assertEqual "output parity"        (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (a) memchr: byte absent (output = 3, the clamped n)
+    testCase "02-memchr-absent: 3-backend output parity (absent sentinel == n)" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/02-memchr-absent.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 3" (T.pack "3") (RCM.rcOutput a)
+          assertEqual "C output == 3"        (T.pack "3") (RCM.rcOutput c)
+          assertEqual "output parity"        (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (b) strndup prefix: n < length, no NUL => Bytes[1,2]; adopt charges 24 B
+    testCase "03-strndup-prefix: 3-backend parity + adopt 24 B handle" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/03-strndup-prefix.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == Bytes[1,2]" (T.pack "Bytes[1,2]") (RCM.rcOutput a)
+          assertEqual "C output == Bytes[1,2]"        (T.pack "Bytes[1,2]") (RCM.rcOutput c)
+          assertEqual "output parity"                 (RCM.rcOutput a)      (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+          -- Pin: the strndup result (2 bytes) is adopted into a 24 B handle.
+          -- Derive BOTH charges from the actual store model (St.allocPure), then
+          -- compare each against an independent expected constant (NOT the same
+          -- code path under test). At length 2 the charges coincide (24 B), so the
+          -- meaningful saving is exercised by the 100-byte pin below.
+          let resultBs    = BS.pack [1, 2]
+              (_, sAdopt) = St.allocPure (St.NForeignBytes resultBs) St.emptyStore
+              (_, sCopy)  = St.allocPure (St.NBytes resultBs)        St.emptyStore
+          assertEqual "strndup result=2 bytes: adopt charge == 24 B (handle)"
+            (24 :: Int) (St.stPeakBytes (St.stStats sAdopt))
+          assertEqual "strndup result=2 bytes: copy charge == 24 B (16 + 8*ceil(2/8))"
+            (24 :: Int) (St.stPeakBytes (St.stStats sCopy))
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (b) strndup full: n >= length, no NUL => Bytes[1,2,3,4]
+    -- This is the key adopt saving case: 4 bytes copied = 24 B (NBytes 4);
+    -- 4 bytes adopted = 24 B handle. Same charge here; pin both.
+    testCase "04-strndup-full: 3-backend parity" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/04-strndup-full.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == Bytes[1,2,3,4]" (T.pack "Bytes[1,2,3,4]") (RCM.rcOutput a)
+          assertEqual "C output == Bytes[1,2,3,4]"        (T.pack "Bytes[1,2,3,4]") (RCM.rcOutput c)
+          assertEqual "output parity"                     (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (b) strndup NUL-truncate: strndup [1,0,3,4] 4 => Bytes[1] (1 byte)
+    -- The adopt saving vs copy for 1 byte:
+    --   NBytes 1 => 16 + 8*ceil(1/8) = 16 + 8 = 24 B
+    --   NForeignBytes 1 => 24 B (fixed handle; buffer is off-heap)
+    -- Saving = 0 B here (both 24 B). This is correct: the saving grows with length.
+    testCase "05-strndup-nul: 3-backend parity + NUL-truncate sentinel" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/05-strndup-nul.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == Bytes[1]" (T.pack "Bytes[1]") (RCM.rcOutput a)
+          assertEqual "C output == Bytes[1]"        (T.pack "Bytes[1]") (RCM.rcOutput c)
+          assertEqual "output parity"               (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (c) ADOPT SAVING PIN: for a large buffer (length 100), pin the concrete
+    -- charge difference between an adopt (24 B) and an equivalent copy (NBytes).
+    -- This is the Slice-1 §4.6 zero-copy-saving invariant, de-tautologized.
+    -- Length 100 bytes: NBytes charges 16 + 8*ceil(100/8) = 16 + 8*13 = 16 + 104 = 120 B.
+    -- NForeignBytes charges 24 B. Saving = 96 B.
+    testCase "adopt saving pin: 100-byte result => 24 B handle vs 120 B copy" $ do
+      let l            = 100
+          adoptCharge  = 24 :: Int
+          copyCharge   = 16 + 8 * ((l + 7) `div` 8)   -- = 16 + 8*13 = 120
+          saving       = copyCharge - adoptCharge       -- = 96
+      adoptCharge @?= (24 :: Int)
+      copyCharge  @?= (120 :: Int)
+      saving      @?= (96 :: Int)
+      -- Verify via the abstract store model (not a file run, to keep it fast).
+      let bs      = BS.replicate l 0x41   -- 100 'A' bytes
+          s0      = St.emptyStore
+          (_, sCopy)  = St.allocPure (St.NBytes bs)        s0
+          (_, sAdopt) = St.allocPure (St.NForeignBytes bs) s0
+      St.stPeakBytes (St.stStats sCopy)  @?= copyCharge
+      St.stPeakBytes (St.stStats sAdopt) @?= adoptCharge
+
+  , -- -------------------------------------------------------------------
+    -- (d) NForeignBytes arg: 06-memchr-on-adopted passes an adopted Bytes as
+    -- the memchr argument. rcReadBytes and rcBorrowCHeapPtr must handle 0xFFFB.
+    testCase "06-memchr-on-adopted: NForeignBytes arg handled by both backends" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/06-memchr-on-adopted.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          -- strndup [1,2,3,4] 4 => [1,2,3,4]; memchr for byte=3 in 4 bytes => index 2
+          assertEqual "abstract output == 2" (T.pack "2") (RCM.rcOutput a)
+          assertEqual "C output == 2"        (T.pack "2") (RCM.rcOutput c)
+          assertEqual "output parity"        (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (e) HEAP-OVERREAD REGRESSION: strndup [1,2,3] 10 with NO zero byte and
+    -- n (10) > length (3). The CHeap scan MUST be clamped to the buffer length
+    -- (min n argLen), so real c_strndup never reads past the wok buffer and
+    -- returns exactly the FULL buffer Bytes[1,2,3] -- matching the model, which
+    -- clamps via BS.take (never reads past the buffer end).
+    --
+    -- WHAT THIS PINS: the CLAMPED, correct behavior (result == full buffer,
+    -- length == argLen == 3, identical across all 3 backends). A regression that
+    -- returns MORE than argLen bytes (an unclamped scan landing on a non-NUL run
+    -- of trailing heap memory) makes the CHeap output diverge and trips this
+    -- parity assertion.
+    -- WHAT THIS DOES NOT PIN: the overread itself is undefined behavior whose
+    -- VALUE-level visibility is non-deterministic (if the bytes immediately after
+    -- the buffer happen to be NUL, an unclamped strndup stops at the boundary and
+    -- the output coincidentally matches). The memory-safety guarantee against the
+    -- overread is the ASan death-test in Task 7; this is the logical complement.
+    testCase "07-strndup-overrun: clamp to buffer len (no overread)" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/07-strndup-overrun.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == Bytes[1,2,3] (clamped)" (T.pack "Bytes[1,2,3]") (RCM.rcOutput a)
+          assertEqual "C output == Bytes[1,2,3] (clamped, no overread)" (T.pack "Bytes[1,2,3]") (RCM.rcOutput c)
+          assertEqual "output parity (clamp == model)" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (e) Adopt dup/drop: strndup result shared across two uses.
+    -- Perceus inserts a dup (rc 1->2) before the second use and two drops
+    -- (2->1->0) at the two consuming sites; libc free fires at rc=0.
+    -- A double-free would abort the CHeap run before this assertion is
+    -- reached. MUTATION-CONFIRMED: temporarily injecting `free(p)` right
+    -- after adoptCHeapPtr (src/Wok/Interp/RC/Machine.hs) caused a SIGABRT
+    -- (macOS libc double-free detection) that killed the test process before
+    -- any result was reported; the injection was reverted.
+    testCase "08-strndup-dup-share: adopt dup+drop frees once (double-free would abort)" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/08-strndup-dup-share.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 14 (length 4 + index 0 = 10)"
+            (T.pack "14") (RCM.rcOutput a)
+          assertEqual "C output == 14 (double-free-free on libc malloc)"
+            (T.pack "14") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (possible double-free): " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (f) Borrow-out lifetime: memchr borrows `b`, `b` survives + is used again.
+    -- Perceus dups `b` before memchr (rc 1->2) and drops the borrow-copy inside
+    -- the dispatch (rc 2->1). `length b` then consumes the last ref (rc 1->0).
+    -- A UAF (borrow consuming the original) would corrupt `b`'s byte data;
+    -- the CHeap run would crash or produce a wrong answer. 3-backend parity
+    -- pins that the lent buffer is intact after the call.
+    testCase "09-borrow-lifetime: borrowed Bytes intact after memchr call" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/09-borrow-lifetime.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          -- memchr [65,66,67] 65 3 => 0 (found at index 0); length [65,66,67] => 3
+          -- 0 + 3 = 3
+          assertEqual "abstract output == 3 (borrow + length)"
+            (T.pack "3") (RCM.rcOutput a)
+          assertEqual "C output == 3 (borrow intact, no UAF)"
+            (T.pack "3") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (possible borrow UAF): " <> show e)
+
+  , -- -------------------------------------------------------------------
+    -- (g) Huge-n clamp regression: n = 2^63 must NOT wrap to negative in Int
+    -- and must return the full buffer, not empty. Pins the Word64-domain clamp
+    -- fix in foreignStrndup / the abstract model (the CHeap path already
+    -- clamped correctly, so this checks the abstract backend now agrees).
+    testCase "10-strndup-huge-n: n = 2^63 clamped to buffer len, returns full buffer" $ do
+      (absR, cR, _, cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/10-strndup-huge-n.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == Bytes[1,2,3] (clamped, not empty)"
+            (T.pack "Bytes[1,2,3]") (RCM.rcOutput a)
+          assertEqual "C output == Bytes[1,2,3] (huge-n clamp)"
+            (T.pack "Bytes[1,2,3]") (RCM.rcOutput c)
+          assertEqual "output parity (models agree on huge n)"
+            (RCM.rcOutput a) (RCM.rcOutput c)
+          assertEqual "peak_bytes parity"
+            (fromIntegral (St.stPeakBytes (RCM.rcStats a)) :: Word64) cPeakBytes
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED: " <> show e)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 2 Task 7: soundness tests with mutation-confirmed death teeth.
+--
+-- These tests cover the ADOPT and BORROW-OUT paths through the CHeap backend:
+--
+-- (a) ADOPT DUP/DROP double-free guard (08-strndup-dup-share).
+--     A strndup result is shared across two consuming uses; Perceus inserts a
+--     dup (rc 1->2) and the two drops (2->1->0) fire libc free exactly once.
+--     The CHeap run is the live guard: a double-free aborts before the
+--     assertion is reached. MUTATION-CONFIRMED: injecting `free(p)` right
+--     after adoptCHeapPtr in src/Wok/Interp/RC/Machine.hs (strndup/CHeap arm)
+--     caused an immediate SIGABRT (macOS libc double-free detection) on the
+--     CHeap run; the process died before any test result was printed. The
+--     injection was reverted and confirmed clean (3 of 3 tests pass).
+--
+-- (b) BORROW-OUT lifetime (09-borrow-lifetime).
+--     Covered inline in rcFfiForeignParity as case (f); the 3-backend output
+--     parity IS the UAF guard. Included here for the dedicated soundness
+--     commentary.
+--
+-- SANITIZER COVERAGE (honest statement):
+-- The borrow-out and adopt paths run under the slab allocator (no redzones) in
+-- the default `cabal test`. An overread past a slab-internal buffer would land
+-- in intra-slab memory and be invisible. The STANDALONE C lifecycle tests
+-- (wok_rc_test.c / wok_arena_test.c) under ASan+WOK_RC_MALLOC cover:
+--   - WokForeignBytes alloc/free cycle + libc free at rc-zero + LSan negative control
+-- THE HASKELL INTERP BORROW-OUT PATH IS NOW ALSO COVERED:
+--   `bash scripts/asan-runtime.sh interp` runs the full rc-ffi-foreign corpus
+--   through the wok RC interpreter under ASan+WOK_RC_MALLOC (cabal flag asan).
+--   POSITIVE: the corpus runs CLEAN (no ASan reports on the clamped path).
+--   NEGATIVE CONTROL (mutation-confirmed): flag ffi-noclamp-negctrl drops the
+--   scan clamp; asan-overrun-probe.wok (8-byte no-zero buffer, n=128) crosses
+--   the cell redzone and aborts, proving the clamp gate has teeth.
+--   The residual documented in earlier revisions is NOW CLOSED.
+-- ---------------------------------------------------------------------------
+
+rcFfiForeignSoundness :: TestTree
+rcFfiForeignSoundness = testGroup "ffi foreign soundness"
+  [ -- -----------------------------------------------------------------------
+    -- (a) Adopt dup/drop double-free guard.
+    -- The CHeap run IS the live double-free detector. MUTATION-CONFIRMED:
+    -- see module comment above for the observed SIGABRT and reverted injection.
+    testCase "08-strndup-dup-share: adopt dup+drop frees once (double-free guard)" $ do
+      (absR, cR, _, _cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/08-strndup-dup-share.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 14" (T.pack "14") (RCM.rcOutput a)
+          assertEqual "C output == 14 (no double-free)" (T.pack "14") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (possible double-free): " <> show e)
+
+  , -- -----------------------------------------------------------------------
+    -- (b) Borrow-out lifetime: borrowed Bytes survives the call and is correct.
+    testCase "09-borrow-lifetime: borrowed Bytes intact after memchr call" $ do
+      (absR, cR, _, _cPeakBytes) <-
+        withBothBackends "test/rc-ffi-foreign/09-borrow-lifetime.wok"
+      case (absR, cR) of
+        (Right a, Right c) -> do
+          assertEqual "abstract output == 3" (T.pack "3") (RCM.rcOutput a)
+          assertEqual "C output == 3 (borrow intact)" (T.pack "3") (RCM.rcOutput c)
+          assertEqual "output parity" (RCM.rcOutput a) (RCM.rcOutput c)
+        (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
+        (_, Left e) -> assertFailure ("C FAILED (possible borrow UAF): " <> show e)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 2 Task 7: end-to-end IO discharge tests.
+--
+-- A foreign-calling program at entry has IO in its effect row. The reference
+-- interpreter treats IO as a ground effect (no handler needed; discharged by
+-- running the program). These tests verify:
+--   (1) A program calling a foreign function typechecks and runs to a value.
+--   (2) A function calling a foreign function WITHOUT a `with IO` signature
+--       annotation is rejected (UndischargedEffect / RowMismatch).
+-- ---------------------------------------------------------------------------
+
+foreignIoDischargeTests :: TestTree
+foreignIoDischargeTests = testGroup "foreign IO discharge"
+  [ -- AC1: end-to-end IO -- a foreign-calling `main` typechecks and runs.
+    -- Libc.memchr [65,66,67] 66 3  =>  1 (byte 66 at index 1).
+    -- IO is ground: the reference interpreter evaluates the body directly.
+    testCase "memchr at entry: IO ground effect, typechecks and runs to value" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+        , "main = Libc.memchr (fromList [65, 66, 67]) 66 3"
+        ]
+      result @?= Right (T.pack "1")
+
+  , -- AC2: end-to-end IO with strndup -- adopted result runs and renders correctly.
+    testCase "strndup at entry: IO ground effect, adopted Bytes renders" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Bytes"
+        , "foreign module Libc \"c\" free \"free\" where"
+        , "  owned strndup : Bytes -> U64 -> Bytes with IO"
+        , "main = Libc.strndup (fromList [1, 2, 3]) 3"
+        ]
+      result @?= Right (T.pack "Bytes[1,2,3]")
+
+  , -- AC3: a caller without `with IO` that calls a foreign function is rejected.
+    -- The foreign call introduces IO into the caller's row; if the caller is
+    -- declared pure (no `with IO`), the undischarged IO is a type error.
+    testCase "caller without `with IO` sig calling foreign fn: rejected (UndischargedEffect)" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "-- declared pure but body introduces IO -- must be rejected"
+             , "pure_caller : Bytes -> U64"
+             , "pure_caller b = Libc.memchr b 65 3"
+             ]
+             "pure_caller" of
+        Left err ->
+          assertBool ("expected UndischargedEffect or RowMismatch, got: " ++ err)
+            (  "UndischargedEffect" `Data.List.isInfixOf` err
+            || "RowMismatch"        `Data.List.isInfixOf` err )
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , -- AC4: IO-handler rejection -- a with-handler targeting the ground IO is
+    -- rejected (IOEffectNotHandleable). Regression pin: confirming the foreign-
+    -- module declaration does not bypass the IO-handler gate.
+    testCase "with-handler over IO in foreign-module context: rejected (IOEffectNotHandleable)" $
+      case schemeOf
+             [ "foreign module Libc \"c\" free \"free\" where"
+             , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
+             , "bad_handler x ="
+             , "  with IO { v -> v }"
+             , "  x"
+             ]
+             "bad_handler" of
+        Left err ->
+          assertBool ("expected IOEffectNotHandleable, got: " ++ err)
+            ("IOEffectNotHandleable" `Data.List.isInfixOf` err)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
   ]

@@ -1,0 +1,6 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  memchr : Bytes -> U64 -> U64 -> U64 with IO
+-- memchr [65,66,67] 66 3 => 1 (byte 66 at index 1)
+main = Libc.memchr (fromList [65, 66, 67]) 66 3

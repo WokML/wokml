@@ -1,0 +1,8 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+-- Regression for the strndup heap-overread: a buffer with NO zero byte and
+-- n (10) > length (3). The scan MUST be clamped to the buffer length, so the
+-- result is the FULL buffer Bytes[1,2,3], not an overread past it.
+main = Libc.strndup (fromList [1, 2, 3]) 10

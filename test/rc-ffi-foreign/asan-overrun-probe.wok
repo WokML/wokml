@@ -1,0 +1,29 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+
+-- Dual-role ASan probe for the strndup borrow-out path.
+--
+-- POSITIVE (normal build, flag asan):
+--   The scan clamp (min n argLen) bounds the strndup scan to the 8-byte
+--   buffer. With WOK_RC_MALLOC the cell has an ASan redzone immediately
+--   after offset 24; the clamped scan stays within [16,24) and ASan is
+--   SILENT. The result is Bytes[1,2,3,4,5,6,7,8] (length 8).
+--
+-- NEGATIVE CONTROL (flag asan + flag ffi-noclamp-negctrl):
+--   WOK_FFI_NOCLAMP_NEGCTRL drops the clamp (scanN = fromIntegral n = 128).
+--   strndup scans 128 bytes starting at the buffer, which lies at cell
+--   offset 16 in a 24-byte cell (wok_string_cell_bytes(8)=24, data at +16).
+--   The scan crosses into the ASan redzone past offset 24, triggering a
+--   heap-buffer-overflow report and aborting.
+--
+-- Buffer: 8 bytes with NO zero byte (zeros would terminate strndup early,
+-- masking the overread). n=128 is large enough to reliably cross the redzone.
+-- 8 bytes fills the 24-byte cell exactly: wok_string_cell_bytes(8) = 24
+-- (header 16 B + 8 B data = 24 B), so the overread starts at the first
+-- byte past the cell, right into the ASan redzone.
+main =
+  let buf = fromList [1, 2, 3, 4, 5, 6, 7, 8]
+      result = Libc.strndup buf 128
+  in length result

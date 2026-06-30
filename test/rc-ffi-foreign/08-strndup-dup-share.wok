@@ -1,0 +1,18 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+
+-- Shares ONE adopted (WokForeignBytes) Bytes produced by Libc.strndup across
+-- two consuming uses, forcing a Perceus dup (rc 1->2) then two drops
+-- (2->1->0, libc free triggered at rc=0).
+-- If the foreign free fired at the dup, or fired twice, the CHeap (libc malloc)
+-- run would double-free and abort before the assertion could be reached.
+-- Run on both RC backends (AbstractHeap + CHeap via real libc); the expected
+-- value is derived from the reference-interpreter semantics. The CHeap run with
+-- real libc free is what makes the double-free bite (the live guard).
+-- Input: strndup [10,20,30,40] 4  => Bytes[10,20,30,40]
+-- Expected: length b + index b 0  = 4 + 10 = 14.
+main =
+  let b = Libc.strndup (fromList [10, 20, 30, 40]) 4
+  in length b + index b 0

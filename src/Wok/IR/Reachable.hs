@@ -93,7 +93,8 @@ exprUniques = goE
       -- already-fused module inside 'runModuleRC', so this walk MUST tolerate it:
       -- 'RReuseCon tok c fields' references the token + field atoms, exactly like an
       -- 'RCon' plus the token operand.
-      Anf.RReuseCon tok _ xs -> Set.union (av tok) (avs xs)
+      Anf.RReuseCon tok _ xs       -> Set.union (av tok) (avs xs)
+      Anf.RForeignCall _ _ _ _ xs -> avs xs
     goA a = case a of
       Anf.AltCon _ _ e -> goE e
       Anf.AltLit _ e   -> goE e
@@ -218,7 +219,10 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
       -- An 'RReuseCon' (post-pass, after insertRC) carries no LetRec-relevant
       -- content; like 'RCon'/'RApp' it contributes no violation. The guard re-runs
       -- on the fused module inside 'runModuleRC', so this must not error.
-      Anf.RReuseCon{}      -> []
+      Anf.RReuseCon{}             -> []
+      -- A foreign call's args are plain atoms (no sub-expressions); no LetRec
+      -- violation can arise from the call itself.
+      Anf.RForeignCall{}          -> []
     alt mob lr bsc a = case a of
       Anf.AltCon _ bs b -> go mob lr (Set.union bsc (Set.fromList (boxedBs bs))) b
       Anf.AltLit _ b    -> go mob lr bsc b

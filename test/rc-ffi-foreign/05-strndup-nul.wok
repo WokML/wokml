@@ -1,0 +1,6 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+-- strndup [1,0,3,4] 4 => Bytes[1] (truncates at NUL)
+main = Libc.strndup (fromList [1, 0, 3, 4]) 4

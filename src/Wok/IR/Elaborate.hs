@@ -17,10 +17,12 @@ import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
 import Wok.IR.Name
+import Wok.FFI.Blessed (lookupBlessed, bsReturn)
 import Wok.TypeChecking.Env
   ( Env, envVars, envVarOrigin, lookupCon, conArity, conTyCon, lookupRecordCon, rcFields
   , lookupTyCon, TyConInfo (..)
-  , classOfMethod, lookupClass, ClassInfo (..) )
+  , classOfMethod, lookupClass, ClassInfo (..)
+  , lookupForeignModule, ForeignModuleInfo (..), ForeignMemberInfo (..) )
 import Wok.TypeChecking.Carrier (freeVars)
 import Wok.TypeChecking.Infer (TypedDecl (..))
 import Wok.TypeChecking.Typed
@@ -378,8 +380,17 @@ elabRhsF ty (TCon c) k = do
   rhs <- saturateCon ty c [] a
   k rhs
 
--- Effect-operation reference (zero-argument): E.op
-elabRhsF _ (TProjCon effect op) k = k (ROp Nothing effect op [])
+-- Effect-operation reference or foreign-member reference (zero arguments).
+-- If the head is a declared foreign module, partial application (zero args here)
+-- is not supported; raise an elaboration error. Effect ops still route to ROp.
+elabRhsF _ (TProjCon modOrEffect op) k = do
+  env <- asks ecEnv
+  case lookupForeignModule modOrEffect env of
+    Just _ ->
+      error ("elaborate: foreign module member '" <> Tx.unpack modOrEffect
+             <> "." <> Tx.unpack op
+             <> "' used without arguments (partial application not supported)")
+    Nothing -> k (ROp Nothing modOrEffect op [])
 
 -- Named perform `instance.op` (zero-argument). Normalize the instance node to
 -- an atom and route the op through it: `ROp (Just instanceAtom) effect op []`.
@@ -388,6 +399,12 @@ elabRhsF _ (TPerformOn inst effect op) k =
   normName inst $ \ia -> k (ROp (Just ia) effect op [])
 
 -- Application: head + args. Head being a constructor or effect op is visible.
+-- A foreign-module projection head (M.member) emits 'RForeignCall' instead
+-- of 'ROp'. Saturation: the typechecker already enforced arity via the arrow
+-- type, so arriving here with a saturated arg list is the only case we need.
+-- If the head is a foreign member AND the arg list is empty, this should only
+-- be reachable via the zero-arg arm above (which errors), so we do not need
+-- to handle that here.
 elabRhsF ty (TApp hd args) k =
   normAll args $ \atoms ->
     case hd of
@@ -395,7 +412,26 @@ elabRhsF ty (TApp hd args) k =
         a <- conArityOf c
         rhs <- saturateCon ty c atoms a
         k rhs
-      Texp _ (TProjCon effect op) -> k (ROp Nothing effect op atoms)
+      Texp _ (TProjCon modOrEffect op) -> do
+        env <- asks ecEnv
+        case lookupForeignModule modOrEffect env of
+          Just fmi ->
+            case Map.lookup op (fmMembers fmi) of
+              Nothing ->
+                error ("elaborate: foreign member '" <> Tx.unpack op
+                       <> "' not in module '" <> Tx.unpack modOrEffect <> "'")
+              Just minfo ->
+                -- The blessed table is the contract of record: use its ReturnDisp.
+                -- 'lookupBlessed' validated this pair at typecheck time; if it is
+                -- absent here it is a compiler bug (the honesty gate was bypassed).
+                case lookupBlessed (fmLib fmi) (fmiSymbol minfo) of
+                  Nothing ->
+                    error ("elaborate: unblessed foreign symbol reached elaborator: "
+                           <> Tx.unpack (fmLib fmi) <> "." <> Tx.unpack (fmiSymbol minfo))
+                  Just bsig ->
+                    k (RForeignCall (fmLib fmi) (fmiSymbol minfo) (bsReturn bsig)
+                                    (fmFree fmi) atoms)
+          Nothing -> k (ROp Nothing modOrEffect op atoms)
       -- Named perform applied (e.g. `count.set x`): normalize the receiver
       -- instance to an atom, route through it: `ROp (Just ia) effect op atoms`.
       Texp _ (TPerformOn inst effect op) ->

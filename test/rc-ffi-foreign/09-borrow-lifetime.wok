@@ -1,0 +1,22 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  memchr : Bytes -> U64 -> U64 -> U64 with IO
+
+-- Pins the borrow-out lifetime discipline: `b` is used BOTH as the Bytes
+-- argument to Libc.memchr AND again afterward (via `length b`).
+-- Perceus inserts a dup before the memchr call (rc 1->2) and the dispatch
+-- drops the borrowed copy after the synchronous C call returns (rc 2->1).
+-- The second use of `b` (length) then drops the last ref (rc 1->0).
+-- If the borrow consumed or corrupted `b`, the CHeap run would either
+-- crash (UAF) or produce a wrong answer.
+-- Run on both RC backends (AbstractHeap + CHeap via real libc); the expected
+-- value is derived from the reference-interpreter semantics. The CHeap run with
+-- real libc is what makes a borrow corruption / UAF bite (the live guard).
+-- Input: b = fromList [65,66,67]  (bytes A,B,C)
+-- memchr b 65 3  => 0  (byte 65 found at index 0)
+-- length b       => 3
+-- Expected: 0 + 3 = 3.
+main =
+  let b = fromList [65, 66, 67]
+  in Libc.memchr b 65 3 + length b

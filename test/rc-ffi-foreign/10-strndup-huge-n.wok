@@ -1,0 +1,9 @@
+module Main
+import Std.Bytes
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+-- Regression for the huge-n Int wrap: n = 2^63 converted to Int wrapped
+-- NEGATIVE, causing BS.take to return empty instead of the real prefix.
+-- After the Word64-domain clamp fix, huge n is treated as n >= length,
+-- so the result is the full buffer Bytes[1,2,3], identical across all backends.
+main = Libc.strndup (fromList [1, 2, 3]) 9223372036854775808

@@ -185,9 +185,13 @@ escapingAtomsRhs (RProj _ a)      = [a]
 -- to the owned/escaping set, so it is IGNORED. (S2 additionally forbids a token
 -- from spanning an effect op --- see Wok.IR.ReusePairing.findTarget's 'ROp' arm ---
 -- so this path is a defensive belt-and-braces total fallback, not a hot path.)
-escapingAtomsRhs (RReuseCon _ _ as) = as
-escapingAtomsRhs (ROp m _ _ as)   = maybe as (: as) m
-escapingAtomsRhs (RLam ps e)      =
+escapingAtomsRhs (RReuseCon _ _ as)       = as
+escapingAtomsRhs (ROp m _ _ as)          = maybe as (: as) m
+-- Foreign call: all args are escaping moves (like RApp arguments; no call-head
+-- exemption since the callee is identified by (lib, sym) text, not an Atom).
+-- Task 6 will refine to borrow-pass the buffer pointer; for now, all args escape.
+escapingAtomsRhs (RForeignCall _ _ _ _ as) = as
+escapingAtomsRhs (RLam ps e)              =
   -- A value captured into a nested lambda ESCAPES (it outlives the build site
   -- inside the closure cell). EVERY free occurrence in the body counts --- even a
   -- bare call head: a var used only as a call head inside the nested lambda still
@@ -617,8 +621,10 @@ consumingOccs caps = goE
     -- here is genuinely unreachable and stays a LOUD error (the repo's
     -- loud-on-violation convention). Contrast 'escapingAtomsRhs', which IS on the
     -- runtime continuation-drop path and so is made total above.
-    goR (RReuseCon{})    = error "RReuseCon: produced only by reusePairing post-pass (consumingOccs is a compile-time boundary-guard analysis, never sees post-pass IR)"
-    goR (ROp m _ _ as)   = Set.unions (map watched (maybe as (: as) m))
+    goR (RReuseCon{})             = error "RReuseCon: produced only by reusePairing post-pass (consumingOccs is a compile-time boundary-guard analysis, never sees post-pass IR)"
+    goR (ROp m _ _ as)            = Set.unions (map watched (maybe as (: as) m))
+    -- Foreign call: all args are consuming (like RApp; no call-head exemption).
+    goR (RForeignCall _ _ _ _ as) = Set.unions (map watched as)
     goR (RLam ps e)      =
       -- A capture referenced inside a nested lambda body is moved into that
       -- closure cell (it outlives the build) --- consuming. The lambda's own

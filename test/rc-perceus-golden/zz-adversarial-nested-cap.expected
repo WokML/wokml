@@ -1,27 +1,27 @@
 build a b xs =
-  join j106(r.1) =
+  join j123(r.1) =
     let h = r.1
     let t.1 = Cell(h, a, b)
     t.1
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      join j109(r.2) =
+      join j126(r.2) =
         let g.1 = r.2
-        jump j106(g.1)
+        jump j123(g.1)
       case b of
-        Nil -> jump j109(0)
-        Cons p _.1 -> jump j109(p)
+        Nil -> jump j126(0)
+        Cons p _.1 -> jump j126(p)
     Cons y _.2 ->
       let _drop.2 = __rc_drop(xs)
-      join j116(r.3) =
+      join j133(r.3) =
         let g.2 = r.3
-        jump j106(g.2)
+        jump j123(g.2)
       case a of
-        Nil -> jump j116(y)
+        Nil -> jump j133(y)
         Cons q _.3 ->
           let t.2 = +(y, q)
-          jump j116(t.2)
+          jump j133(t.2)
 
 main =
   let t.1 = Nil
@@ -134,6 +134,18 @@ dict$Eq$String$m1 x y =
 
 dict$Eq$String =
   let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
+
+dict$Eq$Bytes$m0 =
+  eqBytes
+
+dict$Eq$Bytes$m1 x y =
+  let t.1 = dict$Eq$Bytes$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$Bytes =
+  let t = Eq$Dict(dict$Eq$Bytes$m0, dict$Eq$Bytes$m1)
   t
 
 reader e c =
@@ -591,3 +603,28 @@ countFrom s n from acc =
       let t.4 = +(acc, 1)
       let t.5 = countFrom(s, n, t.3, t.4)
       t.5
+
+foldChars f acc str =
+  let _dup = __rc_dup(str)
+  let t.1 = byteLength(str)
+  let t.2 = foldCharsGo(f, acc, str, 0, t.1)
+  t.2
+
+foldCharsGo f acc str off end =
+  let t.1 = eqU64(off, end)
+  case t.1 of
+    True ->
+      let _drop.1 = __rc_drop(t.1)
+      let _drop.2 = __rc_drop(f)
+      let _drop.3 = __rc_drop(str)
+      acc
+    False ->
+      let _drop.4 = __rc_drop(t.1)
+      let _dup.1 = __rc_dup(str)
+      let t.2 = decodeCharAt(str, off)
+      let t.3 = f(acc, t.2)
+      let _dup.2 = __rc_dup(str)
+      let t.4 = charWidthAt(str, off)
+      let t.5 = +(off, t.4)
+      let t.6 = foldCharsGo(f, t.3, str, t.5, end)
+      t.6

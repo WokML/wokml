@@ -13,9 +13,12 @@ module Wok.Interp.RC.Heap
   , wokForeignBytesAlloc, wokForeignBytesPtr, wokForeignBytesLen
   , wokValidateUtf8
   , wokArenaOpen, wokArenaAlloc, wokArenaClose, wokStatArenaBytes, wokStatArenaPeak
+  -- libc calls used by rcForeignDispatch (Task 6 FFI Slice 2)
+  , c_memchr, c_strndup, c_strlen
   ) where
 
 import Foreign.Ptr (Ptr)
+import Foreign.C.Types (CInt (..), CSize (..))
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
 
@@ -66,3 +69,11 @@ foreign import ccall unsafe "wok_arena_alloc"      wokArenaAlloc    :: Ptr WokHe
 foreign import ccall unsafe "wok_arena_close"      wokArenaClose    :: Ptr WokHeap -> Word32 -> IO ()
 foreign import ccall unsafe "wok_stat_arena_bytes" wokStatArenaBytes :: Ptr WokHeap -> IO Word64
 foreign import ccall unsafe "wok_stat_arena_peak"  wokStatArenaPeak  :: Ptr WokHeap -> IO Word64
+
+-- libc blessed calls (Task 6 FFI Slice 2: borrow-out dispatch)
+-- memchr(buf, byte, n): returns pointer to first matching byte, or NULL.
+foreign import ccall unsafe "string.h memchr"  c_memchr  :: Ptr Word8 -> CInt -> CSize -> IO (Ptr Word8)
+-- strndup(buf, n): malloc's a NUL-terminated copy of up to n bytes of buf.
+foreign import ccall unsafe "string.h strndup" c_strndup :: Ptr Word8 -> CSize -> IO (Ptr Word8)
+-- strlen(s): byte length of NUL-terminated C string.
+foreign import ccall unsafe "string.h strlen"  c_strlen  :: Ptr Word8 -> IO CSize

@@ -1,10 +1,10 @@
 sumPairs p.1 p.2 =
-  join j103(x, xs, y, ys) =
+  join j120(x, xs, y, ys) =
     let t.1 = +(x, y)
     let t.2 = sumPairs(xs, ys)
     let t.3 = +(t.1, t.2)
     t.3
-  join j111() =
+  join j128() =
     0
   case p.1 of
     Cons f.1 f.2 ->
@@ -14,15 +14,15 @@ sumPairs p.1 p.2 =
         Cons f.3 f.4 ->
           let _dup.2 = __rc_dup(f.4)
           let _drop.2 = __rc_drop(p.2)
-          jump j103(f.1, f.2, f.3, f.4)
+          jump j120(f.1, f.2, f.3, f.4)
         _ ->
           let _drop.3 = __rc_drop(p.2)
           let _drop.4 = __rc_drop(f.2)
-          jump j111()
+          jump j128()
     _ ->
       let _drop.5 = __rc_drop(p.1)
       let _drop.6 = __rc_drop(p.2)
-      jump j111()
+      jump j128()
 
 main =
   let t.3 = Nil
@@ -136,6 +136,18 @@ dict$Eq$String$m1 x y =
 
 dict$Eq$String =
   let t = Eq$Dict(dict$Eq$String$m0, dict$Eq$String$m1)
+  t
+
+dict$Eq$Bytes$m0 =
+  eqBytes
+
+dict$Eq$Bytes$m1 x y =
+  let t.1 = dict$Eq$Bytes$m0(x, y)
+  let t.2 = not(t.1)
+  t.2
+
+dict$Eq$Bytes =
+  let t = Eq$Dict(dict$Eq$Bytes$m0, dict$Eq$Bytes$m1)
   t
 
 reader e c =
@@ -593,3 +605,28 @@ countFrom s n from acc =
       let t.4 = +(acc, 1)
       let t.5 = countFrom(s, n, t.3, t.4)
       t.5
+
+foldChars f acc str =
+  let _dup = __rc_dup(str)
+  let t.1 = byteLength(str)
+  let t.2 = foldCharsGo(f, acc, str, 0, t.1)
+  t.2
+
+foldCharsGo f acc str off end =
+  let t.1 = eqU64(off, end)
+  case t.1 of
+    True ->
+      let _drop.1 = __rc_drop(t.1)
+      let _drop.2 = __rc_drop(f)
+      let _drop.3 = __rc_drop(str)
+      acc
+    False ->
+      let _drop.4 = __rc_drop(t.1)
+      let _dup.1 = __rc_dup(str)
+      let t.2 = decodeCharAt(str, off)
+      let t.3 = f(acc, t.2)
+      let _dup.2 = __rc_dup(str)
+      let t.4 = charWidthAt(str, off)
+      let t.5 = +(off, t.4)
+      let t.6 = foldCharsGo(f, t.3, str, t.5, end)
+      t.6
