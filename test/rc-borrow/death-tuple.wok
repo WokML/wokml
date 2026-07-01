@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- DEATH TEST (FFI Slice 3 Task 6, TUPLE/constructor route). `leak` lends a
+-- malloc'd borrow and stores it in a TUPLE that escapes its lending activation.
+-- Normal build: compile-time CarrierEscape. Under the `ffi-borrow-noescape-negctrl`
+-- mutation it runs: the activation-scoped close frees the buffer when `leak`
+-- returns, and `main` scans the borrow projected back out of the tuple via the
+-- C-side `memchr` -> ASan read-after-free on the freed malloc'd buffer. (`memchr`,
+-- not `byteAt`: the C `c_memchr` load is ASan-instrumented; `peekElemOff` is not.)
+leak n =
+  let b = Demo.lendBuffer n in
+  (b, 0)
+
+main =
+  case leak 8 of
+    (b, _) ->
+      case memchr b 5 of
+        Some o -> o
+        None   -> 99

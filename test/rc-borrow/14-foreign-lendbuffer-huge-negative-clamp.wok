@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Regression for the whole-branch review finding on top of the Task-4 clamp
+-- fix (08-foreign-lendbuffer-clamp.wok): the REFERENCE interpreter's
+-- `Demo.lendBuffer` arm clamped `n` in `Integer` domain (`min n cap`) but had
+-- NO `max 0` floor before the single downcast to `Int` (the argument to
+-- `Utf8.demoPattern`). For an ordinary negative `n` (like `0 - 1`) this was
+-- harmless -- `demoPattern` builds an EMPTY list whenever its `Int` argument
+-- is negative, regardless of magnitude. But a literal at or below
+-- `-(2^63 + 1)` (a wok `U64` does NOT wrap, so this stays a genuine negative
+-- `Integer`) falls outside the representable `Int` range, and the
+-- `Integer -> Int` downcast wraps via two's-complement -- landing back in
+-- POSITIVE territory for `-(2^63 + 1)` specifically (it wraps to
+-- `maxBound :: Int`), so the reference tried to build an astronomically
+-- large byte pattern (hang/OOM) while the RC backends -- which already
+-- floored at zero -- yielded an empty read. `n` below is exactly that
+-- boundary literal, reproducing the divergence pre-fix and the agreed-empty
+-- read post-fix on all three backends.
+main =
+  let n = 0 - 9223372036854775809 in
+  length (Demo.lendBuffer n)

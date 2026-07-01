@@ -13,6 +13,7 @@ data-files:         prelude/Std/Base.wok
                     prelude/Std/Array.wok
                     prelude/Std/String.wok
                     prelude/Std/Bytes.wok
+                    prelude/Std/Borrow.wok
 
 -- Enable AddressSanitizer for the C runtime and the wok executable.
 -- WOK_RC_MALLOC forces the slab pool to fall back to plain malloc, giving
@@ -29,6 +30,18 @@ flag asan
 -- Default: False (never enabled in a normal build).
 flag ffi-noclamp-negctrl
   description: Drop the strndup scan clamp (ASan negative control only). NEVER use in production.
+  default:     False
+  manual:      True
+
+-- Negative-control flag (FFI Slice 3 Task 6 death-test matrix): disable the
+-- foreign-borrow carrier ESCAPE rejection (CarrierEscape) in the type checker so
+-- a Borrow that escapes its lending activation type-checks and can be RUN.
+-- Combined with -fasan this turns each escape route into a GENUINE ASan
+-- use-after-free (the activation-scoped close frees the malloc'd buffer the
+-- escapee then reads), proving the carrier rule is load-bearing.
+-- Default: False (never enabled in a normal build).
+flag ffi-borrow-noescape-negctrl
+  description: Disable the Borrow carrier escape check (ASan death-test negative control only). NEVER use in production.
   default:     False
   manual:      True
 
@@ -148,6 +161,8 @@ library
       cc-options:     -fsanitize=address -fno-omit-frame-pointer -DWOK_RC_MALLOC
     if flag(ffi-noclamp-negctrl)
       cpp-options:    -DWOK_FFI_NOCLAMP_NEGCTRL
+    if flag(ffi-borrow-noescape-negctrl)
+      cpp-options:    -DWOK_FFI_BORROW_NOESCAPE_NEGCTRL
     autogen-modules:
         Paths_wok
     other-modules:

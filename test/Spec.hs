@@ -83,7 +83,7 @@ import Data.Unique (newUnique, hashUnique)
 import Data.Bifunctor (first)
 import qualified Data.List
 import qualified Data.Maybe
-import Data.List (sortBy)
+import Data.List (sortBy, isPrefixOf)
 import Data.Ord (comparing)
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
 import Foreign.Ptr (castPtr)
@@ -174,6 +174,31 @@ main = do
   -- Programs are handler-free. Wired to rc differential + rc stats + C-backend
   -- parity; also has a dedicated 3-backend parity + adopt saving pin group.
   rcFfiForeignFiles <- findByExtension [".wok"] "test/rc-ffi-foreign"
+  -- FFI Slice 3 Task 3: Borrow read prims (length/byteAt/slice/memchr) + the
+  -- Bytes.copy escape hatch, exercised over the internal __borrow_demo test
+  -- fixture (a static deterministic buffer). Programs are handler-free.
+  -- Wired to rc differential + rc stats + C-backend parity, matching the
+  -- rc-ffi-bytes / rc-ffi-foreign corpus pattern; this is the foundation
+  -- Task 5 (family-liveness) builds on, so it must be under the oracle first.
+  -- FFI Slice 3 Task 6 negative controls in test/rc-borrow/. Two families, both
+  -- excluded from the clean-path corpus groups (rc differential / rc stats / parity /
+  -- close-count) because those RUN their file and a negative control is rejected, not
+  -- runnable:
+  --   * `death-*.wok`  : a Borrow that escapes its lending activation via one of the
+  --     five non-continuation routes. REJECTED at compile time with a CarrierEscape in
+  --     a normal build (the death-test compile-reject group below), and turned into a
+  --     GENUINE ASan use-after-free under the test-only `ffi-borrow-noescape-negctrl`
+  --     mutation (driven by scripts/asan-runtime.sh).
+  --   * `contstore-*.wok` : the stored-continuation route (Q4). NOT a CarrierEscape and
+  --     NOT a runnable UAF -- it is rejected at the M3 continuation-escape boundary
+  --     (`firstOrderNoHandlerViolations`); see the dedicated assertion below.
+  rcBorrowAllFiles <- findByExtension [".wok"] "test/rc-borrow"
+  let isDeathFile      = isPrefixOf "death-" . takeBaseName
+      isContStoreFile  = isPrefixOf "contstore-" . takeBaseName
+      isNegControlFile f = isDeathFile f || isContStoreFile f
+      rcBorrowDeathFiles     = filter isDeathFile rcBorrowAllFiles
+      rcBorrowContStoreFiles = filter isContStoreFile rcBorrowAllFiles
+      rcBorrowFiles          = filter (not . isNegControlFile) rcBorrowAllFiles
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -455,7 +480,177 @@ main = do
         , rcFfiForeignParity
         , rcFfiForeignSoundness
         ]
+    -- FFI Slice 3 Task 3: Borrow read prims + Bytes.copy escape hatch, over
+    -- the internal __borrow_demo fixture. Runs rc differential + rc stats +
+    -- C-heap parity, mirroring the rc-ffi-bytes / rc-ffi-foreign wiring
+    -- exactly. This closes the Task-3 review finding: prior to this group,
+    -- the read prims had no committed RC-backend coverage even though they
+    -- are correct (reproduced green ad hoc); Task 5 (family-liveness) builds
+    -- directly on borrowSliceRC's CHeap slice path, so this is the
+    -- foundation that must be under the oracle first.
+    , testGroup "rc-borrow"
+        [ testGroup "rc differential"
+            [ testCase (takeBaseName f) (rcDifferentialHarness f)
+            | f <- rcBorrowFiles ]
+        , testGroup "rc stats"
+            [ testCase (takeBaseName f) (rcStatsHarness f)
+            | f <- rcBorrowFiles ]
+        , rcCBackendParity rcBorrowFiles
+        -- FFI Slice 3 Task 5: the ABSOLUTE foreign-borrow close count per malloc'd-
+        -- producer program, pinned on BOTH backends. Parity (above) proves abstract ==
+        -- C, but 0 == 0 would also pass if the close silently vanished on both; this
+        -- pins the real N (exactly one close per lent buffer). Programs that use only
+        -- the static __borrow_demo intrinsic lend nothing -> 0 closes.
+        , testGroup "borrow close-count"
+            [ testCase (takeBaseName f) (rcBorrowCloseCount f n)
+            | (f, n) <- borrowCloseCounts ]
+        -- FFI Slice 3 xhigh review Fix 1: the OBSERVABLE off-heap borrow-lent peak
+        -- characterization (the TCO/deep-loop activation-scoped-close limitation).
+        , testGroup "borrow lent-peak (TCO/deep-loop characterization)"
+            [ testCase "17-tail-loop-borrow-lent-peak: 8 iterations x 65536 bytes accumulate (activation-scoped close)"
+                (rcBorrowLentPeak "test/rc-borrow/17-tail-loop-borrow-lent-peak.wok" (8 * 65536)) ]
+        -- FFI Slice 3 Task 6 (death-test matrix, compile-reject half / vacuity guard
+        -- step 1). Each `death-*.wok` is the EXACT program scripts/asan-runtime.sh runs
+        -- under the `ffi-borrow-noescape-negctrl` mutation to produce a genuine ASan
+        -- use-after-free; here we pin that WITHOUT the mutation each is rejected at
+        -- compile time with a CarrierEscape. Asserting the same program is normally
+        -- rejected is what makes the mutation-confirmed UAF non-vacuous.
+        , testGroup "borrow death-test compile-reject"
+            [ testCase (takeBaseName f) (borrowDeathCompileRejects f)
+            | f <- rcBorrowDeathFiles ]
+        -- FFI Slice 3 Task 6 (stored-continuation route, Q4). The carrier rule does
+        -- NOT independently fire here (a Borrow captured by a continuation is not
+        -- surface-visible). The load-bearing guard is the M3 continuation-escape
+        -- boundary: a captured continuation may not escape its op-arm body except into
+        -- a `__cont_store` cell. This pins that a borrow-capturing continuation which
+        -- escapes (alias-then-store) is REJECTED at that boundary -- so the borrow
+        -- cannot ride a continuation out of its lending activation.
+        , testGroup "borrow cont-store route (M3-boundary reject)"
+            [ testCase (takeBaseName f) (borrowContStoreBoundaryRejects f)
+            | f <- rcBorrowContStoreFiles ]
+        -- FFI Slice 3 Task 7: the zero-copy saving pin (differential, not
+        -- tautological -- see the group's doc comment above its definition).
+        , rcBorrowZeroCopySavingPin
+        ]
     ]
+
+-- | (program, expected close count) for the malloc'd-producer corpus (FFI Slice 3
+-- Task 5). Each `Demo.lendBuffer` that executes mallocs ONE buffer freed by ONE
+-- activation-exit close; a slice shares the base buffer and adds no close.
+borrowCloseCounts :: [(FilePath, Int)]
+borrowCloseCounts =
+  [ ("test/rc-borrow/07-foreign-lendbuffer.wok",        1)  -- one lend
+  , ("test/rc-borrow/08-foreign-lendbuffer-clamp.wok",  2)  -- two lends (neg + over-large)
+  , ("test/rc-borrow/09-malloc-lend-slice.wok",         1)  -- one lend + a slice (base closed once)
+  , ("test/rc-borrow/10-case-arm-lend.wok",             2)  -- scrutinee lend + taken-arm lend
+  , ("test/rc-borrow/11-recursion-per-activation.wok",  3)  -- one lend per lending activation (n=3,2,1)
+  , ("test/rc-borrow/14-foreign-lendbuffer-huge-negative-clamp.wok", 1)  -- one lend (empty read)
+  , ("test/rc-borrow/17-tail-loop-borrow-lent-peak.wok",  8)  -- one lend per loop iteration (n=8..1)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 3 xhigh review Fix 1: OBSERVABLE off-heap borrow-lent peak.
+--
+-- '17-tail-loop-borrow-lent-peak.wok' lends a fresh 65536-byte buffer on each of
+-- 8 TAIL-recursive loop iterations. The activation-scoped close (Task 5, KEPT
+-- AS-IS by this fix -- family-liveness is a deferred optimization, not this fix's
+-- job) frees iteration i's buffer only when iteration i's OWN lending activation
+-- returns, which does not happen until the WHOLE chain of tail calls unwinds
+-- (each recursive call nests inside the current activation's body). So all 8
+-- lent buffers are live SIMULTANEOUSLY at the deepest point even though TCO
+-- means the interpreter's own call stack never grows -- an O(N) peak that was
+-- previously INVISIBLE to the oracle (the malloc'd buffers touch no wok_rc
+-- stat). 'stBorrowLentPeak' now pins this exactly, on both backends.
+-- ---------------------------------------------------------------------------
+
+-- | Assert the off-heap borrow-lent high-water mark ('St.stBorrowLentPeak') for a
+-- borrow-lending program, on BOTH backends (CHeap really mallocs; AbstractHeap
+-- charges the same logical size, exactly like 'St.stCloses').
+rcBorrowLentPeak :: FilePath -> Word64 -> Assertion
+rcBorrowLentPeak path expected = do
+  (absR, cR, _cAllocs, _cPeakBytes) <- withBothBackends path
+  case (absR, cR) of
+    (Right a, Right c) -> do
+      assertEqual (path <> ": borrowLentPeak (AbstractHeap)")
+        expected (St.stBorrowLentPeak (RCM.rcStats a))
+      assertEqual (path <> ": borrowLentPeak (CHeap)")
+        expected (St.stBorrowLentPeak (RCM.rcStats c))
+    (Left e, _) -> assertFailure (path <> ": abstract backend FAILED: " <> show e)
+    (_, Left e) -> assertFailure (path <> ": C backend FAILED: " <> show e)
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 3 Task 7: zero-copy saving pin.
+--
+-- Two DIFFERENT programs over the IDENTICAL source (`Demo.lendBuffer 4096`):
+--   * '12-saving-borrow-read.wok' (PROGRAM A) reads the borrow via
+--     `length`/`byteAt` only, with NO `Bytes.copy`. The borrow view is a
+--     fixed 24 B 0xFFFA handle; the malloc'd 4096-byte buffer sits off the
+--     wok_rc books (Task 5), so A's peak_bytes charges ONLY the handle.
+--   * '13-saving-copy.wok' (PROGRAM B) reads the SAME `length`/`byteAt`
+--     prefix, then ALSO calls `copy` (materializing an owned WokBytes) and
+--     reads it (`eqBytes c c` -- a self-compare that DUPs the same cell
+--     rather than allocating a second one, so exactly one copy is charged).
+--     B's peak_bytes therefore charges the 24 B handle PLUS an n-byte
+--     on-heap WokBytes copy.
+--
+-- The pin: peak_bytes(B) - peak_bytes(A) == the SAME charge
+-- 'St.wouldBeCBytes' assigns an n-byte 'NBytes' value -- COMPUTED from the
+-- store-layer formula, not a hardcoded magic number -- checked on BOTH the
+-- C heap (ground truth 'wok_stat_peak_bytes', via 'withBothBackends') and
+-- the abstract heap (must agree, per the existing 'rc-c-backend-parity'
+-- peak_bytes-parity invariant already run over this corpus).
+--
+-- NON-VACUITY: this is a DIFFERENTIAL measurement across two genuinely
+-- different programs on the SAME data, not a path compared to itself. If
+-- `Bytes.copy` were ever changed to a zero-copy alias (no allocation), B's
+-- peak_bytes would collapse to A's (24 B) and BOTH the vacuity-guard
+-- inequality and the exact-delta equality below would fail. The vacuity
+-- guard is asserted FIRST and independently of the exact-delta arithmetic,
+-- so a regression that merely shrinks (rather than eliminates) the delta is
+-- also caught by the equality, while a regression that eliminates it
+-- entirely trips the strict inequality first with a clearer message.
+-- ---------------------------------------------------------------------------
+
+rcBorrowZeroCopySavingPin :: TestTree
+rcBorrowZeroCopySavingPin = testGroup "borrow zero-copy saving pin"
+  [ testCase "12-saving-borrow-read vs 13-saving-copy: peak_bytes delta == n-byte WokBytes charge" $ do
+      (absA, cA, _, cPeakA) <- withBothBackends "test/rc-borrow/12-saving-borrow-read.wok"
+      (absB, cB, _, cPeakB) <- withBothBackends "test/rc-borrow/13-saving-copy.wok"
+      case (absA, cA, absB, cB) of
+        (Right ra, Right _, Right rb, Right _) -> do
+          let n              = 4096 :: Int
+              expectedCharge = St.wouldBeCBytes (St.NBytes (BS.replicate n 0))
+              absPeakA       = St.stPeakBytes (RCM.rcStats ra)
+              absPeakB       = St.stPeakBytes (RCM.rcStats rb)
+              cPeakA'        = fromIntegral cPeakA :: Int
+              cPeakB'        = fromIntegral cPeakB :: Int
+          -- Vacuity guard FIRST: the two programs must have genuinely
+          -- different heap footprints on identical source data.
+          assertBool
+            ("vacuity guard: peak_bytes(copy)=" <> show cPeakB'
+              <> " must exceed peak_bytes(borrow)=" <> show cPeakA'
+              <> " -- the two programs must genuinely differ on identical data")
+            (cPeakB' > cPeakA')
+          -- The differential pin, on the C heap (ground truth allocator).
+          assertEqual "CHeap: peak_bytes(copy) - peak_bytes(borrow) == n-byte WokBytes charge"
+            expectedCharge (cPeakB' - cPeakA')
+          -- The same pin on the abstract heap (must agree with CHeap; the
+          -- existing rc-c-backend-parity group over this corpus already
+          -- pins abstract peak_bytes == C peak_bytes per-file, so this is
+          -- belt-and-suspenders on the DELTA specifically).
+          assertEqual "AbstractHeap: peak_bytes(copy) - peak_bytes(borrow) == n-byte WokBytes charge"
+            expectedCharge (absPeakB - absPeakA)
+          -- Concrete numbers pinned (not just the delta), so a future
+          -- regression to either side's absolute charge is also caught.
+          assertEqual "CHeap peak_bytes(borrow) == 24 (fixed 0xFFFA handle, buffer off-heap)"
+            (24 :: Int) cPeakA'
+          assertEqual "CHeap peak_bytes(copy) == handle (24 B) + n-byte WokBytes charge"
+            (24 + expectedCharge) cPeakB'
+        (Left e, _, _, _) -> assertFailure ("program A (borrow-read) abstract backend FAILED: " <> show e)
+        (_, Left e, _, _) -> assertFailure ("program A (borrow-read) C backend FAILED: " <> show e)
+        (_, _, Left e, _) -> assertFailure ("program B (Bytes.copy) abstract backend FAILED: " <> show e)
+        (_, _, _, Left e) -> assertFailure ("program B (Bytes.copy) C backend FAILED: " <> show e)
+  ]
 
 goldenFor :: FilePath -> FilePath
 goldenFor exampleFile =
@@ -1231,8 +1426,8 @@ envOverlayTests = testGroup "envOverlay"
   , testCase "tycon collision returns Left with NsTyCon" $
       -- A genuine collision requires DIFFERING entries under the same name
       -- (byte-identical re-exports merge silently to support diamond imports).
-      let tciA = TE.TyConInfo Ty.KStar 0 [] False []
-          tciB = TE.TyConInfo Ty.KStar 1 [] False [Ty.KStar]
+      let tciA = TE.TyConInfo Ty.KStar 0 [] False True []
+          tciB = TE.TyConInfo Ty.KStar 1 [] False True [Ty.KStar]
           a = TE.extendTyCon (T.pack "Foo") tciA TE.emptyEnv
           b = TE.extendTyCon (T.pack "Foo") tciB TE.emptyEnv
       in case TE.overlayEnvs a b of
@@ -1299,8 +1494,8 @@ envOverlayTests = testGroup "envOverlay"
   , testCase "collisions across multiple namespaces are all reported" $
       let sA  = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           sB  = Ty.mkScheme [] (Ty.CTCon Ty.TcBool [])
-          tciA = TE.TyConInfo Ty.KStar 0 [] False []
-          tciB = TE.TyConInfo Ty.KStar 1 [] False [Ty.KStar]
+          tciA = TE.TyConInfo Ty.KStar 0 [] False True []
+          tciB = TE.TyConInfo Ty.KStar 1 [] False True [Ty.KStar]
           a = TE.extendTyCon (T.pack "X") tciA (TE.extendVar (T.pack "y") sA TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tciB (TE.extendVar (T.pack "y") sB TE.emptyEnv)
       in case TE.overlayEnvs a b of
@@ -1315,7 +1510,7 @@ envOverlayTests = testGroup "envOverlay"
       -- module that re-exports `Std.Base` without every shared name
       -- clashing.
       let s   = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
-          tci = TE.TyConInfo Ty.KStar 0 [] False []
+          tci = TE.TyConInfo Ty.KStar 0 [] False True []
           a = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
           b = TE.extendTyCon (T.pack "X") tci (TE.extendVar (T.pack "y") s TE.emptyEnv)
       in case TE.overlayEnvs a b of
@@ -3422,11 +3617,12 @@ loaderTests = testGroup "loader"
       case res of
         Right (entryName, modules) -> do
           entryName @?= T.pack "Main"
-          -- Three preludes are always embedded: Std.Base, Std.Control (imports
-          -- Std.Base), and Std.Array (imports Std.Base). Std.Base must come
-          -- first (nothing it depends on); the others follow in some
-          -- dependency-valid order. Assert the leading prelude + the full set
-          -- rather than a brittle exact permutation of the tail.
+          -- The embedded preludes are always loaded: Std.Base, Std.Control
+          -- (imports Std.Base), Std.Array (imports Std.Base), Std.String,
+          -- Std.Bytes, and Std.Borrow. Std.Base must come first (nothing it
+          -- depends on); the others follow in some dependency-valid order.
+          -- Assert the leading prelude + the full set rather than a brittle
+          -- exact permutation of the tail.
           let names = map Loader.lmName modules
           case names of
             (n0 : _) -> n0 @?= T.pack "Std.Base"
@@ -3435,7 +3631,7 @@ loaderTests = testGroup "loader"
             Data.List.sort
               [ T.pack "Std.Base", T.pack "Std.Control"
               , T.pack "Std.Array", T.pack "Std.String"
-              , T.pack "Std.Bytes", T.pack "Main" ]
+              , T.pack "Std.Bytes", T.pack "Std.Borrow", T.pack "Main" ]
         Left err -> assertFailure ("unexpected error: " ++ show err)
 
   , testCase "rejects file missing a module header" $ do
@@ -4908,6 +5104,8 @@ interpPrimTests = testGroup "InterpPrim"
               ++ map (T.pack "Std.Bytes",)
                   ["fromList","toList","length","index","fromBytes","toBytes"
                   ,"__ffi_demo_copy","__ffi_demo_adopt"]
+              ++ map (T.pack "Std.Borrow",)
+                  ["length","byteAt","slice","memchr","copy","__borrow_demo"]
               )
   , testCase "addition" $
       case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
@@ -6549,6 +6747,57 @@ foreignResolutionTests = testGroup "foreign resolution"
             (("ForeignDispositionMismatch" `isInfixOf` err)
              || ("ForeignAdoptFree" `isInfixOf` err)
              || ("free" `isInfixOf` err))
+
+    -- -----------------------------------------------------------------------
+    -- FFI Slice 3 Task 4: the borrow disposition (a member whose return TYPE
+    -- is `Borrow` -- no new keyword, unlike `owned`).
+    -- -----------------------------------------------------------------------
+
+  , -- AC14: a foreign-module member whose return type is `Borrow` resolves
+    -- as the borrow disposition with no `owned` keyword involved. Mirrors
+    -- AC10/AC11's "still resolves" shape for the new disposition.
+    testCase "lendBuffer (Borrow return, no owned) resolves as the borrow disposition" $
+      case schemeOf
+             [ "extern type Borrow"
+             , "foreign module Demo \"wok\" where"
+             , "  lendBuffer : U64 -> Borrow with IO"
+             , "call_lend n = Demo.lendBuffer n"
+             ]
+             "call_lend" of
+        Left err -> assertFailure ("expected success, got: " ++ err)
+        Right _  -> pure ()
+
+  , -- AC15: `owned` on a DispBorrow member -> ForeignDispositionMismatch
+    -- ("returns a borrowed view; remove `owned`") -- the same coherence
+    -- machinery as AC8/AC9, exercising the new disposition's message arm.
+    testCase "owned lendBuffer (DispBorrow) gives ForeignDispositionMismatch" $
+      case schemeOf
+             [ "extern type Borrow"
+             , "foreign module Demo \"wok\" free \"free\" where"
+             , "  owned lendBuffer : U64 -> Borrow with IO"
+             ]
+             "Demo" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignDispositionMismatch, got: " ++ err)
+            ("ForeignDispositionMismatch" `isInfixOf` err)
+
+  , -- AC16: a member blessed DispBorrow but declared with a NON-Borrow return
+    -- type -> ForeignDispositionMismatch. Without this check the elaborator
+    -- would still wrap the call's result as a 0xFFFA borrow view (the
+    -- blessed table is authoritative for the runtime disposition) while the
+    -- checked type says something else -- a backend-divergence soundness
+    -- hole this AC pins shut at compile time.
+    testCase "lendBuffer declared with a non-Borrow return gives ForeignDispositionMismatch" $
+      case schemeOf
+             [ "foreign module Demo \"wok\" where"
+             , "  lendBuffer : U64 -> U64 with IO"
+             ]
+             "Demo" of
+        Right s -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+        Left err ->
+          assertBool ("expected ForeignDispositionMismatch, got: " ++ err)
+            ("ForeignDispositionMismatch" `isInfixOf` err)
   ]
   where
     isInfixOf needle hay = needle `Data.List.isInfixOf` hay
@@ -13158,6 +13407,59 @@ withBothBackends path = do
     `Control.Exception.finally` Heap.wokHeapFree hp
   pure (absR, cR, cAllocs, cPeakBytes)
 
+-- | FFI Slice 3 Task 5: run a borrow program through BOTH backends and assert the
+-- foreign-borrow close count equals @expected@ on each. CHeap performs the real
+-- @free@ (ASan-checked separately via scripts/asan-runtime.sh); AbstractHeap counts
+-- the same N. Pinning the absolute count (not just abstract == C parity) catches a
+-- regression where the close silently stops firing on both backends.
+rcBorrowCloseCount :: FilePath -> Int -> Assertion
+rcBorrowCloseCount path expected = do
+  (absR, cR, _cAllocs, _cPeakBytes) <- withBothBackends path
+  case (absR, cR) of
+    (Right a, Right c) -> do
+      assertEqual (path <> ": closes (AbstractHeap)")
+        expected (St.stCloses (RCM.rcStats a))
+      assertEqual (path <> ": closes (CHeap)")
+        expected (St.stCloses (RCM.rcStats c))
+    (Left e, _) -> assertFailure (path <> ": abstract backend FAILED: " <> show e)
+    (_, Left e) -> assertFailure (path <> ": C backend FAILED: " <> show e)
+
+-- | FFI Slice 3 Task 6 (death-test matrix, compile-reject half). Type-check a
+-- `death-*.wok` Borrow-escape program in the NORMAL build and assert it is
+-- rejected with a CarrierEscape. This is vacuity-guard step 1: the EXACT program
+-- scripts/asan-runtime.sh later runs under the `ffi-borrow-noescape-negctrl`
+-- mutation to produce a genuine ASan use-after-free is, without the mutation,
+-- a compile-time rejection. If a death file ever type-checked here it would mean
+-- the carrier rule had a hole on that route -- a soundness regression.
+borrowDeathCompileRejects :: FilePath -> Assertion
+borrowDeathCompileRejects path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure (path <> ": loader error: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.typecheckProgram entryName ms of
+        Left msg
+          | T.pack "CarrierEscape" `T.isInfixOf` T.pack msg -> pure ()
+          | otherwise -> assertFailure
+              (path <> ": expected CarrierEscape, got: " <> msg)
+        Right _ -> assertFailure
+          (path <> ": expected a compile-time CarrierEscape rejection, but it type-checked")
+
+-- | FFI Slice 3 Task 6 (stored-continuation route, Q4). A borrow-capturing
+-- continuation that ESCAPES its op-arm body (aliased then `__cont_store`'d) must be
+-- rejected at the M3 continuation-escape boundary (`firstOrderNoHandlerViolations`),
+-- BEFORE the program ever runs on the RC store. The program type-checks (the carrier
+-- rule does not see the continuation capture), so the rejection is the M3 boundary,
+-- not a CarrierEscape -- confirming the route's independent second line keeps a borrow
+-- from riding a continuation out of its lending activation.
+borrowContStoreBoundaryRejects :: FilePath -> Assertion
+borrowContStoreBoundaryRejects path = do
+  vs <- boundaryViolationsOf path
+  assertBool
+    (path <> ": expected an M3 continuation-escape boundary violation, got none "
+          <> "(the borrow-capturing continuation would escape its lending activation)")
+    (not (null vs))
+
 -- | Run one corpus program through both backends and assert parity.
 rcParityHarness :: FilePath -> Assertion
 rcParityHarness path = do
@@ -13172,6 +13474,13 @@ rcParityHarness path = do
         (St.stFrees (RCM.rcStats a)) (St.stFrees (RCM.rcStats c))
       assertEqual (path <> ": peak parity")
         (St.stPeak (RCM.rcStats a)) (St.stPeak (RCM.rcStats c))
+      -- closes parity (FFI Slice 3 Task 5): the foreign-borrow close count must be
+      -- IDENTICAL on both backends. CHeap performs the real free; AbstractHeap only
+      -- counts (no buffer), but the logical count is bumped in lockstep, so the
+      -- abstract/C oracle pins "exactly one close per lent buffer". 0 == 0 for every
+      -- non-borrow program (trivially true), N == N for a borrow-lending one.
+      assertEqual (path <> ": closes parity")
+        (St.stCloses (RCM.rcStats a)) (St.stCloses (RCM.rcStats c))
       -- peak_bytes parity: the abstract stPeakBytes must match the C runtime's
       -- wok_stat_peak_bytes (read before wok_heap_free). Both charge the same
       -- bytes per node via wouldBeCBytes, so the high-water marks must agree.
@@ -24957,5 +25266,40 @@ foreignIoDischargeTests = testGroup "foreign IO discharge"
         Left err ->
           assertBool ("expected IOEffectNotHandleable, got: " ++ err)
             ("IOEffectNotHandleable" `Data.List.isInfixOf` err)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , -- AC5 (FFI Slice 3 Task 4): end-to-end IO with the borrow disposition --
+    -- a `Demo.lendBuffer`-calling `main` typechecks and runs, with `Borrow`
+    -- and the foreign module declared via `import Std.Borrow` (the prelude),
+    -- exactly the surface a real user program would use. buf[i] = i & 0xFF,
+    -- so byteAt (Demo.lendBuffer 8) 5 = 5.
+    testCase "Demo.lendBuffer at entry: IO ground effect, typechecks and runs to value" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Borrow"
+        , "main = byteAt (Demo.lendBuffer 8) 5"
+        ]
+      result @?= Right (T.pack "5")
+
+  , -- AC6: a caller without `with IO` that calls Demo.lendBuffer is rejected,
+    -- mirroring AC3 for the borrow disposition. The Borrow result is consumed
+    -- locally (never escapes pure_caller), so the only failure is the
+    -- undischarged IO row, not a CarrierEscape. Uses 'runSourceWith' (the
+    -- real loader, resolving `import Std.Borrow`) rather than 'schemeOf'
+    -- (which seeds 'Builtins.initialEnv' directly with no import
+    -- resolution): `Borrow` and `Demo` are prelude-declared, not builtins.
+    testCase "caller without `with IO` sig calling Demo.lendBuffer: rejected (UndischargedEffect)" $ do
+      result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
+        [ "module Main"
+        , "import Std.Borrow"
+        , "pure_caller : U64 -> U64"
+        , "pure_caller n = length (Demo.lendBuffer n)"
+        , "main = pure_caller 8"
+        ]
+      case result of
+        Left err ->
+          assertBool ("expected UndischargedEffect or RowMismatch, got: " ++ err)
+            (  "UndischargedEffect" `Data.List.isInfixOf` err
+            || "RowMismatch"        `Data.List.isInfixOf` err )
         Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
   ]

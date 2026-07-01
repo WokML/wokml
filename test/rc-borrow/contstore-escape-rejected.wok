@@ -1,0 +1,44 @@
+module Main
+import Std.Base
+import Std.Borrow
+import Std.Control
+
+-- FFI Slice 3 Task 6, STORED-CONTINUATION route (Q4). The honest result for this
+-- route differs from the other five: the carrier rule does NOT independently fire,
+-- because a Borrow captured by a CONTINUATION is not visible in the surface syntax
+-- (in `prog`, `b` is only ever READ via `byteAt`, a handle slot -- the carrier rule
+-- sees no escape). The load-bearing guard for this route is instead the M3
+-- continuation-escape boundary (`firstOrderNoHandlerViolations`): a captured
+-- continuation may not escape its op-arm body except into a `__cont_store` cell.
+--
+-- Here `prog` lends a Borrow `b`, performs `tick` (so the captured continuation
+-- closes over `b`), and reads `b` after the resume point. The `runTick` handler
+-- ALIASES the resume (`let k2 = k`) and stores the alias -- a continuation escape
+-- (exactly rc-m3-reject/02's shape). That escape would let the borrow-capturing
+-- continuation outlive `prog`'s lending activation, so it is REJECTED at the M3
+-- boundary BEFORE the program runs (the program never executes on the RC store).
+--
+-- This is the route's "independent second line": continuation escapes are already
+-- forbidden, so a borrow riding a continuation cannot leak. (The ADMITTED fragment
+-- -- a within-extent store/take/resume, rc-m3/01's shape -- is sound: the resume
+-- reads `b` before `prog`'s activation-scoped close frees the buffer; verified to
+-- run clean with closes=1.) A runnable cont-store UAF is therefore NOT stageable:
+-- the carrier mutation alone leaves the program admitted-and-sound, and forcing an
+-- escape would require gutting the M3 boundary guard, which makes the test vacuous.
+effect Tick = { tick : U64 }
+
+runTick : (Tick -> U64 with Tick + eff e) -> U64 with eff e
+runTick c = with self = Tick { tick k ->
+  let k2 = k in
+  let cell = __cont_cell_new () in
+  let filled = __cont_store cell k2 in
+  let k3 = __cont_take filled in
+  k3 1 } in c self
+
+prog : Tick -> U64 with Tick + IO
+prog t =
+  let b = Demo.lendBuffer 8 in
+  let x = t.tick in
+  byteAt b 0 + x
+
+main = runTick prog

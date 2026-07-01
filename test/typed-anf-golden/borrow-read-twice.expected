@@ -1,0 +1,5 @@
+f b : Borrow =
+  let t.1 : U64 = length(b)
+  let t.2 : U64 = length(b)
+  let t.3 : U64 = +(t.1, t.2)
+  t.3

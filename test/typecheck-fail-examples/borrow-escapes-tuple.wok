@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Borrow is second-class: putting it into a tuple lets it escape its scope -- a
+-- tuple element is not a handle slot, so this is a CarrierEscape too.
+h : Borrow -> (Borrow, U64)
+h b = (b, 0)

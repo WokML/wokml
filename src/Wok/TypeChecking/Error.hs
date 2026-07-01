@@ -221,16 +221,23 @@ data TypeError
     -- reclaim the adopted pointer. Args: position, module name, member name.
     -- Message: "owned member mem in foreign module M requires a free clause."
   | ForeignDispositionMismatch SourceSpan Text Text
-    -- ^ A @foreign module@ member's @owned@ keyword disagrees with the blessed
-    -- symbol's return disposition. The blessed table is the ground truth for how
-    -- the callee's return value must be handled; any mismatch would produce
-    -- backend divergence (one backend errors, another silently leaks or
-    -- double-frees). Args: position, member name, guidance message.
+    -- ^ A @foreign module@ member's declared signature disagrees with the
+    -- blessed symbol's return disposition -- either the @owned@ keyword, or
+    -- (for @DispBorrow@, FFI Slice 3 Task 4) the declared return TYPE, which
+    -- is not @Borrow@. The blessed table is the ground truth for how the
+    -- callee's return value must be handled; any mismatch would produce
+    -- backend divergence (one backend errors, another silently leaks,
+    -- double-frees, or disagrees with its checked type). Args: position,
+    -- member name, guidance message.
     --
     -- For @DispAdopt@: "foreign member 'mem' returns an owned buffer; declare
     -- it @owned@ and give the module a @free@ clause."
     -- For @DispScalar@ or @DispCopy@: "foreign member 'mem' returns a scalar;
     -- remove @owned@."
+    -- For @DispBorrow@: "foreign member 'mem' returns a borrowed view; remove
+    -- @owned@" (if @owned@ was wrongly declared), or "... its declared return
+    -- type must be @Borrow@" (if the return type disagrees with the blessed
+    -- disposition).
   | DuplicateForeignModule SourceSpan Text
     -- ^ A @foreign module@ declaration uses a name that is already registered
     -- as a foreign module in the same file (or via an import). The second

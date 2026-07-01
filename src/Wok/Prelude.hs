@@ -18,6 +18,8 @@ module Wok.Prelude
   , stdStringSource
   , stdBytesName
   , stdBytesSource
+  , stdBorrowName
+  , stdBorrowSource
   ) where
 
 import Data.Text (Text)
@@ -80,4 +82,15 @@ stdBytesName = Tx.pack "Std.Bytes"
 stdBytesSource :: IO Text
 stdBytesSource = do
   path <- Paths_wok.getDataFileName "prelude/Std/Bytes.wok"
+  TIO.readFile path
+
+stdBorrowName :: Text
+stdBorrowName = Tx.pack "Std.Borrow"
+
+-- | Read the Std.Borrow embedded prelude source from the installed
+-- data-files location. Like Std.Bytes, the .wok file is the editable
+-- source of truth and is located at runtime via Paths_wok.getDataFileName.
+stdBorrowSource :: IO Text
+stdBorrowSource = do
+  path <- Paths_wok.getDataFileName "prelude/Std/Borrow.wok"
   TIO.readFile path

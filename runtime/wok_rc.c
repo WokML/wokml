@@ -292,6 +292,11 @@ void wok_free(WokHeap* h, WokObj* p) {
         /* Fixed 24-byte handle. The foreign buffer at data_ptr is NOT freed here --
            the Haskell host frees it (libc free) BEFORE calling wok_free. */
         bytes = 24u;
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_BORROW_VIEW_TAG)) {
+        /* Fixed 24-byte handle. The borrowed buffer at ptr is NEVER freed here, nor by
+           the Haskell host -- wok does not own it (contrast WOK_FOREIGN_BYTES_TAG). Only
+           the handle is reclaimed. */
+        bytes = 24u;
     } else {
         bytes = wok_cell_bytes((uint32_t)p->arity);
     }
@@ -488,6 +493,27 @@ WokObj* wok_foreign_bytes_alloc(WokHeap* h, uint8_t* data_ptr, uint64_t byte_len
     if (WOK_UNLIKELY(p == NULL)) { abort(); }
     p->rc = 1u; p->tag = (uint16_t)WOK_FOREIGN_BYTES_TAG; p->arity = 0u; p->scan = 0u;
     uintptr_t ptr_word = (uintptr_t)data_ptr;
+    memcpy((char*)p + 8,  &ptr_word, sizeof(uint64_t));
+    memcpy((char*)p + 16, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_PHYS_ADD(h, sz);   /* per-cell malloc grows physical */
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_borrow_view_alloc(WokHeap* h, uint8_t* ptr, uint64_t byte_len) {
+    /* Fixed 24-byte handle, structurally identical to wok_foreign_bytes_alloc. Charges its
+       real 24B to cur_bytes; the borrowed buffer is off-heap, foreign, and intentionally
+       not counted. Unlike wok_foreign_bytes_alloc, this handle's drop (wok_free) never
+       frees `ptr` -- see WOK_BORROW_VIEW_TAG's wok_free branch. */
+    size_t sz = 24u;
+    WokObj* p = (WokObj*)malloc(sz);
+    if (WOK_UNLIKELY(p == NULL)) { abort(); }
+    p->rc = 1u; p->tag = (uint16_t)WOK_BORROW_VIEW_TAG; p->arity = 0u; p->scan = 0u;
+    uintptr_t ptr_word = (uintptr_t)ptr;
     memcpy((char*)p + 8,  &ptr_word, sizeof(uint64_t));
     memcpy((char*)p + 16, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
@@ -738,6 +764,12 @@ void wok_free(WokHeap* h, WokObj* p) {
            (libc free) BEFORE calling wok_free, mirroring WokStringView (scan=0). */
         bytes = 24u;
         cls   = 2u;
+    } else if (WOK_UNLIKELY((uint32_t)p->tag == WOK_BORROW_VIEW_TAG)) {
+        /* Fixed 24-byte handle, size class 2 (24/8-1 = 2, shared with NCon arity=2 /
+           WokForeignBytes). The borrowed buffer at ptr is NEVER freed here, nor by the
+           Haskell host -- wok does not own it (contrast WOK_FOREIGN_BYTES_TAG). */
+        bytes = 24u;
+        cls   = 2u;
     } else {
         uint32_t arity = (uint32_t)p->arity;
         bytes = wok_cell_bytes(arity);
@@ -938,6 +970,48 @@ WokObj* wok_foreign_bytes_alloc(WokHeap* h, uint8_t* data_ptr, uint64_t byte_len
     }
     p->rc = 1u; p->tag = (uint16_t)WOK_FOREIGN_BYTES_TAG; p->arity = 0u; p->scan = 0u;
     uintptr_t ptr_word = (uintptr_t)data_ptr;
+    memcpy((char*)p + 8,  &ptr_word, sizeof(uint64_t));
+    memcpy((char*)p + 16, &byte_len, sizeof(uint64_t));
+    h->allocs += 1u; h->live += 1;
+    if (h->live > h->peak) { h->peak = h->live; }
+    h->cur_bytes += (uint64_t)sz;
+    if (h->cur_bytes > h->peak_bytes) { h->peak_bytes = h->cur_bytes; }
+    WOK_LOGICAL_MARK(h);
+    return p;
+}
+
+WokObj* wok_borrow_view_alloc(WokHeap* h, uint8_t* ptr, uint64_t byte_len) {
+    /* Fixed 24-byte handle, size class 2 (24/8 - 1). Charges its real 24B to cur_bytes --
+       the borrowed buffer is off-heap, foreign, and intentionally not counted. Unlike
+       wok_foreign_bytes_alloc, this handle's drop (wok_free) never frees `ptr`. */
+    size_t  sz  = 24u;
+    size_t  cls = 2u;   /* 24/8 - 1 = 2, always in range (< WOK_NUM_CLASSES = 64) */
+    WokObj* p;
+    /* Structurally identical to wok_foreign_bytes_alloc: the free-list/bump path is wrapped
+       in the same `if (cls < WOK_NUM_CLASSES)` guard so a future layout change cannot desync
+       the allocators. The large (cls >= WOK_NUM_CLASSES) path is UNREACHABLE for a fixed
+       24-byte cell (cls is the constant 2); the else branch mirrors the sibling (and keeps
+       `p` defined on every path so the compiler is satisfied without an init-to-NULL). */
+    if (cls < WOK_NUM_CLASSES) {
+        WokObj* head = h->freelist[cls];
+        if (head != NULL) {                       /* reuse from shared class-2 free-list */
+            h->freelist[cls] = fl_next(head);
+            p = head;
+            h->reused += 1u;
+        } else {                                  /* bump */
+            if (h->bump_ptr == NULL || sz > (size_t)(h->bump_end - h->bump_ptr)) {
+                wok_new_slab(h);
+            }
+            p = (WokObj*)h->bump_ptr;
+            h->bump_ptr += sz;
+        }
+    } else {                                      /* large: direct malloc (unreachable for cls=2) */
+        p = (WokObj*)malloc(sz);
+        if (WOK_UNLIKELY(p == NULL)) { abort(); }
+        WOK_PHYS_ADD(h, sz);
+    }
+    p->rc = 1u; p->tag = (uint16_t)WOK_BORROW_VIEW_TAG; p->arity = 0u; p->scan = 0u;
+    uintptr_t ptr_word = (uintptr_t)ptr;
     memcpy((char*)p + 8,  &ptr_word, sizeof(uint64_t));
     memcpy((char*)p + 16, &byte_len, sizeof(uint64_t));
     h->allocs += 1u; h->live += 1;
@@ -1152,6 +1226,42 @@ uint64_t wok_foreign_bytes_len(const WokObj* p) {
     assert((uint32_t)p->tag == WOK_FOREIGN_BYTES_TAG);
     uint64_t w; memcpy(&w, (const char*)p + 16, sizeof(uint64_t));
     return w;
+}
+
+/* ---- WokBorrowView accessors (shared, no allocator involvement) --------------------- */
+
+uint8_t* wok_borrow_view_ptr(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_BORROW_VIEW_TAG);
+    uint64_t w; memcpy(&w, (const char*)p + 8, sizeof(uint64_t));
+    return (uint8_t*)(uintptr_t)w;
+}
+
+uint64_t wok_borrow_view_len(const WokObj* p) {
+    assert((uint32_t)p->tag == WOK_BORROW_VIEW_TAG);
+    uint64_t w; memcpy(&w, (const char*)p + 16, sizeof(uint64_t));
+    return w;
+}
+
+/* ---- Demo borrow producer: malloc'd lend-THEN-free (FFI Slice 3 Task 5) -------------
+   A genuine malloc/free pair backing `Demo.lendBuffer`. The returned buffer is the
+   PRODUCER's to free (via wok_borrow_demo_close), placed by the interpreter at the
+   borrowing activation's exit. This buffer is off the WokHeap (it is a foreign buffer the
+   borrow view points INTO), so these functions take no WokHeap* and touch no slab/stat
+   bookkeeping -- exactly like the libc buffer behind WokForeignBytes. Independent of
+   WOK_RC_MALLOC: always real malloc/free, so ASan redzones and the leak detector see it. */
+uint8_t* wok_borrow_demo_lend(uint64_t n) {
+    uint64_t len = (n > WOK_BORROW_DEMO_CAPACITY) ? WOK_BORROW_DEMO_CAPACITY : n;
+    /* malloc(0) is implementation-defined; allocate at least 1 byte so every lend returns a
+       distinct, freeable pointer (a 0-length borrow still has a buffer to close exactly once). */
+    size_t   sz  = (len == 0u) ? 1u : (size_t)len;
+    uint8_t* buf = (uint8_t*)malloc(sz);
+    if (buf == NULL) { abort(); }   /* OOM at a system boundary: fail loud, never return NULL */
+    for (uint64_t i = 0u; i < len; i++) { buf[i] = (uint8_t)(i & 0xFFu); }
+    return buf;
+}
+
+void wok_borrow_demo_close(uint8_t* ptr) {
+    free(ptr);   /* free(NULL) is a no-op; a double close would be an ASan double-free */
 }
 
 /* ---- WokArray accessors (shared, no allocator involvement) -------------------------- */

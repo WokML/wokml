@@ -1,0 +1,5 @@
+f b =
+  let t.1 = length(b)
+  let t.2 = length(b)
+  let t.3 = +(t.1, t.2)
+  t.3

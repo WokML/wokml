@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Borrow is NOT affine: reading it twice (two non-escaping uses) type-checks,
+-- unlike a Suspension/Step/ContCell (which would be FutureConsumedTwice).
+f : Borrow -> U64
+f b = length b + length b

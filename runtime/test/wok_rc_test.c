@@ -6,6 +6,8 @@
 
 static void test_wok_bytes_cell(void);
 static void test_foreign_bytes_cell(void);
+static void test_borrow_view_cell(void);
+static void test_borrow_demo_lend_close(void);
 
 static void test_wok_validate_utf8(void) {
     /* Valid: empty buffer */
@@ -451,8 +453,43 @@ int main(void) {
     /* --- WokForeignBytes: adopted foreign buffer lifecycle (FFI Slice 1) -------------- */
     test_foreign_bytes_cell();
 
+    /* --- WokBorrowView: uncounted-ownership borrowed buffer lifecycle (FFI Slice 3) --- */
+    test_borrow_view_cell();
+
+    /* --- Demo borrow producer: malloc'd lend-THEN-free pair (FFI Slice 3 Task 5) ------ */
+    test_borrow_demo_lend_close();
+
     printf("OK\n");
     return 0;
+}
+
+/* FFI Slice 3 Task 5: the malloc'd Demo borrow producer's lend/close lifecycle. lend mallocs
+   a real buffer (the deterministic i&0xFF pattern); close frees it. A balanced lend/close pair
+   is LSan-clean (Linux) and ASan-clean everywhere (no double-free, no UAF); the deterministic
+   contents are what the interpreter reads through the 0xFFFA view. The capacity clamp and the
+   0-length (still-freeable) edge are exercised too. */
+static void test_borrow_demo_lend_close(void) {
+    /* normal lend: 8 bytes of i&0xFF, then close (the only owner frees it once). */
+    uint8_t* b = wok_borrow_demo_lend(8u);
+    assert(b != NULL);
+    for (unsigned i = 0u; i < 8u; i++) { assert(b[i] == (uint8_t)(i & 0xFFu)); }
+    wok_borrow_demo_close(b);
+
+    /* capacity clamp: an over-large n saturates to WOK_BORROW_DEMO_CAPACITY (no overrun). */
+    uint8_t* big = wok_borrow_demo_lend(WOK_BORROW_DEMO_CAPACITY + 4096u);
+    assert(big != NULL);
+    assert(big[WOK_BORROW_DEMO_CAPACITY - 1u] == (uint8_t)((WOK_BORROW_DEMO_CAPACITY - 1u) & 0xFFu));
+    wok_borrow_demo_close(big);
+
+    /* 0-length lend still returns a distinct, freeable pointer (malloc(0) is impl-defined). */
+    uint8_t* empty = wok_borrow_demo_lend(0u);
+    assert(empty != NULL);
+    wok_borrow_demo_close(empty);
+
+    /* free(NULL) is a no-op (the AbstractHeap sentinel analogue at the C boundary). */
+    wok_borrow_demo_close(NULL);
+
+    printf("ok test_borrow_demo_lend_close\n");
 }
 
 static void test_wok_bytes_cell(void) {
@@ -532,4 +569,43 @@ static void test_foreign_bytes_cell(void) {
 
     wok_heap_free(h);
     printf("ok test_foreign_bytes_cell\n");
+}
+
+/* ---- WokBorrowView: uncounted-ownership borrowed buffer lifecycle (FFI Slice 3) -----
+   Positive: alloc a view over a STACK buffer (never libc-malloc'd, never libc-freed -- a
+   genuine borrow, not an adopt), verify tag/ptr/len/cur_bytes, drop it, and confirm the
+   handle is reclaimed (wok_stat_live back to 0; LSan-clean -- no separate free obligation
+   exists for a stack buffer).
+   Negative control: the buffer is on the stack, so if wok_free ever called free() on
+   `ptr` (the WOK_FOREIGN_BYTES_TAG mistake), this would crash immediately under ASan
+   (free of a non-heap pointer) -- the mutation this test is designed to catch. We also
+   re-check the buffer's contents AFTER the drop to confirm it was never touched/poisoned. */
+static void test_borrow_view_cell(void) {
+    WokHeap* h = wok_heap_new();
+    uint64_t base_peak = wok_stat_peak_bytes(h);
+
+    /* genuinely foreign-shaped but actually a STACK buffer: wok must NEVER free this */
+    uint8_t buf[4] = {1u, 2u, 3u, 4u};
+
+    WokObj* v = wok_borrow_view_alloc(h, buf, 4);
+    assert(v != NULL);
+    assert(wok_tag(v)            == WOK_BORROW_VIEW_TAG);
+    assert(wok_rc(v)             == 1u);
+    assert(wok_borrow_view_ptr(v) == buf);
+    assert(wok_borrow_view_len(v) == 4u);
+    /* the 24B handle is charged; the borrowed buffer is NOT counted */
+    assert(wok_stat_peak_bytes(h) >= base_peak + 24u);
+
+    /* drop: decrement to zero and recycle the 24B handle. NO free(buf) anywhere --
+       that is the entire point (contrast test_foreign_bytes_cell's libc free). */
+    assert(wok_dec(v) == 0u);
+    wok_free(h, v);
+    assert(wok_stat_live(h)   == 0);
+    assert(wok_stat_allocs(h) == wok_stat_frees(h));
+
+    /* negative control: the buffer must be untouched (no bad-free, no poison-through) */
+    assert(buf[0] == 1u && buf[1] == 2u && buf[2] == 3u && buf[3] == 4u);
+
+    wok_heap_free(h);
+    printf("ok test_borrow_view_cell\n");
 }

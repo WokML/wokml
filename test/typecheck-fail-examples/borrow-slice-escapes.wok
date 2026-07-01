@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- slice returns a Borrow too (a derived view into the same buffer), so it is
+-- just as second-class as the original: returning it out of the scope it was
+-- built in is still a CarrierEscape.
+h : Borrow -> Borrow
+h b = slice b 0 1

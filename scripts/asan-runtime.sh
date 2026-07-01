@@ -56,10 +56,15 @@ fi
 
 if [ "${1:-}" = "interp" ]; then
   # ---------------------------------------------------------------------------
-  # POSITIVE: run the full rc-ffi-foreign corpus through the wok RC interpreter
-  # (the borrow-out path) under ASan+WOK_RC_MALLOC. Every .wok file in
-  # test/rc-ffi-foreign/ is run; an ASan-reported error on ANY clean-path file
-  # is a regression. detect_leaks=0: macOS has no LSan (harmless on Linux too).
+  # POSITIVE: run the full rc-ffi-foreign AND rc-borrow corpora through the
+  # wok RC interpreter (the borrow-out / foreign-borrow-read paths) under
+  # ASan+WOK_RC_MALLOC. Every .wok file in test/rc-ffi-foreign/ and
+  # test/rc-borrow/ is run; an ASan-reported error on ANY clean-path file is a
+  # regression. rc-borrow exercises the raw-pointer CHeap read path
+  # (peekElemOff/plusPtr/H.c_memchr over a CHeap buffer + the 0xFFFA
+  # WokBorrowView handle alloc/free in borrowSliceRC/borrowDemoRC) under the
+  # same sanitizer coverage as the Slice-2 borrow-out path (FFI Slice 3 Task 3
+  # review finding). detect_leaks=0: macOS has no LSan (harmless on Linux too).
   #
   # WHY cabal clean: GHC's C compilation reuses cached .dyn_o objects keyed on
   # the source file hash, not the cc-options hash. Switching the 'asan' flag
@@ -74,7 +79,13 @@ if [ "${1:-}" = "interp" ]; then
   echo "== interp: building wok with -fasan (WOK_RC_MALLOC, ASan redzones) =="
   cabal build -fasan exe:wok
   echo "== interp: positive -- corpus must be CLEAN under ASan =="
-  for f in test/rc-ffi-foreign/*.wok; do
+  for f in test/rc-ffi-foreign/*.wok test/rc-borrow/*.wok; do
+    # FFI Slice 3 Task 6 negative controls (death-*.wok / contstore-*.wok) are
+    # REJECTED at compile/admission time, not clean-path runnable -- skip them here;
+    # they have their own negative-control sections below.
+    case "$(basename "$f")" in
+      death-*|contstore-*) continue ;;
+    esac
     if ASAN_OPTIONS=detect_leaks=0 cabal run -v0 -fasan exe:wok -- "$f" --dump-rc-stats >/dev/null 2>&1; then
       echo "ok: $f"
     else
@@ -82,7 +93,7 @@ if [ "${1:-}" = "interp" ]; then
       exit 1
     fi
   done
-  echo "ok: borrow-out corpus clean under ASan"
+  echo "ok: borrow-out + borrow-read corpus clean under ASan"
 
   # ---------------------------------------------------------------------------
   # NEGATIVE CONTROL: rebuild with the clamp removed (ffi-noclamp-negctrl).
@@ -104,6 +115,45 @@ if [ "${1:-}" = "interp" ]; then
   else
     echo "ok: borrow-out overread caught by ASan (clamp gate has teeth)"
   fi
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE CONTROL (FFI Slice 3 Task 6 death-test matrix): rebuild with the
+  # Borrow carrier ESCAPE check disabled (flag ffi-borrow-noescape-negctrl) and
+  # confirm each escape route is a GENUINE use-after-free, not a vacuous control.
+  #
+  # Each test/rc-borrow/death-*.wok forces a Borrow from the malloc'd
+  # `Demo.lendBuffer` (Task 5 -- NOT the static `__borrow_demo`) past the carrier
+  # wall (return / list / tuple / closure / slice). With the wall disabled the
+  # program type-checks and runs: the lending function's activation-scoped close
+  # (`KBorrowCloseRC` -> `borrowClose` -> `wok_borrow_demo_close` = libc free)
+  # frees the buffer when the function returns, and the caller's read then hits the
+  # FREED malloc'd buffer -> ASan read-after-free. A clean exit on ANY of these
+  # means the carrier wall (Task 1) or the activation close (Task 5) is inert -- a
+  # regression. The malloc'd producer is what makes this NON-vacuous: a static
+  # `__borrow_demo` buffer would never fault.
+  #
+  # This is an incremental Haskell-only rebuild: the flag flips a CPP gate in
+  # Wok.TypeChecking.Carrier; the C objects (already -DWOK_RC_MALLOC + ASan from
+  # the positive build) are reused unchanged -- exactly like the noclamp control.
+  #
+  # The stored-continuation route (contstore-*.wok) is DELIBERATELY ABSENT: it is
+  # rejected at the M3 continuation-escape boundary (`firstOrderNoHandlerViolations`),
+  # which this mutation does not disable, so it never runs and stages no UAF (see the
+  # Task 6 notes in test/rc-borrow/contstore-escape-rejected.wok).
+  # ---------------------------------------------------------------------------
+  echo "== interp: negative control -- rebuilding with -fffi-borrow-noescape-negctrl =="
+  cabal build -fasan -fffi-borrow-noescape-negctrl exe:wok
+  for f in test/rc-borrow/death-*.wok; do
+    echo "== interp: borrow death-test -- $(basename "$f") MUST abort under ASan =="
+    if ASAN_OPTIONS=detect_leaks=0 cabal run -v0 -fasan -fffi-borrow-noescape-negctrl exe:wok \
+         -- "$f" --dump-rc-stats >/dev/null 2>&1; then
+      echo "FAIL: $f did NOT abort (carrier wall inert, or close not freeing the buffer?)" >&2
+      exit 1
+    else
+      echo "ok: $(basename "$f") use-after-free caught by ASan (carrier wall + activation close are load-bearing)"
+    fi
+  done
+
   # Restore the default (no-asan) build so subsequent `cabal test` works without
   # the ASan dylib dependency. cabal clean + rebuild re-links against the normal
   # slab allocator.
@@ -150,6 +200,10 @@ fi
 #   - NEGATIVE CONTROL (mutation-confirmed): flag ffi-noclamp-negctrl drops
 #     the scan clamp; asan-overrun-probe.wok (8-byte no-zero buffer, n=128)
 #     crosses the cell redzone and aborts. This proves the clamp gate has teeth.
+#   - FFI Slice 3 Task 3 (foreign-borrow read prims): the full rc-borrow corpus
+#     (length/byteAt/slice/memchr/copy over __borrow_demo) also runs CLEAN,
+#     exercising the 0xFFFA WokBorrowView raw-pointer reads (peekElemOff,
+#     H.c_memchr) and handle alloc/free in borrowSliceRC/borrowDemoRC.
 # The double-free guard for the adopt path is mutation-confirmed at the Haskell
 # level (08-strndup-dup-share in test/rc-ffi-foreign/): temporarily injecting
 # free(p) right after adoptCHeapPtr caused a SIGABRT from macOS libc double-free

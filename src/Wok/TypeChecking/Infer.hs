@@ -53,7 +53,8 @@ import Wok.TypeChecking.Types
   , Scheme (..), mkScheme, TyCon (..), TVar (..), Type (..) )
 import Wok.TypeChecking.Typed (TExprS, TExpr, TPatS, TPat)
 import qualified Wok.TypeChecking.Typed as Ty
-import Wok.TypeChecking.Carrier (checkCarriers, checkFutureAffine)
+import Wok.TypeChecking.Carrier
+  (CarrierTys (..), AffineCarrierTys (..), checkCarriers, checkFutureAffine)
 import Wok.IR.Match
   ( ConOracle (..), Coverage (..), MPat (..), MPatF (..)
   , matchCoverage, tupleTag )
@@ -1039,7 +1040,20 @@ processDataDecls env0 decls = do
         Nothing -> do
           let pks  = map paramKind params
               k    = foldr KArrow KStar pks
-              info = TyConInfo k (length params) [] carrier pks
+              -- tcAffine: False ONLY for the prelude's 'Borrow' carrier (FFI
+              -- Slice 3 Task 1) -- second-class but readable any number of
+              -- times. True for every other carrier (and for non-carriers,
+              -- where the flag is unconsulted), so 'Suspension'/'Step'/
+              -- 'ContCell' stay consume-once unchanged.
+              -- (Flagged repeatedly as "safe but not principled": it is safe
+              -- because 'extern' is prelude-only and tycon names are
+              -- globally unique, so no user-defined type can shadow
+              -- 'Borrow' here; a marker mechanism is over-engineering for
+              -- one consumer, so this literal-name gate is deliberate, not
+              -- an oversight. A future second non-affine carrier extends
+              -- this check.)
+              affine = name /= Tx.pack "Borrow"
+              info = TyConInfo k (length params) [] carrier affine pks
           registerTyCons (extendTyCon name info env) ds
 
     registerCons env [] = pure env
@@ -1307,6 +1321,9 @@ processForeignDecls env0 decls = foldM registerForeign env0 foreignDecls
       -- DispAdopt  <=> owned must be True  (caller takes ownership, needs free).
       -- DispScalar <=> owned must be False (plain scalar, no heap transfer).
       -- DispCopy   <=> owned must be False (transfer-none copy; wok manages it).
+      -- DispBorrow <=> owned must be False (the BORROW disposition has its own
+      --   keyword-free coherence check below -- the member's declared return
+      --   TYPE, not `owned`, is what must agree with DispBorrow).
       let expectedOwned = Blessed.bsReturn bsig == Blessed.DispAdopt
       when (isOwned /= expectedOwned) $
         let msg = if expectedOwned
@@ -1316,6 +1333,8 @@ processForeignDecls env0 decls = foldM registerForeign env0 foreignDecls
                     else case Blessed.bsReturn bsig of
                            Blessed.DispCopy   -> "foreign member '" <> memberName <>
                                                  "' returns a copy-managed buffer; remove `owned`"
+                           Blessed.DispBorrow -> "foreign member '" <> memberName <>
+                                                 "' returns a borrowed view; remove `owned`"
                            _                  -> "foreign member '" <> memberName <>
                                                  "' returns a scalar; remove `owned`"
         in throwError (ForeignDispositionMismatch memberPos memberName msg)
@@ -1335,12 +1354,32 @@ processForeignDecls env0 decls = foldM registerForeign env0 foreignDecls
       -- Translate the declared type as a full top-level signature (supporting
       -- `with E` rows and polymorphism).
       scheme <- translateSig env ty
+      -- Borrow-disposition coherence (FFI Slice 3 Task 4): unlike `owned`,
+      -- the borrow disposition is carried by the member's declared RETURN
+      -- TYPE, not a keyword -- a member blessed DispBorrow must declare its
+      -- final (post-application) return type as exactly `Borrow`. Without
+      -- this check a blessed-DispBorrow member could declare a different
+      -- return type (e.g. `U64`); the elaborator would still wrap the call's
+      -- result as a 0xFFFA borrow view (the blessed table is authoritative
+      -- for the runtime disposition), producing a value whose runtime
+      -- representation disagrees with its checked type -- a soundness hole.
+      when (Blessed.bsReturn bsig == Blessed.DispBorrow
+            && finalReturnCType (schemeBody scheme) /= CTCon (TcUser (Tx.pack "Borrow")) []) $
+        throwError (ForeignDispositionMismatch memberPos memberName
+          ("foreign member '" <> memberName <>
+           "' is blessed as a borrow-disposition producer; its declared" <>
+           " return type must be `Borrow`"))
       let minfo = ForeignMemberInfo
                     { fmiScheme = scheme
                     , fmiSymbol = cSymbol
                     , fmiOwned  = isOwned
                     }
       pure (Map.insert memberName minfo acc)
+
+    -- Peel a CType's arrow chain down to its final (non-arrow) result type.
+    finalReturnCType :: CType -> CType
+    finalReturnCType (CTArr _ _ b) = finalReturnCType b
+    finalReturnCType t             = t
 
 -- ---------------------------------------------------------------------------
 -- Pattern inference
@@ -3555,6 +3594,15 @@ inferProgramTC seedEnv origin decls = do
     -- carrier-ness rides the marker, not a TyCon tag (slice 4d).
     let carrierTys = Set.fromList
           [ n | (n, info) <- Map.toList (envTyCons env2), tcCarrier info ]
+        -- The AFFINE subset of 'carrierTys' -- carriers flagged 'tcAffine'
+        -- (consume-once). Fed ONLY to 'checkFutureAffine' below, so that
+        -- check's consume-once bound applies to 'Suspension'/'Step'/
+        -- 'ContCell' but not to a non-affine carrier such as 'Borrow' (FFI
+        -- Slice 3 Task 1), which stays second-class via the escape check
+        -- (still driven by the full, unfiltered 'carrierTys') without being
+        -- consume-once.
+        affineCarrierTys = Set.fromList
+          [ n | (n, info) <- Map.toList (envTyCons env2), tcCarrier info, tcAffine info ]
     -- Part 1 gate: `extern` is the trust anchor for the soundness analyses (the
     -- one-shot relaxation's escape sink and the affine check's non-consuming
     -- reader are recognised by EXTERN IDENTITY — see C2/C3). Only the standard
@@ -3608,7 +3656,7 @@ inferProgramTC seedEnv origin decls = do
                     ((pats, _) : _) -> length pats
                     []              -> 0
       in either throwError pure
-           (checkCarriers carrierTys resolveParams
+           (checkCarriers (CarrierTys carrierTys) resolveParams
                           producerExempt
                           (producerExempt && resultIsAffineCarrier carrierTys arity (tdScheme td))
                           (declSpan td) (tdName td) (tdClauses td))
@@ -3624,7 +3672,7 @@ inferProgramTC seedEnv origin decls = do
                                     , not (Set.member (tdName td) externs) ]
     forM_ tds $ \td ->
       either throwError pure
-        (checkFutureAffine carrierTys ownNonExtern (declSpan td) (tdName td) (tdClauses td))
+        (checkFutureAffine (AffineCarrierTys affineCarrierTys) ownNonExtern (declSpan td) (tdName td) (tdClauses td))
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
 
@@ -3662,10 +3710,17 @@ schemeParamTypes = go . schemeBody
     go _             = []
 
 -- | Is a binding's DECLARED result type (after applying its @arity@ value params)
--- an AFFINE CARRIER — a coroutine 'Step' or 'Suspension'? Such a binding is a
--- carrier PRODUCER (e.g. @start@/@step@ in @Std.Control@ return a 'Step'), so the
--- carrier rule permits the tail of its body to be an inline-produced carrier of
--- that type (see 'checkCarriers' @resultIsCarrier@). Peels exactly @arity@
+-- a CARRIER? (The @Affine@ in the name is legacy: this is fed the FULL carrier set,
+-- so it answers for any carrier — a coroutine 'Step'/'Suspension' AND the non-affine
+-- 'Borrow'.) Such a binding is a carrier PRODUCER (e.g. @start@/@step@ in
+-- @Std.Control@ return a 'Step'; a 'Borrow'-returning prelude equation returns a
+-- fresh borrow), so the carrier rule permits the flat tail of its body to be an
+-- inline-produced carrier of that type (see 'checkCarriers' @resultIsCarrier@).
+-- It MUST use the full carrier set: it is the tail-position complement of
+-- 'isInlineFutureApp', which also consults the full set, so filtering to the affine
+-- subset would over-reject (every 'Borrow'-returning prelude equation would become
+-- un-writable). Escape and consume-once are orthogonal — the affine subset gates
+-- only 'checkFutureAffine', never this escape-exemption. Peels exactly @arity@
 -- arrows, so a function that RETURNS a function (a partial-application producer)
 -- is judged on its true result, not an intermediate arrow.
 resultIsAffineCarrier :: Set.Set Text -> Int -> Scheme -> Bool

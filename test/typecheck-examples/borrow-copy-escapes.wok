@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Bytes.copy materializes an OWNED Bytes from a Borrow; unlike Borrow itself
+-- the result is NOT second-class, so it may escape the scope it was built in
+-- freely -- this type-checks (no CarrierEscape), confirming `copy` is the
+-- escape hatch.
+f : Borrow -> Bytes
+f b = copy b

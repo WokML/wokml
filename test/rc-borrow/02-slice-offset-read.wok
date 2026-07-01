@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- __borrow_demo 10 yields buf = [0,1,2,...,9]. slice b 3 8 is a NEW Borrow
+-- over buf[3..8) = [3,4,5,6,7] (length 5, NON-ZERO offset). Reading the
+-- slice's length AND its first byte exercises both the slice allocation
+-- (borrowSliceRC) and the zero-copy read path over the derived view.
+-- length s = 5, byteAt s 0 = 3 (the parent's byte at offset 3).
+-- Expected: 5 + 3 = 8.
+main : U64
+main =
+  let s = slice (__borrow_demo 10) 3 8 in
+  length s + byteAt s 0

@@ -86,6 +86,14 @@ module Wok.IR.PrimNames
     -- * FFI bytes-in Slice 1: host-blessed deterministic producers
   , ffiDemoCopyName
   , ffiDemoAdoptName
+    -- * Std.Borrow prim names (FFI Slice 3 Task 3)
+  , stdBorrowModule
+  , borrowLengthName
+  , borrowByteAtName
+  , borrowSliceName
+  , borrowMemchrName
+  , borrowCopyName
+  , borrowDemoName
   ) where
 
 import Data.Set (Set)
@@ -324,3 +332,44 @@ ffiDemoCopyName = Tx.pack "__ffi_demo_copy"
 -- fixture; superseded by the real FFI surface (Slice 2).
 ffiDemoAdoptName :: Text
 ffiDemoAdoptName = Tx.pack "__ffi_demo_adopt"
+
+-- ---------------------------------------------------------------------------
+-- Std.Borrow prim names (FFI Slice 3 Task 3)
+
+-- | The defining module of the Borrow prelude externs.
+stdBorrowModule :: Text
+stdBorrowModule = Tx.pack "Std.Borrow"
+
+-- | @length b@: the borrow's byte length, O(1).
+borrowLengthName :: Text
+borrowLengthName = Tx.pack "length"
+
+-- | @byteAt b i@: the i-th byte as a U64 (0-based, bounds-checked).
+borrowByteAtName :: Text
+borrowByteAtName = Tx.pack "byteAt"
+
+-- | @slice b i j@: a NEW Borrow over the SAME buffer, offset @i@, length
+-- @j - i@ (saturating: out-of-range @i@/@j@ are clamped, a backward range
+-- yields an empty slice). A derived, still second-class, borrow.
+borrowSliceName :: Text
+borrowSliceName = Tx.pack "slice"
+
+-- | @memchr b byte@: scan @b[0 .. length b)@ for the low 8 bits of @byte@;
+-- @Some offset@ on the first match, @None@ if absent.
+borrowMemchrName :: Text
+borrowMemchrName = Tx.pack "memchr"
+
+-- | @copy b@: materialize an OWNED @Bytes@ copy of the borrowed range. The
+-- escape hatch -- unlike @Borrow@, the result may escape its scope freely.
+borrowCopyName :: Text
+borrowCopyName = Tx.pack "copy"
+
+-- | @__borrow_demo n@: a PERMANENT, prelude-only internal test fixture
+-- (Task 3) that returns a Borrow over a STATIC, deterministic buffer
+-- (pattern @i mod 256@), valid forever -- no free is ever needed. Exercises
+-- the read prims independently of any real foreign producer. Task 4 ADDS
+-- @Demo.lendBuffer@, the real lend-then-free foreign-module producer,
+-- ALONGSIDE this fixture (NOT a replacement) -- mirroring how Slice 2 kept
+-- @__ffi_demo_copy@/@__ffi_demo_adopt@ as permanent internal fixtures.
+borrowDemoName :: Text
+borrowDemoName = Tx.pack "__borrow_demo"

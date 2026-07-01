@@ -2,6 +2,7 @@ module Wok.Interp.RC.Prim
   ( rcPrimTable
   , stringBytes
   , bytesBytes
+  , allocBorrowDemoLend
   ) where
 
 import Control.Monad (foldM)
@@ -10,7 +11,9 @@ import Control.Monad.Trans.Except (throwE)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
-import Foreign.Ptr (castPtr)
+import Foreign.Marshal.Alloc (mallocBytes)
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Ptr (castPtr, minusPtr, nullPtr, plusPtr)
 import Foreign.Storable (peekElemOff)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -22,11 +25,12 @@ import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.RC.Value
   ( RC, liftRC, RCPrim (..), RCPrimResult (..), RCPrimTable, RCValue (..)
   , Addr (..), HeapBackend (..)
-  , Node (..), Cell (..), Store (..), alloc, deref, incref, dropAddr, dropReuse, writeNode
+  , Node (..), Cell (..), Store (..), alloc, allocPure, deref, incref, dropAddr, dropReuse, writeNode
   , continuationOwned, valueChildren
   , atIndex, setAt, arrayLenOf, arrayUnique, arraySetSlotInPlace, encodeSlotC
   , maxInlineStr, allocNStringView, wokStringTag
-  , wokBytesTag, wokForeignBytesTag )
+  , wokBytesTag, wokForeignBytesTag
+  , wokBorrowViewTag, allocBorrowView, borrowRegister )
 import Wok.Interp.Value (RuntimeError (..))
 import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
@@ -59,6 +63,7 @@ taggedRcPrims =
   ++ map (PN.stdStringModule,)  rcStringPrims
   ++ map (PN.stdBytesModule,)   rcBytesPrims
   ++ map (PN.stdBaseModule,)    rcBytesBasePrims
+  ++ map (PN.stdBorrowModule,)  rcBorrowPrims
 
 rcBasePrims :: [RCPrim]
 rcBasePrims =
@@ -135,6 +140,16 @@ rcBytesPrims =
   , bytesToBytesRC
   , ffiDemoCopyRC
   , ffiDemoAdoptRC
+  ]
+
+rcBorrowPrims :: [RCPrim]
+rcBorrowPrims =
+  [ borrowLengthRC
+  , borrowByteAtRC
+  , borrowSliceRC
+  , borrowMemchrRC
+  , borrowCopyRC
+  , borrowDemoRC
   ]
 
 -- ---------------------------------------------------------------------------
@@ -1290,3 +1305,306 @@ ffiDemoAdoptRC = RCPrim PN.ffiDemoAdoptName 1 [] $ \args s -> case args of
     (a, s1) <- alloc (NForeignBytes (Utf8.demoPattern (fromIntegral n))) s
     pure (PRDone (RVBox a), s1)
   _ -> throwE (ArityError PN.ffiDemoAdoptName)
+
+-- ---------------------------------------------------------------------------
+-- Std.Borrow primitives (FFI Slice 3 Task 3).
+--
+-- A Borrow is represented as an 'NBorrowView' cell: on 'CHeap' a genuine
+-- 0xFFFA 'WokBorrowView' C cell wrapping a FOREIGN pointer (read via
+-- 'H.wokBorrowViewPtr'/'H.wokBorrowViewLen', zero-copy, no intermediate
+-- 'ByteString'); on 'AbstractHeap' a pure 'NBorrowView' 'ByteString' window.
+-- Every prim here CONSUMES its 'RVBox' borrow argument (ownership moves in,
+-- like every other RC prim) -- this is independent of Task 1's NON-AFFINE
+-- carrier rule, which is a TYPE-CHECK-time relaxation (a source-level Borrow
+-- may be read twice; Perceus inserts the ordinary '__rc_dup' between the two
+-- uses, exactly as for a 'Bytes'/'String' binder).
+--
+-- ZERO-COPY READS. 'length'/'byteAt'/'memchr' take a CHeap fast path that
+-- reads the borrowed buffer THROUGH the raw pointer (no 'ByteString' copy of
+-- the buffer is ever made); only 'copy' (the escape hatch) and the
+-- 'AbstractHeap'/fallback path materialize a 'ByteString' via 'borrowBytes'.
+-- 'readCBorrowViewBytes' (Value.hs, render/inspection-only) is intentionally
+-- NOT used here.
+
+-- | Extract the 'ByteString' view of a Borrow handle, MATERIALIZING a copy.
+-- Used by 'copy' (which must produce an owned buffer regardless of backend)
+-- and as the 'AbstractHeap'/fallback read path for the other prims, which
+-- otherwise take a zero-copy 'CHeap' fast path. Does NOT consume/drop the
+-- input; callers drop it themselves after reading. Mirrors 'bytesBytes'.
+borrowBytes :: RCValue -> Store -> RC BS.ByteString
+borrowBytes (RVBox a@(CAddr p)) s = case stBackend s of
+  CHeap _ -> do
+    tid <- liftIO (H.wokTag p)
+    if tid == wokBorrowViewTag
+      then do
+        len <- liftIO (H.wokBorrowViewLen p)
+        ptr <- liftIO (H.wokBorrowViewPtr p)
+        liftIO (BS.packCStringLen (castPtr ptr, fromIntegral len))
+      else borrowViaDeref (RVBox a) s
+  AbstractHeap -> borrowViaDeref (RVBox a) s
+borrowBytes v s = borrowViaDeref v s
+
+-- | Fallback: deref the handle and extract bytes from the 'NBorrowView' node.
+borrowViaDeref :: RCValue -> Store -> RC BS.ByteString
+borrowViaDeref (RVBox a) s = do
+  c <- deref a s
+  case cNode c of
+    NBorrowView bs -> pure bs
+    _              -> throwE (PrimError (Tx.pack "Borrow: not a borrow"))
+borrowViaDeref _ _ = throwE (PrimError (Tx.pack "Borrow: not a borrow"))
+
+-- | @length b@: the borrow's byte length. Consumes 'b'. RC: 0 alloc.
+-- On 'CHeap' with a genuine 'WokBorrowView' cell, reads 'H.wokBorrowViewLen'
+-- directly (no 'ByteString' materialized).
+borrowLengthRC :: RCPrim
+borrowLengthRC = RCPrim PN.borrowLengthName 1 [] $ \args s -> case args of
+  [RVBox (CAddr p)] -> case stBackend s of
+    CHeap _ -> do
+      tid <- liftIO (H.wokTag p)
+      if tid == wokBorrowViewTag
+        then do
+          len <- liftIO (H.wokBorrowViewLen p)
+          s1  <- dropAddr (CAddr p) s
+          pure (PRDone (RVLit (LInt (toInteger len))), s1)
+        else borrowLengthViaBytes (CAddr p) s
+    AbstractHeap -> borrowLengthViaBytes (CAddr p) s
+  [RVBox a] -> borrowLengthViaBytes a s
+  _ -> throwE (ArityError PN.borrowLengthName)
+
+borrowLengthViaBytes :: Addr -> Store -> RC (RCPrimResult, Store)
+borrowLengthViaBytes a s = do
+  bs <- borrowBytes (RVBox a) s
+  let n = BS.length bs
+  s1 <- dropAddr a s
+  pure (PRDone (RVLit (LInt (toInteger n))), s1)
+
+-- | @byteAt b i@: the i-th byte as a U64 (0-based, bounds-checked). OOB raises
+-- 'PrimError'. Consumes 'b'. RC: 0 alloc. On 'CHeap' with a genuine
+-- 'WokBorrowView' cell, bounds-checks via 'H.wokBorrowViewLen' and reads one
+-- byte via a direct 'peekElemOff' on 'H.wokBorrowViewPtr' (no full-body copy),
+-- mirroring 'bytesIndexRC's 'wokForeignBytesTag' arm.
+borrowByteAtRC :: RCPrim
+borrowByteAtRC = RCPrim PN.borrowByteAtName 2 [] $ \args s -> case args of
+  [RVBox (CAddr p), iv] -> case stBackend s of
+    CHeap _ -> do
+      tid <- liftIO (H.wokTag p)
+      if tid == wokBorrowViewTag
+        then do
+          i   <- asStringIndex iv
+          len <- liftIO (H.wokBorrowViewLen p)
+          if i >= fromIntegral len
+            then throwE (PrimError (Tx.pack "Borrow.byteAt: out of bounds"))
+            else do
+              ptr <- liftIO (H.wokBorrowViewPtr p)
+              w   <- liftIO (peekElemOff ptr i)
+              s1  <- dropAddr (CAddr p) s
+              pure (PRDone (RVLit (LInt (toInteger (w :: Word8)))), s1)
+        else borrowByteAtViaBytes (CAddr p) iv s
+    AbstractHeap -> borrowByteAtViaBytes (CAddr p) iv s
+  [RVBox a, iv] -> borrowByteAtViaBytes a iv s
+  _ -> throwE (ArityError PN.borrowByteAtName)
+
+borrowByteAtViaBytes :: Addr -> RCValue -> Store -> RC (RCPrimResult, Store)
+borrowByteAtViaBytes a iv s = do
+  bs <- borrowBytes (RVBox a) s
+  i  <- asStringIndex iv
+  if i >= BS.length bs
+    then throwE (PrimError (Tx.pack "Borrow.byteAt: out of bounds"))
+    else do
+      let byte = BS.index bs i
+      s1 <- dropAddr a s
+      pure (PRDone (RVLit (LInt (toInteger (byte :: Word8)))), s1)
+
+-- | @slice b i j@: a NEW Borrow over the SAME buffer, window [i, j),
+-- saturating bounds (mirrors 'Prim.borrowSliceP' exactly: out-of-range i/j
+-- clamped, a backward range j < i is empty). Consumes 'b'. RC: +1 alloc (a
+-- fresh 24 B view handle).
+--
+-- CHeap: 'H.wokBorrowViewPtr'/'_Len' read the parent's pointer/length (no
+-- 'ByteString' copy), then 'allocBorrowView' wraps @ptr + i@ at length
+-- @j' - i'@ as a NEW 0xFFFA cell into the SAME foreign buffer -- a derived
+-- borrow (its family liveness vs. the parent buffer's free is Task 5's job).
+-- The non-borrow-view CAddr arm below is a should-never-happen internal
+-- error: there is no foreign pointer to wrap for an arbitrary CAddr, so
+-- falling back to an abstract-heap allocation here would silently mint an
+-- HAddr under a CHeap run (the exact mis-route the generic 'alloc' catch-all
+-- warns against; see Value.hs).
+borrowSliceRC :: RCPrim
+borrowSliceRC = RCPrim PN.borrowSliceName 3 [] $ \args s -> case args of
+  [RVBox (CAddr p), startV, endV] -> case stBackend s of
+    CHeap hp -> do
+      tid <- liftIO (H.wokTag p)
+      if tid == wokBorrowViewTag
+        then do
+          len   <- liftIO (H.wokBorrowViewLen p)
+          ptr   <- liftIO (H.wokBorrowViewPtr p)
+          start <- asStringIndex startV
+          end   <- asStringIndex endV
+          let start' = min start (fromIntegral len)
+              end'   = max start' (min end (fromIntegral len))
+              newLen = end' - start'
+          -- DROP THE PARENT HANDLE BEFORE ALLOCATING THE NEW VIEW. ptr/len
+          -- are already captured as Haskell locals above, so the parent's
+          -- 24 B cell is no longer read after this point -- dropping it
+          -- first is safe (no UAF) and matches 'borrowSliceAbstract's
+          -- drop-then-alloc order exactly, so the high-water peak ('stPeak')
+          -- never transiently counts both the parent and the new view cell
+          -- alive at once. (Code-review finding: the prior alloc-then-drop
+          -- order here diverged from the abstract reference's peak count.)
+          s1       <- dropAddr (CAddr p) s
+          (va, s2) <- allocBorrowView hp (ptr `plusPtr` start') (fromIntegral newLen) s1
+          pure (PRDone (RVBox va), s2)
+        else throwE (PrimError
+               (Tx.pack "internal: Borrow.slice: non-borrow-view CAddr under CHeap"))
+    AbstractHeap -> borrowSliceAbstract (CAddr p) startV endV s
+  [RVBox a, startV, endV] -> borrowSliceAbstract a startV endV s
+  _ -> throwE (ArityError PN.borrowSliceName)
+
+-- | 'AbstractHeap'-only construction: derive the sub-'ByteString' and
+-- allocate a fresh 'NBorrowView' directly via 'allocPure' (NOT the generic
+-- 'alloc', whose 'NBorrowView' catch-all is correct here too since this arm
+-- only ever runs under 'AbstractHeap' -- 'allocPure' just makes that explicit;
+-- see the guard at 'alloc's catch-all in Value.hs).
+borrowSliceAbstract :: Addr -> RCValue -> RCValue -> Store -> RC (RCPrimResult, Store)
+borrowSliceAbstract a startV endV s = do
+  bs    <- borrowBytes (RVBox a) s
+  start <- asStringIndex startV
+  end   <- asStringIndex endV
+  let n      = BS.length bs
+      start' = min start n
+      end'   = max start' (min end n)
+      sub    = BS.take (end' - start') (BS.drop start' bs)
+  s1 <- dropAddr a s
+  let (va, s2) = allocPure (NBorrowView sub) s1
+  pure (PRDone (RVBox va), s2)
+
+-- | @memchr b byte@: scan b[0 .. length b) for the low 8 bits of byte;
+-- @Some offset@ on the first match, @None@ if absent. Consumes 'b'. RC: 0 or
+-- +1 alloc (the result 'NCon': 'None' is a nullary inline immediate, 'Some'
+-- allocates one cell). On 'CHeap' scans via the real libc 'H.c_memchr' on the
+-- borrowed pointer directly (no 'ByteString' copy).
+borrowMemchrRC :: RCPrim
+borrowMemchrRC = RCPrim PN.borrowMemchrName 2 [] $ \args s -> case args of
+  [RVBox (CAddr p), byteV] -> case stBackend s of
+    CHeap _ -> do
+      tid <- liftIO (H.wokTag p)
+      if tid == wokBorrowViewTag
+        then do
+          byte <- liftRC (asInt byteV)
+          len  <- liftIO (H.wokBorrowViewLen p)
+          ptr  <- liftIO (H.wokBorrowViewPtr p)
+          hit  <- liftIO (H.c_memchr ptr (fromIntegral (byte .&. 0xFF :: Integer)) (fromIntegral len))
+          s1   <- dropAddr (CAddr p) s
+          if hit == nullPtr
+            then do
+              (noneA, s2) <- alloc (NCon (Tx.pack "None") []) s1
+              pure (PRDone (RVBox noneA), s2)
+            else do
+              let off = hit `minusPtr` ptr
+              (someA, s2) <- alloc (NCon (Tx.pack "Some") [RVLit (LInt (toInteger off))]) s1
+              pure (PRDone (RVBox someA), s2)
+        else borrowMemchrViaBytes (CAddr p) byteV s
+    AbstractHeap -> borrowMemchrViaBytes (CAddr p) byteV s
+  [RVBox a, byteV] -> borrowMemchrViaBytes a byteV s
+  _ -> throwE (ArityError PN.borrowMemchrName)
+
+borrowMemchrViaBytes :: Addr -> RCValue -> Store -> RC (RCPrimResult, Store)
+borrowMemchrViaBytes a byteV s = do
+  bs   <- borrowBytes (RVBox a) s
+  byte <- liftRC (asInt byteV)
+  let tgt = fromIntegral (byte .&. 0xFF :: Integer) :: Word8
+  s1 <- dropAddr a s
+  case BS.elemIndex tgt bs of
+    Nothing -> do
+      (noneA, s2) <- alloc (NCon (Tx.pack "None") []) s1
+      pure (PRDone (RVBox noneA), s2)
+    Just off -> do
+      (someA, s2) <- alloc (NCon (Tx.pack "Some") [RVLit (LInt (toInteger off))]) s1
+      pure (PRDone (RVBox someA), s2)
+
+-- | @copy b@: materialize an owned 'Bytes' copy of the borrowed range (Tier-1
+-- copy-in, the escape hatch). Consumes 'b'. RC: +1 alloc ('NBytes'). The
+-- generic 'alloc' is safe for 'NBytes' (it has its own backend-dispatch arm),
+-- unlike 'NBorrowView'.
+borrowCopyRC :: RCPrim
+borrowCopyRC = RCPrim PN.borrowCopyName 1 [] $ \args s -> case args of
+  [bv@(RVBox a)] -> do
+    bs       <- borrowBytes bv s
+    (na, s1) <- alloc (NBytes bs) s
+    s2       <- dropAddr a s1
+    pure (PRDone (RVBox na), s2)
+  _ -> throwE (ArityError PN.borrowCopyName)
+
+-- | @__borrow_demo n@: a PERMANENT, prelude-only internal test fixture
+-- (Task 3) returning a Borrow over n deterministic bytes (pattern
+-- @i mod 256@). On 'CHeap' the buffer is malloc'd FRESH PER CALL and
+-- DELIBERATELY NEVER FREED -- a leak-by-design test fixture (valid for the
+-- rest of the process's lifetime since nothing ever frees it, but NOT a
+-- single buffer shared across calls), matching the contract this intrinsic
+-- exists to exercise; 'allocBorrowView' wraps it with NO ownership, so
+-- dropping the resulting handle frees only the 24 B view cell, never this
+-- buffer. Task 4 ADDS the @Demo.lendBuffer@ foreign-module producer
+-- ('allocBorrowDemoLend', below) ALONGSIDE this fixture, not as a
+-- replacement -- mirroring how Slice 2 kept @__ffi_demo_copy@/
+-- @__ffi_demo_adopt@ as permanent internal fixtures. Unlike this intrinsic,
+-- @Demo.lendBuffer@ is the freed producer: a genuine malloc'd lend-THEN-FREE
+-- pair with a liveness-placed @close@ at the borrowing activation's exit
+-- (Task 5, landed -- see 'allocBorrowDemoLend' below). @n@ is clamped via the
+-- shared 'Utf8.clampBorrowDemoLen' (code-review: a raw, unclamped @n@ let an
+-- admitted program request an arbitrarily large malloc/list -- a reachable
+-- OOM/hang), matching how 'allocBorrowDemoLend' below clamps its own @n@.
+borrowDemoRC :: RCPrim
+borrowDemoRC = RCPrim PN.borrowDemoName 1 [] $ \args s -> case args of
+  [RVLit (LInt n)] -> do
+    let bs = Utf8.demoPattern (fromIntegral (Utf8.clampBorrowDemoLen n))
+    case stBackend s of
+      CHeap hp -> do
+        ptr <- liftIO (mallocBytes (max 1 (BS.length bs)))
+        liftIO (BS.useAsCStringLen bs (\(src, len) -> copyBytes ptr (castPtr src) len))
+        (a, s1) <- allocBorrowView hp ptr (fromIntegral (BS.length bs)) s
+        pure (PRDone (RVBox a), s1)
+      AbstractHeap -> do
+        let (a, s1) = allocPure (NBorrowView bs) s
+        pure (PRDone (RVBox a), s1)
+  _ -> throwE (ArityError PN.borrowDemoName)
+
+-- ---------------------------------------------------------------------------
+-- Demo.lendBuffer: the foreign-module surface's borrow-disposition producer
+-- (FFI Slice 3 Task 4; the malloc'd lend-THEN-free producer landed in Task 5).
+--
+-- Shared by 'Wok.Interp.RC.Machine.rcForeignDispatch's @("wok","lendBuffer")@
+-- dispatch arm. Produces a Borrow over @max 0 (min n borrowDemoCapacity)@
+-- deterministic bytes (buf[i] = i & 0xFF), backend-dispatched:
+--
+--   * 'CHeap': a REAL malloc'd buffer ('H.wokBorrowDemoLend'), wrapped in a 0xFFFA
+--     borrow view (zero-copy, no ownership of the buffer). The buffer's BASE ptr is
+--     REGISTERED in the activation's close-set ('borrowRegister'); the close placed at
+--     activation exit ('Wok.Interp.RC.Machine' 'KBorrowCloseRC' -> 'borrowClose')
+--     frees it EXACTLY ONCE, so ASan/LSan can prove no leak / no double-free / no UAF.
+--     This REPLACES Task 4's static process-lifetime buffer: a genuine lend-then-free
+--     pair, activation-scoped (sound because 'Borrow' cannot escape -- Task 1's carrier
+--     rule). A slice shares this same base buffer, so 'borrowSliceRC' registers nothing.
+--   * 'AbstractHeap': a pure 'NBorrowView' window (no real memory backing). It STILL
+--     registers a 'nullPtr' sentinel in the close-set so the close COUNT ('stCloses')
+--     matches the C backend (the abstract/C parity oracle pins one close per buffer);
+--     'borrowClose' frees nothing for a 'nullPtr'.
+--
+-- Takes the raw 'Integer' literal (a wok @U64@ does NOT wrap -- @0 - 1@ is a
+-- genuine negative 'Integer'), and clamps via the shared
+-- 'Utf8.clampBorrowDemoLen' -- Integer domain, floored at zero, BEFORE the
+-- single downcast to 'Word64' -- mirroring
+-- 'Wok.Interp.Machine.evalForeignCall's reference-interpreter clamp exactly.
+-- Clamping a negative @n@ to a 'Word64' first (as a prior version of this
+-- code did) wraps it via two's-complement into a huge value, diverging from
+-- the reference (which floors at zero, observably 0 bytes).
+allocBorrowDemoLend :: Integer -> Store -> RC (Addr, Store)
+allocBorrowDemoLend n s = do
+  let len = Utf8.clampBorrowDemoLen n
+  case stBackend s of
+    CHeap hp -> do
+      ptr      <- liftIO (H.wokBorrowDemoLend len)
+      (a, s1)  <- allocBorrowView hp ptr len s
+      pure (a, borrowRegister ptr len s1)
+    AbstractHeap -> do
+      let (a, s1) = allocPure (NBorrowView (Utf8.demoPattern (fromIntegral len))) s
+      pure (a, borrowRegister nullPtr len s1)

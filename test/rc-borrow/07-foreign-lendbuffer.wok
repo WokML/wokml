@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 4: the `foreign module` surface's borrow disposition.
+-- `Demo.lendBuffer n` is a real RForeignCall (not the `__borrow_demo`
+-- extern intrinsic the rest of this corpus exercises): the (lib,sym) pair
+-- ("wok","lendBuffer") is blessed DispBorrow, so the call wraps the lent
+-- pointer in a 0xFFFA borrow view exactly like __borrow_demo does, but
+-- reached through real foreign-module resolution + elaboration
+-- (lookupForeignModule -> RForeignCall -> rcForeignDispatch), and the
+-- entry's IO row is INFERRED (no explicit `with IO` signature needed, per
+-- Slice 2's IO discharge -- this is also a regression pin that the
+-- foreign-module IO machinery is unchanged by the new disposition).
+-- buf[i] = i & 0xFF, so byteAt 5 = 5, memchr for 5 hits at offset 5.
+main =
+  let b = Demo.lendBuffer 8 in
+  let n = length b in
+  let b0 = byteAt b 0 in
+  let b5 = byteAt b 5 in
+  case memchr b 5 of
+    Some off -> n + b0 + b5 + off
+    None -> 0

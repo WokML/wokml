@@ -1,0 +1,8 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- __borrow_demo n yields buf[i] = i mod 256 for i in 0..n-1 (Utf8.demoPattern).
+-- Sanity check: length of an 8-byte borrow is 8.
+main : U64
+main = length (__borrow_demo 8)

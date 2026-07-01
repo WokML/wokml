@@ -1,0 +1,65 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-01-ffi-slice3-borrow-in.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Borrow carrier type (second-class, non-affine)",
+      "status": "completed",
+      "description": "**Goal:** A prelude-minted `extern type Borrow` that is second-class (escape = CarrierEscape) but non-affine (read repeatedly), at the type level.\n\n```json:metadata\n{\"files\":[\"prelude/Std/Borrow.wok\",\"src/Wok/TypeChecking/Env.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"src/Wok/TypeChecking/Carrier.hs\",\"test/typecheck-fail-examples/borrow-escapes-return.wok\",\"test/typecheck-examples/borrow-read-twice.wok\"],\"verifyCommand\":\"cabal test 2>&1 | tail -20\",\"acceptanceCriteria\":[\"extern type Borrow registers tcCarrier=True tcAffine=False\",\"returning/storing a Borrow is CarrierEscape\",\"reading a Borrow twice type-checks\",\"existing carriers stay affine\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Uncounted 0xFFFA borrow-view cell + RC node",
+      "status": "completed",
+      "description": "**Goal:** A C cell (tag 0xFFFA) {ptr,len} into a foreign buffer, no-op drop, RC node reading zero-copy with isBoxedType=False.\n\n```json:metadata\n{\"files\":[\"runtime/wok_rc.h\",\"runtime/wok_rc.c\",\"runtime/test/wok_rc_test.c\",\"src/Wok/Interp/RC/Value.hs\",\"src/Wok/Interp/RC/Heap.hs\",\"src/Wok/IR/Escape.hs\",\"scripts/asan-runtime.sh\"],\"verifyCommand\":\"scripts/asan-runtime.sh 2>&1 | tail -15\",\"acceptanceCriteria\":[\"0xFFFA cell alloc/read; drop frees handle not ptr\",\"NBorrowView uncounted isBoxedType=False no dup/drop\",\"asan-runtime.sh green with new C unit test\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Borrow read prims + Bytes.copy escape hatch",
+      "status": "completed",
+      "blockedBy": [
+        1,
+        2
+      ],
+      "description": "**Goal:** Borrow.length/byteAt/slice/memchr zero-copy reads (slice returns Borrow); Bytes.copy : Borrow -> Bytes.\n\n```json:metadata\n{\"files\":[\"prelude/Std/Borrow.wok\",\"src/Wok/IR/PrimNames.hs\",\"src/Wok/Interp/RC/Prim.hs\",\"src/Wok/Interp/Prim.hs\",\"test/run-examples/borrow-read.wok\"],\"verifyCommand\":\"cabal test 2>&1 | tail -20\",\"acceptanceCriteria\":[\"length/byteAt/memchr correct all backends\",\"slice returns a Borrow (second-class)\",\"Bytes.copy returns escapable owned Bytes\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Deterministic lend-then-free Borrow producer + surface",
+      "status": "completed",
+      "blockedBy": [
+        3
+      ],
+      "description": "**Goal:** A foreign-module member returning Borrow (disposition carried by the return type), backed by a deterministic host lend/close pair.\n\n```json:metadata\n{\"files\":[\"runtime/wok_rc.c\",\"runtime/wok_rc.h\",\"prelude/Std/Borrow.wok\",\"src/Wok/Interp/RC/Heap.hs\",\"src/Wok/TypeChecking/Infer.hs\",\"scripts/asan-runtime.sh\"],\"verifyCommand\":\"cabal test 2>&1 | tail -20\",\"acceptanceCriteria\":[\"Demo.lendBuffer deterministic bytes all backends\",\"Borrow-typed return = borrow disposition no keyword\",\"with IO discharge unchanged\"],\"modelTier\":\"standard\"}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Activation-scoped close placement (soundness-critical) -- IMPLEMENTED (activation-scoped, not precise family-liveness; family-liveness deferred)",
+      "status": "completed",
+      "blockedBy": [
+        4
+      ],
+      "description": "**Goal:** Place close at the last use of the borrow family (b + every slice b), no refcount, freed exactly once after the last read.\n\n```json:metadata\n{\"files\":[\"src/Wok/IR/Escape.hs\",\"src/Wok/IR/Region.hs\",\"src/Wok/Interp/RC/Machine.hs\",\"test/run-examples/borrow-slice-family.wok\"],\"verifyCommand\":\"scripts/asan-runtime.sh interp 2>&1 | tail -15\",\"acceptanceCriteria\":[\"buffer freed exactly once after family last-use (ASan/LSan clean)\",\"slice outliving parent mention reads valid bytes\",\"one close per lent buffer in rc-stats\"],\"modelTier\":\"frontier\"}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Death-test matrix (escape routes, ASan mutation-confirmed)",
+      "status": "completed",
+      "blockedBy": [
+        5
+      ],
+      "description": "**Goal:** Every escape route is a compile-time CarrierEscape; disabling the check turns each into a real ASan UAF. No vacuous controls.\n\n```json:metadata\n{\"files\":[\"test/typecheck-fail-examples/borrow-escape-return.wok\",\"test/typecheck-fail-examples/borrow-escape-cont-store.wok\",\"test/rc-ffi-borrow/\",\"test/Spec.hs\",\"scripts/asan-runtime.sh\"],\"verifyCommand\":\"scripts/asan-runtime.sh 2>&1 | tail -20\",\"acceptanceCriteria\":[\"every escape route rejected with CarrierEscape\",\"stored-continuation route rejected (Q4)\",\"each mutation aborts under ASan; no vacuous control\"],\"modelTier\":\"frontier\"}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Differential oracle + zero-copy saving pin",
+      "status": "completed",
+      "blockedBy": [
+        4,
+        5
+      ],
+      "description": "**Goal:** Three-backend oracle validates borrow reads byte-identically and pins the zero-copy saving as a real delta vs an explicit copy.\n\n```json:metadata\n{\"files\":[\"test/Spec.hs\",\"test/rc-ffi-borrow/\"],\"verifyCommand\":\"cabal test 2>&1 | grep -i rc-ffi-borrow\",\"acceptanceCriteria\":[\"three backends byte-identical for borrow reads\",\"borrow copies 0 buffer bytes vs len for Bytes.copy\",\"saving pin is differential not tautological\"],\"modelTier\":\"standard\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-07-01T00:00:06Z"
+}

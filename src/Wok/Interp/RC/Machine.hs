@@ -33,7 +33,7 @@ import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.IR.Region (Placement (..), RegionPlan (..), SliceRep (..), planRegions)
 import Wok.FFI.Blessed (ReturnDisp (..))
 import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup)
-import Wok.Interp.RC.Prim (rcPrimTable)
+import Wok.Interp.RC.Prim (rcPrimTable, allocBorrowDemoLend)
 import Wok.Interp.RC.Value
 import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.Value (RuntimeError (..))
@@ -144,6 +144,18 @@ returnToRC _   v (KArenaCloseRC k)      s = do
 -- 'PrimError' fires. Only ever pushed when the death-test flag is on.
 returnToRC _   v (KWindowCloseRC k)     s = do
   s' <- windowClose s
+  pure (RReturn v k s')
+-- FOREIGN-BORROW CLOSE BRACKET (FFI Slice 3 Task 5). The body that opened this close-set
+-- frame has produced its final value @v@ (every exit path threads through this frame, like
+-- 'KArenaCloseRC'). 'borrowClose' frees every malloc'd borrow buffer registered in this
+-- activation EXACTLY ONCE (on CHeap a real @free@; on AbstractHeap only the logical
+-- 'stCloses' count advances) and delivers @v@ onward. Sound because a 'Borrow' cannot escape
+-- its activation (Task 1's carrier rule), so every read of the buffer provably happened
+-- earlier in this body; the buffer is dead by the time @v@ returns here. The 0xFFFA view
+-- HANDLE's refcount is separate and already handled by Perceus drops -- this frees only the
+-- off-heap buffer.
+returnToRC _   v (KBorrowCloseRC k)     s = do
+  s' <- borrowClose s
   pure (RReturn v k s')
 -- Normal completion of a handled computation (M2b-1 Task 3): run the return arm,
 -- binding the produced value to the return binder in the frame's captured scope.
@@ -506,18 +518,40 @@ rcForeignDispatch lib sym disp mfree vs s cont
               (a, s2) <- adoptCHeapPtr hp (castPtr p) len s1
               cont (RVBox a) s2
         _ -> throwE (PrimError (Tx.pack "strndup (RC): expected (Bytes, U64)"))
+  -- 'Demo.lendBuffer' (FFI Slice 3 Task 5): the borrow-disposition surface
+  -- producer. Backend-dispatched by 'allocBorrowDemoLend'. On CHeap: produces
+  -- a real malloc'd buffer (buf[i] = i & 0xFF) up to borrowDemoCapacity, wrapped
+  -- in a 0xFFFA borrow view (zero-copy, no ownership). The buffer base ptr is
+  -- registered in the activation's close-set and freed exactly once at activation
+  -- exit by 'KBorrowCloseRC' -> 'borrowClose' (ASan/LSan can verify no leak/double-free/UAF).
+  -- On AbstractHeap: a pure 'NBorrowView' window; 'nullPtr' sentinel still registered
+  -- for oracle parity. 'disp' is statically 'DispBorrow' for this pair (blessed table +
+  -- typecheck-time Borrow-return-type coherence); 'mfree' is irrelevant.
+  | lib == libWok, sym == symLendBuffer =
+      case vs of
+        [RVLit (LInt n)] -> do
+          (a, s1) <- allocBorrowDemoLend n s
+          cont (RVBox a) s1
+        _ -> throwE (PrimError (Tx.pack "lendBuffer (RC): expected (U64)"))
   | otherwise =
       throwE (PrimError
         (Tx.pack "foreign symbol not available in the RC interpreter: "
           <> lib <> Tx.pack "." <> sym))
   where
-    libC       = Tx.pack "c"
-    symMemchr  = Tx.pack "memchr"
-    symStrndup = Tx.pack "strndup"
+    libC          = Tx.pack "c"
+    symMemchr     = Tx.pack "memchr"
+    symStrndup    = Tx.pack "strndup"
+    libWok        = Tx.pack "wok"
+    symLendBuffer = Tx.pack "lendBuffer"
 
 -- | Allocate the result of a DispAdopt/DispCopy/DispScalar return on AbstractHeap.
 -- DispAdopt => 'NForeignBytes' (24 B handle); DispCopy => 'NBytes'; DispScalar
--- is not a buffer type and this helper is never called for it.
+-- is not a buffer type and this helper is never called for it. DispBorrow
+-- (Task 4) also never reaches this helper: 'Demo.lendBuffer' is dispatched by
+-- its own (lib,sym) guard via 'allocBorrowDemoLend', which needs a raw
+-- 'Ptr Word8' on CHeap (not a 'ByteString'), a different shape than this
+-- generic bytestring-allocator takes; the arm below exists only for
+-- 'ReturnDisp' exhaustiveness, mirroring the existing DispScalar stub.
 allocResult :: ReturnDisp -> BS.ByteString -> Store
             -> (RCValue -> Store -> RC RCConfig) -> RC RCConfig
 allocResult DispAdopt bs s cont = do
@@ -528,6 +562,8 @@ allocResult DispCopy bs s cont = do
   cont (RVBox a) s'
 allocResult DispScalar _ _ _ =
   throwE (PrimError (Tx.pack "allocResult: DispScalar has no buffer to allocate"))
+allocResult DispBorrow _ _ _ =
+  throwE (PrimError (Tx.pack "allocResult: DispBorrow is dispatched via allocBorrowDemoLend, not allocResult"))
 
 -- | BORROW-OUT (CHeap only): extract the raw data pointer and byte length from a
 -- CHeap Bytes cell (WokBytes tag 0xFFFC or WokForeignBytes tag 0xFFFB).
@@ -966,6 +1002,7 @@ nodeTag (NString _)      = Tx.pack "<string>"
 nodeTag (NStringView{})  = Tx.pack "<string-view>"
 nodeTag (NBytes _)        = Tx.pack "<bytes>"
 nodeTag (NForeignBytes _) = Tx.pack "<foreign-bytes>"
+nodeTag (NBorrowView _)   = Tx.pack "<borrow-view>"
 nodeTag (NRecord t _)     = t
 nodeTag NClosure{}       = Tx.pack "<closure>"
 nodeTag (NGroupCode _)   = Tx.pack "<closure>"
@@ -1049,6 +1086,9 @@ rcFindHandler mTarget lbl op = go id
     -- Totality only: the window-set bracket (death-test) and effect-handler dispatch
     -- do not co-occur in a normal run; accumulate it for completeness.
     go acc (KWindowCloseRC k)    = go (acc . KWindowCloseRC) k
+    -- Totality only: a borrow-lending run is handler-free, so the borrow-close bracket
+    -- never co-occurs with a handler search; accumulate it for completeness.
+    go acc (KBorrowCloseRC k)    = go (acc . KBorrowCloseRC) k
     go acc (KHandleRC h tag sc k)
       | matches h                = Just (acc, h, tag, sc, k)
       | otherwise                = go (acc . KHandleRC h tag sc) k
@@ -1130,6 +1170,40 @@ bodyOpensArena plc = go
     goRhs RLam{}          = False
     goRhs _               = False
 
+-- | True iff this body can LEND a foreign borrow OF ITS OWN (FFI Slice 3 Task 5): it
+-- contains a 'DispBorrow' foreign call ('Demo.lendBuffer' / any future borrow-returning
+-- foreign-module member) reachable WITHOUT entering a nested 'RLam' (a lambda is a SEPARATE
+-- activation that brackets ITS OWN borrow close-set on its own 'enterBodyRC'). Mirrors
+-- 'bodyOpensArena' structurally: a body that can lend opens a close-set frame and pushes a
+-- 'KBorrowCloseRC' bracket so the lent buffer is freed at THIS activation's exit. Keyed on
+-- the 'DispBorrow' disposition (not the lib/sym strings), so it stays correct for any
+-- borrow-returning producer. A body that never lends opens no frame -- zero overhead, and
+-- behaviour byte-identical to before.
+--
+-- The 'Handle' arm is descended for totality only: 'runModuleRC' rejects every handler
+-- program ('firstOrderNoHandlerViolations'), so a borrow lend never co-occurs with a
+-- handler at RC-interpreter runtime (the R1 "handler-free-modules" coverage limit, here
+-- INHERENT to the interpreter -- a coverage bound, not a soundness hole, since Task 1's
+-- carrier rule already rejects a borrow escaping into a continuation).
+bodyLendsBorrow :: Expr -> Bool
+bodyLendsBorrow = go
+  where
+    go (Ret _)            = False
+    go (Let _ r e)        = goRhs r || go e
+    go (LetRec _ e)       = go e   -- LetRec members are FUNCTION bodies (own frames)
+    go (Case _ alts)      = any goAlt alts
+    go (LetJoin _ _ jb e) = go jb || go e
+    go (Jump _ _)         = False
+    go (Handle e h)       = go e || go (snd (hReturn h))
+                              || any (go . oaBody) (hOps h)
+    goAlt (AltCon _ _ e)  = go e
+    goAlt (AltLit _ e)    = go e
+    goAlt (AltDefault e)  = go e
+    goRhs (RForeignCall _ _ DispBorrow _ _) = True
+    -- An 'RLam' RHS is a DIFFERENT activation: do not look inside it.
+    goRhs RLam{}          = False
+    goRhs _               = False
+
 -- | Enter a function/CAF/lambda body, applying the arena bracket (Region Slice R1,
 -- spec §4.2). If the body opens an arena ('bodyOpensArena'), 'arenaOpenRC' the
 -- store and push a 'KArenaCloseRC' frame ABOVE the body's continuation @k@, so the
@@ -1157,7 +1231,7 @@ windowRouted env b =
   where u = binderUnique b
 
 enterBodyRC :: RCEnv -> Expr -> RCScope -> RCKont -> Store -> RC RCConfig
-enterBodyRC env body sc k s
+enterBodyRC env body sc k0 s0
   -- DEATH-TEST WINDOW-SET BRACKET (String Slice E4 Task 5; flag-gated). Under the
   -- flag, EVERY activation pushes a window-set frame ('windowOpen') and a
   -- 'KWindowCloseRC' frame so the close check runs on every exit path -- the same
@@ -1177,6 +1251,18 @@ enterBodyRC env body sc k s
       s' <- arenaOpenRC s
       pure (REval body sc (KArenaCloseRC k) s')
   | otherwise = pure (REval body sc k s)
+  where
+    -- FOREIGN-BORROW CLOSE BRACKET (FFI Slice 3 Task 5; ALWAYS ON). Computed FIRST, so it
+    -- wraps the whole activation: a body that can lend a borrow ('bodyLendsBorrow') opens a
+    -- close-set frame ('borrowOpen') and gets a 'KBorrowCloseRC' as the OUTERMOST close
+    -- frame (it runs LAST, after any arena/window close, so the off-heap buffer is freed
+    -- once the heap-cell teardown is done). The frame is opened BEFORE the body runs so the
+    -- producer ('allocBorrowDemoLend') registers the buffer's base ptr into it. The 'k'/'s'
+    -- the arena/window logic above uses are these borrow-bracketed values; a non-lending
+    -- body leaves them untouched (no frame, no 'KBorrowCloseRC', zero overhead).
+    (s, k)
+      | bodyLendsBorrow body = (borrowOpen s0, KBorrowCloseRC k0)
+      | otherwise            = (s0, k0)
 
 -- ---------------------------------------------------------------------------
 -- Drivers
@@ -1527,11 +1613,28 @@ installBinds renv knotEnv = go
 renderRcStats :: RCRun -> Text
 renderRcStats run =
   let st = rcStats run
+      -- The foreign-borrow close count (FFI Slice 3 Task 5) is rendered ONLY when a borrow
+      -- was actually lent (> 0), so every existing non-borrow stats golden stays byte-
+      -- identical (closes = 0 -> no line). A borrow-lending program shows one close per lent
+      -- malloc'd buffer, identical on both backends ('stCloses' is bumped in lockstep).
+      closesLine
+        | stCloses st > 0 = [ Tx.pack "closes    = " <> Tx.pack (show (stCloses st)) ]
+        | otherwise       = []
+      -- The off-heap borrow-lent peak (xhigh review Fix 1) is rendered ONLY when a borrow
+      -- was actually lent (> 0), for the same reason as 'closesLine': every existing
+      -- non-borrow stats golden stays byte-identical. A borrow-lending program shows the
+      -- high-water mark of outstanding malloc'd `Demo.lendBuffer` bytes -- the OBSERVABLE
+      -- signal for the activation-scoped-close limitation (a tail-recursive borrow loop's
+      -- O(N) peak; see 'St.stBorrowLentPeak').
+      borrowLentPeakLine
+        | stBorrowLentPeak st > 0 =
+            [ Tx.pack "borrowLentPeak = " <> Tx.pack (show (stBorrowLentPeak st)) ]
+        | otherwise = []
    in Tx.unlines
-        [ Tx.pack "allocs    = " <> Tx.pack (show (stAllocs st))
-        , Tx.pack "frees     = " <> Tx.pack (show (stFrees st))
-        , Tx.pack "peakLive  = " <> Tx.pack (show (stPeak st))
-        , Tx.pack "curBytes  = " <> Tx.pack (show (stCurBytes st))
-        , Tx.pack "peakBytes = " <> Tx.pack (show (stPeakBytes st))
-        , Tx.pack "baseline  = " <> Tx.pack (show (rcBaseline run))
-        ]
+        ([ Tx.pack "allocs    = " <> Tx.pack (show (stAllocs st))
+         , Tx.pack "frees     = " <> Tx.pack (show (stFrees st))
+         , Tx.pack "peakLive  = " <> Tx.pack (show (stPeak st))
+         , Tx.pack "curBytes  = " <> Tx.pack (show (stCurBytes st))
+         , Tx.pack "peakBytes = " <> Tx.pack (show (stPeakBytes st))
+         , Tx.pack "baseline  = " <> Tx.pack (show (rcBaseline run))
+         ] ++ closesLine ++ borrowLentPeakLine)

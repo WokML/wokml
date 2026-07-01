@@ -1,0 +1,35 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- DEATH TEST (FFI Slice 3 Task 6, RETURN route). The load-bearing confirmation
+-- that Task 1's carrier rule + Task 5's activation-scoped close are sound.
+--
+-- `leak` lends a malloc'd borrow (`Demo.lendBuffer`, Task 5 -- NOT the static
+-- `__borrow_demo`) and RETURNS it, escaping its lending activation. In a normal
+-- build this is a compile-time CarrierEscape (the `return` route). Under the
+-- test-only `ffi-borrow-noescape-negctrl` mutation the carrier escape rejection
+-- is disabled, so the program type-checks and RUNS: `leak`'s activation-scoped
+-- close (`KBorrowCloseRC` -> `borrowClose` -> `wok_borrow_demo_close` = `free`)
+-- frees the malloc'd buffer when `leak` returns, and `main`'s `memchr` then scans
+-- the freed buffer -> a GENUINE ASan use-after-free.
+--
+-- The read MUST be `memchr` (not `byteAt`): on CHeap `memchr` scans the buffer via
+-- the real libc `c_memchr` (a C function, so its load of the freed buffer is
+-- ASan-instrumented), whereas `byteAt` reads via a Haskell `peekElemOff` primop
+-- that ASan does not see. VACUITY GUARD: the buffer is the malloc'd
+-- `Demo.lendBuffer` buffer, so the read genuinely faults under ASan; a
+-- static-buffer borrow (`__borrow_demo`) would never fault -- a vacuous control.
+--
+-- `leak`'s type (`U64 -> Borrow with IO`) is INFERRED, not annotated: an explicit
+-- `Borrow` signature without `with IO` would be rejected for UndischargedEffect
+-- BEFORE the post-inference carrier check runs, masking the CarrierEscape we are
+-- pinning (a vacuous compile-reject). Leaving it inferred makes the carrier rule
+-- the cause of rejection, as the compile-reject group asserts.
+leak n = let b = Demo.lendBuffer n in b
+
+main =
+  let b = leak 8 in
+  case memchr b 5 of
+    Some o -> o
+    None   -> 99

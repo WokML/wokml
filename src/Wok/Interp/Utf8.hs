@@ -3,6 +3,8 @@ module Wok.Interp.Utf8
   , decodeCharAt
   , validateUtf8
   , demoPattern
+  , borrowDemoCapacity
+  , clampBorrowDemoLen
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL)
@@ -11,7 +13,7 @@ import qualified Data.ByteString as BS
 import Data.Char (chr)
 import qualified Data.Text as Tx
 import qualified Data.Text.Encoding as TxEnc
-import Data.Word (Word8)
+import Data.Word (Word8, Word64)
 import Wok.Interp.Value (RuntimeError (PrimError))
 
 -- | Byte width (1..4) implied by a UTF-8 lead byte. 'Left' on a continuation
@@ -57,3 +59,22 @@ validateUtf8 bs = case TxEnc.decodeUtf8' bs of
 -- so the differential oracle can compare across all three backends.
 demoPattern :: Int -> ByteString
 demoPattern n = BS.pack [ fromIntegral (i `mod` 256) | i <- [0 .. n - 1] ]
+
+-- | The fixed capacity of the FFI Slice 3 Task 4 @Demo.lendBuffer@ producer
+-- buffer. @lendBuffer n@ is clamped, in 'Integer' domain before the single
+-- downcast, to @max 0 (min n borrowDemoCapacity)@ bytes: the buffer itself
+-- is a genuine malloc'd lend-THEN-FREE pair per activation (Task 5, landed
+-- -- see 'Wok.Interp.RC.Prim.allocBorrowDemoLend'), but it still needs a
+-- fixed upper bound on how much any one lend may allocate. Shared by the
+-- reference interpreter ('Wok.Interp.Machine'), the RC interpreter
+-- ('Wok.Interp.RC.Prim' / 'Wok.Interp.RC.Machine'), so all three backends
+-- clamp identically.
+borrowDemoCapacity :: Word64
+borrowDemoCapacity = 65536
+
+-- | Clamp a raw Integer length to the demo-buffer capacity, floored at 0, in
+-- Integer domain BEFORE the single Word64 downcast (a negative Integer below
+-- Int range would otherwise wrap positive). Shared by every demo borrow
+-- producer so the clamp policy lives in exactly one place.
+clampBorrowDemoLen :: Integer -> Word64
+clampBorrowDemoLen n = fromIntegral (max 0 (min n (toInteger borrowDemoCapacity)))

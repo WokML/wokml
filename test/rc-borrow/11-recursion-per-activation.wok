@@ -1,0 +1,25 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 5 (per-activation close under recursion). Each call to `go`
+-- lends its OWN borrow and reads a byte from it. Every activation opens its own
+-- close-set frame (it lends) and frees ITS buffer at ITS exit, so N lending
+-- activations free N buffers in LIFO order -- no cross-activation leak, no
+-- double-free. The recursive call `go (n - 1)` happens while the current `b`'s
+-- buffer is still registered (freed only at this activation's exit), which is
+-- sound: the borrow never escapes (carrier rule), so the late free is never a UAF.
+--
+-- go 3 lends at n = 3, 2, 1 (the n = 0 base case lends nothing) -> closes = 3.
+-- byteAt b 0 = 0 for every buffer, so the result is just 3 + 2 + 1 + 0 = 6.
+go : U64 -> U64 with IO
+go n =
+  case n of
+    0 -> 0
+    _ ->
+      let b = Demo.lendBuffer n in
+      let first = byteAt b 0 in
+      n + first + go (n - 1)
+
+main : U64
+main = go 3

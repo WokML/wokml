@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Regression for the FFI Slice 3 Task 4 review finding: the reference
+-- interpreter and the RC interpreter clamped `Demo.lendBuffer n` in
+-- DIFFERENT numeric domains. The reference clamps `n` (a wok `U64`, which
+-- does NOT wrap -- `0 - 1` yields a genuine negative `Integer` literal) in
+-- `Integer` domain BEFORE ever touching `Word64`, so a negative `n` produces
+-- an empty byte pattern (0 bytes). The RC interpreter downcast
+-- `Integer -> Word64` BEFORE clamping, so a negative `n` wrapped via
+-- two's-complement to a huge `Word64`, and `min` against the 65536 capacity
+-- then picked 65536 -- the two backends disagreed on a type-checked program.
+-- All three backends must now agree: negative `n` saturates to 0 bytes, and
+-- an over-large `n` (70000, exceeding the 65536 static capacity) saturates
+-- to exactly the capacity.
+main =
+  let neg = 0 - 1 in
+  let lenNeg = length (Demo.lendBuffer neg) in
+  let lenBig = length (Demo.lendBuffer 70000) in
+  lenNeg + lenBig

@@ -32,6 +32,7 @@ taggedPrims =
   ++ map (PN.stdStringModule,)  stringPrims
   ++ map (PN.stdBytesModule,)   bytesPrims
   ++ map (PN.stdBaseModule,)    bytesBasePrims
+  ++ map (PN.stdBorrowModule,)  borrowPrims
 
 basePrims :: [Prim]
 basePrims =
@@ -775,3 +776,92 @@ ffiDemoAdoptP :: Prim
 ffiDemoAdoptP = mkPrim PN.ffiDemoAdoptName 1 $ \args -> case args of
   [VLit (LInt n)] -> Right (PRDone (VBytes (Utf8.demoPattern (fromIntegral n))))
   _               -> Left (ArityError PN.ffiDemoAdoptName)
+
+-- ---------------------------------------------------------------------------
+-- Std.Borrow prims (reference interpreter side, FFI Slice 3 Task 3).
+--
+-- The reference machine has no ownership/RC model, so a 'Borrow' carries the
+-- SAME runtime representation as a 'Bytes' buffer: 'VBytes'. The TYPE checker
+-- (not this machine) enforces the second-class, non-affine carrier discipline
+-- (Task 1); here the read prims are plain byte-buffer operations, mirroring
+-- the Bytes prims above.
+
+borrowPrims :: [Prim]
+borrowPrims =
+  [ borrowLengthP
+  , borrowByteAtP
+  , borrowSliceP
+  , borrowMemchrP
+  , borrowCopyP
+  , borrowDemoP
+  ]
+
+-- | @length b@: the borrow's byte length. O(1).
+borrowLengthP :: Prim
+borrowLengthP = mkPrim PN.borrowLengthName 1 $ \args -> case args of
+  [VBytes bs] ->
+    Right (PRDone (VLit (LInt (fromIntegral (BS.length bs)))))
+  [v] -> Left (PrimError (Tx.pack "Borrow.length: not a Borrow: " <> renderValue v))
+  _   -> Left (ArityError PN.borrowLengthName)
+
+-- | @byteAt b i@: the i-th byte as a U64 (0-based, bounds-checked).
+-- OOB raises 'PrimError'.
+borrowByteAtP :: Prim
+borrowByteAtP = mkPrim PN.borrowByteAtName 2 $ \args -> case args of
+  [VBytes bs, iv] -> do
+    i <- asU64Index iv
+    if i >= BS.length bs
+      then Left (PrimError (Tx.pack "Borrow.byteAt: out of bounds"))
+      else Right (PRDone (VLit (LInt (fromIntegral (BS.index bs i)))))
+  [v, _] -> Left (PrimError (Tx.pack "Borrow.byteAt: not a Borrow: " <> renderValue v))
+  _      -> Left (ArityError PN.borrowByteAtName)
+
+-- | @slice b i j@: a new Borrow over the SAME bytes, window [i, j), saturating
+-- bounds (out-of-range i/j are clamped; a backward range j < i is empty).
+-- Mirrors the RC interpreter's saturating clamp exactly (differential oracle).
+borrowSliceP :: Prim
+borrowSliceP = mkPrim PN.borrowSliceName 3 $ \args -> case args of
+  [VBytes bs, startV, endV] -> do
+    start <- asU64Index startV
+    end   <- asU64Index endV
+    let n      = BS.length bs
+        start' = min start n
+        end'   = max start' (min end n)
+    Right (PRDone (VBytes (BS.take (end' - start') (BS.drop start' bs))))
+  [v, _, _] -> Left (PrimError (Tx.pack "Borrow.slice: not a Borrow: " <> renderValue v))
+  _         -> Left (ArityError PN.borrowSliceName)
+
+-- | @memchr b byte@: scan b[0 .. length b) for the low 8 bits of byte;
+-- @Some offset@ on the first match, @None@ if absent.
+borrowMemchrP :: Prim
+borrowMemchrP = mkPrim PN.borrowMemchrName 2 $ \args -> case args of
+  [VBytes bs, byteV] -> do
+    byte <- asInt byteV
+    let tgt = fromIntegral (byte .&. 0xFF) :: Word8
+    Right (PRDone (case BS.elemIndex tgt bs of
+      Nothing  -> VCon (Tx.pack "None") []
+      Just off -> VCon (Tx.pack "Some") [VLit (LInt (fromIntegral off))]))
+  [v, _] -> Left (PrimError (Tx.pack "Borrow.memchr: not a Borrow: " <> renderValue v))
+  _      -> Left (ArityError PN.borrowMemchrName)
+
+-- | @copy b@: materialize an owned Bytes copy. On the reference machine a
+-- Borrow and a Bytes are both 'VBytes', so this is the identity; the OWNERSHIP
+-- distinction (and the freedom to escape) is enforced only by the type
+-- checker, not by this runtime representation.
+borrowCopyP :: Prim
+borrowCopyP = mkPrim PN.borrowCopyName 1 $ \args -> case args of
+  [VBytes bs] -> Right (PRDone (VBytes bs))
+  [v]         -> Left (PrimError (Tx.pack "Borrow.copy: not a Borrow: " <> renderValue v))
+  _           -> Left (ArityError PN.borrowCopyName)
+
+-- | @__borrow_demo n@: produce a Borrow over n deterministic bytes (pattern
+-- @i mod 256@). Mirrors 'ffiDemoCopyP'; on the reference machine there is no
+-- ownership distinction, so this is a plain 'VBytes'. PERMANENT internal test
+-- fixture (not removed at Task 4; see 'PN.borrowDemoName'). @n@ is clamped
+-- via the shared 'Utf8.clampBorrowDemoLen' (code-review: a raw, unclamped @n@
+-- let an admitted program request an arbitrarily large list -- a reachable
+-- OOM/hang), matching how @Demo.lendBuffer@ clamps its own @n@ above.
+borrowDemoP :: Prim
+borrowDemoP = mkPrim PN.borrowDemoName 1 $ \args -> case args of
+  [VLit (LInt n)] -> Right (PRDone (VBytes (Utf8.demoPattern (fromIntegral (Utf8.clampBorrowDemoLen n)))))
+  _               -> Left (ArityError PN.borrowDemoName)

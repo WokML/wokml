@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- __borrow_demo 8 yields buf = [0,1,2,3,4,5,6,7]. Reads BOTH the first byte
+-- (index 0) and the LAST byte (index 7) off the SAME Borrow handle -- Borrow
+-- is non-affine, so Perceus inserts a dup between the two reads (the
+-- rc-c-backend-parity combinator is the live double-free guard for this).
+-- byteAt b 0 = 0, byteAt b 7 = 7. Expected: 0 + 7 = 7.
+main : U64
+main =
+  let b = __borrow_demo 8 in
+  byteAt b 0 + byteAt b 7

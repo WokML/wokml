@@ -22,6 +22,13 @@ data ReturnDisp
                  -- Reserved for transfer-none buffer returns; no blessed symbol
                  -- uses it yet (no clean deterministic copy-return libc fn).
   | DispAdopt    -- ^ Adopt the returned pointer (free via the module's free clause).
+  | DispBorrow   -- ^ Wrap the returned pointer in an uncounted @0xFFFA@ borrow
+                 -- view (FFI Slice 3 Task 4). Transfer-none: the host keeps
+                 -- ownership; wok never frees it. Unlike 'DispAdopt'/'DispCopy',
+                 -- this disposition is carried by the member's declared return
+                 -- TYPE (@Borrow@) rather than the @owned@ keyword -- a member
+                 -- blessed 'DispBorrow' must declare its return type as @Borrow@
+                 -- (checked in 'Wok.TypeChecking.Infer.processForeignDecls').
   deriving (Eq, Show)
 
 -- | The statically-known part of a blessed symbol's calling contract.
@@ -31,10 +38,19 @@ newtype BlessedSig = BlessedSig { bsReturn :: ReturnDisp }
 -- | The complete allow-list of (lib, symbol) pairs the interpreter accepts.
 -- Key: (library-name, C-symbol-name), both as the TEXT the user wrote in the
 -- foreign-module declaration (lower-cased library tag + C identifier).
+--
+-- @("wok", "lendBuffer")@ is NOT a real C library symbol: it is the FFI
+-- Slice 3 Task 4 deterministic borrow producer, a host function the wok
+-- runtime itself provides (not @dlopen@'d, not linked against any real
+-- library) so the borrow tier has a blessed, deterministic, non-libc source
+-- to lend from. The @"wok"@ library tag deliberately does not claim to be
+-- @"c"@, so a reader of a @foreign module@ header can tell at a glance that
+-- @lendBuffer@ is a wok-internal fixture, not a real libc call.
 blessedTable :: Map.Map (Text, Text) BlessedSig
 blessedTable = Map.fromList
   [ ((Tx.pack "c", Tx.pack "memchr"),  BlessedSig DispScalar)
   , ((Tx.pack "c", Tx.pack "strndup"), BlessedSig DispAdopt)
+  , ((Tx.pack "wok", Tx.pack "lendBuffer"), BlessedSig DispBorrow)
   ]
 
 -- | Look up a (lib, symbol) pair in the blessed table.

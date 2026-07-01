@@ -1,0 +1,22 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- DEATH TEST (FFI Slice 3 Task 6, LIST route). `leak` lends a malloc'd borrow
+-- and stores it in a LIST that escapes its lending activation. Normal build:
+-- compile-time CarrierEscape. Under the `ffi-borrow-noescape-negctrl` mutation
+-- it runs: the activation-scoped close frees the buffer when `leak` returns, and
+-- `main` scans the (now-dangling) borrow held in the list via the C-side `memchr`
+-- -> ASan read-after-free on the freed malloc'd buffer. (`memchr`, not `byteAt`:
+-- the C `c_memchr` load is ASan-instrumented; a Haskell `peekElemOff` is not.)
+leak n =
+  let b = Demo.lendBuffer n in
+  [b]
+
+main =
+  case leak 8 of
+    []     -> 0
+    b :: _ ->
+      case memchr b 5 of
+        Some o -> o
+        None   -> 99

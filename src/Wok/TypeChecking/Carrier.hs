@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | The carrier rule: a second-class escape check for named effect instances
 -- (design §4.3). It runs AFTER inference, over the frozen typed AST, because
 -- handle-ness is read off types.
@@ -28,7 +30,9 @@
 -- recursion; the in-scope handle-binder set is finite and lexically scoped; no
 -- fixpoint.
 module Wok.TypeChecking.Carrier
-  ( checkCarriers
+  ( CarrierTys (..)
+  , AffineCarrierTys (..)
+  , checkCarriers
   , checkFutureAffine
   , isHandleType         -- exported for the slice-4d marker anchor test
   , isAffineCarrierType  -- exported for the slice-4d marker anchor test
@@ -102,6 +106,40 @@ data Env = Env
 err :: Ctx -> Either TypeError a
 err c = Left (CarrierEscape (ctxSpan c) (ctxName c))
 
+-- | Whether the carrier ESCAPE rejection is active. Always 'True' in a normal
+-- build. The @ffi-borrow-noescape-negctrl@ flag (FFI Slice 3 Task 6 death-test
+-- matrix) sets it 'False' so that a second-class carrier escaping its scope --- a
+-- foreign 'Borrow' escaping its lending activation in particular --- type-checks
+-- instead of being rejected, and can therefore be RUN under ASan. Each escape
+-- route then becomes a GENUINE use-after-free (the activation-scoped close frees
+-- the malloc'd buffer the escapee subsequently reads), which proves the carrier
+-- rule is load-bearing rather than vacuous. This is a TEST-ONLY negative control
+-- (default 'False' for the flag, i.e. 'True' here); it must NEVER be set in a
+-- normal build. Mirrors the @ffi-noclamp-negctrl@ clamp-disabling seam (Slice 1/2)
+-- exactly: a gate that, when removed, makes a real fault reachable.
+carrierEscapeEnabled :: Bool
+carrierEscapeEnabled =
+#ifdef WOK_FFI_BORROW_NOESCAPE_NEGCTRL
+  False
+#else
+  True
+#endif
+
+-- | The FULL set of marked carrier tycon names (every @tcCarrier@ tycon),
+-- required by 'checkCarriers' -- the escape check must see every second-class
+-- carrier, affine or not. A distinct type from 'AffineCarrierTys' so the two
+-- carrier-name sets cannot be transposed at a call site (a future caller
+-- passing the affine-filtered subset here would silently stop 'CarrierEscape'
+-- firing for a non-affine carrier, e.g. a leaked FFI 'Borrow').
+newtype CarrierTys = CarrierTys (Set Text)
+
+-- | The AFFINE-FILTERED subset of marked carrier tycon names (@tcCarrier &&
+-- tcAffine@), required by 'checkFutureAffine' -- the consume-once bound
+-- applies only to affine carriers ('Suspension'/'Step'/'ContCell'), not to a
+-- non-affine carrier such as 'Borrow'. A distinct type from 'CarrierTys' for
+-- the same transposition-safety reason.
+newtype AffineCarrierTys = AffineCarrierTys (Set Text)
+
 -- | Check one binding's clauses. The clause params bind handle binders (a param
 -- of handle type), so they seed the in-scope carrier set; the body is then
 -- walked. The 'SourceSpan' (the binding's position) and name carry the
@@ -118,9 +156,9 @@ err c = Left (CarrierEscape (ctxSpan c) (ctxName c))
 -- (via 'recurse'), so a carrier escaping into a list/tuple inside the body is
 -- still caught.
 checkCarriers
-  :: Set Text -> ParamResolver -> Bool -> Bool -> SourceSpan -> Text
+  :: CarrierTys -> ParamResolver -> Bool -> Bool -> SourceSpan -> Text
   -> [([TPat], TExpr)] -> Either TypeError ()
-checkCarriers carrierTys resolve producerThunkExempt resultIsCarrier sp name clauses =
+checkCarriers (CarrierTys carrierTys) resolve producerThunkExempt resultIsCarrier sp name clauses =
   mapM_ checkClause clauses
   where
     ctx = Ctx { ctxResolve = resolve, ctxSpan = sp, ctxName = name
@@ -143,7 +181,7 @@ check ctx env allowed e@(Texp _ node)
   -- themselves — their problematic CHILDREN are caught positionally by the
   -- recursion below. So only the direct-escape forms are checked against
   -- @allowed@; everything else simply recurses.
-  | directlyEscapes (envCarriers env) e, not allowed = err ctx
+  | carrierEscapeEnabled, directlyEscapes (envCarriers env) e, not allowed = err ctx
   -- An INLINE-PRODUCED Future (a saturated call whose result type is a Future,
   -- e.g. @start producer@) is a second-class carrier that must not escape even
   -- when there are no carrier variables in scope. This fires in any non-allowed
@@ -153,7 +191,7 @@ check ctx env allowed e@(Texp _ node)
   -- flag is set to True only for that single level and is reset to False
   -- (via 'recurse') before any child expressions are checked, so nested
   -- escapes (e.g. @[start producer]@ inside an arm) are still caught.
-  | isInlineFutureApp (ctxCarrierTys ctx) e, not allowed, not (ctxHandlerArm ctx) = err ctx
+  | carrierEscapeEnabled, isInlineFutureApp (ctxCarrierTys ctx) e, not allowed, not (ctxHandlerArm ctx) = err ctx
   -- A PRODUCER THUNK: a lambda whose result type is itself an affine carrier
   -- (e.g. @\\() -> start (asConc c)@ of type @() -> Step …@). Such a lambda is the
   -- structural carrier constructor demanded by a driver that must call @start@
@@ -582,6 +620,14 @@ freeVarsArm arm = case arm of
 -- alias, a computed future, etc.) over-approximates to 'Many' (see
 -- 'consumeCard'), so unanalyzable flow is rejected, consistent with the carrier
 -- rule's locality.
+--
+-- NOT every marked carrier tycon is affine. The caller ('Infer.hs') passes
+-- this pass a carrier-name set PRE-FILTERED to 'tcAffine' tycons only (a
+-- strict subset of the full carrier set the escape check, 'checkCarriers',
+-- consults) -- so a second-class but non-affine carrier (e.g. 'Borrow', FFI
+-- Slice 3 Task 1) is invisible to 'isAffineCarrierType' here and incurs no
+-- consume-once bound, while it still cannot escape its scope (that rejection
+-- is unconditional, driven by the unfiltered set).
 -- ---------------------------------------------------------------------------
 
 -- | The non-consuming reader registry, resolved by EXTERN IDENTITY. A Future
@@ -625,9 +671,9 @@ preludeReaderNames = Set.empty
 -- reader name in it is a user redefinition (not the prelude extern) and is NOT
 -- trusted (it is treated as a consumer).
 checkFutureAffine
-  :: Set Text -> Set Text -> SourceSpan -> Text
+  :: AffineCarrierTys -> Set Text -> SourceSpan -> Text
   -> [([TPat], TExpr)] -> Either TypeError ()
-checkFutureAffine carrierTys ownTopLevel sp name clauses = mapM_ checkClause clauses
+checkFutureAffine (AffineCarrierTys carrierTys) ownTopLevel sp name clauses = mapM_ checkClause clauses
   where
     trust = ReaderTrust preludeReaderNames
                         (Set.intersection preludeReaderNames ownTopLevel)
@@ -906,10 +952,21 @@ futureBindersOfDecls carrierTys decls = Set.unions
   ]
   where typeOf (Texp t _) = t
 
--- | Is this an AFFINE carrier type — a MARKED carrier tycon (consume-once)?
--- A 'Suspension' is consumed when passed as an argument; a 'Step' is consumed
--- when it is the SCRUTINEE of a @case@. Effect-instance handles are carriers but
--- are NOT subject to the consumption bound, so they are excluded here.
+-- | Is this type's tycon a MARKED carrier in the given set? A pure
+-- Set-membership predicate -- what "affine" means depends entirely on which
+-- set the caller passes:
+--
+--   * 'checkFutureAffine' (and its helpers) pass the AFFINE SUBSET only (see
+--     the note above), so here it precisely means "is this consume-once" --
+--     a 'Suspension' is consumed when passed as an argument; a 'Step' is
+--     consumed when it is the SCRUTINEE of a @case@.
+--   * 'checkCarriers' ('isInlineFutureApp'/'isProducerThunk') passes the FULL
+--     carrier set, so here it means "is this ANY marked carrier" -- an
+--     unnamed, freshly-produced carrier (affine or not, e.g. a future
+--     'Borrow') must not escape a non-allowed position either.
+--
+-- Effect-instance handles are carriers but are NOT subject to the consumption
+-- bound, so they are excluded here regardless of which set is passed.
 isAffineCarrierType :: Set Text -> CType -> Bool
 isAffineCarrierType carrierTys (CTCon (TcUser n) _) = Set.member n carrierTys
 isAffineCarrierType _          _                     = False

@@ -1,0 +1,57 @@
+module Std.Borrow
+import Std.Base
+
+-- FOREIGN BORROW (prelude-declared `extern`; FFI Slice 3 Task 1).
+--
+-- `Borrow` is the opaque, second-class, NON-AFFINE foreign borrow handle: it
+-- may not escape the scope it was received in (the same `extern type` carrier
+-- wall as `Suspension`/`Step`/`ContCell`), but unlike those it is NOT
+-- consume-once -- it may be read any number of times. This is TYPE-LEVEL ONLY
+-- (no runtime representation yet); the runtime cell and the foreign buffer
+-- free land in a later task.
+extern type Borrow
+
+-- The read surface (Task 3): all zero-copy, all second-class -- the RESULT of
+-- `slice` is itself a `Borrow` and may not escape either. `byteAt` follows the
+-- Bytes/String precedent for bounds behavior (out-of-range is a runtime
+-- error); `slice` saturates instead (an out-of-range `i`/`j` is clamped to the
+-- buffer, and a backward range `j < i` yields an empty slice), matching
+-- `String.slice`/`String.byteSlice`.
+extern length : Borrow -> U64
+extern byteAt : Borrow -> U64 -> U64
+extern slice  : Borrow -> U64 -> U64 -> Borrow
+extern memchr : Borrow -> U64 -> Option U64
+
+-- The escape hatch (Task 3): materialize an OWNED copy of the borrowed range.
+-- The result is a plain `Bytes`, not a `Borrow`, so it may escape its scope
+-- freely (no `CarrierEscape`).
+extern copy : Borrow -> Bytes
+
+-- PERMANENT internal, prelude-only test fixture (`extern`-gated) exercising
+-- the read surface above (Task 3). Returns a `Borrow` over a deterministic
+-- buffer (`buf[i] = i & 0xFF`); on the C backend this is a FRESH `malloc`
+-- per call that is intentionally never freed -- a per-call leak-by-design
+-- fixture (valid for the rest of the process's lifetime since nothing ever
+-- frees it, but NOT a single buffer shared across calls), so this intrinsic
+-- carries none of the lend/close lifetime machinery a real producer needs;
+-- the freed lend-then-close path is covered by `Demo.lendBuffer` below and
+-- its close-count tests instead. Task 4 ADDS `Demo.lendBuffer`, below, as
+-- the real user-facing surface ALONGSIDE this fixture (not a replacement
+-- for it) -- mirroring how Slice 2 kept `__ffi_demo_copy`/`__ffi_demo_adopt`
+-- as permanent internal fixtures after the real FFI surface landed.
+extern __borrow_demo : U64 -> Borrow
+
+-- The `foreign module` surface's borrow disposition (Task 4): a member whose
+-- return TYPE is `Borrow` -- no new `borrowed`-style keyword, unlike `owned`.
+-- `lendBuffer n` returns a `Borrow` over `min n 65536` deterministic bytes
+-- (`buf[i] = i & 0xFF`), the "wok" library tag identifying it as a
+-- wok-internal deterministic producer, not a real C library call (no
+-- `dlopen`, nothing is actually linked). This is the surface-level twin of
+-- `__borrow_demo` above; unlike that fixture, `lendBuffer` is backed by a
+-- genuine malloc'd lend-THEN-FREE pair (Task 5): the buffer is malloc'd
+-- fresh per call and freed by a liveness-placed `close` at the borrowing
+-- activation's exit (sound because `Borrow` cannot escape -- Task 1's
+-- carrier rule), so this producer's lifetime IS analyzed, unlike
+-- `__borrow_demo`'s deliberate per-call leak.
+foreign module Demo "wok" where
+  lendBuffer : U64 -> Borrow with IO

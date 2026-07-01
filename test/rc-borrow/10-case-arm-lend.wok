@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 5 (both arms of a case). `bodyLendsBorrow` sees the DispBorrow
+-- calls reachable in BOTH the scrutinee and the taken arm, so the body opens ONE
+-- activation close-set and the KBorrowCloseRC bracket sits above the whole case.
+-- Whichever arm the scrutinee selects, every borrow lent on THAT exit path is
+-- registered and freed exactly once; a lend in the NOT-taken arm never executes,
+-- so it is never registered. Here the scrutinee's [0,1,2,3] has no byte 99, so
+-- memchr misses -> the None arm runs and lends its own 16-byte borrow.
+--
+-- scrutinee: Demo.lendBuffer 4 -> [0,1,2,3]; memchr ... 99 = None  (one buffer)
+-- None arm:  Demo.lendBuffer 16 -> [0..15]; length = 16            (one buffer)
+-- Both buffers are freed at the activation exit -> closes = 2; result = 16.
+main : U64
+main =
+  case memchr (Demo.lendBuffer 4) 99 of
+    Some off -> off
+    None -> length (Demo.lendBuffer 16)

@@ -81,10 +81,12 @@ loadProgram entry extras = runExceptT $ do
   stdStringLM    <- liftEither (parseAndPrep "<Std.String>" Embedded stdStringText)
   stdBytesText   <- liftIO Prelude.stdBytesSource
   stdBytesLM     <- liftEither (parseAndPrep "<Std.Bytes>" Embedded stdBytesText)
+  stdBorrowText  <- liftIO Prelude.stdBorrowSource
+  stdBorrowLM    <- liftEither (parseAndPrep "<Std.Borrow>" Embedded stdBorrowText)
   extraLMs       <- traverse (ExceptT . loadOne) extras
   entryLM        <- ExceptT (loadOne entry)
   mm             <- liftEither
-                      (buildMap (preludeLM : stdControlLM : stdArrayLM : stdStringLM : stdBytesLM : extraLMs ++ [entryLM]))
+                      (buildMap (preludeLM : stdControlLM : stdArrayLM : stdStringLM : stdBytesLM : stdBorrowLM : extraLMs ++ [entryLM]))
   ms          <- liftEither (topoSort mm)
   pure (lmName entryLM, ms)
 

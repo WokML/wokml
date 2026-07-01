@@ -34,16 +34,16 @@ initialEnv = emptyEnv
 
     tyConEntries :: [(Text, TyConInfo)]
     tyConEntries =
-      [ ("U64",    TyConInfo KStar 0 [] False [])
-      , ("U32",    TyConInfo KStar 0 [] False [])
-      , ("String", TyConInfo KStar 0 [] False [])
-      , ("Bytes",  TyConInfo KStar 0 [] False [])
-      , ("Never",  TyConInfo KStar 0 [] False [])
-      , ("Char",   TyConInfo KStar 0 [] False [])
-      , ("()",     TyConInfo KStar 0 [] False [])
-      , ("[]",     TyConInfo listKind 1 [] False [KStar])
-      , ("Array",  TyConInfo listKind 1 [] False [KStar])
-      ] ++ [ (tupleName n, TyConInfo (tupleKind n) n [] False (replicate n KStar)) | n <- [2 .. 16] ]
+      [ ("U64",    TyConInfo KStar 0 [] False True [])
+      , ("U32",    TyConInfo KStar 0 [] False True [])
+      , ("String", TyConInfo KStar 0 [] False True [])
+      , ("Bytes",  TyConInfo KStar 0 [] False True [])
+      , ("Never",  TyConInfo KStar 0 [] False True [])
+      , ("Char",   TyConInfo KStar 0 [] False True [])
+      , ("()",     TyConInfo KStar 0 [] False True [])
+      , ("[]",     TyConInfo listKind 1 [] False True [KStar])
+      , ("Array",  TyConInfo listKind 1 [] False True [KStar])
+      ] ++ [ (tupleName n, TyConInfo (tupleKind n) n [] False True (replicate n KStar)) | n <- [2 .. 16] ]
 
     conEntries :: [(Text, ConInfo)]
     conEntries = []

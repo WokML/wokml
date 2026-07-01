@@ -51,8 +51,15 @@ data TyConInfo = TyConInfo
   , tcCons :: [Text]
   , tcCarrier :: Bool
     -- ^ True iff declared by an @extern data@/@extern type@ (Embedded-only). A
-    -- carrier tycon is second-class (no escape) and affine (consume-once); the
-    -- Carrier analyses consult this flag, not a TyCon tag.
+    -- carrier tycon is second-class (no escape); the Carrier analyses consult
+    -- this flag, not a TyCon tag.
+  , tcAffine :: Bool
+    -- ^ True iff this carrier is consume-once (affine) -- e.g. 'Suspension'/
+    -- 'Step'/'ContCell' may be used at most once in a consuming position.
+    -- False marks a carrier that stays second-class (no escape) but may be
+    -- read any number of times, e.g. 'Borrow' (FFI Slice 3). Meaningless when
+    -- 'tcCarrier' is False; defaults to True everywhere so every carrier
+    -- declared before this flag existed is unchanged.
   , tcParamKinds :: [Kind]
     -- ^ Kind of each parameter, in order (KStar for bare, KEffect for @(row e)@);
     -- slice B. Length matches 'tcArity'.

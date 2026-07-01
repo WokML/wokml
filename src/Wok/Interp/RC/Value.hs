@@ -60,6 +60,10 @@ module Wok.Interp.RC.Value
   , windowOpen
   , windowRegister
   , windowClose
+    -- * Foreign-borrow close-set (FFI Slice 3 Task 5)
+  , borrowOpen
+  , borrowRegister
+  , borrowClose
   , deref
   , derefPure
   , mkClosure
@@ -105,6 +109,9 @@ module Wok.Interp.RC.Value
   , allocNBytes
   , allocForeignBytes
   , adoptCHeapPtr
+    -- * Borrow-view C-cell support (FFI Slice 3)
+  , wokBorrowViewTag
+  , allocBorrowView
     -- * Array in-place mutation helpers (Slice C)
   , atIndex
   , setAt
@@ -134,7 +141,7 @@ import qualified Data.Text as Tx
 import Data.Word (Word8, Word32, Word64)
 import Foreign.Marshal.Alloc (mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr, wordPtrToPtr, WordPtr (..))
+import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr, wordPtrToPtr, WordPtr (..), nullPtr)
 import Wok.Interp.RC.Heap (WokObj, WokHeap)
 import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.Value (RuntimeError (..))
@@ -339,6 +346,26 @@ data RCKont
     -- release build never pushes it, so the pass-through cases in
     -- 'continuationOwned'/'continuationReservations'/'spliceKont'/'rcFindHandler'
     -- are TOTALITY cases, never exercised by a normal run.
+  | KBorrowCloseRC RCKont
+    -- ^ The PER-ACTIVATION FOREIGN-BORROW CLOSE BRACKET (FFI Slice 3 Task 5). Pushed
+    -- ABOVE a body's continuation when that body can LEND a foreign borrow
+    -- ('bodyLendsBorrow', a body containing a 'DispBorrow' foreign call, see
+    -- 'Wok.Interp.RC.Machine'), in lockstep with the 'borrowOpen' close-set frame. When
+    -- the body's final value returns into this frame it runs 'borrowClose' (free every
+    -- malloc'd borrow buffer registered in this activation, exactly once) and threads the
+    -- value onward. Fires on EVERY exit path STRUCTURALLY, exactly like 'KArenaCloseRC',
+    -- and is likewise DEPTH-INVISIBLE ('kontDepth' does not count it).
+    --
+    -- ACTIVATION-SCOPED SOUNDNESS. The 'Borrow' carrier rule (Task 1) makes a borrow and
+    -- all its slices NON-ESCAPING (returning/storing/capturing one is a compile-time
+    -- 'CarrierEscape'), so every read of the family provably happens INSIDE the body,
+    -- BEFORE this frame runs. Freeing the buffer here is therefore never a use-after-free;
+    -- a precise free-ASAP family-liveness is a deferred optimization. Like the arena
+    -- bracket, this frame never appears in a reified continuation prefix: a borrow-lending
+    -- run is in the handler-free fragment ('firstOrderNoHandlerViolations' rejects
+    -- handlers from 'runModuleRC'), so the pass-through cases in
+    -- 'continuationOwned'/'continuationReservations'/'spliceKont'/'rcFindHandler' are
+    -- TOTALITY cases.
   deriving (Eq, Show)
 
 -- | Number of frames in a continuation (the RC analogue of
@@ -359,6 +386,8 @@ kontDepth = go 0
     go n (KArenaCloseRC k)   = go n k
     -- The window-set bracket (death-test) is likewise depth-invisible bookkeeping.
     go n (KWindowCloseRC k)  = go n k
+    -- The foreign-borrow close bracket (Task 5) is likewise depth-invisible bookkeeping.
+    go n (KBorrowCloseRC k)  = go n k
 
 -- | The OWNED SET of a captured continuation prefix (M2b-1, the crux; spec §4.2):
 -- the addresses the continuation's own pending drop/move instructions would free
@@ -403,6 +432,9 @@ continuationOwned = dedup . go
     -- The window-set bracket (death-test) owns no continuation values (totality
     -- only; the death-test flag and continuation reification do not co-occur).
     go (KWindowCloseRC k)     = go k
+    -- The foreign-borrow close bracket owns no continuation values (totality only;
+    -- a borrow-lending run is handler-free, so never reified, see KBorrowCloseRC).
+    go (KBorrowCloseRC k)     = go k
     -- A nested handler frame in the captured prefix owns its PARAMETER value (if
     -- any).  Only the parameter slot is owned by the frame itself; the rest of
     -- hsc is the captured enclosing scope, whose binders are owned by their own
@@ -542,6 +574,7 @@ continuationReservations k0 reserved = dedup (go k0)
     go (KAppRC vs k)         = fromValues vs ++ go k
     go (KArenaCloseRC k)     = go k  -- totality only (never reified, see KArenaCloseRC)
     go (KWindowCloseRC k)    = go k  -- totality only (death-test never reified)
+    go (KBorrowCloseRC k)    = go k  -- totality only (borrow-lending run is handler-free)
     -- PARAM-ONLY, mirroring 'continuationOwned's KHandleRC arm: a nested handler
     -- frame in the captured prefix OWNS only its parameter slot; the rest of its
     -- 'hsc' is the captured ENCLOSING scope (a DIFFERENT continuation's bindings).
@@ -665,6 +698,7 @@ spliceKont prefix tl = go prefix
     go (KDropCellRC a k)      = KDropCellRC a (go k)
     go (KArenaCloseRC k)      = KArenaCloseRC (go k)  -- totality only (never reified)
     go (KWindowCloseRC k)     = KWindowCloseRC (go k)  -- totality only (death-test never reified)
+    go (KBorrowCloseRC k)     = KBorrowCloseRC (go k)  -- totality only (borrow run is handler-free)
 
 -- ---------------------------------------------------------------------------
 -- Heap nodes
@@ -710,6 +744,18 @@ data Node
   -- but charges a FIXED 24 B handle ('wouldBeCBytes'), modeling that the buffer is
   -- off-heap -- so the oracle pins the zero-copy saving vs a copy-in 'NBytes'. No child
   -- refs ('nodeValues' = []), like 'NBytes'.
+  | NBorrowView ByteString
+  -- ^ An UNCOUNTED-OWNERSHIP foreign-buffer VIEW: a BORROW, not an adopt (FFI Slice 3
+  -- Task 2). On 'CHeap' a 'WokBorrowView' cell (tag 0xFFFA), byte-identical in layout
+  -- to 'WokForeignBytes' (24 B: header + raw ptr + len), but its drop NEVER frees the
+  -- pointed-at buffer -- neither 'wok_free' (C) nor 'dropAddr' (Haskell) touch it, since
+  -- wok does not own it (contrast 'NForeignBytes'). The buffer's real lifetime is the
+  -- PRODUCER's responsibility (a later FFI Slice 3 task's lend/close); this node is a
+  -- temporary, scoped, zero-copy read-through window. On 'AbstractHeap' it holds the
+  -- bytes for op/output faithfulness (a pure window over the producer's bytes -- "no
+  -- real foreignness" since the abstract model has no raw pointers) but charges the
+  -- SAME fixed 24 B handle ('wouldBeCBytes'), mirroring 'NForeignBytes'. No child refs
+  -- ('nodeValues' = []): the pointer is foreign, not a counted ref.
   | NRecord Text (Map Text RCValue)
   | NClosure REnv [Binder] Expr CaptureMode
   -- ^ The 'REnv' captures live RC values. Compare 'VClosure' in
@@ -831,6 +877,38 @@ data Stats = Stats
                          --   @arena_bytes@ region (spec §3.1, §6).
   , stArenaPeak :: Int   -- ^ high-water mark of 'stArenaBytes' (mirrors C
                          --   @arena_peak@). Never reset by 'arenaClose'.
+  , stCloses    :: Int   -- ^ total foreign-borrow buffer CLOSES (FFI Slice 3 Task 5):
+                         --   the count of malloc'd `Demo.lendBuffer` buffers freed at
+                         --   their borrowing activation's exit ('borrowClose'). A LOGICAL
+                         --   counter bumped IDENTICALLY on both backends (CHeap also
+                         --   performs the real @free@; AbstractHeap has no buffer to free,
+                         --   only counts), so the abstract/C parity oracle pins "exactly
+                         --   one close per lent buffer". Off-heap, so it touches none of
+                         --   the cell counters above.
+  , stBorrowLentCur  :: Word64  -- ^ CURRENT off-heap bytes lent by outstanding foreign-
+                         --   borrow buffers (FFI Slice 3 xhigh review, Fix 1): the running
+                         --   total of malloc'd `Demo.lendBuffer` buffer sizes registered
+                         --   ('borrowRegister') but not yet freed ('borrowClose'). Bumped
+                         --   IDENTICALLY on both backends -- CHeap really mallocs the
+                         --   buffer, AbstractHeap has none, but BOTH charge the same
+                         --   logical size so the abstract/C oracle stays in lockstep,
+                         --   exactly like 'stCloses'. Off-heap, so this is a SEPARATE set
+                         --   of books from 'stCurBytes'/'stPeakBytes' (which count only
+                         --   on-heap wok_rc cells) -- deliberately NOT folded into
+                         --   'stPeakBytes', so it never trips the C runtime's
+                         --   @WOK_RC_CHECK_PHYSICAL@ invariant for a legitimate deep
+                         --   borrow loop.
+  , stBorrowLentPeak :: Word64  -- ^ high-water mark of 'stBorrowLentCur' (mirrors how
+                         --   'stPeakBytes' tracks 'stCurBytes'). This is the OBSERVABLE
+                         --   signal for the activation-scoped-close limitation: a borrow
+                         --   lent inside a tail-recursive loop is only freed when its
+                         --   OWN lending activation exits, which (because the tail call
+                         --   nests inside that activation's body) does not happen until
+                         --   the whole chain of calls unwinds -- so N loop iterations
+                         --   each lending one buffer accumulate to an O(N) peak here,
+                         --   even though the interpreter's own call stack never grows
+                         --   (TCO). Never reset; a monotonic high-water mark for the
+                         --   whole run.
   }
   deriving (Eq, Show)
 
@@ -958,6 +1036,25 @@ data Store = Store
     -- registered (a freed C cell cannot be safely probed for liveness), so the
     -- death-test is an 'AbstractHeap' analysis tool, matching the corpus/negative-
     -- control test seam ('runExprRC', AbstractHeap).
+  , stBorrowClose :: [[(Ptr Word8, Word64)]]
+    -- ^ the per-activation FOREIGN-BORROW CLOSE-SET stack (FFI Slice 3 Task 5). A STACK
+    -- of malloc'd-buffer @(base ptr, CLAMPED size)@ pairs, head = the innermost open
+    -- activation. 'borrowOpen' pushes an empty frame on entry of every body that can lend
+    -- a borrow ('bodyLendsBorrow'); the 'Demo.lendBuffer' producer ('allocBorrowDemoLend')
+    -- records the buffer's BASE ptr (the one to free) AND its size (xhigh review Fix 1: so
+    -- 'borrowClose' can subtract exactly what was charged to 'stBorrowLentCur') in the
+    -- innermost frame at the producing call; 'borrowClose' frees every ptr in the innermost
+    -- frame EXACTLY ONCE at activation exit (the 'KBorrowCloseRC' bracket) and pops it.
+    -- Pushed/popped in lockstep with the activation bracket so the depths never diverge,
+    -- exactly like 'stWindowSet'/'stArena'.
+    --
+    -- A slice of a borrow shares the SAME base buffer, so 'borrowSliceRC' registers
+    -- NOTHING (the base is closed once, covering the whole family). On 'AbstractHeap' there
+    -- is no real buffer: the producer registers a 'nullPtr' sentinel (with the SAME logical
+    -- size, so 'stBorrowLentCur'/'stBorrowLentPeak' agree with 'CHeap' just like 'stCloses')
+    -- so the close COUNT matches the C backend, and 'borrowClose' frees nothing. EMPTY
+    -- whenever no enclosing body lends a borrow (the common case): no frame, no overhead,
+    -- behaviour byte-identical to before.
   }
 
 -- | Which heap an 'NCon' is allocated into. 'AbstractHeap' is the default and is
@@ -1005,7 +1102,7 @@ emptyStore = Store
   , stNext       = 0
   , stNextStatic = -1
   , stDead       = IS.empty
-  , stStats      = Stats 0 0 0 0 0 0 0 0
+  , stStats      = Stats 0 0 0 0 0 0 0 0 0 0 0
   , stBackend    = AbstractHeap
   , stTagFwd     = Map.empty
   , stTagRev     = IM.empty
@@ -1015,6 +1112,7 @@ emptyStore = Store
   , stArenaC     = []
   , stArenaHandles = []
   , stWindowSet  = []
+  , stBorrowClose = []
   }
 
 -- | Intern a constructor name to its stable tag-id, allocating a fresh id on
@@ -1038,12 +1136,14 @@ internTag con s = case Map.lookup con (stTagFwd s) of
         -- cell discriminator. Apply bumps in ASCENDING order of the reserved
         -- values (lowest-reserved-tag first) so each bump shifts the running
         -- value past the next reserved slot.
+        --   0xFFFA = WOK_BORROW_VIEW_TAG   (FFI Slice 3 borrowed-buffer view)
         --   0xFFFB = WOK_FOREIGN_BYTES_TAG (FFI Slice 1 adopted foreign buffer)
         --   0xFFFC = WOK_BYTES_TAG         (E6 bytes cell)
         --   0xFFFD = WOK_STRING_VIEW_TAG   (E4 string-view cell)
         --   0xFFFE = WOK_STRING_TAG        (E1 string cell)
         --   0xFFFF = WOK_ARRAY_TAG         (array cell)
-        wF  = if raw >= wokForeignBytesTag then raw + 1 else raw
+        wV  = if raw >= wokBorrowViewTag   then raw + 1 else raw
+        wF  = if wV  >= wokForeignBytesTag then wV  + 1 else wV
         w0  = if wF  >= wokBytesTag        then wF  + 1 else wF
         w1  = if w0  >= wokStringViewTag   then w0  + 1 else w0
         w2  = if w1  >= wokStringTag       then w1  + 1 else w1
@@ -1091,6 +1191,13 @@ wokStringViewTag = 0xFFFD
 -- 'internTag' never assigns this to a constructor.
 wokForeignBytesTag :: Word32
 wokForeignBytesTag = 0xFFFB
+
+-- | The reserved C tag value for borrowed-buffer view cells (WOK_BORROW_VIEW_TAG,
+-- FFI Slice 3): a 24-byte handle holding a RAW pointer into a foreign buffer wok
+-- does NOT own (contrast 'wokForeignBytesTag', which DOES own its buffer and frees
+-- it at refcount-zero). 'internTag' never assigns this to a constructor.
+wokBorrowViewTag :: Word32
+wokBorrowViewTag = 0xFFFA
 
 -- | The reserved C tag value for bytes cells (WOK_BYTES_TAG). A 'CAddr' cell
 -- with this tag is always a 'WokBytes' (flat byte buffer: header + byte_len).
@@ -1625,6 +1732,85 @@ windowClose s = case stWindowSet s of
          else liftRC (Left (PrimError
                 (Tx.pack "view escaped its birth activation (death-test)")))
 
+-- ---------------------------------------------------------------------------
+-- Foreign-borrow close-set (FFI Slice 3 Task 5): the ACTIVATION-SCOPED close.
+--
+-- The 'Borrow' carrier rule (Task 1) guarantees a borrow and all its slices CANNOT
+-- escape their birth activation (return/store/capture is a compile-time
+-- 'CarrierEscape'). So freeing the lent buffer at ACTIVATION EXIT is sound: every read
+-- of the family provably happened earlier in the body. This trio is the runtime side of
+-- that discipline -- the SAME activation-bracket shape as 'windowOpen'/'windowClose', but
+-- always on (the real free, not a death-test assertion). A precise free-ASAP
+-- family-liveness is a deferred optimization, not needed for soundness.
+
+-- | Push an empty close-set frame for a fresh activation (FFI Slice 3 Task 5). The machine
+-- calls this on entry of every body that can lend a borrow ('bodyLendsBorrow'); 'borrowClose'
+-- pops the matching frame on every exit path. Pushed/popped in lockstep with the activation
+-- bracket so the depths never diverge.
+borrowOpen :: Store -> Store
+borrowOpen s = s { stBorrowClose = [] : stBorrowClose s }
+
+-- | Register a malloc'd borrow buffer's BASE ptr and CLAMPED size in the innermost
+-- close-set frame, to be freed exactly once at activation exit (FFI Slice 3 Task 5), and
+-- charge the size to the OBSERVABLE 'stBorrowLentCur' running total / 'stBorrowLentPeak'
+-- high-water mark (xhigh review Fix 1). Called by the producer ('allocBorrowDemoLend') at
+-- the lending call. On 'AbstractHeap' the producer passes 'nullPtr' (no real buffer) but
+-- the SAME logical size: the entry only contributes to the close COUNT and the lent-bytes
+-- total so the abstract and C 'stCloses'/'stBorrowLentCur' agree; 'borrowClose' frees
+-- nothing for it. A slice shares the SAME base buffer, so 'borrowSliceRC' registers
+-- NOTHING -- the family is covered by the one base close.
+--
+-- FAIL LOUD (xhigh review Fix 2) when no close-set frame is open. A borrow-lending
+-- activation ALWAYS opens one via 'borrowOpen' ('enterBodyRC' checks 'bodyLendsBorrow'
+-- on every call), so an empty stack here means this borrow was produced by an expression
+-- run through the bare 'runExprRC' seam, which evaluates directly with 'runRC' and never
+-- calls 'enterBodyRC' -- so no frame is ever opened. The prior behaviour silently no-op'd,
+-- letting the malloc'd buffer's ptr fall on the floor with no diagnostic: a genuine,
+-- invisible leak. Failing loud here turns that into a caught invariant violation instead.
+borrowRegister :: Ptr Word8 -> Word64 -> Store -> Store
+borrowRegister p sz s = case stBorrowClose s of
+  [] -> error
+    (  "borrowRegister: borrow produced with no open close-set frame -- the "
+    <> "borrowing activation was not entered via enterBodyRC (run borrow-lending "
+    <> "expressions via runExprRCBracketed / runModuleRC, not runExprRC)" )
+  (top : rest) ->
+    let g   = stStats s
+        cur = stBorrowLentCur g + sz
+    in s { stBorrowClose = ((p, sz) : top) : rest
+         , stStats = g { stBorrowLentCur  = cur
+                       , stBorrowLentPeak = max (stBorrowLentPeak g) cur
+                       }
+         }
+
+-- | Close the innermost activation's borrow close-set frame (FFI Slice 3 Task 5): free
+-- every registered malloc'd buffer EXACTLY ONCE, bump 'stCloses' by the frame size,
+-- subtract every freed buffer's size from 'stBorrowLentCur' (xhigh review Fix 1), and pop
+-- the frame. The free is a real @wok_borrow_demo_close@ on 'CHeap' (where the ptrs are
+-- genuine off-heap malloc'd buffers); on 'AbstractHeap' there is no buffer (the ptrs are
+-- 'nullPtr' sentinels) so only the logical counts advance -- keeping the two backends
+-- stat-identical. The buffer is off the WokHeap, so this touches no cell counters. With no
+-- open frame this is a no-op. The 0xFFFA view HANDLE's refcount is SEPARATE and unchanged:
+-- handles are freed by normal Perceus drop at their last use; this frees only the buffer.
+borrowClose :: Store -> RC Store
+borrowClose s = case stBorrowClose s of
+  []           -> pure s
+  (top : rest) -> do
+    case stBackend s of
+      CHeap _      -> liftIO (mapM_ (closeOne . fst) top)
+      AbstractHeap -> pure ()
+    let g          = stStats s
+        freedBytes = sum (map snd top)
+        g'         = g { stCloses = stCloses g + length top
+                       , stBorrowLentCur = stBorrowLentCur g - freedBytes
+                       }
+    pure s { stBorrowClose = rest, stStats = g' }
+  where
+    -- free(NULL) is a no-op; on CHeap the producer always registers a real ptr, so the
+    -- guard only ever skips a defensive nullPtr.
+    closeOne p
+      | p == nullPtr = pure ()
+      | otherwise    = H.wokBorrowDemoClose p
+
 -- | Allocate a fresh node on the heap. Returns the new 'Addr' and the updated
 -- 'Store'. The cell is initialised with a reference count of 1.
 --
@@ -1654,6 +1840,16 @@ alloc (NBytes bs)        s = case stBackend s of
 alloc (NForeignBytes bs) s = case stBackend s of
   CHeap hp     -> allocForeignBytes hp bs s
   AbstractHeap -> pure (allocPure (NForeignBytes bs) s)
+-- CATCH-ALL GUARD (FFI Slice 3 Task 2 review). This arm always lands on the
+-- ABSTRACT heap ('allocPure'), even when 'stBackend s' is 'CHeap' -- it has NO
+-- per-node CHeap dispatch. That is correct for node kinds that are ALWAYS
+-- abstract ('NClosure'/'NRecord'/'NCont'/'NContCell'/'NEnv'/'NGroupCode'), but
+-- 'NBorrowView' and 'NStringView' DO have a real CHeap representation with its
+-- own dedicated entry point ('allocBorrowView'/'allocNStringView' respectively)
+-- that a CHeap caller MUST use instead -- routing either through this generic
+-- 'alloc' under a CHeap backend would silently produce an 'HAddr' (abstract)
+-- cell instead of the intended 'CAddr', a confusing oracle mismatch with no
+-- type error to catch it.
 alloc n             s = pure (allocPure n s)
 
 -- | A nullary constructor becomes an inline immediate carrying the interned
@@ -1837,6 +2033,22 @@ adoptCHeapPtr hp p len s = do
   cell <- liftIO (H.wokForeignBytesAlloc hp p len)
   pure (CAddr cell, s { stStats = recordAlloc 24 (stStats s) })
 
+-- | Wrap an ALREADY-existing pointer as a 'WokBorrowView' cell on the real C
+-- heap, WITHOUT taking ownership: no malloc, no copy, and -- unlike
+-- 'adoptCHeapPtr' -- no free obligation either. Charges the fixed 24 B handle.
+-- Mirrors 'adoptCHeapPtr' exactly except for the ownership disposition: the
+-- caller (the buffer's real producer) retains responsibility for the buffer's
+-- lifetime; 'dropAddr' on this cell's tag never calls 'free' on the pointer.
+--
+-- This is the genuine zero-copy entry point a borrow producer uses (FFI Slice 3
+-- Task 2): given a 'Ptr Word8' already obtained from elsewhere (e.g. a foreign
+-- call result, or another wok cell's data pointer), wrap it as a borrowed view
+-- with no copy and no ownership transfer.
+allocBorrowView :: Ptr WokHeap -> Ptr Word8 -> Word64 -> Store -> RC (Addr, Store)
+allocBorrowView hp p len s = do
+  cell <- liftIO (H.wokBorrowViewAlloc hp p len)
+  pure (CAddr cell, s { stStats = recordAlloc 24 (stStats s) })
+
 -- | Allocate an 'NStringView' node: a counted window into a parent string buffer.
 -- The parent is increffed (the view owns one counted ref) then the view cell is
 -- allocated -- on the abstract 'IntMap' heap ('AbstractHeap') or as a 32-byte
@@ -1920,6 +2132,7 @@ nodeCEligible (NString _)        = False  -- has its own dedicated alloc path (n
 nodeCEligible (NStringView{})    = False  -- has its own dedicated alloc path
 nodeCEligible (NBytes _)         = False  -- has its own dedicated alloc path (not NCon slot encoding)
 nodeCEligible (NForeignBytes _)  = False  -- has its own dedicated alloc path (adopted foreign buffer)
+nodeCEligible (NBorrowView _)    = False  -- has its own dedicated alloc path (borrowed buffer view)
 nodeCEligible _                  = False
 
 -- | The field count of a node (FBIP placement match). Only an 'NCon' has a
@@ -1958,6 +2171,10 @@ wouldBeCBytes (NBytes bs)        = 16 + 8 * ((BS.length bs + 7) `div` 8)
 -- Foreign-bytes handle: fixed 24 B (header 8 + data_ptr 8 + byte_len 8). The buffer
 -- itself is off-heap (libc-malloc'd), so only the cell handle is counted.
 wouldBeCBytes (NForeignBytes _)  = 24
+-- Borrow-view handle: fixed 24 B, byte-identical layout to NForeignBytes (header 8 +
+-- ptr 8 + byte_len 8). The borrowed buffer is off-heap and NOT owned, so only the
+-- cell handle is counted -- same charge as NForeignBytes, different drop semantics.
+wouldBeCBytes (NBorrowView _)    = 24
 wouldBeCBytes _                  = 0
 
 -- | Allocate a node into the STATIC immortal region. Returns a NEGATIVE 'Addr'
@@ -2063,8 +2280,9 @@ deref (InlineStr bs) _ = pure (Cell 0 (NString bs) 0)
 -- | Reconstruct the 'Cell' of a C-heap cell from its header. Dispatches on the
 -- tag field: 'wokArrayTag' (0xFFFF) produces an 'NArray'; 'wokStringTag'
 -- (0xFFFE) produces an 'NString'; 'wokStringViewTag' (0xFFFD) produces an
--- 'NStringView'; 'wokBytesTag' (0xFFFC) produces an 'NBytes'; any other tag
--- produces an 'NCon' via 'readCConValues'.
+-- 'NStringView'; 'wokBytesTag' (0xFFFC) produces an 'NBytes'; 'wokForeignBytesTag'
+-- (0xFFFB) produces an 'NForeignBytes'; 'wokBorrowViewTag' (0xFFFA) produces an
+-- 'NBorrowView'; any other tag produces an 'NCon' via 'readCConValues'.
 --
 -- THE @cRc@ FIELD IS A MEANINGLESS PLACEHOLDER (always 0) for a C cell: the real
 -- reference count lives in the C runtime (the @rc@ word of the @WokObj@). NO
@@ -2099,9 +2317,13 @@ readCCell p s = do
             then do
               bs <- readCForeignBytesBytes p
               pure (Cell 0 (NForeignBytes bs) 0)
-            else do
-              vs <- readCConValues p s
-              pure (Cell 0 (NCon (tagName tid s) vs) 0)
+            else if tid == wokBorrowViewTag
+              then do
+                bs <- readCBorrowViewBytes p
+                pure (Cell 0 (NBorrowView bs) 0)
+              else do
+                vs <- readCConValues p s
+                pure (Cell 0 (NCon (tagName tid s) vs) 0)
 
 -- | Decode a C array cell's slots back to @[RCValue]@, reading the header
 -- @elemkind@ once. Delegates to 'readCArraySlots' with the decoded kind. Used by
@@ -2150,6 +2372,17 @@ readCForeignBytesBytes :: Ptr WokObj -> IO ByteString
 readCForeignBytesBytes p = do
   len     <- H.wokForeignBytesLen p
   dataPtr <- H.wokForeignBytesPtr p
+  BS.packCStringLen (castPtr dataPtr, fromIntegral len)
+
+-- | Read all bytes of a 'WokBorrowView' C cell back into a 'ByteString'. Used by
+-- 'readCCell' (deref) to reconstruct the node faithfully. A COPYING read for
+-- inspection/rendering purposes only -- the live runtime read-through path (FFI
+-- Slice 3's later tasks) reads 'wokBorrowViewPtr'/'wokBorrowViewLen' directly
+-- with no intermediate 'ByteString'.
+readCBorrowViewBytes :: Ptr WokObj -> IO ByteString
+readCBorrowViewBytes p = do
+  len     <- H.wokBorrowViewLen p
+  dataPtr <- H.wokBorrowViewPtr p
   BS.packCStringLen (castPtr dataPtr, fromIntegral len)
 
 -- | Decode a C cell's slots back to @[RCValue]@ via its per-constructor
@@ -2294,6 +2527,7 @@ dropAddr a0 s0 = go [a0] s0
           -- StringViews = 32 (fixed, header + parent ptr + offset + len);
           -- Bytes = 16 + 8*ceil(byte_len/8) (same layout as WokString body);
           -- ForeignBytes = 24 (fixed handle: header 8 + ptr 8 + len 8);
+          -- BorrowView = 24 (fixed handle, same layout as ForeignBytes);
           -- NCons = 8 + 8*arity (both C-eligible, same layout as wok_alloc /
           -- wok_array_alloc / wok_string_alloc / wok_string_view_alloc charge).
           bytes <- if tid == wokArrayTag
@@ -2314,9 +2548,12 @@ dropAddr a0 s0 = go [a0] s0
                            else if tid == wokForeignBytesTag
                              -- Fixed 24-byte handle (header 8 + data_ptr 8 + byte_len 8).
                              then pure 24
-                             else do
-                               ar <- liftIO (H.wokArity p)
-                               pure (8 + 8 * fromIntegral (ar :: Word32))
+                             else if tid == wokBorrowViewTag
+                               -- Fixed 24-byte handle (header 8 + ptr 8 + byte_len 8).
+                               then pure 24
+                               else do
+                                 ar <- liftIO (H.wokArity p)
+                                 pure (8 + 8 * fromIntegral (ar :: Word32))
           -- Collect child refs for the cascade (read ALL fields before wok_free).
           -- StringViews: the parent pointer is the ONE counted child (D8).
           -- Read it BEFORE wok_free; add it to the worklist so dropAddr recurses.
@@ -2351,7 +2588,12 @@ dropAddr a0 s0 = go [a0] s0
                               dptr <- liftIO (H.wokForeignBytesPtr p)  -- read BEFORE wok_free
                               liftIO (free dptr)                        -- libc free of the foreign buffer
                               pure []
-                            else countedRefs <$> liftIO (readCConValues p s)
+                            -- Borrow view: the borrowed buffer is NEVER freed here (wok does
+                            -- not own it -- contrast WokForeignBytes above). Only the 24-byte
+                            -- handle is reclaimed; no cascade children.
+                            else if tid == wokBorrowViewTag
+                              then pure []
+                              else countedRefs <$> liftIO (readCConValues p s)
           hp <- heapPtr s
           liftIO (H.wokFree hp p)
           go (kids ++ rest) (bumpFreeStats bytes s)
@@ -2471,6 +2713,10 @@ nodeValues (NBytes _)           = []
 -- Foreign bytes are opaque (no child refs). The foreign buffer is freed by libc
 -- in 'dropAddr' (CHeap path), not via an RC cascade. Like 'NBytes'.
 nodeValues (NForeignBytes _)    = []
+-- Borrowed bytes are opaque (no child refs) AND the pointer is foreign, not a
+-- counted ref: 'dropAddr' on a 'NBorrowView' frees only the 24B handle, with no
+-- child iteration and (unlike 'NForeignBytes') no foreign free either.
+nodeValues (NBorrowView _)      = []
 nodeValues (NRecord _ m)        = Map.elems m
 nodeValues (NClosure env _ _ _) = Map.elems env
 nodeValues (NGroupCode _)       = []
@@ -2846,6 +3092,11 @@ renderValueWith drf = goVal
     -- Render an adopted foreign-bytes buffer the same way as 'NBytes': the content
     -- is identical from the Wok side, so the differential oracle sees the same output.
     goNode _ (NForeignBytes bs) =
+      pure (Tx.pack ("Bytes" <> show (BS.unpack bs)))
+    -- Render a borrowed-buffer view the same way: the content is identical from the
+    -- wok side regardless of ownership disposition, so the differential oracle sees
+    -- the same output as 'NBytes'/'NForeignBytes'.
+    goNode _ (NBorrowView bs) =
       pure (Tx.pack ("Bytes" <> show (BS.unpack bs)))
 
     -- Render a proper Cons/Nil list as @[a, b, c]@. An improper tail renders the

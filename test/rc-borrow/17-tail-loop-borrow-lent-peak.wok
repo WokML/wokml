@@ -1,0 +1,38 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 xhigh review Fix 1 characterization: a BOUNDED TAIL-recursive loop
+-- that lends one 64 KiB buffer per iteration and reads it (byteAt + memchr)
+-- before making the recursive call in TAIL position. `go`'s recursive call is
+-- the ENTIRE result of the non-zero arm, so TCO reuses the interpreter's real
+-- call machinery (no growing evaluation stack for `go` itself) -- but the
+-- foreign-borrow close-set stack ('stBorrowClose') is a SEPARATE bracket that
+-- still grows one frame per lending activation, popped only when THAT
+-- activation's OWN body returns ('borrowClose', at the 'KBorrowCloseRC'
+-- bracket). Because the tail call to `go (n - 1)` happens INSIDE the current
+-- activation's body, the outer frame's close does not run until the WHOLE
+-- chain of recursive calls finally returns -- so at the deepest point, all 8
+-- lent buffers are open SIMULTANEOUSLY even though the call stack itself
+-- never grows.
+--
+-- This DOCUMENTS the deferred activation-scoped-close limitation
+-- (family-liveness / codegen precise close-placement is future work, kept
+-- OUT of scope by this fix): `stBorrowLentPeak` pins the O(N) peak at exactly
+-- 8 * 65536 bytes. When family-liveness lands (closing a borrow at its last
+-- read instead of at activation exit), this peak collapses to O(1) (65536)
+-- and this test's asserted value must be updated to match -- that update IS
+-- the signal the fix landed.
+go : U64 -> U64 with IO
+go n =
+  case n of
+    0 -> 0
+    _ ->
+      let b = Demo.lendBuffer 65536 in
+      let first = byteAt b 0 in
+      case memchr b first of
+        Some _ -> go (n - 1)
+        None   -> go (n - 1)
+
+main : U64
+main = go 8

@@ -1,0 +1,37 @@
+module Main
+import Std.Borrow
+
+-- FFI Slice 3 Task 4: the `Demo.lendBuffer` foreign-module surface,
+-- end-to-end through the reference interpreter (mirrors
+-- test/run-examples/borrow-read.wok, which exercises the same read prims
+-- over the Task-3 __borrow_demo intrinsic instead).
+--
+-- b = Demo.lendBuffer 8 -> [0,1,2,3,4,5,6,7]
+-- n    = length b           = 8
+-- b0   = byteAt b 0         = 0
+-- b7   = byteAt b 7         = 7
+-- s    = slice b 2 6        = [2,3,4,5]
+-- sLen = length s           = 4
+-- s0   = byteAt s 0         = 2
+-- s3   = byteAt s 3         = 5
+-- memchr b 5  = Some 5  (b[5] == 5)
+-- memchr s 5  = Some 3  (s[3] == 5)
+-- memchr b 99 = None    (no byte 99 in a buffer of 0..7)
+--
+-- Total: 8 + 0 + 7 + 4 + 2 + 5 + 5 + 3 = 34
+main =
+  let b = Demo.lendBuffer 8 in
+  let n = length b in
+  let b0 = byteAt b 0 in
+  let b7 = byteAt b 7 in
+  let s = slice b 2 6 in
+  let sLen = length s in
+  let s0 = byteAt s 0 in
+  let s3 = byteAt s 3 in
+  case memchr b 5 of
+    Some off -> case memchr s 5 of
+      Some soff -> case memchr b 99 of
+        None -> n + b0 + b7 + sLen + s0 + s3 + off + soff
+        Some _ -> 0
+      None -> 0
+    None -> 0

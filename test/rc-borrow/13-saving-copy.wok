@@ -1,0 +1,18 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 7: zero-copy saving pin -- PROGRAM B (Bytes.copy).
+-- SAME source (Demo.lendBuffer 4096) and the SAME length/byteAt reads as
+-- 12-saving-borrow-read.wok, but additionally materializes an OWNED copy via
+-- `copy` and reads it (`eqBytes c c`, so exactly ONE copy is allocated --
+-- comparing `c` against itself dups the reference and does not allocate a
+-- second Bytes cell). The extra n-byte WokBytes cell this program allocates
+-- (that 12-saving-borrow-read.wok does not) is the delta test/Spec.hs pins.
+main : U64
+main =
+  let b = Demo.lendBuffer 4096 in
+  let n = length b in
+  let b0 = byteAt b 0 in
+  let c = copy b in
+  if eqBytes c c then n + b0 else 0

@@ -1,0 +1,21 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- DEATH TEST (FFI Slice 3 Task 6, escaping-CLOSURE route). `leak` lends a malloc'd
+-- borrow and returns a CLOSURE that captures it. Normal build: compile-time
+-- CarrierEscape. Under the `ffi-borrow-noescape-negctrl` mutation it runs: the
+-- activation-scoped close frees the buffer when `leak` returns, and calling the
+-- escaped closure in `main` scans the captured borrow's freed malloc'd buffer via
+-- the C-side `memchr` -> ASan read-after-free. (`memchr`, not `byteAt`: the C
+-- `c_memchr` load is ASan-instrumented; a Haskell `peekElemOff` is not.)
+leak n =
+  let b = Demo.lendBuffer n in
+  \x ->
+    case memchr b x of
+      Some o -> o
+      None   -> 99
+
+main =
+  let f = leak 8 in
+  f 5

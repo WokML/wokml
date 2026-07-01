@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 7: zero-copy saving pin -- PROGRAM A (borrow-read only).
+-- Reads Demo.lendBuffer 4096 via `length`/`byteAt` with NO `Bytes.copy`. The
+-- borrow view is a fixed 24 B 0xFFFA handle; the malloc'd n-byte buffer sits
+-- off the wok_rc books (Task 5), so this program's peak_bytes charges only
+-- the handle, never the n-byte buffer. Paired with 13-saving-copy.wok (SAME
+-- source, SAME length/byteAt prefix, but also `copy`s) for the differential
+-- saving-pin test in test/Spec.hs ("borrow zero-copy saving pin").
+main : U64
+main =
+  let b = Demo.lendBuffer 4096 in
+  let n = length b in
+  let b0 = byteAt b 0 in
+  n + b0

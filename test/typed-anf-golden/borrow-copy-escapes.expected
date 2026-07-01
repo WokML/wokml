@@ -1,0 +1,3 @@
+f b : Borrow =
+  let t : Bytes = copy(b)
+  t

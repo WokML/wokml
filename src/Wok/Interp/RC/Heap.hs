@@ -11,6 +11,8 @@ module Wok.Interp.RC.Heap
   , wokStringViewAlloc, wokStringViewParent, wokStringViewOffset, wokStringViewLen
   , wokBytesAlloc, wokBytesLen, wokBytesData, wokBytesByteGet
   , wokForeignBytesAlloc, wokForeignBytesPtr, wokForeignBytesLen
+  , wokBorrowViewAlloc, wokBorrowViewPtr, wokBorrowViewLen
+  , wokBorrowDemoLend, wokBorrowDemoClose
   , wokValidateUtf8
   , wokArenaOpen, wokArenaAlloc, wokArenaClose, wokStatArenaBytes, wokStatArenaPeak
   -- libc calls used by rcForeignDispatch (Task 6 FFI Slice 2)
@@ -63,6 +65,16 @@ foreign import ccall unsafe "wok_bytes_byte_get" wokBytesByteGet  :: Ptr WokObj 
 foreign import ccall unsafe "wok_foreign_bytes_alloc" wokForeignBytesAlloc :: Ptr WokHeap -> Ptr Word8 -> Word64 -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_foreign_bytes_ptr"   wokForeignBytesPtr   :: Ptr WokObj -> IO (Ptr Word8)
 foreign import ccall unsafe "wok_foreign_bytes_len"   wokForeignBytesLen   :: Ptr WokObj -> IO Word64
+foreign import ccall unsafe "wok_borrow_view_alloc" wokBorrowViewAlloc :: Ptr WokHeap -> Ptr Word8 -> Word64 -> IO (Ptr WokObj)
+foreign import ccall unsafe "wok_borrow_view_ptr"   wokBorrowViewPtr   :: Ptr WokObj -> IO (Ptr Word8)
+foreign import ccall unsafe "wok_borrow_view_len"   wokBorrowViewLen   :: Ptr WokObj -> IO Word64
+-- The malloc'd lend-THEN-free Demo producer (FFI Slice 3 Task 5). Heap-context-free:
+-- the lent buffer is a FOREIGN buffer the borrow view points into, off the WokHeap, so
+-- these take no 'Ptr WokHeap'. 'wokBorrowDemoLend n' mallocs min(n,cap) bytes (buf[i]=i&0xFF)
+-- and returns the base pointer; 'wokBorrowDemoClose ptr' frees it. The interpreter registers
+-- the base ptr at the producing call and frees it once at the borrowing activation's exit.
+foreign import ccall unsafe "wok_borrow_demo_lend"  wokBorrowDemoLend  :: Word64 -> IO (Ptr Word8)
+foreign import ccall unsafe "wok_borrow_demo_close" wokBorrowDemoClose :: Ptr Word8 -> IO ()
 foreign import ccall unsafe "wok_validate_utf8"  wokValidateUtf8  :: Ptr Word8 -> Word64 -> IO Int
 foreign import ccall unsafe "wok_arena_open"         wokArenaOpen        :: Ptr WokHeap -> IO Word32
 foreign import ccall unsafe "wok_arena_alloc"      wokArenaAlloc    :: Ptr WokHeap -> Word32 -> Word32 -> IO (Ptr WokObj)

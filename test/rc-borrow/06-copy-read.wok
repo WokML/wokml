@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- copy materializes an OWNED Bytes from the borrow. No Std.Bytes import:
+-- Std.Borrow and Std.Bytes both define `length`, which would clash if both
+-- were imported into the same module (the known cross-module name-collision
+-- constraint -- see the String/Bytes corpus comments in test/Spec.hs);
+-- `eqBytes` lives in Std.Base, so the copy's contents can still be
+-- read/compared without it (mirrors test/run-examples/borrow-read.wok).
+-- Two INDEPENDENT copies of the same deterministic pattern must compare equal.
+main : U64
+main =
+  if eqBytes (copy (__borrow_demo 6)) (copy (__borrow_demo 6))
+    then 1
+    else 0

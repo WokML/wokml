@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Borrow is second-class: storing it inside a data constructor lets it outlive
+-- its scope. `Some`'s argument is a polymorphic slot (`a`), not a handle slot,
+-- so a Borrow flowing into it is a CarrierEscape -- exactly like the
+-- handle-into-`Some` case (52-carrier-constructor.wok).
+h : Borrow -> Option Borrow
+h b = Some b

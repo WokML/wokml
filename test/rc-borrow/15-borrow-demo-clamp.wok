@@ -1,0 +1,24 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Regression for a code-review finding on top of the Task-4/08 `Demo.lendBuffer`
+-- clamp fix: `__borrow_demo` (the Task 3 internal read-test fixture) took its
+-- raw `n` straight into `Utf8.demoPattern` with NO clamp to `borrowDemoCapacity`
+-- and NO `max 0` floor, in BOTH the reference (`borrowDemoP`) and RC
+-- (`borrowDemoRC`) interpreters -- unlike its sibling `Demo.lendBuffer`, which
+-- was already clamped. `__borrow_demo 100000000000` would build a ~100 GB
+-- byte pattern (hang/OOM) on an admitted, type-checked program: a reachable
+-- denial-of-service via a single prelude call.
+--
+-- All four producer sites (reference `Demo.lendBuffer`, RC `Demo.lendBuffer`,
+-- reference `__borrow_demo`, RC `__borrow_demo`) now route through the shared
+-- `Utf8.clampBorrowDemoLen`, so `__borrow_demo` clamps to `borrowDemoCapacity`
+-- (65536) exactly like `lendBuffer` (mirrors 08-foreign-lendbuffer-clamp.wok):
+-- an ordinary negative `n` saturates to 0 bytes, and an astronomically large
+-- `n` saturates to exactly the capacity instead of allocating `n` bytes.
+main =
+  let neg = 0 - 1 in
+  let lenNeg = length (__borrow_demo neg) in
+  let lenHuge = length (__borrow_demo 100000000000) in
+  lenNeg + lenHuge

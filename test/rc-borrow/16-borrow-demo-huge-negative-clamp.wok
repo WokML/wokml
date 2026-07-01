@@ -1,0 +1,23 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- Regression for the SAME wraparound-below-Int-range hazard fixed for
+-- `Demo.lendBuffer` in 14-foreign-lendbuffer-huge-negative-clamp.wok, but for
+-- `__borrow_demo`: pre-fix, `borrowDemoP`/`borrowDemoRC` took the raw
+-- `Integer` literal straight into `Utf8.demoPattern` with NO clamp at all (not
+-- even a `max 0` floor). For an ordinary negative `n` (like `0 - 1`) this was
+-- harmless -- `demoPattern` builds an EMPTY list whenever its `Int` argument
+-- is negative. But a literal at or below `-(2^63 + 1)` (a wok `U64` does NOT
+-- wrap, so this stays a genuine negative `Integer`) falls outside the
+-- representable `Int` range, and the `Integer -> Int` downcast wraps via
+-- two's-complement -- landing back in POSITIVE territory (it wraps to
+-- `maxBound :: Int` for `-(2^63 + 1)` specifically), so `__borrow_demo` would
+-- try to build an astronomically large byte pattern (hang/OOM) instead of the
+-- empty read every other backend/producer already agreed on. `n` below is
+-- exactly that boundary literal; the shared `Utf8.clampBorrowDemoLen` floors
+-- in `Integer` domain BEFORE the downcast, so this now yields an empty read
+-- on every backend, matching `Demo.lendBuffer`'s already-fixed behavior.
+main =
+  let n = 0 - 9223372036854775809 in
+  length (__borrow_demo n)

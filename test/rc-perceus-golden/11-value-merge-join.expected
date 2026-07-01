@@ -1,15 +1,15 @@
 firstOr xs d =
-  join j122(r) =
+  join j128(r) =
     let h = r
     let t = +(h, 1)
     t
   case xs of
     Nil ->
       let _drop.1 = __rc_drop(xs)
-      jump j122(d)
+      jump j128(d)
     Cons y _ ->
       let _drop.2 = __rc_drop(xs)
-      jump j122(y)
+      jump j128(y)
 
 main =
   let t.2 = Nil

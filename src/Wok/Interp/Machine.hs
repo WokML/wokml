@@ -19,6 +19,7 @@ import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup)
 import Wok.Interp.Prim (primTable)
 import qualified Wok.Interp.Sched as Sched
+import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Interp.Value
 
 -- | Single small-step. Halts on Return into KDone.
@@ -157,6 +158,23 @@ evalForeignCall lib sym args
         [VBytes buf, VLit (LInt n)] ->
           Right (VBytes (foreignStrndup buf (fromIntegral n)))
         _ -> Left (PrimError (Tx.pack "strndup: expected (Bytes, U64)"))
+  -- 'Demo.lendBuffer' (FFI Slice 3 Task 4): the borrow-disposition surface
+  -- producer. The reference interpreter models ownership/borrowing as
+  -- unobservable (per the Slice 3 spec, sec 4.7), so a Borrow is represented
+  -- identically to Bytes here -- 'VBytes' of the deterministic pattern, via
+  -- the shared 'Utf8.clampBorrowDemoLen' (Integer domain, floored at 0,
+  -- BEFORE the single Word64 downcast), exactly as the RC backends clamp
+  -- ('allocBorrowDemoLend'), so all three backends agree on observable
+  -- bytes. The floor matters: without it, a pathological literal below
+  -- @-(2^63 + 1)@ (a wok 'U64' does NOT wrap, so this stays a genuine
+  -- negative 'Integer') would wrap POSITIVE through the 'Integer' -> 'Int'
+  -- downcast in 'Utf8.demoPattern', building an astronomically large byte
+  -- pattern instead of the empty read RC produces.
+  | lib == Tx.pack "wok", sym == Tx.pack "lendBuffer" =
+      case args of
+        [VLit (LInt n)] ->
+          Right (VBytes (Utf8.demoPattern (fromIntegral (Utf8.clampBorrowDemoLen n))))
+        _ -> Left (PrimError (Tx.pack "lendBuffer: expected (U64)"))
   | otherwise =
       Left (PrimError
         (Tx.pack "foreign symbol not available in the interpreter: "

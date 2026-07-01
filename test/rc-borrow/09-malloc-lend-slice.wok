@@ -1,0 +1,27 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 5 (family + activation-scoped close). A malloc'd borrow whose
+-- slice is read AFTER the parent's last mention. `b`'s only/last use is the
+-- slice creation, so its 0xFFFA handle is dropped right after; the slice `s`
+-- points into the SAME malloc'd buffer, which lives until this activation's exit
+-- (registered ONCE at the lend; the slice registers nothing). So every read of
+-- `s` after `b`'s handle is gone reads valid bytes (no UAF), and the single base
+-- buffer is freed exactly once (no double-free) -- closes = 1.
+--
+-- b = Demo.lendBuffer 8 -> [0..7]
+-- s = slice b 1 7  = [1,2,3,4,5,6]   (b's last mention; handle dies here)
+-- ns = length s    = 6
+-- s0 = byteAt s 0  = 1
+-- memchr s 5 = Some 4  (s[4] == 5)
+-- Total: 6 + 1 + 4 = 11
+main : U64
+main =
+  let b = Demo.lendBuffer 8 in
+  let s = slice b 1 7 in
+  let ns = length s in
+  let s0 = byteAt s 0 in
+  case memchr s 5 of
+    Some off -> ns + s0 + off
+    None -> 99

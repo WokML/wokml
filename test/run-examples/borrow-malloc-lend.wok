@@ -1,0 +1,33 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- FFI Slice 3 Task 5: the malloc'd `Demo.lendBuffer` borrow + a slice of it,
+-- end-to-end through the reference interpreter (the third backend; the RC
+-- abstract/CHeap backends are exercised by test/rc-borrow/09-malloc-lend-slice).
+--
+-- Unlike Task 4's static buffer, the CHeap producer now MALLOCS a real buffer
+-- per lend and frees it with a `close` placed at this activation's exit
+-- (sound because a `Borrow` cannot escape its activation -- Task 1's carrier
+-- rule). The slice shares the SAME base buffer, so the family is freed by ONE
+-- close; reading the slice after `b`'s last mention still reads valid bytes
+-- (the buffer outlives `b`'s handle, freed only at activation exit).
+--
+-- b = Demo.lendBuffer 8 -> [0,1,2,3,4,5,6,7]
+-- nb = length b   = 8
+-- b7 = byteAt b 7 = 7
+-- s  = slice b 2 6  = [2,3,4,5]   (b's LAST mention; its handle dies here)
+-- ns = length s   = 4            (read AFTER b's last mention)
+-- s0 = byteAt s 0 = 2
+-- s3 = byteAt s 3 = 5
+-- Total: 8 + 7 + 4 + 2 + 5 = 26
+main : U64
+main =
+  let b = Demo.lendBuffer 8 in
+  let nb = length b in
+  let b7 = byteAt b 7 in
+  let s = slice b 2 6 in
+  let ns = length s in
+  let s0 = byteAt s 0 in
+  let s3 = byteAt s 3 in
+  nb + b7 + ns + s0 + s3

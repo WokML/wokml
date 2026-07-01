@@ -82,9 +82,10 @@ WOK_PURE uint64_t wok_stat_peak_physical_bytes(const WokHeap* h);
    len <= 62 (class < WOK_NUM_CLASSES 64) -> arena free-list; len >= 63 -> malloc.
    The arena free-list[len+1] is SHARED with NCon arity (len+1): identical byte size,
    shape-agnostic recycling.
-   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFB, 0xFFFC, 0xFFFD,
-   0xFFFE, or 0xFFFF (0xFFFE=WOK_STRING_TAG, 0xFFFD=WOK_STRING_VIEW_TAG, 0xFFFC=WOK_BYTES_TAG,
-   0xFFFB=WOK_FOREIGN_BYTES_TAG, all five reserved). */
+   WOK_ARRAY_TAG is reserved Haskell-side: internTag never returns 0xFFFA, 0xFFFB, 0xFFFC,
+   0xFFFD, 0xFFFE, or 0xFFFF (0xFFFE=WOK_STRING_TAG, 0xFFFD=WOK_STRING_VIEW_TAG,
+   0xFFFC=WOK_BYTES_TAG, 0xFFFB=WOK_FOREIGN_BYTES_TAG, 0xFFFA=WOK_BORROW_VIEW_TAG,
+   all six reserved). */
 
 #define WOK_ARRAY_TAG 0xFFFFu
 
@@ -107,9 +108,9 @@ WOK_PURE uint64_t wok_array_slot_get(const WokObj* p, uint64_t i);
    Size class = (cell_bytes/8) - 1 = 1 + ceil(byte_len/8)  (shares the free-list with an
    NCon of that arity / a WokArray of that word-len -- identical byte size, shape-agnostic
    recycling).  class < WOK_NUM_CLASSES (64) -> arena free-list; else -> malloc.
-   WOK_STRING_TAG is reserved Haskell-side: internTag never returns 0xFFFB, 0xFFFC, 0xFFFD,
-   0xFFFE, or 0xFFFF (0xFFFD=WOK_STRING_VIEW_TAG, 0xFFFC=WOK_BYTES_TAG, 0xFFFB=WOK_FOREIGN_BYTES_TAG,
-   all five also reserved). */
+   WOK_STRING_TAG is reserved Haskell-side: internTag never returns 0xFFFA, 0xFFFB, 0xFFFC,
+   0xFFFD, 0xFFFE, or 0xFFFF (0xFFFD=WOK_STRING_VIEW_TAG, 0xFFFC=WOK_BYTES_TAG,
+   0xFFFB=WOK_FOREIGN_BYTES_TAG, 0xFFFA=WOK_BORROW_VIEW_TAG, all six also reserved). */
 
 #define WOK_STRING_TAG 0xFFFEu
 
@@ -129,8 +130,8 @@ WOK_PURE uint64_t wok_string_byte_get(const WokObj* p, uint64_t i); /* one byte,
    Cell byte size = 16 + 8*ceil(byte_len/8)  (body rounds UP to an 8-byte granule, identical
    to WokString). Size class = 1 + ceil(byte_len/8) (shares free-list with WokString / NCon /
    WokArray of the same byte size). class < WOK_NUM_CLASSES -> arena free-list; else -> malloc.
-   WOK_BYTES_TAG is reserved Haskell-side: internTag never returns 0xFFFB, 0xFFFC, 0xFFFD,
-   0xFFFE, or 0xFFFF (all five special tags reserved). */
+   WOK_BYTES_TAG is reserved Haskell-side: internTag never returns 0xFFFA, 0xFFFB, 0xFFFC,
+   0xFFFD, 0xFFFE, or 0xFFFF (all six special tags reserved). */
 
 #define WOK_BYTES_TAG 0xFFFCu
 
@@ -156,7 +157,7 @@ int wok_validate_utf8(const uint8_t *bytes, uint64_t len);
    The parent pointer is NOT decremented by wok_free (scan=0, no C cascade): the parent
    drop is Haskell-driven via dropAddr, mirroring the WokArray pattern (D8 of the spec).
    WOK_STRING_VIEW_TAG is reserved Haskell-side: internTag never returns
-   0xFFFB/0xFFFC/0xFFFD/0xFFFE/0xFFFF (all five special tags reserved). */
+   0xFFFA/0xFFFB/0xFFFC/0xFFFD/0xFFFE/0xFFFF (all six special tags reserved). */
 
 #define WOK_STRING_VIEW_TAG 0xFFFDu
 
@@ -179,7 +180,7 @@ WOK_PURE uint64_t wok_string_view_len(const WokObj* p);    /* byte length at off
    Size class = 24/8 - 1 = 2 (shares the free-list with NCon arity=2).
    The foreign buffer's bytes are NOT counted in cur_bytes (they are foreign); only the
    24B handle is charged. WOK_FOREIGN_BYTES_TAG is reserved Haskell-side: internTag never
-   returns 0xFFFB/0xFFFC/0xFFFD/0xFFFE/0xFFFF (all five special tags reserved). */
+   returns 0xFFFA/0xFFFB/0xFFFC/0xFFFD/0xFFFE/0xFFFF (all six special tags reserved). */
 
 #define WOK_FOREIGN_BYTES_TAG 0xFFFBu
 
@@ -187,6 +188,43 @@ WokObj*  wok_foreign_bytes_alloc(WokHeap* h, uint8_t* data_ptr, uint64_t byte_le
                                                         /* rc=1, tag=WOK_FOREIGN_BYTES_TAG, 24 bytes */
 WOK_PURE uint8_t* wok_foreign_bytes_ptr(const WokObj* p);  /* raw foreign pointer at offset 8 */
 WOK_PURE uint64_t wok_foreign_bytes_len(const WokObj* p);  /* byte length at offset 16 */
+
+/* ---- WokBorrowView: an UNCOUNTED-OWNERSHIP foreign-buffer VIEW C cell (FFI Slice 3) ----
+   A 24-byte handle, BYTE-IDENTICAL in layout to WokForeignBytes, that POINTS AT a foreign
+   buffer wok does NOT own (a BORROW, not an adopt). Unlike WokForeignBytes, NEITHER wok_free
+   NOR the Haskell host ever frees the pointed-at buffer at refcount-zero -- only this 24B
+   handle is reclaimed. The buffer's lifetime is the PRODUCER's responsibility (FFI Slice 3
+   Task 4's lend/close); this handle is a temporary, scoped, zero-copy read-through window.
+   Layout (always 8-aligned, fixed 24 bytes):
+     offset  0  uint32 rc / uint16 tag / uint8 reserved / uint8 scan  (WokObj prefix)
+     offset  8  uint64 ptr       <- raw pointer to the BORROWED (not owned) buffer
+     offset 16  uint64 byte_len  <- buffer length in bytes
+   Size class = 24/8 - 1 = 2 (shares the free-list with NCon arity=2 / WokForeignBytes).
+   The borrowed buffer's bytes are NOT counted in cur_bytes (foreign); only the 24B handle
+   is charged. WOK_BORROW_VIEW_TAG is reserved Haskell-side: internTag never returns
+   0xFFFA/0xFFFB/0xFFFC/0xFFFD/0xFFFE/0xFFFF (all six special tags reserved). */
+
+#define WOK_BORROW_VIEW_TAG 0xFFFAu
+
+WokObj*  wok_borrow_view_alloc(WokHeap* h, uint8_t* ptr, uint64_t byte_len);
+                                                        /* rc=1, tag=WOK_BORROW_VIEW_TAG, 24 bytes */
+WOK_PURE uint8_t* wok_borrow_view_ptr(const WokObj* p);  /* raw borrowed pointer at offset 8 */
+WOK_PURE uint64_t wok_borrow_view_len(const WokObj* p);  /* byte length at offset 16 */
+
+/* ---- Demo borrow producer: the malloc'd lend-THEN-free pair (FFI Slice 3 Task 5) ----
+   The deterministic host buffer behind `Demo.lendBuffer`. UNLIKE the static
+   process-lifetime buffer Task 4 shipped (and unlike the `__borrow_demo` intrinsic, which
+   deliberately leaks a static fixture), this producer mallocs a REAL buffer per lend and
+   wok_borrow_demo_close frees it -- so the close placed at activation exit (Machine.hs
+   KBorrowCloseRC) performs a genuine free and ASan/LSan can prove "freed exactly once".
+   These are heap-CONTEXT-FREE raw malloc/free (the lent buffer is off the WokHeap, like any
+   foreign buffer), so they take no WokHeap* and are independent of the slab/malloc backend.
+   `n` arrives already clamped to [0, capacity] in the Integer domain Haskell-side; the
+   defensive `min(n, capacity)` here bounds a direct C caller too. byte_len 0 still mallocs a
+   distinct freeable 1-byte cell (malloc(0) is implementation-defined). */
+#define WOK_BORROW_DEMO_CAPACITY 65536u
+uint8_t* wok_borrow_demo_lend(uint64_t n);   /* malloc min(n,cap) bytes, buf[i]=i&0xFF, return base ptr */
+void     wok_borrow_demo_close(uint8_t* ptr);/* free a buffer wok_borrow_demo_lend returned (free(NULL) ok) */
 
 /* ---- Uncounted per-activation arena (Region Slice R1) -----------------------------
    A LIFO checkpoint over the bump allocator. wok_arena_alloc returns an UNCOUNTED cell

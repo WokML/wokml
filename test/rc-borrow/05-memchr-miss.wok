@@ -1,0 +1,10 @@
+module Main
+import Std.Base
+import Std.Borrow
+
+-- __borrow_demo 5 yields buf = [0,1,2,3,4]. Byte 99 is absent -> None.
+main : U64
+main =
+  case memchr (__borrow_demo 5) 99 of
+    Some _ -> 1
+    None   -> 0
