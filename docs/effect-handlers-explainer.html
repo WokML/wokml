@@ -48,14 +48,13 @@
 <div class="wrap">
 
   <h1>wok effect-surface — remaining debt</h1>
-  <p class="sub">Pending correctness &amp; foundation debt on the effect-handler surface. Three items remain; item&nbsp;1 is the load-bearing one and the next slice.</p>
+  <p class="sub">Pending correctness &amp; foundation debt on the effect-handler surface. Two items remain; item&nbsp;1 is the load-bearing one and the next slice.</p>
 
-  <div class="done"><b>Just closed:</b> the <code>var</code> state-member + block-scope-arm-body slice shipped (merged to main), so the "handlers must be one line" debt is resolved. Earlier soundness fixes — carrier-escape via equation-form local fn, the M2b raw-abort leak, and the value-position multishot false-positive — are also done. None of those are pending.</div>
+  <div class="done"><b>Just closed:</b> Conc's phantom residual row (below); the <code>var</code> state-member + block-scope-arm-body slice; and the earlier soundness fixes — carrier-escape via equation-form local fn, the M2b raw-abort leak, and the value-position multishot false-positive. None of those are pending.</div>
 
-  <h2>The three remaining items</h2>
+  <h2>The two remaining items</h2>
   <div class="grid">
     <div class="card debt"><span class="label">open &middot; type soundness</span><h3>1 &middot; Resume launders effects</h3><p>A generic resume/await driver hides the resumed code's effects from its own type — the type lies. The next slice; detailed below.</p></div>
-    <div class="card debt"><span class="label">open &middot; runtime trap</span><h3>2 &middot; Conc drops the handler context</h3><p>A spawned child, or the root's own tail, performing a non-<code>Conc</code> effect across a suspension traps at runtime, not compile time.</p></div>
     <div class="card debt"><span class="label">open &middot; feature interaction</span><h3>3 &middot; Regions can't meet handlers</h3><p>Function-local arenas and the FFI borrow tier disable in any module that contains a handler.</p></div>
   </div>
 
@@ -92,15 +91,26 @@ replay g = run g 0     <span class="c">-- `with eff e` now MANDATORY; callers mu
   </div>
   <div class="note"><b>Shape of the slice:</b> type-only. The one change is in the effect emitter — stop absorbing bare row variables. The interpreter is untouched (<code>e</code> stays phantom at runtime), no codegen, no first-class carriers. The only visible fallout: <code>coro-resume-driver.wok</code>'s golden consciously flips and effect-polymorphic drivers must declare <code>with eff e</code>. Design: <code>docs/superpowers/specs/2026-06-11-resume-site-control-and-heap-continuations-design.md</code>.</div>
 
-  <!-- 2: Conc -->
-  <h2>2 &middot; Conc drops the handler context</h2>
-  <p>The <code>Conc</code> provider scheduler (<code>__drive_conc</code>) resumes coroutine segments under a fresh continuation <em>without</em> the ambient handler context. So a spawned/async child — or the root's own tail — that performs any <em>non-<code>Conc</code></em> effect across a suspension (yield/await/…) traps at <strong>runtime</strong> with an unhandled-effect error, not a type error. The type system accepts programs the scheduler cannot run. It's a soundness-adjacent gap (runtime trap on a type-accepted program), and it interacts with item&nbsp;1: a truly explicit layer-3 scheduler needs the load-bearing residual row first.</p>
+  <h2 style="font-size:1.02rem;margin-top:30px">1a &middot; Write vs infer &mdash; decided: explicit</h2>
+  <p>Effect rows stay <strong>explicit</strong>. A missing <code>with</code> means <em>pure</em>, not "infer" — performing an undeclared effect stays a compile error. Inference (Koka-style omit-and-infer) is <em>sound</em> but wrong for wok: it would delete wok's <em>sole</em> effect safety net (the declaration-site check — there is no boundary/<code>main</code> discharge gate) and turn effects from an authored contract into inferred metadata, undercutting the "explicit, controllable effects" thesis. So the law stays uniform: every effect, concrete or polymorphic, is declared.</p>
+  <p>If verbosity ever bites, the escape hatch is a <strong>visible opt-in placeholder</strong> — <code>_</code> in the row tail — never silent inference:</p>
+<pre>replay : <span class="s">Suspension</span> U64 U64 U64 (<span class="k">row</span> e) -&gt; U64 <span class="hl">with eff e</span>   <span class="c">-- explicit (default, the law)</span>
+replay : <span class="s">Suspension</span> U64 U64 U64 (<span class="k">row</span> e) -&gt; U64 <span class="hl">with eff _</span>   <span class="c">-- opt-in: infer this row from the body</span>
+
+<span class="c">-- a shared input/output row must stay NAMED; `_` fits output/determined positions:</span>
+map : (a -&gt; b <span class="hl">with eff e</span>) -&gt; [a] -&gt; [b] <span class="hl">with eff _</span></pre>
+  <p class="cap">1a &mdash; <code>with eff _</code> still <em>declares</em> "effects flow here" (opt-in, on the page), so the type never lies; it's a middle point between spelling the row out and silent inference. <strong>Deferred</strong> — ship explicit-only first. Rationale: <code>docs/superpowers/specs/2026-07-02-resume-launders-effect-row-explicitness-decision.md</code>.</p>
+
+  <!-- 2: Conc — FIXED -->
+  <h2 style="color:var(--ok)">&check; Fixed &middot; Conc's phantom residual row</h2>
+  <p><code>runConc : (() -> a with Conc + eff e) -> a with eff e</code> used to promise the root could perform effects <code>e</code> handled <em>around</em> <code>runConc</code> — but the scheduler (<code>__drive_conc</code>) runs the root and every resume under a fresh <code>KDone</code>, severing the ambient handler frames. So any non-<code>Conc</code> effect handled <strong>outside</strong> <code>runConc</code> trapped at runtime with <code>NoMatchingHandler</code>. The residual was <strong>phantom</strong>: type-accepted, unrunnable.</p>
+  <div class="done"><b>Fix (Option A, implemented on <code>feat/conc-drop-phantom-residual</code>):</b> drop the phantom residual — <code>__drive_conc</code> and <code>runConc</code> become <code>(() -> a with Conc) -> a</code>. An outer-handled non-<code>Conc</code> effect is now a compile-time <code>RowMismatch</code> at the <code>runConc</code> site (like <code>spawn</code>/<code>async</code> children already got), not a runtime trap. Effects handled <em>inside</em> the root still run (the carrier re-installs their handler on resume). Two signature edits, no runtime change, 2118 tests green — nothing depended on the phantom, proving it was truly unrunnable. <b>Deferred (non-breaking):</b> the strict <code>with Conc</code> also rejects a root doing a ground/foreign effect like <code>IO</code> (an in-place call that would run); widening to <code>Conc</code> + ground effects needs a ground-vs-handler distinction — a later follow-up.</div>
 
   <!-- 3: regions -->
   <h2>3 &middot; Regions can't meet handlers</h2>
   <p>Function-local arenas (region slice R1) and the FFI borrow tier both <strong>disable in any module that contains a handler</strong> — the arena/borrow analyses are gated off module-wide when a handler is present. Two foundation features that don't yet coexist per-module. Lifting this is its own slice (arena&nbsp;&harr;&nbsp;continuations interaction), lower priority than item&nbsp;1.</p>
 
-  <div class="note"><b>Next up:</b> item&nbsp;1 — make the residual effect row load-bearing (Option&nbsp;B), a self-contained type-only slice that closes the one real type-soundness hole on this surface and de-risks every future layer-3 consumer. Items&nbsp;2 and&nbsp;3 are lower-priority and separately scoped.</div>
+  <div class="note"><b>Next up:</b> item&nbsp;1 — make the residual effect row load-bearing (Option&nbsp;B), a self-contained type-only slice that closes the one real type-soundness hole on this surface and de-risks every future layer-3 consumer. Item&nbsp;3 (regions) is lower-priority and separately scoped.</div>
 
 </div>
 </body>

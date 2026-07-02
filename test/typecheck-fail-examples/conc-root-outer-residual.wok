@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.Control
+
+-- Death test (Conc phantom-residual fix): a Conc root performing a non-Conc
+-- effect (Log) handled OUTSIDE runConc is rejected at COMPILE TIME. The scheduler
+-- resumes coroutine segments under a fresh KDone that severs the outer handler,
+-- so such a residual could never run -- previously it trapped at runtime with
+-- NoMatchingHandler; runConc's `(() -> a with Conc) -> a` now makes it a
+-- RowMismatch on the argument. (An effect handled INSIDE the root is fine.)
+effect Log = { log : U64 -> () }
+
+root : () -> U64 with Conc + Log
+root u = let a = yield () in Log.log 1
+
+main : U64
+main = with Log { log x k -> k () } runConc root

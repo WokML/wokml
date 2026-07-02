@@ -216,27 +216,39 @@ asConc c _ = with Conc { req r k -> k (Coro.suspend r) } (c ())
 -- wok side hands it already-`start`-wrapped STARTER THUNKS: each `() -> Step ...`,
 -- when applied to `()`, installs Coro and runs the producer to its first Step.
 --
--- Residual-effect scope (LIMITATION): the residual row `e` here is STRUCTURAL.
--- Provider A (driveConc) resumes coroutine segments under a fresh `KDone`, i.e.
--- WITHOUT the ambient handler context. So spawned/async children must be
--- effect-closed up to `Conc`: a child performing a non-`Conc` effect (e.g. Log)
--- across a suspension is not yet runnable across resume -- it would hit an
--- unhandled-effect error at runtime, not a type error. A documented limitation.
-extern __drive_conc : (() -> Step Request Transport a (row e) with eff e) -> a with eff e
+-- Effect-closed driven thunk (no residual row). Provider A (driveConc) resumes
+-- every coroutine segment under a fresh `KDone`, i.e. WITHOUT the ambient handler
+-- context, so it can only run a thunk that is effect-closed up to `Conc`. The
+-- thunk type therefore carries NO `with eff e`: the driver makes no claim it
+-- cannot honour. (`Step`'s `(row e)` DOES track the residual effect row elsewhere
+-- in this module; here, with no `with eff e` alongside it, `e` is simply
+-- unconstrained -- always empty -- at this one call site.) A non-`Conc` effect
+-- handled OUTSIDE the drive would be
+-- severed by the `KDone` resume; requiring an effect-free thunk turns that from a
+-- runtime `NoMatchingHandler` trap into a compile-time `RowMismatch` at the call
+-- site (see `runConc`). Effects handled INSIDE the thunk are fine -- the carrier
+-- captures their handler and re-installs it on resume.
+extern __drive_conc : (() -> Step Request Transport a (row e)) -> a
 
--- Residual-effect scope (LIMITATION): `e` is structural -- see __drive_conc above.
--- Provider A resumes coroutine segments without the ambient handler context, so
--- spawned/async children must be effect-closed up to `Conc`; non-`Conc` residual
--- effects in children are not yet runnable across resume (documented limitation).
--- This applies to the ROOT computation too, not only children: the root's own
--- non-`Conc` residual performed AFTER its first suspension (yield/await/...) also
--- runs under a fresh `KDone` and traps at runtime with an unhandled-effect error.
+-- The root must be effect-closed up to `Conc` (like `spawn`/`async` children).
+-- A non-`Conc` effect handled INSIDE the root runs fine -- the coroutine carrier
+-- captures its handler and re-installs it across every resume. A non-`Conc`
+-- effect handled OUTSIDE `runConc` is rejected at COMPILE TIME (a `RowMismatch`
+-- on the argument), rather than trapping at runtime under the scheduler's fresh
+-- `KDone`. (Prior versions carried a phantom `+ eff e` that the scheduler could
+-- never honour.)
+--
+-- CONSERVATISM (deferred, non-breaking to relax): the strict `with Conc` also
+-- rejects a root performing a ground/foreign effect such as `IO`, which runs as
+-- an in-place call and would NOT trap. Widening to `Conc + <ground effects>`
+-- (forbidding only handler-dispatched residuals) needs the type system to
+-- distinguish ground from handler effects; left for a follow-up.
 --
 -- Handle identity: Fiber/Promise/Chan handles are bound to the scheduler
 -- instance that minted them. Using a handle under a different runConc (nested
 -- or later) is a runtime error ("not owned by this scheduler"), never a
 -- silent delivery. Nested runConc with its own handles is supported.
-runConc : (() -> a with Conc + eff e) -> a with eff e
+runConc : (() -> a with Conc) -> a
 runConc c = __drive_conc (\ () -> start (asConc c))
 
 yield : () -> () with Conc
