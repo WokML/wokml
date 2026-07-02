@@ -1,0 +1,22 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, REJECT: OwnedModifierMisplaced via an
+-- arrow-tail `owned`. `Bytes -> owned (Bytes -> U64)` places `owned` on the
+-- (curried) return type, not a parameter head -- `classifyOwnedParams` only
+-- strips `owned` from a parameter head (`argOf`), so this `owned` is left
+-- standing and `translateSig` rejects it as misplaced.
+--
+-- Before the diagnostic-defect fix, `translateSig`'s `goT` unconditionally
+-- stripped EVERY `TOwned` it saw, including this arrow-tail one, so
+-- `Bytes -> owned (Bytes -> U64)` silently became `Bytes -> Bytes -> U64`
+-- (arity 2) -- the misplaced `owned` had no effect and was never diagnosed,
+-- it just silently reinterpreted the arrow's arity (previously pinned here as
+-- a graceful `ForeignBlessedMoveOutNeedsOwned` rejection on that
+-- reinterpreted arity-2 signature). This regression pin now asserts the
+-- CORRECT behavior: a return-position `owned` is rejected outright, not
+-- silently reinterpreted as another parameter.
+foreign module Sink "wok" where
+  consume "consume" : Bytes -> owned (Bytes -> U64)
+
+main = Sink.consume (fromList [65, 66, 67]) (fromList [1, 2])

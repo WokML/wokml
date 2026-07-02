@@ -252,6 +252,48 @@ data TypeError
     -- module name, member name.
     -- Message: "foreign member M.f must be fully applied; it cannot be used as
     -- a first-class value."
+  | ForeignOwnedArgNotBytes SourceSpan Text Text
+    -- ^ A @foreign module@ member declares a parameter as @owned T@ (FFI
+    -- Slice 4) where @T@ (after stripping @owned@) is not @Bytes@. The
+    -- transfer-full argument tier is scoped to @Bytes@ only in this slice --
+    -- there is no blessed sink for any other owned-INTO-C payload shape.
+    -- Args: position (the member's declared type), member name, guidance
+    -- message.
+    -- Message: "foreign member 'mem' declares an `owned` parameter of type
+    -- <T>; `owned` is only supported on `Bytes` parameters."
+  | ForeignOwnedArgNotBlessed SourceSpan Text Text
+    -- ^ A @foreign module@ member declares an @owned@ parameter, but the
+    -- blessed table's entry for its (lib, C-symbol) pair does not carry a
+    -- matching 'Wok.FFI.Blessed.MoveOut' at that argument position. The
+    -- blessed table is authoritative for what the runtime actually does with
+    -- an argument; a mismatch here would mean the checked signature promises
+    -- a transfer-full handoff the runtime never performs (or vice versa).
+    -- Args: position, member name, guidance message.
+    -- Message: "foreign member 'mem' declares an `owned` parameter but is not
+    -- blessed as a transfer-full argument sink at that position."
+  | ForeignBlessedMoveOutNeedsOwned SourceSpan Text Text
+    -- ^ The dual of 'ForeignOwnedArgNotBlessed': the blessed table marks an
+    -- argument position 'Wok.FFI.Blessed.MoveOut' (transfer-full), but the
+    -- member's surface signature did NOT declare that parameter @owned@. This
+    -- is a latent use-after-move: the runtime router (FFI Slice 4 Task 4) acts
+    -- on the BLESSED transfer list, so it would move/consume the argument
+    -- while the checker treated it as a plain (borrowed) value the caller may
+    -- still use. Rejecting here keeps the surface @owned@ and the blessed
+    -- 'MoveOut' in agreement at every position. Args: position, member name,
+    -- guidance message.
+    -- Message: "foreign member 'mem' is blessed to take ownership of parameter
+    -- N; declare it as `owned <T>`."
+  | OwnedModifierMisplaced SourceSpan Text
+    -- ^ A surface `owned` type modifier (FFI Slice 4) appeared somewhere other
+    -- than a `Bytes` parameter head of a `foreign module` member: in ordinary
+    -- (non-foreign) code, on a foreign member's return type, or nested inside
+    -- a compound parameter type (e.g. `Array (owned Bytes)`). `owned` is
+    -- boundary metadata scoped to that one position; 'Wok.TypeChecking.Infer.
+    -- registerMember's `classifyOwnedParams' strips it there before the type
+    -- ever reaches this check, so any `TOwned` this error fires on is by
+    -- construction misplaced. Args: position, guidance message.
+    -- Message: "`owned` is only allowed on a `Bytes` parameter of a
+    -- foreign-module member."
   deriving (Show)
   -- Note: the @eff@/@row@ domain split (an @eff@ var in a record tail, or a
   -- @row@ var in a @with@ clause) needs no type error -- the two are disjoint

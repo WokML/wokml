@@ -1,0 +1,29 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 6: mutation-confirmed ASan death-test (USE-AFTER-MOVE).
+--
+-- `b` is `Sink.consume`d AND read again afterward (`Libc.memchr`), so Perceus
+-- dups it before the consume -> the runtime refcount is > 1 at the call -> the
+-- UNMUTATED router COPIES (hands C a fresh buffer, decrements the original,
+-- which stays live and readable -- this file is CLEAN under the normal build,
+-- exactly like `01-consume-shared.wok`).
+--
+-- Under `-fffi-owned-noguard-negctrl`, the shared branch is mutated to
+-- HARD-FREE the original buffer directly (bypassing the refcount) instead of
+-- copying, modeling a C consumer that took the raw shared pointer and called
+-- `free` on it. The subsequent `Libc.memchr b` is a REAL C read (ASan
+-- intercepts `memchr`, unlike a Haskell `peekElemOff`, which ASan does not
+-- instrument -- the Slice 3 vacuous-test lesson) over the now-freed buffer:
+-- ASan MUST report a heap-use-after-free naming this read.
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> U64 with IO
+foreign module Libc "c" free "free" where
+  memchr : Bytes -> U64 -> U64 -> U64 with IO
+
+main : U64
+main =
+  let b = fromList [65, 66, 67] in
+  let h = Sink.consume b in
+  let n = Libc.memchr b 66 3 in
+  h + n

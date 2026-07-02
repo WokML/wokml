@@ -436,6 +436,7 @@ checkAnonTailPolarity sp = goT True
       Abs.TCon _            -> pure ()
       Abs.TVar _            -> pure ()
       Abs.TRowArg _         -> pure ()   -- row var arg: leaf, no anon `..` tail
+      Abs.TOwned t'         -> goT pos t'
       Abs.TUnit             -> pure ()
 
     goRow :: Bool -> Abs.EffectRow -> TC s ()
@@ -538,6 +539,25 @@ translateSig env ty = do
         goT (Abs.TQual _ _) =
           throwError (UnsupportedFeature Nothing
             (Tx.pack "nested qualified type (constraint context) not supported"))
+        -- `owned Type2` (FFI Slice 4) is boundary METADATA on a `Bytes`
+        -- PARAMETER of a `foreign module` member, not part of the checked
+        -- type: the transfer-full marker is captured separately, per
+        -- parameter, by 'Wok.TypeChecking.Infer.registerMember's
+        -- `classifyOwnedParams` walk over the surface `Abs.Type` (into
+        -- 'Wok.FFI.Blessed.ArgTransfer' / 'Wok.TypeChecking.Env.fmiArgTransfer'),
+        -- which STRIPS `owned` from valid parameter-head positions before the
+        -- resulting type ever reaches this `walk`. So any `TOwned` this arm
+        -- still sees is misplaced: either ordinary (non-foreign) code, where
+        -- `owned` is never boundary metadata at all, or a foreign member's
+        -- return type / a nested position (`Array (owned Bytes)`), neither of
+        -- which `classifyOwnedParams` strips. Reject rather than silently
+        -- discard -- silently discarding is exactly the bug this guards
+        -- against (see 'ForeignOwnedArgNotBytes' & co. for the sibling
+        -- parameter-position coherence checks).
+        goT (Abs.TOwned _) =
+          throwError (OwnedModifierMisplaced Nothing
+            (Tx.pack "`owned` is only allowed on a `Bytes` parameter of a \
+                     \foreign-module member"))
         goT (Abs.TFun a b) = CTArr <$> goT a <*> pure CREmpty <*> goT b
         goT (Abs.TVar (Abs.VarId (_, name))) = do
           seen <- liftST (readSTRef seenRef)
@@ -1351,9 +1371,87 @@ processForeignDecls env0 decls = foldM registerForeign env0 foreignDecls
                   "' is adopt-return; the module's `free` clause must be" <>
                   " \"free\" (the only supported destructor), got " <> sym
         in throwError (ForeignDispositionMismatch memberPos memberName msg)
-      -- Translate the declared type as a full top-level signature (supporting
-      -- `with E` rows and polymorphism).
-      scheme <- translateSig env ty
+      -- Per-argument transfer marker (FFI Slice 4): walk the surface `owned`
+      -- modifiers, recording one 'Blessed.ArgTransfer' per parameter in
+      -- declaration order AND stripping `owned` from the (only) positions
+      -- where it is valid -- a parameter head. Any `owned` left standing
+      -- after this strip (a return type, or nested inside a compound
+      -- parameter type) is therefore, BY CONSTRUCTION, misplaced, and
+      -- 'translateSig' below rejects it with 'OwnedModifierMisplaced'.
+      let (transfers, tyStripped) = classifyOwnedParams ty
+      -- Translate the (owned-stripped) declared type as a full top-level
+      -- signature (supporting `with E` rows and polymorphism).
+      scheme <- translateSig env tyStripped
+      -- `classifyOwnedParams` and `translateSig`'s arrow-spine walk (`goT`)
+      -- classify every `Abs.Type` shape identically (advance on `TFun`/
+      -- `TWith`, transparently unwrap `TParen`/prenex-`TQual`, terminate on
+      -- everything else -- see `classifyOwnedParams`'s doc), so `transfers`
+      -- and `paramCTys` are STRUCTURALLY the same length: no runtime
+      -- assertion is needed to keep them in sync.
+      let paramCTys = paramCTypesOf (schemeBody scheme)
+      -- Argument-transfer coherence (a): `owned` is boundary metadata scoped
+      -- to `Bytes` parameters only in this slice -- there is no blessed sink
+      -- for any other owned-INTO-C payload shape (spec §6.1).
+      sequence_
+        [ throwError (ForeignOwnedArgNotBytes memberPos memberName
+            ("foreign member '" <> memberName <>
+             "' declares an `owned` parameter of type " <>
+             prettyCType paramCTy <>
+             "; `owned` is only supported on `Bytes` parameters"))
+        | (transfer, paramCTy) <- zip transfers paramCTys
+        , transfer == Blessed.MoveOut
+        , paramCTy /= CTCon TcBytes []
+        ]
+      -- Argument-transfer coherence (b), BIDIRECTIONAL: the surface `owned`
+      -- markers and the blessed table's per-argument `MoveOut` markers must
+      -- AGREE at every position. Out-of-range/absent positions on either side
+      -- default to `TransferNone` (mirroring `[]` meaning "all borrow-out").
+      -- The blessed table is authoritative for what the runtime router (FFI
+      -- Slice 4 Task 4) actually does with an argument, so BOTH mismatch
+      -- directions are unsound:
+      --   * surface `owned` but no blessed `MoveOut` -> the signature promises
+      --     a transfer-full handoff nothing performs (ForeignOwnedArgNotBlessed);
+      --   * blessed `MoveOut` but no surface `owned` -> the runtime moves/frees
+      --     the buffer while the checker treated it as a still-usable borrow,
+      --     a latent use-after-move (ForeignBlessedMoveOutNeedsOwned).
+      -- INVARIANT (relied on by Task 2/4): for any member that passes this
+      -- check, the surface-derived `fmiArgTransfer` equals the blessed
+      -- `bsArgTransfer` at every parameter position, so either list may be
+      -- threaded into `RForeignCall` / the router interchangeably.
+      let transferAt xs i = case drop i xs of
+            (t : _) -> t
+            []      -> Blessed.TransferNone
+          blessedTransfers = Blessed.bsArgTransfer bsig
+      sequence_
+        [ throwError (ForeignOwnedArgNotBlessed memberPos memberName
+            ("foreign member '" <> memberName <>
+             "' declares an `owned` parameter at position " <> Tx.pack (show i) <>
+             ", but " <> libText <> "." <> cSymbol <>
+             " is not blessed with a matching `MoveOut` there"))
+        | (i, transfer) <- zip [0 :: Int ..] transfers
+        , transfer == Blessed.MoveOut
+        , transferAt blessedTransfers i /= Blessed.MoveOut
+        ]
+      sequence_
+        [ throwError (ForeignBlessedMoveOutNeedsOwned memberPos memberName
+            ("foreign member '" <> memberName <>
+             "' is blessed to take ownership of parameter " <> Tx.pack (show i) <>
+             " (" <> libText <> "." <> cSymbol <>
+             " is a transfer-full sink there); declare it as `owned " <>
+             prettyCType paramTy <> "`"))
+        | (i, blessedT, paramTy)
+            -- The `++ repeat Bytes` tail is a best-effort MESSAGE hint only:
+            -- it supplies a default `Bytes` type to render if the blessed table
+            -- ever over-declares `MoveOut` at a position past the member's
+            -- declared arity. The rejection itself fires correctly regardless
+            -- (it keys on `blessedT`/`transfers`, not `paramTy`); only the
+            -- shown type would be the default in that (currently unreachable)
+            -- over-declaration case.
+            <- zip3 [0 :: Int ..] blessedTransfers
+                    (paramCTys ++ repeat (CTCon TcBytes []))
+        , blessedT == Blessed.MoveOut
+        , transferAt transfers i /= Blessed.MoveOut
+        ]
       -- Borrow-disposition coherence (FFI Slice 3 Task 4): unlike `owned`,
       -- the borrow disposition is carried by the member's declared RETURN
       -- TYPE, not a keyword -- a member blessed DispBorrow must declare its
@@ -1370,11 +1468,77 @@ processForeignDecls env0 decls = foldM registerForeign env0 foreignDecls
            "' is blessed as a borrow-disposition producer; its declared" <>
            " return type must be `Borrow`"))
       let minfo = ForeignMemberInfo
-                    { fmiScheme = scheme
-                    , fmiSymbol = cSymbol
-                    , fmiOwned  = isOwned
+                    { fmiScheme      = scheme
+                    , fmiSymbol      = cSymbol
+                    , fmiOwned       = isOwned
+                    , fmiArgTransfer = transfers
                     }
       pure (Map.insert memberName minfo acc)
+
+    -- Walk the surface signature's arrow spine ONCE, doing double duty:
+    --   (1) extract one ArgTransfer per parameter (`owned T` at a parameter
+    --       HEAD -> MoveOut, else TransferNone), in declaration order;
+    --   (2) strip the `owned` wrapper from exactly those parameter-head
+    --       positions, leaving every other `TOwned` (a return type, or one
+    --       nested inside a compound parameter type like `Array (owned
+    --       Bytes)`) untouched.
+    -- The returned, owned-stripped type is what 'translateSig' then
+    -- translates -- so `translateSig`'s `goT` only ever sees a leftover
+    -- `TOwned` that is genuinely misplaced, and rejects it with
+    -- 'OwnedModifierMisplaced'.
+    --
+    -- `go` (the spine walk) and `translateSig`'s own arrow walk (`goT`,
+    -- Infer.hs:~539-652) MUST classify every `Abs.Type` shape identically,
+    -- because the two lists this produces (the `ArgTransfer`s and, via the
+    -- stripped type, `paramCTypesOf (schemeBody scheme)`) are zipped
+    -- position-by-position by the coherence checks below:
+    --   * ADVANCE the spine (emit a param, recurse on the tail): `TFun`,
+    --     `TWith` (`goT` maps both to `CTArr <param> _ <tail>`).
+    --   * TRANSPARENT continuation (unwrap in place, position-preserving):
+    --     `TParen` (`goT (TParen t') = goT t'`) and a prenex `TQual ctx body`
+    --     (peeled to `body` at `translateSig`'s entry; a NON-prenex `TQual`
+    --     is rejected by `goT` before this walk runs).
+    --   * TERMINATE (a leaf, no further params): everything else -- `TApp`,
+    --     `TVar`, `TCon`, `TList`, `TTuple`, `TUnit`, `TRowArg`, `TExtend`,
+    --     and (deliberately, UNLIKE the old design) a bare `TOwned` reached
+    --     outside a parameter head, which is a non-parameter position and
+    --     so is left as a leaf for `goT` to reject (`paramCTypesOf` stops on
+    --     the resulting non-`CTArr`, and `go`'s `_` arm stops here too).
+    -- `argOf` classifies exactly one parameter HEAD: `owned T` (through a
+    -- `TParen`) strips to `T` and reports `MoveOut`; anything else is left
+    -- as-is with `TransferNone`.
+    -- Keep this correspondence exact: a missing transparent case truncates
+    -- the transfer list (dropping a later parameter's `owned`, bypassing the
+    -- gate) and desyncs it from `paramCTys`'s length.
+    classifyOwnedParams :: Abs.Type -> ([Blessed.ArgTransfer], Abs.Type)
+    classifyOwnedParams = go
+      where
+        go (Abs.TFun a rest) =
+          let (transfer, a')      = argOf a
+              (transfers, rest')  = go rest
+          in (transfer : transfers, Abs.TFun a' rest')
+        go (Abs.TWith a rest eff) =
+          let (transfer, a')      = argOf a
+              (transfers, rest')  = go rest
+          in (transfer : transfers, Abs.TWith a' rest' eff)
+        go (Abs.TParen t) =
+          let (transfers, t') = go t
+          in (transfers, Abs.TParen t')
+        go (Abs.TQual ctx body) =
+          let (transfers, body') = go body
+          in (transfers, Abs.TQual ctx body')
+        go t = ([], t)
+
+        argOf (Abs.TOwned t) = (Blessed.MoveOut, t)
+        argOf (Abs.TParen t) =
+          let (transfer, t') = argOf t
+          in (transfer, Abs.TParen t')
+        argOf t = (Blessed.TransferNone, t)
+
+    -- Peel a CType's arrow chain down to its parameter types, in order.
+    paramCTypesOf :: CType -> [CType]
+    paramCTypesOf (CTArr a _ b) = a : paramCTypesOf b
+    paramCTypesOf _             = []
 
     -- Peel a CType's arrow chain down to its final (non-arrow) result type.
     finalReturnCType :: CType -> CType

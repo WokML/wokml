@@ -242,6 +242,8 @@ typeArgToCType vmap = go
                              (Tx.pack "type-level extension in class/instance head"))
       Abs.TRowArg{}     -> Left (MalformedInstance
                              (Tx.pack "row variable in class/instance head"))
+      Abs.TOwned{}      -> Left (MalformedInstance
+                             (Tx.pack "owned modifier in class/instance head"))
 
 -- | Translate an 'Abs.Constraint' (grammar form) to a 'Types.Constraint'
 -- over the given var map.
@@ -274,6 +276,7 @@ collectVarsT = go
       Abs.TApp f x       -> go (go m f) x
       Abs.TExtend a _ _  -> go m a
       Abs.TCon _         -> m
+      Abs.TOwned t'      -> go m t'
       Abs.TRowArg (Abs.VarId (_, n)) ->
         if Map.member n m then m else Map.insert n (Map.size m) m
       Abs.TVar (Abs.VarId (_, n)) ->
@@ -481,6 +484,7 @@ substTyVar p target = go
       Abs.TCon{}          -> t
       Abs.TUnit           -> t
       Abs.TRowArg _       -> t  -- row var: distinct namespace from class param (slice B)
+      Abs.TOwned a        -> Abs.TOwned (go a)
       Abs.TExtend a s rc  -> Abs.TExtend (go a) s rc
 
 -- | Encode an instance context (@[Abs.Constraint]@) as the constraint-context

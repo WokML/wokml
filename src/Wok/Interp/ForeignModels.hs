@@ -11,9 +11,10 @@
 module Wok.Interp.ForeignModels
   ( foreignMemchr
   , foreignStrndup
+  , referenceFNV1a
   ) where
 
-import Data.Bits ((.&.))
+import Data.Bits (xor, (.&.))
 import qualified Data.ByteString as BS
 import Data.Word (Word64)
 
@@ -44,3 +45,9 @@ foreignMemchr bs byte n =
 foreignStrndup :: BS.ByteString -> Word64 -> BS.ByteString
 foreignStrndup bs n =
   BS.takeWhile (/= 0) (BS.take (fromIntegral (min n (fromIntegral (BS.length bs) :: Word64))) bs)
+
+-- | Pure model for FNV-1a hash (64-bit) over byte sequence.
+-- Uses the FNV-1a offset basis and prime, consistent with the C implementation.
+referenceFNV1a :: BS.ByteString -> Word64
+referenceFNV1a = BS.foldl' step 0xcbf29ce484222325
+  where step h b = (h `xor` fromIntegral b) * 0x100000001b3

@@ -1,0 +1,13 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, REJECT: ForeignBlessedMoveOutNeedsOwned (the
+-- dual, latent-use-after-move direction). `consume` is blessed with MoveOut at
+-- position 0, but this signature omits `owned` on that parameter. The runtime
+-- router (Task 4) acts on the BLESSED transfer list, so it would move/free the
+-- buffer while the checker treated it as a still-usable borrow -- a
+-- use-after-move. Rejecting here keeps surface `owned` <=> blessed MoveOut.
+foreign module Sink "wok" where
+  consume "consume" : Bytes -> U64 with IO
+
+main = Sink.consume (fromList [65, 66, 67])

@@ -16,7 +16,7 @@ import Wok.IR.Anf
   ( Alt (..), Atom (..), Binder (..), CoreModule (..), Expr (..), Handler (..)
   , Lit (..), OpArm (..), Rhs (..), TopBind (..) )
 import Wok.IR.Name (JoinId (..), Unique (..), nameHint, nameUniq)
-import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup)
+import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup, referenceFNV1a)
 import Wok.Interp.Prim (primTable)
 import qualified Wok.Interp.Sched as Sched
 import qualified Wok.Interp.Utf8 as Utf8
@@ -135,7 +135,7 @@ evalRhs prims sup b rhs body sc k = case rhs of
   -- No ownership transfer in the reference interpreter (it models bytes as VBytes).
   -- Dispatch is purely by (lib, sym); the 'ReturnDisp' field is consumed in Task 6
   -- at the return-allocation site, not here. Task 6 also adds real C calls.
-  RForeignCall lib sym _disp _mfree as -> do
+  RForeignCall lib sym _disp _xfer _mfree as -> do
     vs <- mapM (resolveAtom prims sc) as
     v  <- evalForeignCall lib sym vs
     cont v
@@ -175,6 +175,11 @@ evalForeignCall lib sym args
         [VLit (LInt n)] ->
           Right (VBytes (Utf8.demoPattern (fromIntegral (Utf8.clampBorrowDemoLen n))))
         _ -> Left (PrimError (Tx.pack "lendBuffer: expected (U64)"))
+  | lib == Tx.pack "wok", sym == Tx.pack "consume" =
+      case args of
+        [VBytes bs] ->
+          Right (VLit (LInt (toInteger (referenceFNV1a bs))))
+        _ -> Left (PrimError (Tx.pack "consume: expected (Bytes)"))
   | otherwise =
       Left (PrimError
         (Tx.pack "foreign symbol not available in the interpreter: "

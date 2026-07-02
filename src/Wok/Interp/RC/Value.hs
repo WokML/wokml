@@ -107,6 +107,7 @@ module Wok.Interp.RC.Value
   , wokBytesTag
   , wokForeignBytesTag
   , allocNBytes
+  , allocNBytesFromPtr
   , allocForeignBytes
   , adoptCHeapPtr
     -- * Borrow-view C-cell support (FFI Slice 3)
@@ -2006,6 +2007,25 @@ allocNBytes hp bs s = do
              copyBytes dest (castPtr src) len)
   pure (CAddr p, s { stStats = recordAlloc charged (stStats s) })
 
+-- | Allocate a fresh 'WokBytes' C cell of length @byteLen@ and fill it with a
+-- SINGLE C-to-C memcpy from a foreign source pointer @src@ -- no 'ByteString'
+-- round-trip. Used by the FFI Slice 4 move-out COPY branch
+-- ('Wok.Interp.RC.Machine's @symConsume@ arm) when the owned-Bytes source is
+-- already a live C cell (a native 'WokBytes' or an adopted 'WokForeignBytes'):
+-- reading via 'bytesBytes' (C -> 'ByteString') then 'alloc (NBytes _)'
+-- ('ByteString' -> C) would cost two full copies for one logical copy.
+-- CHeap-only (mirrors 'allocNBytes'); charges the identical
+-- @16 + 8*ceil(byteLen/8)@ cell size, so the byte-accounting oracle sees no
+-- difference from the two-copy path.
+allocNBytesFromPtr :: Ptr WokHeap -> Ptr Word8 -> Word64 -> Store -> RC (Addr, Store)
+allocNBytesFromPtr hp src byteLen s = do
+  let byteLenI = fromIntegral byteLen :: Int
+      charged  = bytesCellCBytes byteLenI
+  p    <- liftIO (H.wokBytesAlloc hp byteLen)
+  dest <- liftIO (H.wokBytesData p)
+  liftIO (copyBytes dest src byteLenI)
+  pure (CAddr p, s { stStats = recordAlloc charged (stStats s) })
+
 -- | Adopt a foreign byte buffer into a 'WokForeignBytes' cell. The buffer is
 -- libc-malloc'd HERE (off the wok heap) to model a genuine C->RC handoff; the cell
 -- stores the raw pointer and wok frees it (libc free) at refcount-zero in 'dropAddr'.
@@ -2152,6 +2172,16 @@ nodeArity _           = 0
 -- Used to keep 'stCurBytes'/'stPeakBytes' bit-for-bit identical to the C
 -- runtime's @cur_bytes@/@peak_bytes@ so the differential oracle can assert
 -- 'peak_bytes' equality between both backends.
+-- | Counted cell byte size of a flat byte buffer of length @n@ (the shared
+-- WokString / WokBytes layout): 8-byte header + 8-byte byte_len field + body
+-- rounded UP to an 8-byte granule = @16 + 8*ceil(n/8)@. Single source of truth
+-- for the 'NString'/'NBytes' cases of 'wouldBeCBytes' and for
+-- 'allocNBytesFromPtr' -- a layout change updates this one formula, keeping the
+-- move-out COPY branch's byte accounting in lockstep with every other Bytes
+-- allocation. Matches @wok_string_alloc@/@wok_bytes_alloc@ exactly.
+bytesCellCBytes :: Int -> Int
+bytesCellCBytes n = 16 + 8 * ((n + 7) `div` 8)
+
 wouldBeCBytes :: Node -> Int
 wouldBeCBytes n@(NCon _ vs)
   | nodeCEligible n = 8 + 8 * length vs
@@ -2161,13 +2191,13 @@ wouldBeCBytes (NArray vs)  = 16 + 8 * length vs
 -- granule so the next bumped cell stays 8-aligned (contrast NArray, whose body
 -- is already word-aligned and needs no rounding). Matches wok_string_alloc
 -- charge exactly so AbstractHeap and CHeap agree on peak_bytes.
-wouldBeCBytes (NString bs)    = 16 + 8 * ((BS.length bs + 7) `div` 8)
+wouldBeCBytes (NString bs)    = bytesCellCBytes (BS.length bs)
 -- View cell: 8-byte header + parent ptr 8B + offset 8B + len 8B = 32B fixed.
 -- Matches the WokStringView C cell layout exactly.
 wouldBeCBytes (NStringView{}) = 32
 -- Bytes cell byte size = 16 + 8*ceil(byte_len/8). Same layout as NString:
 -- header 16B + 8-byte-rounded body. Matches wok_bytes_alloc charge exactly.
-wouldBeCBytes (NBytes bs)        = 16 + 8 * ((BS.length bs + 7) `div` 8)
+wouldBeCBytes (NBytes bs)        = bytesCellCBytes (BS.length bs)
 -- Foreign-bytes handle: fixed 24 B (header 8 + data_ptr 8 + byte_len 8). The buffer
 -- itself is off-heap (libc-malloc'd), so only the cell handle is counted.
 wouldBeCBytes (NForeignBytes _)  = 24

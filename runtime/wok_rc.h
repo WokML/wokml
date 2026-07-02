@@ -139,6 +139,7 @@ WokObj*          wok_bytes_alloc(WokHeap* h, uint64_t byte_len); /* rc=1, tag=WO
 WOK_PURE uint64_t wok_bytes_len(const WokObj* p);                /* byte_len */
          uint8_t* wok_bytes_data(WokObj* p);                     /* pointer to body (bulk fill + FFI) */
 WOK_PURE uint64_t wok_bytes_byte_get(const WokObj* p, uint64_t i); /* one byte, zero-extended */
+WOK_PURE uint64_t wok_bytes_fnv1a(const WokObj* p); /* FNV-1a (64-bit), no side effects (pure read, does not free) */
 
 /* ---- UTF-8 validation (shared by Std.Bytes.fromBytes) ---- */
 int wok_validate_utf8(const uint8_t *bytes, uint64_t len);

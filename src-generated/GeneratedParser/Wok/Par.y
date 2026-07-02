@@ -339,6 +339,7 @@ Type2
   | '(' Type ')' { GeneratedParser.Wok.Abs.TParen $2 }
   | '(' ')' { GeneratedParser.Wok.Abs.TUnit }
   | '(' 'row' VarId ')' { GeneratedParser.Wok.Abs.TRowArg $3 }
+  | 'owned' Type2 { GeneratedParser.Wok.Abs.TOwned $2 }
 
 RowContrib :: { GeneratedParser.Wok.Abs.RowContrib }
 RowContrib

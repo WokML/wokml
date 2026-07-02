@@ -94,7 +94,7 @@ exprUniques = goE
       -- 'RReuseCon tok c fields' references the token + field atoms, exactly like an
       -- 'RCon' plus the token operand.
       Anf.RReuseCon tok _ xs       -> Set.union (av tok) (avs xs)
-      Anf.RForeignCall _ _ _ _ xs -> avs xs
+      Anf.RForeignCall _ _ _ _ _ xs -> avs xs
     goA a = case a of
       Anf.AltCon _ _ e -> goE e
       Anf.AltLit _ e   -> goE e

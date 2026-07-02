@@ -79,12 +79,15 @@ if [ "${1:-}" = "interp" ]; then
   echo "== interp: building wok with -fasan (WOK_RC_MALLOC, ASan redzones) =="
   cabal build -fasan exe:wok
   echo "== interp: positive -- corpus must be CLEAN under ASan =="
-  for f in test/rc-ffi-foreign/*.wok test/rc-borrow/*.wok; do
+  for f in test/rc-ffi-foreign/*.wok test/rc-borrow/*.wok test/rc-ffi-owned/*.wok; do
     # FFI Slice 3 Task 6 negative controls (death-*.wok / contstore-*.wok) are
     # REJECTED at compile/admission time, not clean-path runnable -- skip them here;
-    # they have their own negative-control sections below.
+    # they have their own negative-control sections below. FFI Slice 4 adds
+    # coherence-*.wok (Task 1 compile-reject fixtures) in test/rc-ffi-owned/ --
+    # also not clean-path runnable; the runnable move-out corpus is the rest
+    # (00-consume-unique / 01-consume-shared exercise the MOVE / COPY branches).
     case "$(basename "$f")" in
-      death-*|contstore-*) continue ;;
+      death-*|contstore-*|coherence-*) continue ;;
     esac
     if ASAN_OPTIONS=detect_leaks=0 cabal run -v0 -fasan exe:wok -- "$f" --dump-rc-stats >/dev/null 2>&1; then
       echo "ok: $f"
@@ -153,6 +156,87 @@ if [ "${1:-}" = "interp" ]; then
       echo "ok: $(basename "$f") use-after-free caught by ASan (carrier wall + activation close are load-bearing)"
     fi
   done
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE CONTROLS (FFI Slice 4 Task 6 death-test matrix, owned-INTO-C): defeat
+  # the copy-when-shared guard TWO distinct ways and confirm each is a GENUINE,
+  # DISTINCT fault, not a vacuous control.
+  #
+  # Both death-*.wok fixtures build a SHARED Bytes (`b` is read again after
+  # `Sink.consume b`, so Perceus dups it -> rc > 1 at the call -> the UNMUTATED
+  # router COPIES, and both files run CLEAN without any flag). Each flag mutates
+  # the shared branch of `symConsume` differently. NOTE: neither mutation is the
+  # naive "always dropAddr" force-move -- 'dropAddr' is refcount-SAFE (it only
+  # frees at rc==0), so at rc==2 it would merely decrement to 1 and NOTHING would
+  # fault. Both mutations reach PAST 'dropAddr' to the real allocator's 'free'.
+  #
+  #   * ffi-owned-noguard-negctrl + death-use-after-move.wok: hard-free the cell
+  #     pointer ONCE (models a C consumer that took the raw shared buffer and
+  #     freed it). The sibling's later `Libc.memchr` read -- a REAL C call ASan
+  #     intercepts, unlike a Haskell `peekElemOff`, which ASan does NOT instrument
+  #     (the Slice-3 vacuous-test lesson) -- then touches the freed buffer ->
+  #     ASan `heap-use-after-free`.
+  #   * ffi-owned-doublefree-negctrl + death-double-free.wok: free the cell
+  #     pointer TWICE back-to-back INSIDE the dispatch (models the buffer freed by
+  #     BOTH C and wok). ASan intercepts the SECOND `free` on the already-freed
+  #     pointer -> ASan `attempting double-free` -- a DISTINCT class from the UAF
+  #     above, with no intervening poisoned read.
+  #
+  # A single global mutation cannot produce BOTH classes at once (the first hard
+  # free poisons the region, so any later access is a UAF read before a second
+  # free could be reached), hence the two separate flags -- one genuine UAF, one
+  # genuine double-free. A clean exit under EITHER flag means the copy-when-shared
+  # guard (Task 4) is inert -- a regression.
+  #
+  # Region-double-move (a MoveOut on an R1-region-reachable, uncounted Bytes) has
+  # NO fixture here: Wok.IR.Escape.escapingAtomsRhs treats EVERY RForeignCall
+  # argument as an escaping position with NO call-head exemption (unlike a plain
+  # RApp), so arenaEscapes is unconditionally True for any Bytes binder used as a
+  # Sink.consume argument -- such a value can never be arena/region-routed by the
+  # current compiler; it is always born on the counted heap. Confirmed empirically
+  # (a Bytes built and consumed only inside a helper, never escaping otherwise,
+  # still allocates/frees through the ordinary counted MOVE path, matching
+  # 00-consume-unique.wok's accounting -- no arena instrumentation fires). The
+  # router's "uncounted -> COPY" branch (spec §7.1) is therefore defensive-only
+  # against a hypothetical future relaxation of that escape rule, not reachable
+  # from today's surface language; this is reported honestly rather than faked.
+  #
+  # Each flag flip is an incremental Haskell-only rebuild (a CPP gate in
+  # Wok.Interp.RC.Machine's `symConsume` arm); the C objects (already
+  # -DWOK_RC_MALLOC + ASan from the positive build) are reused unchanged --
+  # exactly like the noclamp / borrow-noescape controls.
+  # ---------------------------------------------------------------------------
+  echo "== interp: owned-INTO-C death-tests -- confirming flag OFF runs them CLEAN under ASan =="
+  for f in test/rc-ffi-owned/death-*.wok; do
+    if ASAN_OPTIONS=detect_leaks=0 cabal run -v0 -fasan exe:wok -- "$f" --dump-rc-stats >/dev/null 2>&1; then
+      echo "ok: $(basename "$f") clean without the mutation (unmutated COPY path is safe)"
+    else
+      echo "FAIL: $(basename "$f") aborted WITHOUT the mutation (flag off) -- the fixture itself is unsound" >&2
+      exit 1
+    fi
+  done
+
+  echo "== interp: negative control (UAF) -- rebuilding with -fffi-owned-noguard-negctrl =="
+  cabal build -fasan -fffi-owned-noguard-negctrl exe:wok
+  echo "== interp: owned-INTO-C death-test -- death-use-after-move.wok MUST abort (heap-use-after-free) =="
+  if ASAN_OPTIONS=detect_leaks=0 cabal run -v0 -fasan -fffi-owned-noguard-negctrl exe:wok \
+       -- test/rc-ffi-owned/death-use-after-move.wok --dump-rc-stats >/dev/null 2>&1; then
+    echo "FAIL: death-use-after-move.wok did NOT abort (copy-when-shared guard inert?)" >&2
+    exit 1
+  else
+    echo "ok: death-use-after-move.wok heap-use-after-free caught by ASan (copy-when-shared guard is load-bearing)"
+  fi
+
+  echo "== interp: negative control (double-free) -- rebuilding with -fffi-owned-doublefree-negctrl =="
+  cabal build -fasan -fffi-owned-doublefree-negctrl exe:wok
+  echo "== interp: owned-INTO-C death-test -- death-double-free.wok MUST abort (attempting double-free) =="
+  if ASAN_OPTIONS=detect_leaks=0 cabal run -v0 -fasan -fffi-owned-doublefree-negctrl exe:wok \
+       -- test/rc-ffi-owned/death-double-free.wok --dump-rc-stats >/dev/null 2>&1; then
+    echo "FAIL: death-double-free.wok did NOT abort (copy-when-shared guard inert?)" >&2
+    exit 1
+  else
+    echo "ok: death-double-free.wok double-free caught by ASan (copy-when-shared guard is load-bearing)"
+  fi
 
   # Restore the default (no-asan) build so subsequent `cabal test` works without
   # the ASan dylib dependency. cabal clean + rebuild re-links against the normal

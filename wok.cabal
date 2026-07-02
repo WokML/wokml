@@ -45,6 +45,32 @@ flag ffi-borrow-noescape-negctrl
   default:     False
   manual:      True
 
+-- Negative-control flag (FFI Slice 4 Task 6 death-test matrix): defeat the
+-- owned-INTO-C router's copy-when-shared guard in the RC interpreter's
+-- ("wok","consume") dispatch (Wok.Interp.RC.Machine) so a SHARED Bytes (rc>1)
+-- is hard-freed via a raw libc 'free' instead of copied, modeling a C consumer
+-- that took the raw shared buffer and freed it directly, bypassing wok's
+-- refcount. Combined with -fasan this turns a later touch of the buffer (a
+-- sibling's normal drop, or a sibling's Libc.memchr read) into a GENUINE ASan
+-- use-after-free / double-free, proving the copy-when-shared guard has teeth.
+-- Default: False (never enabled in a normal build).
+flag ffi-owned-noguard-negctrl
+  description: Defeat the owned-INTO-C copy-when-shared guard (ASan death-test negative control only). NEVER use in production.
+  default:     False
+  manual:      True
+
+-- Negative-control flag (FFI Slice 4 Task 6 death-test matrix, DOUBLE-FREE class):
+-- like ffi-owned-noguard-negctrl, but the mutated shared branch frees the cell
+-- pointer TWICE back-to-back (free; free). ASan intercepts the SECOND free on the
+-- already-freed pointer and reports a genuine `attempting double-free` (a distinct
+-- class from the use-after-free the single-hard-free control produces via a later
+-- read), faithfully modeling the move-out double-free hazard (the buffer freed by
+-- BOTH C and wok). Default: False (never enabled in a normal build).
+flag ffi-owned-doublefree-negctrl
+  description: Free the owned-INTO-C buffer twice (ASan double-free death-test negative control only). NEVER use in production.
+  default:     False
+  manual:      True
+
 -- Plain -Wall, used by the generated parser sublibrary (BNFC/alex/happy
 -- output carries unavoidable warnings, so it must NOT be -Werror).
 common warnings
@@ -159,10 +185,21 @@ library
                       -Wdouble-promotion -Wstrict-prototypes -Wformat-security
     if flag(asan)
       cc-options:     -fsanitize=address -fno-omit-frame-pointer -DWOK_RC_MALLOC
+      -- Also surface WOK_RC_MALLOC to GHC's CPP (cc-options above only reaches
+      -- the C compiler): Wok.Interp.RC.Machine's negctrl flags '#error' out at
+      -- Haskell compile time if a negctrl flag is enabled WITHOUT this backend
+      -- (see the guard near its other CPP checks), since the negctrl mutations
+      -- call libc 'free()' directly on a cell pointer -- well-defined ONLY under
+      -- the real-malloc WOK_RC_MALLOC backend, UB against the slab arena.
+      cpp-options:    -DWOK_RC_MALLOC
     if flag(ffi-noclamp-negctrl)
       cpp-options:    -DWOK_FFI_NOCLAMP_NEGCTRL
     if flag(ffi-borrow-noescape-negctrl)
       cpp-options:    -DWOK_FFI_BORROW_NOESCAPE_NEGCTRL
+    if flag(ffi-owned-noguard-negctrl)
+      cpp-options:    -DWOK_FFI_OWNED_NOGUARD_NEGCTRL
+    if flag(ffi-owned-doublefree-negctrl)
+      cpp-options:    -DWOK_FFI_OWNED_DOUBLEFREE_NEGCTRL
     autogen-modules:
         Paths_wok
     other-modules:

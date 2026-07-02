@@ -3,6 +3,7 @@ module Wok.Interp.RC.Prim
   , stringBytes
   , bytesBytes
   , allocBorrowDemoLend
+  , consumeChecksum
   ) where
 
 import Control.Monad (foldM)
@@ -10,7 +11,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (throwE)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
-import Data.Word (Word8)
+import Data.Word (Word8, Word64)
 import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr, minusPtr, nullPtr, plusPtr)
@@ -32,6 +33,7 @@ import Wok.Interp.RC.Value
   , wokBytesTag, wokForeignBytesTag
   , wokBorrowViewTag, allocBorrowView, borrowRegister )
 import Wok.Interp.Value (RuntimeError (..))
+import Wok.Interp.ForeignModels (referenceFNV1a)
 import qualified Wok.Interp.Utf8 as Utf8
 import Wok.Runtime.StringZilla (szFind, szHash, szEditDistance)
 
@@ -1118,6 +1120,25 @@ bytesViaDeref (RVBox a) s = do
     NForeignBytes bs -> pure bs
     _                -> throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
 bytesViaDeref _ _ = throwE (PrimError (Tx.pack "Bytes: not a Bytes cell"))
+
+-- | The deterministic FNV-1a checksum of a Bytes cell's bytes, backend-split for
+-- the @("wok","consume")@ move-out dispatch (FFI Slice 4). On CHeap over a genuine
+-- 'WokBytes' cell it calls the REAL C 'wok_bytes_fnv1a' (so the
+-- three-backend differential oracle exercises the C function on the common path);
+-- any other Bytes cell (an adopted 'WokForeignBytes' typed as Bytes, or the
+-- AbstractHeap backend) computes the byte-identical Haskell 'referenceFNV1a' over
+-- the same bytes. Pure-read: it NEVER frees or mutates the cell -- the free is
+-- Haskell-driven synchronously at the dispatch site (design i-b, spec §7.4).
+consumeChecksum :: Addr -> Store -> RC Word64
+consumeChecksum a s = case stBackend s of
+  CHeap _ -> case a of
+    CAddr p -> do
+      tid <- liftIO (H.wokTag p)
+      if tid == wokBytesTag
+        then liftIO (H.wokBytesFnv1a p)
+        else referenceFNV1a <$> bytesBytes (RVBox a) s
+    _ -> referenceFNV1a <$> bytesBytes (RVBox a) s
+  AbstractHeap -> referenceFNV1a <$> bytesBytes (RVBox a) s
 
 -- | @length buf@: byte count of the buffer. Consumes 'buf'. RC: 0 alloc.
 bytesLengthRC :: RCPrim

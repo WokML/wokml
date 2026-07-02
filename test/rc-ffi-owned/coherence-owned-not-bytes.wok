@@ -1,0 +1,10 @@
+module Main
+
+-- FFI Slice 4 Task 1 coherence, REJECT: ForeignOwnedArgNotBytes. `owned` is
+-- boundary metadata scoped to `Bytes` parameters in this slice; declaring
+-- `owned U64` has no blessed transfer-full sink for that payload shape, so the
+-- checker rejects it before the argument would ever be marshalled.
+foreign module Sink "wok" where
+  bad "consume" : owned U64 -> U64 with IO
+
+main = Sink.bad 3

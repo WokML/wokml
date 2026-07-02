@@ -136,6 +136,7 @@ data Type
     | TParen Type
     | TUnit
     | TRowArg VarId
+    | TOwned Type
     | TExtend Type VarSym RowContrib
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 

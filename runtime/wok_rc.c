@@ -1214,6 +1214,17 @@ uint64_t wok_bytes_byte_get(const WokObj* p, uint64_t i) {
     return (uint64_t)(((const uint8_t*)((const char*)p + 16))[i]);
 }
 
+uint64_t wok_bytes_fnv1a(const WokObj* cell) {
+    assert((uint32_t)cell->tag == WOK_BYTES_TAG);
+    uint64_t h = 0xcbf29ce484222325ULL;              /* FNV-1a offset basis */
+    uint64_t len = wok_bytes_len(cell);
+    /* Body starts at offset 16 (8-byte WokObj prefix + 8-byte byte_len field);
+       inline the offset to stay const-clean (mirrors wok_bytes_byte_get). */
+    const uint8_t* data = (const uint8_t*)((const char*)cell + 16);
+    for (uint64_t i = 0; i < len; i++) { h ^= data[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+
 /* ---- WokForeignBytes accessors (shared, no allocator involvement) -------------------- */
 
 uint8_t* wok_foreign_bytes_ptr(const WokObj* p) {

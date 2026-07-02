@@ -1,0 +1,12 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, REJECT: ForeignOwnedArgNotBlessed. `memchr` is
+-- blessed (("c","memchr"), DispScalar, []) -- a read-only borrow-out symbol with
+-- NO MoveOut at any position. Declaring its buffer parameter `owned Bytes`
+-- promises a transfer-full handoff the runtime never performs, so the surface
+-- `owned` with no blessed MoveOut behind it is rejected.
+foreign module Libc "c" free "free" where
+  bad2 "memchr" : owned Bytes -> U64 -> U64 -> U64 with IO
+
+main = Libc.bad2 (fromList [65, 66, 67]) 66 3

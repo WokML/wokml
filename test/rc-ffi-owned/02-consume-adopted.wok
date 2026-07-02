@@ -1,0 +1,29 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 (finding #4): cross-tier composition -- an ADOPTED foreign-bytes
+-- cell (0xFFFB WokForeignBytes, produced by Libc.strndup's owned-return adopt
+-- tier from FFI Slice 2) fed DIRECTLY into the owned-INTO-C `Sink.consume`
+-- router (Slice 4). Neither Task-4 fixture (00/01) drives this composition:
+-- both start from a freshly-built (fromList) 0xFFFC WokBytes cell, never a
+-- 0xFFFB adopted one. This fixture closes that gap.
+--
+-- `Libc.strndup`'s result is used exactly ONCE (as the sole argument to
+-- `Sink.consume`), so Perceus emits no dup before the call -> the runtime
+-- refcount is 1 at the dispatch -> the router takes the MOVE branch: it frees
+-- the adopted buffer exactly once (0 copy bytes), same discipline as
+-- 00-consume-unique.wok but over a 0xFFFB cell instead of a 0xFFFC one. If the
+-- MOVE branch mishandled the adopted cell's destructor (e.g. skipped `free`,
+-- or freed it via the wrong path), this would show up as a leak (rc stats,
+-- Suite B) or a double-free/UAF (ASan, via scripts/asan-runtime.sh).
+--
+-- Input: strndup [65,66,67,68] 4 => Bytes[65,66,67,68] (A,B,C,D, no NUL, n ==
+-- length so no truncation). consume then folds it into the FNV-1a checksum
+-- compared differentially across the reference/RC-abstract/RC-CHeap backends.
+foreign module Libc "c" free "free" where
+  owned strndup : Bytes -> U64 -> Bytes with IO
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> U64 with IO
+
+main : U64
+main = Sink.consume (Libc.strndup (fromList [65, 66, 67, 68]) 4)

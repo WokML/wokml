@@ -1,0 +1,14 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, REJECT: OwnedModifierMisplaced via a `owned`
+-- on a foreign member's RETURN type. `consume` is blessed DispScalar with
+-- MoveOut at position 0; position 0 here is correctly `owned Bytes` (so this
+-- isolates the return-position defect, not a param-coherence one). `owned`
+-- has no meaning on a return type -- it is not stripped by
+-- `classifyOwnedParams` (only a parameter HEAD is), so `translateSig` sees it
+-- as a leftover, misplaced `TOwned` and rejects it.
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> owned U64 with IO
+
+main = Sink.consume (fromList [65, 66, 67])

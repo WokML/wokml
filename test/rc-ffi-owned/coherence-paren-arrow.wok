@@ -1,0 +1,14 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, REJECT: ForeignOwnedArgNotBlessed via a
+-- PARENTHESIZED arrow. `A -> (B -> C)` is type-identical to `A -> B -> C` but
+-- BNFC parses the tail as `TParen (TFun ...)`. `consume` is blessed with
+-- MoveOut at position 0 ONLY; position 1 here declares `owned Bytes` with no
+-- blessed MoveOut behind it, so it must be rejected. Regression pin for the
+-- `argTransfers` TParen-unwrap bug (without the unwrap the walk truncated at
+-- the paren and this bypassed the gate).
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> (owned Bytes -> U64)
+
+main = Sink.consume (fromList [65, 66, 67]) (fromList [1, 2])

@@ -83,6 +83,14 @@ entrypoints Module ;
 -- parameters, plus the `TRowArg` Type2 (`(row e)` as a type argument). No new
 -- manual patch is required (`row` is already a keyword; the `(` ... `)` framing
 -- disambiguates cleanly). The patch list stays at exactly the three above.
+--
+-- POST-REGEN NOTE: FFI Slice 4 (Task 0) added the `TOwned` Type2 (`owned Type2`,
+-- a transfer-full argument modifier on a foreign-member parameter type). It
+-- requires NO manual patch beyond the three above: `owned` is already a keyword
+-- (consumed by `FMOwned` before the `:` in a ForeignMember), and `TOwned` is
+-- only reachable AFTER the `:`, inside a `Type` -- a distinct LALR(1) context,
+-- so the two `owned` productions never compete for the same lookahead. The
+-- patch list stays at exactly the three above.
 layout toplevel ;
 layout "let", "where", "of" ;
 layout stop "in" ;
@@ -314,6 +322,7 @@ TTuple.   Type2 ::= "(" Type "," [Type] ")" ;
 TParen.   Type2 ::= "(" Type ")" ;
 TUnit.    Type2 ::= "(" ")" ;            -- unit type; whitespace permitted
 TRowArg.  Type2 ::= "(" "row" VarId ")" ;   -- a row variable as a type argument (slice B)
+TOwned.   Type2 ::= "owned" Type2 ;   -- FFI Slice 4: transfer-full argument modifier
 
 -- Type-level extension `Point + ext` (left-assoc; tighter than `->`).
 -- The `+` token is captured via `VarSym`; the elaborator restricts to literal "+"

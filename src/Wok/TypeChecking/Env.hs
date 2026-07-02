@@ -36,6 +36,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified GeneratedParser.Wok.Abs as Abs
+import Wok.FFI.Blessed (ArgTransfer)
 import Wok.TypeChecking.Types (CType, Constraint, Kind, Scheme)
 
 data ConInfo = ConInfo
@@ -117,9 +118,15 @@ data InstanceInfo = InstanceInfo
 -- a top-level signature is ('translateSig'), so it may carry an effect row
 -- (e.g. @U64 -> U64 with IO@ becomes @CTArr CTU64 (CRExtend "IO" ...) CTU64@).
 data ForeignMemberInfo = ForeignMemberInfo
-  { fmiScheme :: Scheme   -- ^ The member's declared type scheme.
-  , fmiSymbol :: Text     -- ^ The C symbol name (FSName override or the member name).
-  , fmiOwned  :: Bool     -- ^ True iff declared with the @owned@ keyword.
+  { fmiScheme      :: Scheme   -- ^ The member's declared type scheme.
+  , fmiSymbol      :: Text     -- ^ The C symbol name (FSName override or the member name).
+  , fmiOwned       :: Bool     -- ^ True iff declared with the @owned@ keyword.
+  , fmiArgTransfer :: [ArgTransfer]
+    -- ^ Per-parameter transfer marker (FFI Slice 4), one entry per parameter
+    -- in declaration order: 'Wok.FFI.Blessed.MoveOut' where the surface
+    -- parameter type was @owned T@, 'Wok.FFI.Blessed.TransferNone'
+    -- otherwise. Carried but not yet acted on at runtime (Task 1); mirrors
+    -- the blessed table's 'Wok.FFI.Blessed.bsArgTransfer'.
   }
   deriving (Eq, Show)
 

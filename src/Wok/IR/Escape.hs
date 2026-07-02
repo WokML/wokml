@@ -189,8 +189,13 @@ escapingAtomsRhs (RReuseCon _ _ as)       = as
 escapingAtomsRhs (ROp m _ _ as)          = maybe as (: as) m
 -- Foreign call: all args are escaping moves (like RApp arguments; no call-head
 -- exemption since the callee is identified by (lib, sym) text, not an Atom).
--- Task 6 will refine to borrow-pass the buffer pointer; for now, all args escape.
-escapingAtomsRhs (RForeignCall _ _ _ _ as) = as
+-- This args-always-escape treatment is INTENTIONAL and LOAD-BEARING: it is what
+-- keeps an `owned Bytes` argument (FFI Slice 4 move-out) off the uncounted region
+-- heap, so it is always born counted and the move/copy router's rc peek is
+-- meaningful. Do NOT relax this to borrow-pass/exempt a foreign-call arg without
+-- re-checking Slice 4's region-double-move soundness (the router's `uncounted -> COPY`
+-- branch is defensive-only precisely because this rule makes region-routing unreachable).
+escapingAtomsRhs (RForeignCall _ _ _ _ _ as) = as
 escapingAtomsRhs (RLam ps e)              =
   -- A value captured into a nested lambda ESCAPES (it outlives the build site
   -- inside the closure cell). EVERY free occurrence in the body counts --- even a
@@ -624,7 +629,7 @@ consumingOccs caps = goE
     goR (RReuseCon{})             = error "RReuseCon: produced only by reusePairing post-pass (consumingOccs is a compile-time boundary-guard analysis, never sees post-pass IR)"
     goR (ROp m _ _ as)            = Set.unions (map watched (maybe as (: as) m))
     -- Foreign call: all args are consuming (like RApp; no call-head exemption).
-    goR (RForeignCall _ _ _ _ as) = Set.unions (map watched as)
+    goR (RForeignCall _ _ _ _ _ as) = Set.unions (map watched as)
     goR (RLam ps e)      =
       -- A capture referenced inside a nested lambda body is moved into that
       -- closure cell (it outlives the build) --- consuming. The lambda's own

@@ -1,0 +1,14 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 4: the UNIQUE (move) router branch. The freshly built Bytes
+-- is `Sink.consume`d as its ONLY use, so Perceus inserts no dup -> the runtime
+-- refcount is 1 at the call -> the router MOVES: it frees the buffer exactly once
+-- (0 copy bytes). The result is the deterministic FNV-1a checksum of [65,66,67],
+-- identical on the pure reference, RC-abstract, and RC-CHeap backends. Accounting
+-- balances (stAllocs == stFrees, stLive == baseline: the one alloc, one free).
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> U64 with IO
+
+main : U64
+main = Sink.consume (fromList [65, 66, 67])

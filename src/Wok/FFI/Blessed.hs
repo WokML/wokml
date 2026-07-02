@@ -7,6 +7,7 @@
 module Wok.FFI.Blessed
   ( BlessedSig (..)
   , ReturnDisp (..)
+  , ArgTransfer (..)
   , blessedTable
   , lookupBlessed
   ) where
@@ -31,8 +32,27 @@ data ReturnDisp
                  -- (checked in 'Wok.TypeChecking.Infer.processForeignDecls').
   deriving (Eq, Show)
 
+-- | How an ARGUMENT's ownership is handed from wok to the callee.
+data ArgTransfer
+  = TransferNone  -- ^ The callee does not take ownership; wok keeps the value.
+  | MoveOut       -- ^ Transfer-full: the callee takes ownership of the argument
+                  -- (FFI Slice 4). Carried by the surface @owned@ modifier on
+                  -- a parameter type (e.g. @owned Bytes@); wok must not touch
+                  -- the value again after the call.
+  deriving (Eq, Show)
+
 -- | The statically-known part of a blessed symbol's calling contract.
-newtype BlessedSig = BlessedSig { bsReturn :: ReturnDisp }
+data BlessedSig = BlessedSig
+  { bsReturn      :: ReturnDisp
+  , bsArgTransfer :: [ArgTransfer]
+    -- ^ One entry per parameter, in declaration order. Threaded onto
+    -- 'Wok.IR.Anf.RForeignCall' (FFI Slice 4 Task 1) for the CODEGEN backend to
+    -- dispatch on at each argument. The REFERENCE INTERPRETER does NOT consult
+    -- this field at runtime: its router dispatches move-vs-copy per blessed
+    -- (lib, sym) pair (see 'Wok.Interp.RC.Machine's @symConsume@ arm), not by
+    -- reading the tag. Generalizing the interpreter's router to read this list
+    -- would be premature for the single 'MoveOut' symbol it currently serves.
+  }
   deriving (Eq, Show)
 
 -- | The complete allow-list of (lib, symbol) pairs the interpreter accepts.
@@ -46,11 +66,17 @@ newtype BlessedSig = BlessedSig { bsReturn :: ReturnDisp }
 -- to lend from. The @"wok"@ library tag deliberately does not claim to be
 -- @"c"@, so a reader of a @foreign module@ header can tell at a glance that
 -- @lendBuffer@ is a wok-internal fixture, not a real libc call.
+-- @("wok", "consume")@ is likewise a wok-internal fixture (not a real C
+-- library symbol): the FFI Slice 4 deterministic transfer-full sink, the
+-- dual of @lendBuffer@'s borrow-in tier -- a host function the wok runtime
+-- accepts an owned @Bytes@ argument through, so the owned-INTO-C tier has a
+-- blessed, deterministic sink to move into.
 blessedTable :: Map.Map (Text, Text) BlessedSig
 blessedTable = Map.fromList
-  [ ((Tx.pack "c", Tx.pack "memchr"),  BlessedSig DispScalar)
-  , ((Tx.pack "c", Tx.pack "strndup"), BlessedSig DispAdopt)
-  , ((Tx.pack "wok", Tx.pack "lendBuffer"), BlessedSig DispBorrow)
+  [ ((Tx.pack "c", Tx.pack "memchr"),  BlessedSig DispScalar [])
+  , ((Tx.pack "c", Tx.pack "strndup"), BlessedSig DispAdopt [])
+  , ((Tx.pack "wok", Tx.pack "lendBuffer"), BlessedSig DispBorrow [])
+  , ((Tx.pack "wok", Tx.pack "consume"), BlessedSig DispScalar [MoveOut])
   ]
 
 -- | Look up a (lib, symbol) pair in the blessed table.

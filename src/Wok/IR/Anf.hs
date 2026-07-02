@@ -32,7 +32,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Tx
-import Wok.FFI.Blessed (ReturnDisp (..))
+import Wok.FFI.Blessed (ArgTransfer (..), ReturnDisp (..))
 import Wok.IR.Name (Name, JoinId (..), Unique (..), nameHint, nameUniq)
 import Wok.TypeChecking.Types (CType (..), TyCon (..))
 
@@ -74,16 +74,22 @@ data Rhs
     -- FBIP reuse-pairing post-pass that runs AFTER 'Wok.IR.Perceus.insertRC';
     -- the elaborator and every analysis that runs before that post-pass never
     -- emit or observe it (spec 2026-06-23-fbip-reuse-design §5.1).
-  | RForeignCall Text Text ReturnDisp (Maybe Text) [Atom]
+  | RForeignCall Text Text ReturnDisp [ArgTransfer] (Maybe Text) [Atom]
     -- ^ A saturated foreign-library call.
-    -- Fields: lib, sym, disposition, freeSym, args.
+    -- Fields: lib, sym, disposition, argTransfers, freeSym, args.
     -- 'lib'  = library tag as written in the @foreign module@ declaration (e.g. @"c"@).
     -- 'sym'  = C symbol name (the member's 'fmiSymbol').
     -- 'ReturnDisp' = the blessed return contract ('DispScalar' / 'DispAdopt').
+    -- '[ArgTransfer]' = per-argument transfer contract ('TransferNone' / 'MoveOut'),
+    -- positionally aligned with '[Atom]' below (the blessed sig's 'bsArgTransfer').
+    -- FFI Slice 4 (owned-INTO-C) carries this list starting at Task 2, FORWARD-
+    -- LOOKING for the CODEGEN backend to dispatch move-vs-copy on at each
+    -- 'MoveOut' argument. The REFERENCE INTERPRETER does NOT route on it: its
+    -- move-vs-copy decision (the @symConsume@ arm of 'Wok.Interp.RC.Machine')
+    -- dispatches on the literal blessed @(lib, sym)@ pair instead, and every IR
+    -- analysis treats these args as ordinary sub-expressions, ignoring the tags.
     -- 'Maybe Text' = free-function symbol (from @free@ clause) needed for 'DispAdopt'.
     -- '[Atom]' = saturated call arguments, each a pure 'Atom'.
-    -- Task 6 will refine the borrow semantics of these args; for now they are
-    -- treated as ordinary sub-expressions by every IR analysis.
   deriving (Eq, Show)
 
 -- | Block / control structure. Strict: Let = evaluate-now sequencing.
@@ -164,7 +170,7 @@ collectRhs (ROp minst _ _ xs) t = foldr collectAtom t (maybe xs (: xs) minst)
 collectRhs (RRecord _ flds) t = foldr (\(_, a) acc -> collectAtom a acc) t flds
 collectRhs (RProj _ a)     t = collectAtom a t
 collectRhs (RReuseCon tok _ xs) t = foldr collectAtom t (tok : xs)
-collectRhs (RForeignCall _ _ _ _ xs) t = foldr collectAtom t xs
+collectRhs (RForeignCall _ _ _ _ _ xs) t = foldr collectAtom t xs
 
 collectExpr :: Expr -> HintTable -> HintTable
 collectExpr (Ret a)              t = collectAtom a t
@@ -293,7 +299,7 @@ renderRhs _   tbl (RReuseCon tok c xs) =
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
-renderRhs _   tbl (RForeignCall lib sym _disp _mfree xs) =
+renderRhs _   tbl (RForeignCall lib sym _disp _xfer _mfree xs) =
   Tx.pack "foreign<" <> lib <> Tx.pack "." <> sym <> Tx.pack ">("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
@@ -542,7 +548,7 @@ freeVarsRhs (ROp m _ _ as)   = Set.unions (map atomVars (maybe as (: as) m))
 freeVarsRhs (RRecord _ flds) = Set.unions (map (atomVars . snd) flds)
 freeVarsRhs (RProj _ a)      = atomVars a
 freeVarsRhs (RReuseCon tok _ as) = Set.unions (atomVars tok : map atomVars as)
-freeVarsRhs (RForeignCall _ _ _ _ as) = Set.unions (map atomVars as)
+freeVarsRhs (RForeignCall _ _ _ _ _ as) = Set.unions (map atomVars as)
 
 atomVars :: Atom -> Set Unique
 atomVars (AVar n) = Set.singleton (nameUniq n)

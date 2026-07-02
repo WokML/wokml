@@ -178,7 +178,7 @@ cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
       -- multiplicity analysis; it never reaches this pass.
       RReuseCon{}      -> error "RReuseCon: produced only by reusePairing post-pass (after multiplicity analysis)"
       -- Foreign call: args are plain values, never the resume continuation.
-      RForeignCall _ _ _ _ as -> if mentionsAny r as then Many else Zero
+      RForeignCall _ _ _ _ _ as -> if mentionsAny r as then Many else Zero
 
 -- | Conservative "does `r` occur free anywhere in `e`" (shadowing ignored: resume
 -- binders are fresh, and a false positive only over-approximates to Many).
@@ -202,7 +202,7 @@ occursRhs r rhs = case rhs of
   RRecord _ flds   -> any (mentionsAtom r . snd) flds
   RProj _ a        -> mentionsAtom r a
   RReuseCon{}              -> error "RReuseCon: produced only by reusePairing post-pass (after multiplicity analysis)"
-  RForeignCall _ _ _ _ as -> mentionsAny r as
+  RForeignCall _ _ _ _ _ as -> mentionsAny r as
 
 occursAlt :: Name -> Alt -> Bool
 occursAlt r (AltCon _ _ b) = occursExpr r b

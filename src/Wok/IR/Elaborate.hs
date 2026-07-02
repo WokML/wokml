@@ -17,7 +17,7 @@ import Data.Text (Text)
 import qualified Data.Text as Tx
 import Wok.IR.Anf
 import Wok.IR.Name
-import Wok.FFI.Blessed (lookupBlessed, bsReturn)
+import Wok.FFI.Blessed (lookupBlessed, bsArgTransfer, bsReturn)
 import Wok.TypeChecking.Env
   ( Env, envVars, envVarOrigin, lookupCon, conArity, conTyCon, lookupRecordCon, rcFields
   , lookupTyCon, TyConInfo (..)
@@ -430,7 +430,7 @@ elabRhsF ty (TApp hd args) k =
                            <> Tx.unpack (fmLib fmi) <> "." <> Tx.unpack (fmiSymbol minfo))
                   Just bsig ->
                     k (RForeignCall (fmLib fmi) (fmiSymbol minfo) (bsReturn bsig)
-                                    (fmFree fmi) atoms)
+                                    (bsArgTransfer bsig) (fmFree fmi) atoms)
           Nothing -> k (ROp Nothing modOrEffect op atoms)
       -- Named perform applied (e.g. `count.set x`): normalize the receiver
       -- instance to an atom, route through it: `ROp (Just ia) effect op atoms`.

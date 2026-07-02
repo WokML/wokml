@@ -343,6 +343,7 @@ instance Print GeneratedParser.Wok.Abs.Type where
     GeneratedParser.Wok.Abs.TParen type_ -> prPrec i 2 (concatD [doc (showString "("), prt 0 type_, doc (showString ")")])
     GeneratedParser.Wok.Abs.TUnit -> prPrec i 2 (concatD [doc (showString "("), doc (showString ")")])
     GeneratedParser.Wok.Abs.TRowArg varid -> prPrec i 2 (concatD [doc (showString "("), doc (showString "row"), prt 0 varid, doc (showString ")")])
+    GeneratedParser.Wok.Abs.TOwned type_ -> prPrec i 2 (concatD [doc (showString "owned"), prt 2 type_])
     GeneratedParser.Wok.Abs.TExtend type_ varsym rowcontrib -> prPrec i 1 (concatD [prt 1 type_, prt 0 varsym, prt 0 rowcontrib])
 
 instance Print GeneratedParser.Wok.Abs.EffectAtom where

@@ -1,0 +1,13 @@
+module Main
+import Std.Bytes
+
+-- Verified diagnostic-defect regression: `owned` is boundary metadata scoped
+-- to a `Bytes` parameter of a `foreign module` member ONLY. Before the fix,
+-- `translateSig`'s `goT` unconditionally stripped `TOwned` everywhere, so
+-- `owned` in an ORDINARY (non-foreign) signature silently compiled away with
+-- no effect at all -- `owned` was accepted and discarded language-wide. This
+-- must now be an OwnedModifierMisplaced compile error.
+myFn : owned Bytes -> U64
+myFn b = length b
+
+main = myFn (fromList [65, 66, 67])

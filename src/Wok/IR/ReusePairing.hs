@@ -199,7 +199,12 @@ rhsMaxU (ROp m _ _ as)       = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
 rhsMaxU (RRecord _ flds)     = foldr (max . atomMaxU . snd) (-1) flds
 rhsMaxU (RProj _ a)          = atomMaxU a
 rhsMaxU (RReuseCon tok _ as)      = foldr (max . atomMaxU) (atomMaxU tok) as
-rhsMaxU (RForeignCall _ _ _ _ as) = foldr (max . atomMaxU) (-1) as
+-- N/A: RForeignCall is never reuse-paired (only RCon/RReuseCon participate).
+-- FFI Slice 4: nor can a MoveOut (consumed) arg become a reuse SOURCE -- reuse
+-- pairs a @__rc_drop p@ token with a downstream RCon ('dropTargetOf'), but a
+-- foreign-call arg is an owned MOVE so Perceus emits no @__rc_drop@ for it; with
+-- no drop token there is nothing for 'reusePairing' to donate. No action needed.
+rhsMaxU (RForeignCall _ _ _ _ _ as) = foldr (max . atomMaxU) (-1) as
 
 atomMaxU :: Atom -> Int
 atomMaxU (AVar n)  = uOf n

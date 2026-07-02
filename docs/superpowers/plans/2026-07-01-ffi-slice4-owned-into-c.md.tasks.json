@@ -1,0 +1,53 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-01-ffi-slice4-owned-into-c.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: owned-on-a-parameter grammar (TOwned) + BNFC regen",
+      "status": "pending",
+      "description": "**Goal:** Add a `owned Type` type modifier so `consume : owned Bytes -> U64 with IO` parses, without breaking member-leading `owned` (FMOwned).\n\n**Files:** grammar/Wok.cf (TOwned. Type2 ::= \"owned\" Type2 ; near line 310); regenerate src-generated via BNFC; reapply the three manual post-regen patches.\n\n**Verify:** `bnfc --haskell -d -o /tmp/bnfc-check grammar/Wok.cf 2>&1 | grep -i conflict` (no output) then `cabal build exe:wok`.\n\n```json:metadata\n{\"files\": [\"grammar/Wok.cf\", \"src-generated/GeneratedParser/Wok/Abs.hs\"], \"verifyCommand\": \"bnfc --haskell -d -o /tmp/bnfc-check grammar/Wok.cf 2>&1 | grep -i conflict; cabal build exe:wok\", \"acceptanceCriteria\": [\"TOwned production added\", \"zero grammar conflicts\", \"manual patches reapplied\", \"cabal build succeeds\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: MoveOut transfer tag + blessed entry + fmiArgTransfer threading",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Carry a per-argument transfer marker from surface TOwned into the blessed table and ForeignMemberInfo; register the (\"wok\",\"consume\") blessed member.\n\n**Files:** src/Wok/FFI/Blessed.hs (widen BlessedSig -> data + bsArgTransfer; ArgTransfer=TransferNone|MoveOut; consume entry), src/Wok/TypeChecking/Env.hs (fmiArgTransfer), src/Wok/TypeChecking/Infer.hs (argTransfers walk in registerMember + coherence check), src/Wok/TypeChecking/Error.hs.\n\n**Verify:** `cabal build exe:wok`; `owned Bytes` param type-checks, `owned U64` rejected.\n\n```json:metadata\n{\"files\": [\"src/Wok/FFI/Blessed.hs\", \"src/Wok/TypeChecking/Env.hs\", \"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Error.hs\"], \"verifyCommand\": \"cabal build exe:wok\", \"acceptanceCriteria\": [\"ArgTransfer/MoveOut added and BlessedSig widened\", \"consume blessed entry present\", \"fmiArgTransfer set from surface TOwned\", \"coherence check rejects owned on non-Bytes param\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Thread [ArgTransfer] into the RForeignCall IR node",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Add the per-argument transfer list to RForeignCall and thread it from elaboration, bumping every pattern-match site.\n\n**Files:** src/Wok/IR/Anf.hs:77-86 (add [ArgTransfer]); src/Wok/IR/Elaborate.hs:408-434 (pass bsArgTransfer bsig); underscore-bump Anf/Reachable/Multiplicity/Escape/Interp.Machine; placeholder-bump Perceus/ReusePairing/RC.Machine (real logic in Task 4).\n\n**Verify:** `cabal build` (no incomplete RForeignCall patterns).\n\n```json:metadata\n{\"files\": [\"src/Wok/IR/Anf.hs\", \"src/Wok/IR/Elaborate.hs\", \"src/Wok/IR/Reachable.hs\", \"src/Wok/IR/Multiplicity.hs\", \"src/Wok/IR/Escape.hs\", \"src/Wok/Interp/Machine.hs\"], \"verifyCommand\": \"cabal build\", \"acceptanceCriteria\": [\"RForeignCall carries [ArgTransfer]\", \"all pattern sites compile\", \"elaboration threads the real list\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: pure-read checksum consumer (C + Haskell FNV-1a reference)",
+      "status": "pending",
+      "description": "**Goal:** Provide wok_bytes_consume_checksum (C, pure-read FNV-1a) + a byte-identical Haskell referenceFNV1a. Independent of Tasks 0-2.\n\n**Files:** runtime/wok_rc.h + .c (FNV-1a offset 0xcbf29ce484222325, prime 0x100000001b3; does not free), src/Wok/Interp/RC/Heap.hs (foreign import), src/Wok/Interp/ForeignModels.hs (referenceFNV1a), src/Wok/Interp/Machine.hs (reference-interp consume arm), test/Spec.hs (C==Haskell cross-check).\n\n**Verify:** `cabal test --test-options='-p checksum'`.\n\n```json:metadata\n{\"files\": [\"runtime/wok_rc.h\", \"runtime/wok_rc.c\", \"src/Wok/Interp/RC/Heap.hs\", \"src/Wok/Interp/ForeignModels.hs\", \"src/Wok/Interp/Machine.hs\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test --test-options='-p checksum'\", \"acceptanceCriteria\": [\"C FNV-1a consumer added (pure-read)\", \"Haskell referenceFNV1a byte-identical\", \"reference-interp consume arm\", \"C==Haskell cross-check test passes\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: rc==1 move/copy router + accounting + FBIP consuming-use (SOUNDNESS CORE)",
+      "status": "pending",
+      "blockedBy": [2, 3],
+      "description": "**Goal:** Implement the (\"wok\",\"consume\") RC dispatch arm as the move/copy router; the FBIP/reuse pass treats a MoveOut arg as a consuming use.\n\n**Model:** dispatch owns the SINGLE free (like memchr's dropAddr). consume b: csum=checksum(b); if arrayUnique b then dropAddr b (MOVE, 0 copy) else { copy=allocNBytes(bytesOf b); dropAddr copy; dropAddr b } (COPY, len copy); return csum.\n\n**Files:** src/Wok/Interp/RC/Machine.hs:521-545, src/Wok/Interp/RC/Prim.hs (consumeChecksum backend split), src/Wok/IR/Perceus.hs + ReusePairing.hs:202, test/rc-ffi-owned/00-consume-unique.wok + 01-consume-shared.wok, test/Spec.hs, scripts/asan-runtime.sh.\n\n**LINCHPIN (Step 1):** resolve whether Perceus drops RForeignCall Bytes args vs the dispatch being sole dropper (vs the memchr arm) BEFORE writing the router.\n\n**Verify:** `cabal test && scripts/asan-runtime.sh interp`.\n\n```json:metadata\n{\"files\": [\"src/Wok/Interp/RC/Machine.hs\", \"src/Wok/Interp/RC/Prim.hs\", \"src/Wok/IR/Perceus.hs\", \"src/Wok/IR/ReusePairing.hs\", \"test/rc-ffi-owned/00-consume-unique.wok\", \"test/rc-ffi-owned/01-consume-shared.wok\", \"test/Spec.hs\"], \"verifyCommand\": \"cabal test && scripts/asan-runtime.sh interp\", \"acceptanceCriteria\": [\"3-backend checksum parity for consume\", \"move: 0 copy bytes freed once; balance\", \"copy: fresh buffer freed + original decremented and readable\", \"reuse pass treats MoveOut as consuming\", \"ASan positive corpus clean\"], \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: QuickCheck property suite (P1-P7)",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Property-test the move-out scope over random Bytes on the differential oracle (the repo's first monadicIO usage), plus the two named demos.\n\n**Files:** test/Spec.hs (testGroup \"FFI Slice 4: owned-INTO-C properties\"; genBytes; oracle runner over ref-interp + withBothBackends via QC.ioProperty; P1-P7), test/rc-ffi-owned/consumeOwned.wok + consumeShared.wok.\n\n**Verify:** `cabal test --test-options='-p \"owned-INTO-C\"'`.\n\n```json:metadata\n{\"files\": [\"test/Spec.hs\", \"test/rc-ffi-owned/consumeOwned.wok\", \"test/rc-ffi-owned/consumeShared.wok\"], \"verifyCommand\": \"cabal test --test-options='-p \\\"owned-INTO-C\\\"'\", \"acceptanceCriteria\": [\"genBytes generator + referenceFNV1a\", \"P1-P7 as testProperty over random Bytes\", \"oracle driven via ioProperty/withBothBackends + reference interp\", \"cabal test green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: death-test matrix (mutation-confirmed under ASan)",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**USER-ORDERED GATE — NON-SKIPPABLE.** Requested by the user (\"death-tests are mandatory and must genuinely bite\"). Close only after every acceptanceCriteria item is re-validated independently with output captured.\n\n**Goal:** Prove the router guards are load-bearing — double-free, use-after-move, region-double-move each fault under ASan only when a mutation defeats the guard, clean otherwise.\n\n**Files:** wok.cabal (flag ffi-owned-noguard-negctrl), src/Wok/Interp/RC/Machine.hs (CPP-gated force-move mutation), test/rc-ffi-owned/death-double-free.wok + death-use-after-move.wok + death-region-double-move.wok, scripts/asan-runtime.sh (negative-control loop).\n\n**Verify:** `scripts/asan-runtime.sh interp` — positive clean; each -fffi-owned-noguard-negctrl build faults nonzero with an ASan UAF/double-free report; unmutated clean. Use an ASan-instrumented C read (Libc.memchr), NOT peekElemOff.\n\n```json:metadata\n{\"files\": [\"wok.cabal\", \"src/Wok/Interp/RC/Machine.hs\", \"test/rc-ffi-owned/death-double-free.wok\", \"test/rc-ffi-owned/death-use-after-move.wok\", \"test/rc-ffi-owned/death-region-double-move.wok\", \"scripts/asan-runtime.sh\"], \"verifyCommand\": \"scripts/asan-runtime.sh interp\", \"acceptanceCriteria\": [\"double-free faults under the flag, clean without\", \"use-after-move faults via an ASan-instrumented C read, clean without\", \"region-double-move faults under the flag, clean without\", \"each control is non-vacuous (ASan names the free + access)\", \"positive corpus clean\"], \"modelTier\": \"standard\", \"userGate\": true, \"tags\": [\"user-gate\"], \"requiresUserSpecification\": false, \"requireEvidenceTokens\": [[\"mutated\", \"flag-on\", \"-fffi-owned-noguard-negctrl\"], [\"unmutated\", \"flag-off\", \"clean\"]]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-07-01T00:00:00Z"
+}

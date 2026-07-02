@@ -58,6 +58,7 @@ import qualified Wok.Runtime.StringZilla as SZ
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
 import Data.Bits (shiftR, (.&.))
+import Text.Read (readMaybe)
 import qualified Wok.IR.Name as Name
 import qualified Wok.IR.Match as M
 import qualified Wok.IR.Perceus as Perceus
@@ -83,7 +84,7 @@ import Data.Unique (newUnique, hashUnique)
 import Data.Bifunctor (first)
 import qualified Data.List
 import qualified Data.Maybe
-import Data.List (sortBy, isPrefixOf)
+import Data.List (sortBy, isPrefixOf, intercalate)
 import Data.Ord (comparing)
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
 import Foreign.Ptr (castPtr)
@@ -199,6 +200,16 @@ main = do
       rcBorrowDeathFiles     = filter isDeathFile rcBorrowAllFiles
       rcBorrowContStoreFiles = filter isContStoreFile rcBorrowAllFiles
       rcBorrowFiles          = filter (not . isNegControlFile) rcBorrowAllFiles
+  -- FFI Slice 4 Task 4: the owned-INTO-C move-out corpus. The directory ALSO
+  -- holds the Task-1 `coherence-*.wok` compile-reject fixtures (wired by explicit
+  -- name below) and, later, the Task-6 `death-*.wok` mutation controls -- neither
+  -- is a runnable positive; the runnable move-out corpus is everything else.
+  rcFfiOwnedAllFiles <- findByExtension [".wok"] "test/rc-ffi-owned"
+  let rcFfiOwnedRunFiles =
+        filter (\f -> let b = takeBaseName f
+                      in not (isPrefixOf "coherence-" b)
+                         && not (isPrefixOf "death-" b))
+               rcFfiOwnedAllFiles
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -465,6 +476,7 @@ main = do
         , rcCBackendParity rcFfiBytesFiles
         , rcFfiBytesZeroCopySavingPin
         , rcFfiBytesSoundness
+        , rcBytesChecksumTests
         ]
     -- FFI Slice 2 Task 6: real libc memchr/strndup + borrow-out + adopt oracle.
     -- Runs rc differential + rc stats + C-heap parity; dedicated group also pins
@@ -532,6 +544,94 @@ main = do
         -- tautological -- see the group's doc comment above its definition).
         , rcBorrowZeroCopySavingPin
         ]
+    -- FFI Slice 4 Task 4: the owned-INTO-C move-out router corpus. Mirrors the
+    -- rc-ffi-foreign wiring exactly (rc differential = pure-ref vs RC-abstract;
+    -- rc stats = alloc/free balance + stLive baseline; rcCBackendParity =
+    -- RC-abstract vs RC-CHeap), giving 3-backend checksum parity plus the
+    -- accounting balance for BOTH router branches. 00-consume-unique exercises
+    -- the rc==1 MOVE (free once, 0 copy bytes); 01-consume-shared exercises the
+    -- rc>1 COPY (fresh boundary buffer freed, original decremented and still
+    -- readable -- the `length b` after the consume, whose success in the
+    -- differential run IS the "original still readable" assertion).
+    , testGroup "rc-ffi-owned"
+        [ testGroup "rc differential"
+            [ testCase (takeBaseName f) (rcDifferentialHarness f)
+            | f <- rcFfiOwnedRunFiles ]
+        , testGroup "rc stats"
+            [ testCase (takeBaseName f) (rcStatsHarness f)
+            | f <- rcFfiOwnedRunFiles ]
+        , rcCBackendParity rcFfiOwnedRunFiles
+        ]
+    -- FFI Slice 4 Task 1: the compile-time owned-arg coherence gates. These lock
+    -- down the surface-`owned` <=> blessed-`MoveOut` invariant the Task 4 router
+    -- relies on: one POSITIVE anchor plus each of the three rejection directions,
+    -- asserting on the specific TypeError constructor (not merely "some error").
+    , testGroup "FFI Slice 4: owned-arg coherence"
+        [ testCase "owned Bytes on a MoveOut-blessed sink type-checks"
+            (ffiOwnedCoherenceAccepts
+               "test/rc-ffi-owned/coherence-ok-owned-bytes.wok")
+        , testCase "owned on a non-Bytes param -> ForeignOwnedArgNotBytes"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-owned-not-bytes.wok"
+               "ForeignOwnedArgNotBytes")
+        , testCase "owned param with no blessed MoveOut -> ForeignOwnedArgNotBlessed"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-owned-not-blessed.wok"
+               "ForeignOwnedArgNotBlessed")
+        , testCase "blessed MoveOut but no surface owned -> ForeignBlessedMoveOutNeedsOwned"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-moveout-needs-owned.wok"
+               "ForeignBlessedMoveOutNeedsOwned")
+        -- Regression pin: a PARENTHESIZED-tail arrow (`A -> (B -> C)`, parsed
+        -- `TFun A (TParen (TFun B C))`) is type-identical to `A -> B -> C`. Before
+        -- `argTransfers` unwrapped `TParen` in its spine walk, the walk truncated
+        -- at the paren and dropped position 1's `owned`, bypassing this gate.
+        , testCase "parenthesized-tail arrow doesn't bypass the gate -> ForeignOwnedArgNotBlessed"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-paren-arrow.wok"
+               "ForeignOwnedArgNotBlessed")
+        -- Regression pin: an arrow-TAIL `owned` (`Bytes -> owned (Bytes -> U64)`,
+        -- parsed `TFun Bytes (TOwned (TParen (TFun Bytes U64)))`) places `owned`
+        -- on a return type, not a parameter head, so it must be rejected as
+        -- misplaced rather than silently reinterpreted as another parameter
+        -- (the pre-fix behavior: `owned` was unconditionally transparent in
+        -- `translateSig`, so this was type-identical to `Bytes -> Bytes -> U64`,
+        -- arity 2, and previously rejected -- for the wrong reason -- as
+        -- `ForeignBlessedMoveOutNeedsOwned`). See the fixture's own comment.
+        , testCase "arrow-tail owned is rejected as misplaced -> OwnedModifierMisplaced"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-owned-arrow-tail.wok"
+               "OwnedModifierMisplaced")
+        -- Diagnostic-defect regression (verified live): `owned` in an ORDINARY
+        -- (non-foreign) signature used to be silently stripped by
+        -- `translateSig`'s unconditional `TOwned` unwrap and compile away with
+        -- no effect. `owned` is foreign-boundary-only metadata; it must now be
+        -- a compile error everywhere else.
+        , testCase "owned in ordinary (non-foreign) code -> OwnedModifierMisplaced"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-owned-ordinary-code.wok"
+               "OwnedModifierMisplaced")
+        -- Diagnostic-defect regression: `owned` in a NON-parameter position of
+        -- a foreign member (here, the RETURN type) used to be silently
+        -- swallowed with no coherence check at all. `classifyOwnedParams` only
+        -- strips `owned` from a parameter head, so a return-position `owned`
+        -- now reaches `translateSig` untouched and is rejected.
+        , testCase "owned on a foreign member's return type -> OwnedModifierMisplaced"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-owned-return-misplaced.wok"
+               "OwnedModifierMisplaced")
+        -- Diagnostic-defect regression: `owned` NESTED inside a compound
+        -- parameter type (`[owned Bytes]`) rather than at the parameter head
+        -- itself. Also previously silently swallowed; now rejected.
+        , testCase "owned nested inside a compound parameter type -> OwnedModifierMisplaced"
+            (ffiOwnedCoherenceRejects
+               "test/rc-ffi-owned/coherence-owned-nested-misplaced.wok"
+               "OwnedModifierMisplaced")
+        ]
+    -- FFI Slice 4 Task 5: the owned-INTO-C move-out router, differentially
+    -- fuzzed over RANDOM 'Bytes' contents (the Task 4 corpus above only pins
+    -- two FIXED programs). See 'ffiOwnedIntoCPropertyTests' for the mechanism.
+    , ffiOwnedIntoCPropertyTests
     ]
 
 -- | (program, expected close count) for the malloc'd-producer corpus (FFI Slice 3
@@ -1466,7 +1566,7 @@ envOverlayTests = testGroup "envOverlay"
       -- member name is arbitrary.
       let mk sym = TE.ForeignMemberInfo
                      (Ty.mkScheme [] (Ty.CTCon Ty.TcU64 []))
-                     (T.pack sym) False
+                     (T.pack sym) False []
           fmiA = TE.ForeignModuleInfo (T.pack "c") (Just (T.pack "free"))
                    (Map.fromList [(T.pack "memchr", mk "memchr")])
           fmiB = TE.ForeignModuleInfo (T.pack "c") (Just (T.pack "free"))
@@ -1482,7 +1582,7 @@ envOverlayTests = testGroup "envOverlay"
       -- case and must merge without a clash.
       let mk sym = TE.ForeignMemberInfo
                      (Ty.mkScheme [] (Ty.CTCon Ty.TcU64 []))
-                     (T.pack sym) False
+                     (T.pack sym) False []
           fmi = TE.ForeignModuleInfo (T.pack "c") (Just (T.pack "free"))
                   (Map.fromList [(T.pack "memchr", mk "memchr")])
           a = TE.extendForeignModule (T.pack "Libc") fmi TE.emptyEnv
@@ -5613,7 +5713,7 @@ aprimKeysInModule (Anf.CoreModule binds) =
       RRecord _ fls -> Set.unions (map (goA . snd) fls)
       RProj _ a     -> goA a
       RReuseCon{}          -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
-      RForeignCall _ _ _ _ as -> Set.unions (map goA as)
+      RForeignCall _ _ _ _ _ as -> Set.unions (map goA as)
     goE e = case e of
       Ret a               -> goA a
       Jump _ as           -> Set.unions (map goA as)
@@ -13445,6 +13545,509 @@ borrowDeathCompileRejects path = do
         Right _ -> assertFailure
           (path <> ": expected a compile-time CarrierEscape rejection, but it type-checked")
 
+-- | FFI Slice 4 Task 1 (owned-arg coherence, compile-reject half). Type-check a
+-- `foreign module` fixture and assert it is rejected with the given TypeError
+-- CONSTRUCTOR (matched by name in the pipeline's rendered error string, exactly
+-- as 'borrowDeathCompileRejects' matches "CarrierEscape"). These pin the
+-- soundness-critical surface-`owned` <=> blessed-`MoveOut` invariant the Slice 4
+-- Task 4 router relies on; without a committed test a refactor could silently
+-- drop a rejection (Tasks 5/6 only exercise runtime behavior, never these
+-- compile-time gates).
+ffiOwnedCoherenceRejects :: FilePath -> String -> Assertion
+ffiOwnedCoherenceRejects path expectedCon = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure (path <> ": loader error: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.typecheckProgram entryName ms of
+        Left msg
+          | T.pack expectedCon `T.isInfixOf` T.pack msg -> pure ()
+          | otherwise -> assertFailure
+              (path <> ": expected " <> expectedCon <> ", got: " <> msg)
+        Right _ -> assertFailure
+          (path <> ": expected a compile-time " <> expectedCon
+                <> " rejection, but it type-checked")
+
+-- | FFI Slice 4 Task 1 (owned-arg coherence, POSITIVE case). The dual of
+-- 'ffiOwnedCoherenceRejects': a fixture whose surface `owned` markers agree with
+-- the blessed `MoveOut` list must type-check cleanly. Pins that the coherence
+-- checks are not over-eager (a well-formed `owned Bytes` sink still passes).
+ffiOwnedCoherenceAccepts :: FilePath -> Assertion
+ffiOwnedCoherenceAccepts path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure (path <> ": loader error: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.typecheckProgram entryName ms of
+        Right _  -> pure ()
+        Left msg -> assertFailure
+          (path <> ": expected a clean type-check, but was rejected: " <> msg)
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 4 Task 5: owned-INTO-C move-out router, QuickCheck properties
+-- (P1-P7) over RANDOM 'Bytes' contents.
+--
+-- The Task 4 corpus ('test/rc-ffi-owned/00-consume-unique.wok' and
+-- '01-consume-shared.wok') pins the MOVE and COPY router branches on ONE fixed
+-- byte string ([65, 66, 67]). This suite reuses those exact two program
+-- SHAPES -- templatized over the byte contents -- and drives them through the
+-- SAME three-backend oracle ('rcDifferentialHarness' + 'withBothBackends')
+-- per QuickCheck iteration, over randomly generated 'Bytes'.
+--
+-- MECHANISM: 'Wok.Loader.loadProgram' only reads source from disk, so each
+-- iteration spools the templatized source to a scratch temp file, runs it
+-- through load -> elaborate -> M1 scope guard -> prune -> (reference
+-- interpreter on the pre-Perceus ANF) and (Perceus insertRC + reusePairing on
+-- RC-abstract and RC-CHeap), and removes the temp file. This is the SAME
+-- front end 'rcDifferentialHarness'/'withBothBackends' use on the fixed
+-- corpus, just parameterized by a source string instead of a corpus path.
+-- ---------------------------------------------------------------------------
+
+-- | A sized length distribution spanning empty, small, and multi-KB 'Bytes'
+-- contents, so the corpus exercises the router's MOVE/COPY branches (which
+-- don't care about size) alongside the CHeap allocator's small-vs-large paths.
+genFfiOwnedBytesLen :: Gen Int
+genFfiOwnedBytesLen = QC.frequency
+  [ (2, pure 0)
+  , (5, QC.choose (1, 32))
+  , (3, QC.choose (33, 512))
+  , (2, QC.choose (513, 4096))
+  ]
+
+-- | The property generator: a random byte string spanning empty/small/multi-KB.
+-- Each byte is drawn via 'QC.choose' (uniform over the FULL 0..255 range,
+-- independent of QuickCheck's internal "size" parameter) rather than
+-- 'QC.arbitrary' (whose 'Word8' instance scales its range with size, so
+-- early/small-size iterations would otherwise skew heavily toward 0/1 and
+-- never exercise the full byte-value domain).
+genFfiOwnedBytes :: Gen [Word8]
+genFfiOwnedBytes = do
+  n <- genFfiOwnedBytesLen
+  QC.vectorOf n (QC.choose (0, 255 :: Word8))
+
+-- | Render a byte list as a wok @[U64]@ literal body (no brackets), matching
+-- the corpus files' @fromList [65, 66, 67]@ shape.
+ffiOwnedRenderBytes :: [Word8] -> String
+ffiOwnedRenderBytes = intercalate ", " . map show
+
+-- | The @module Main@ / @import Std.Bytes@ / @foreign module Sink@ preamble
+-- shared by every generated template, verbatim from the Task 4 corpus files.
+ffiOwnedPreamble :: [String]
+ffiOwnedPreamble =
+  [ "module Main"
+  , "import Std.Bytes"
+  , ""
+  , "foreign module Sink \"wok\" where"
+  , "  consume \"consume\" : owned Bytes -> U64 with IO"
+  , ""
+  ]
+
+-- | The UNIQUE (move) template, parameterized by byte contents. Mirrors
+-- 'test/rc-ffi-owned/00-consume-unique.wok': the freshly built 'Bytes' is
+-- consumed as its ONLY use, so Perceus emits no dup -> rc==1 at the call ->
+-- the router MOVES (frees the buffer once, 0 copy bytes). The rendered result
+-- IS the checksum.
+ffiOwnedUniqueSource :: [Word8] -> String
+ffiOwnedUniqueSource bs = unlines $ ffiOwnedPreamble ++
+  [ "main : U64"
+  , "main = Sink.consume (fromList [" <> ffiOwnedRenderBytes bs <> "])"
+  ]
+
+-- | The SHARED (copy) template, parameterized by byte contents. Mirrors
+-- 'test/rc-ffi-owned/01-consume-shared.wok': 'b' is consumed AND read again
+-- (@length b@), so Perceus dups it before the consume -> rc>1 at the call ->
+-- the router COPIES. When 'bs' is non-empty we also read byte 0 of 'b' AFTER
+-- the consume (the P4 non-interference check); which arm to emit is decided
+-- in HASKELL (not a wok @if@) to keep the surface syntax to what the corpus
+-- already uses. The rendered result is @checksum + length b (+ byte 0)@.
+ffiOwnedSharedSource :: [Word8] -> String
+ffiOwnedSharedSource bs = unlines $ ffiOwnedPreamble ++
+  [ "main : U64"
+  , "main ="
+  , "  let b = fromList [" <> ffiOwnedRenderBytes bs <> "] in"
+  , "  let h = Sink.consume b in"
+  , "  let n = length b in"
+  ] ++
+  ( if null bs
+      then [ "  h + n" ]
+      else [ "  let x = index b 0 in"
+           , "  h + n + x"
+           ]
+  )
+
+-- | The N-ARY independent-unique-consumes template for P7: 'n' separate
+-- 'Bytes' literals (never aliased), each consumed exactly once (each its own
+-- MOVE), summed. Every summand is expected to equal @referenceFNV1a bs@.
+ffiOwnedMultiUniqueSource :: Int -> [Word8] -> String
+ffiOwnedMultiUniqueSource n bs = unlines $ ffiOwnedPreamble ++
+  [ "main : U64"
+  , "main ="
+  ] ++
+  [ "  let c" <> show i <> " = Sink.consume (fromList [" <> ffiOwnedRenderBytes bs <> "]) in"
+  | i <- [0 .. n - 1]
+  ] ++
+  [ "  " <> intercalate " + " [ "c" <> show i | i <- [0 .. n - 1] ] ]
+
+-- | The pure Haskell oracle for the UNIQUE template's rendered checksum.
+ffiOwnedExpectedChecksum :: [Word8] -> Word64
+ffiOwnedExpectedChecksum bs = FM.referenceFNV1a (BS.pack bs)
+
+-- | @0@ for an empty buffer, else the first byte (widened to 'Integer') --
+-- the P4/P3 templates' @index b 0@ term.
+ffiOwnedFirstByte :: [Word8] -> Integer
+ffiOwnedFirstByte []       = 0
+ffiOwnedFirstByte (b0 : _) = toInteger b0
+
+-- | Parse a rendered U64 (a plain decimal 'Text') back into an 'Integer'.
+-- MUST be 'Integer', not 'Word64': the interpreter's arithmetic prims
+-- ('Wok.Interp.Prim.arith' / 'Wok.Interp.RC.Prim.arith') operate on
+-- unbounded @Integer -> Integer -> Integer@, i.e. wok's \"U64\" @+@ does NOT
+-- wrap modulo 2^64 the way Haskell's 'Word64' does. Summing several 64-bit
+-- FNV-1a checksums (P7) or adding a checksum to a small length/byte (P3/P4)
+-- can genuinely exceed 'maxBound :: Word64'; reading such a value back into a
+-- 'Word64' would silently wrap (GHC's 'Read' instance reduces mod 2^64) and
+-- desync from wok's true unbounded result. 'Integer' has no such ceiling.
+-- 'read' is partial (a bare 'Prelude.read: no parse' on any unparseable
+-- 'Text' gives no indication of the offending string or which property
+-- caller hit it). Parse via 'readMaybe' and fail LOUD with a labeled message
+-- naming the unparseable text on the 'Nothing' branch, mirroring the
+-- 'ffiOwnedExpectRight' idiom used throughout this group: both run inside
+-- 'QC.ioProperty' 'IO' actions, so an 'assertFailure' here fails the
+-- property with a clear counterexample instead of throwing an opaque
+-- 'Prelude.read' parse-error exception.
+ffiOwnedReadInteger :: String -> Text -> IO Integer
+ffiOwnedReadInteger label t = case readMaybe (T.unpack t) of
+  Just n  -> pure n
+  Nothing -> assertFailure
+    (label <> ": unparseable Integer: " <> show t)
+
+-- | Unwrap a backend result inside the property's 'IO', or fail the property
+-- with a labeled message (mirrors the @Left lerr -> assertFailure@ idiom used
+-- throughout the corpus harnesses above, generalized to any labeled 'Either').
+ffiOwnedExpectRight :: Show e => String -> Either e a -> IO a
+ffiOwnedExpectRight label = either (\e -> assertFailure (label <> ": FAILED: " <> show e)) pure
+
+-- | The three-backend result of running ONE generated program: the pure
+-- reference interpreter's rendered output (pre-Perceus ANF), the RC-abstract
+-- run, the RC-CHeap run, and the CHeap's own allocation counter (read before
+-- the CHeap is freed, exactly as 'withBothBackends' does). We capture the
+-- alloc COUNT (not peak bytes) because P6 pins the router's move-vs-copy signal
+-- as an alloc-count delta -- see 'prop_ffiOwnedZeroCopySaving' for why peak
+-- bytes is unusable here.
+data FfiOwnedRun = FfiOwnedRun
+  { forRef        :: Either IV.RuntimeError Text
+  , forAbs        :: Either IV.RuntimeError RCM.RCRun
+  , forC          :: Either IV.RuntimeError RCM.RCRun
+  , forCAllocs    :: Word64
+  }
+
+-- | Run one property-generated wok SOURCE STRING through the full three-backend
+-- oracle. Spools 'src' to a scratch temp file for the duration of the run (only
+-- 'Loader.loadProgram' needs disk; everything downstream is in-memory), removing
+-- it afterward via 'Control.Exception.finally' so a thrown exception mid-run
+-- cannot leak the scratch file. Mirrors 'rcDifferentialHarness' +
+-- 'withBothBackends' EXACTLY: load -> elaborate -> M1 scope guard -> prune ->
+-- (reference interpreter on the pruned pre-Perceus ANF) and (Perceus insertRC +
+-- reusePairing, run on AbstractHeap then a fresh CHeap).
+runFfiOwnedSource :: String -> IO FfiOwnedRun
+runFfiOwnedSource src = do
+  u <- newUnique
+  let path = "test/.interp-tmp-" <> show (hashUnique u) <> ".wok"
+  writeFile path src
+  Control.Exception.finally (runFfiOwnedPath path) (removeFileIfExists path)
+
+-- 'runFfiOwnedPath' deliberately does NOT go through 'withBothBackends' /
+-- 'rcStatsPrepare': this suite needs the pre-Perceus (reference-interpreter)
+-- module AND the Perceus-instrumented module TOGETHER in one 'FfiOwnedRun'
+-- (P1/P3 compare the reference output against both RC backends), and no
+-- existing helper exposes that pair -- 'withBothBackends' only returns the
+-- two RC-backend results, and 'rcStatsPrepare' only prepares the
+-- instrumented module. So this mirrors 'rcDifferentialHarness' +
+-- 'withBothBackends' inline rather than sharing either. A real shared
+-- helper (returning reference + instrumented together) would be a larger
+-- refactor touching both call sites; left as a documented follow-up, not
+-- done here.
+runFfiOwnedPath :: FilePath -> IO FfiOwnedRun
+runFfiOwnedPath path = do
+  result <- Loader.loadProgram path []
+  case result of
+    Left lerr -> assertFailure (path <> ": loader: " <> show lerr)
+    Right (entryName, ms) ->
+      case Pipeline.elaborateProgramFull entryName ms of
+        Left s   -> assertFailure (path <> ": elaborate: " <> s)
+        Right cm -> do
+          case firstOrderNoHandlerViolations cm of
+            [] -> pure ()
+            vs -> assertFailure
+              (path <> ": not a handler-free program (Handle/ROp out of scope):\n"
+                 <> unlines (map T.unpack vs))
+          let pruned = pruneToReachable cm
+              refRes = case Interp.runModule pruned of
+                         Left e  -> Left e
+                         Right v -> Right (Interp.renderValue v)
+              instrumented = reusePairing (Perceus.insertRC pruned)
+          absR <- RCM.runModuleRCWith St.AbstractHeap instrumented
+          hp   <- Heap.wokHeapNew
+          (cR, cAllocs) <-
+            (do c  <- RCM.runModuleRCWith (St.CHeap hp) instrumented
+                a  <- Heap.wokStatAllocs hp
+                pure (c, a))
+            `Control.Exception.finally` Heap.wokHeapFree hp
+          pure (FfiOwnedRun refRes absR cR cAllocs)
+
+-- | The paired result of running BOTH router-branch templates on the same
+-- random 'bs' -- shared by every property below so each random sample only
+-- pays the compile+run cost once per template.
+data FfiOwnedTrial = FfiOwnedTrial
+  { fotUnique :: FfiOwnedRun
+  , fotShared :: FfiOwnedRun
+  }
+
+runFfiOwnedTrial :: [Word8] -> IO FfiOwnedTrial
+runFfiOwnedTrial bs = do
+  u <- runFfiOwnedSource (ffiOwnedUniqueSource bs)
+  s <- runFfiOwnedSource (ffiOwnedSharedSource bs)
+  pure (FfiOwnedTrial u s)
+
+-- | P1: 'consume'\'s checksum is identical across the pure reference
+-- interpreter, RC-abstract, and RC-CHeap -- on BOTH router branches (the
+-- unique/MOVE template's output IS the checksum; the shared/COPY template's
+-- output is @checksum + length + byte0@, so backend agreement there still
+-- pins backend-parity of the router's COPY-branch checksum contribution).
+prop_ffiOwnedBackendParity :: Property
+prop_ffiOwnedBackendParity =
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      trial <- runFfiOwnedTrial bs
+      pu <- parityOf "unique(MOVE)" (fotUnique trial)
+      ps <- parityOf "shared(COPY)" (fotShared trial)
+      pure (QC.conjoin [pu, ps])
+  where
+    parityOf label run = do
+      refText <- ffiOwnedExpectRight (label <> ": reference interpreter") (forRef run)
+      absRun  <- ffiOwnedExpectRight (label <> ": RC-abstract") (forAbs run)
+      cRun    <- ffiOwnedExpectRight (label <> ": RC-CHeap") (forC run)
+      let absText = RCM.rcOutput absRun
+          cText   = RCM.rcOutput cRun
+          ok      = refText == absText && absText == cText
+      pure $ QC.counterexample
+        (label <> ": backend divergence -- ref=" <> T.unpack refText
+          <> " abstract=" <> T.unpack absText <> " cheap=" <> T.unpack cText)
+        ok
+
+-- | P2: the unique(MOVE) template's checksum equals the pure Haskell
+-- 'referenceFNV1a' oracle -- the RIGHT value, not merely agreement across
+-- backends (which P1 already covers).
+prop_ffiOwnedSemanticChecksum :: Property
+prop_ffiOwnedSemanticChecksum =
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      run    <- runFfiOwnedSource (ffiOwnedUniqueSource bs)
+      absRun <- ffiOwnedExpectRight "unique(MOVE) RC-abstract" (forAbs run)
+      let expected = T.pack (show (ffiOwnedExpectedChecksum bs))
+          got      = RCM.rcOutput absRun
+      pure $ QC.counterexample
+        ("unique(MOVE) checksum: got=" <> T.unpack got
+          <> " expected(referenceFNV1a bs)=" <> T.unpack expected)
+        (got == expected)
+
+-- | P3: the router's MOVE branch and COPY branch yield the IDENTICAL checksum
+-- for the same input -- the branch taken is an implementation detail, never
+-- observable in the result. We isolate the COPY branch's checksum
+-- contribution ALGEBRAICALLY (subtracting the deterministic @length + byte0@
+-- terms, known independent of the checksum) and compare it against the
+-- OBSERVED unique(MOVE) checksum -- not the Haskell oracle -- so this pins
+-- router self-consistency independent of 'referenceFNV1a' correctness (P2's
+-- job).
+--
+-- NOTE (redundancy, intentionally kept): this property is algebraically
+-- IMPLIED by P2 (@prop_ffiOwnedSemanticChecksum@: unique(MOVE) checksum ==
+-- the 'referenceFNV1a' oracle) conjoined with P4
+-- (@prop_ffiOwnedCopyFidelity@: shared(COPY) total - oracle ==
+-- @length + byte0@) -- substituting P2's equality into P4's gives exactly
+-- this property's assertion. It is not a bug; it is deliberate redundant
+-- coverage kept as an INDEPENDENT cross-check that does not route through
+-- the Haskell oracle at all (see the paragraph above). Do not delete it as
+-- "redundant" without first checking this note -- P2 and P4 are each
+-- independently load-bearing and neither alone subsumes what P3 checks.
+prop_ffiOwnedBranchInvariance :: Property
+prop_ffiOwnedBranchInvariance =
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      trial <- runFfiOwnedTrial bs
+      uAbs <- ffiOwnedExpectRight "unique(MOVE) RC-abstract" (forAbs (fotUnique trial))
+      sAbs <- ffiOwnedExpectRight "shared(COPY) RC-abstract" (forAbs (fotShared trial))
+      let uChecksumText = RCM.rcOutput uAbs
+          sTotalText     = RCM.rcOutput sAbs
+          extra          = toInteger (length bs) + ffiOwnedFirstByte bs
+      uChecksum <- ffiOwnedReadInteger "P3 unique(MOVE) checksum" uChecksumText
+      let expectedShared = T.pack (show (uChecksum + extra))
+      pure $ QC.counterexample
+        ("branch invariance: unique(MOVE) checksum=" <> T.unpack uChecksumText
+          <> " shared(COPY) total=" <> T.unpack sTotalText
+          <> " expected(from unique checksum + length + byte0)=" <> T.unpack expectedShared)
+        (sTotalText == expectedShared)
+
+-- | P4: copy-fidelity / non-interference. In the shared(COPY) template, the
+-- ORIGINAL 'b' must still read correctly (both its length and its first byte)
+-- AFTER the consume that copied it out. We derive the observed
+-- @length + byte0@ contribution by subtracting the KNOWN-CORRECT oracle
+-- checksum (not the observed one, unlike P3 -- this property targets the
+-- length/byte-read fidelity specifically, assuming P2 already pins the
+-- checksum) from the shared template's total, and compare it against the
+-- Haskell-computed @length bs (+ bs !! 0)@.
+prop_ffiOwnedCopyFidelity :: Property
+prop_ffiOwnedCopyFidelity =
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      run    <- runFfiOwnedSource (ffiOwnedSharedSource bs)
+      absRun <- ffiOwnedExpectRight "shared(COPY) RC-abstract" (forAbs run)
+      sTotal <- ffiOwnedReadInteger "P4 shared(COPY) total" (RCM.rcOutput absRun)
+      let oracle              = toInteger (ffiOwnedExpectedChecksum bs)
+          observedLenPlusByte = sTotal - oracle
+          expectedLenPlusByte = toInteger (length bs) + ffiOwnedFirstByte bs
+      pure $ QC.counterexample
+        ("copy-fidelity (original still readable after COPY): observed(length+byte0)="
+          <> show observedLenPlusByte <> " expected=" <> show expectedLenPlusByte
+          <> " (total=" <> show sTotal <> " oracleChecksum=" <> show oracle <> ")")
+        (observedLenPlusByte == expectedLenPlusByte)
+
+-- | P5: heap-accounting balance on BOTH RC backends, for BOTH router
+-- branches: 'stLive' returns to the immortal baseline and
+-- @stAllocs - stFrees == baseline@ -- no leak, no double-free, on either the
+-- MOVE or the COPY path, for any random 'bs'.
+prop_ffiOwnedAccountingBalance :: Property
+prop_ffiOwnedAccountingBalance =
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      trial <- runFfiOwnedTrial bs
+      pu <- balanceOf "unique(MOVE)" (fotUnique trial)
+      ps <- balanceOf "shared(COPY)" (fotShared trial)
+      pure (QC.conjoin [pu, ps])
+  where
+    balanceOf label run = do
+      absRun <- ffiOwnedExpectRight (label <> " RC-abstract") (forAbs run)
+      cRun   <- ffiOwnedExpectRight (label <> " RC-CHeap") (forC run)
+      pure $ QC.conjoin
+        [ balanced (label <> " RC-abstract") absRun
+        , balanced (label <> " RC-CHeap") cRun
+        ]
+    balanced label run =
+      let st       = RCM.rcStats run
+          baseline = RCM.rcBaseline run
+          liveOk   = St.stLive st == baseline
+          allocOk  = St.stAllocs st - St.stFrees st == baseline
+      in QC.counterexample
+           (label <> ": stLive=" <> show (St.stLive st) <> " baseline=" <> show baseline
+             <> " allocs=" <> show (St.stAllocs st) <> " frees=" <> show (St.stFrees st))
+           (liveOk && allocOk)
+
+-- | P6: the zero-copy saving, differentially, over random 'bs'. We use the
+-- CHeap's ALLOC-COUNT ('forCAllocs', i.e. 'Heap.wokStatAllocs' -- a fresh
+-- counter per run, exactly as 'withBothBackends' reads it), NOT peak bytes:
+-- both templates first evaluate an IDENTICAL @fromList [b0, b1, ...]@ literal,
+-- which itself builds a transient Cons/Nil SPINE of @length bs@ cells before
+-- 'Bytes.fromList' folds it into one flat 'NBytes' cell (dropping the spine
+-- first, per 'bytesFromListRC'). That spine's PEAK BYTE contribution (~24B per
+-- Cons cell) dwarfs a packed byte buffer's charge (~1B/byte) for any
+-- non-trivial length, so 'wokStatPeakBytes' is swamped by spine noise and
+-- cannot isolate the router's move-vs-copy signal (verified empirically: an
+-- earlier version of this property pinned peak bytes directly and failed
+-- immediately once 'bs' was non-trivially sized). Alloc COUNT is immune to
+-- this: the spine contributes IDENTICALLY @length bs@ allocs to both
+-- templates (cancels out), so the router's OWN contribution is exact and
+-- absolute -- unique(MOVE) allocates exactly @length bs + 1@ cells (the
+-- spine, folded into ONE buffer, never a second); shared(COPY) allocates
+-- exactly @length bs + 2@ (the spine's buffer, PLUS the router's fresh
+-- boundary copy) -- a genuine differential measurement of the real CHeap
+-- run, matching \"unique allocates 0 extra cells; shared allocates 1 extra
+-- ... cell\" precisely as an alloc-count delta.
+prop_ffiOwnedZeroCopySaving :: Property
+prop_ffiOwnedZeroCopySaving =
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      trial <- runFfiOwnedTrial bs
+      -- Force both runs' Either results so a hard failure surfaces as a clear
+      -- assertFailure message rather than silently comparing stale alloc-count
+      -- fields from a failed run.
+      _ <- ffiOwnedExpectRight "unique(MOVE) RC-CHeap" (forC (fotUnique trial))
+      _ <- ffiOwnedExpectRight "shared(COPY) RC-CHeap" (forC (fotShared trial))
+      let uAllocs  = forCAllocs (fotUnique trial)
+          sAllocs  = forCAllocs (fotShared trial)
+          spineLen = fromIntegral (length bs) :: Word64
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("unique(MOVE) CHeap allocs: got " <> show uAllocs
+              <> " expected (spine + 1 buffer) = " <> show (spineLen + 1))
+            (uAllocs == spineLen + 1)
+        , QC.counterexample
+            ("shared(COPY) CHeap allocs: got " <> show sAllocs
+              <> " expected (spine + buffer + 1 boundary copy) = " <> show (spineLen + 2))
+            (sAllocs == spineLen + 2)
+        , QC.counterexample
+            ("zero-copy saving: the COPY branch must allocate EXACTLY ONE extra cell vs "
+              <> "MOVE -- got delta " <> show (sAllocs - uAllocs))
+            (sAllocs - uAllocs == 1)
+        ]
+
+-- | P7: multi-consume. For a random small arity @n@ (1..4), @n@ INDEPENDENT
+-- unique(MOVE) consumes of freshly built (never-aliased) copies of the same
+-- 'bs' all return 'referenceFNV1a bs', and the whole program's accounting
+-- still balances on both RC backends.
+prop_ffiOwnedMultiConsume :: Property
+prop_ffiOwnedMultiConsume =
+  QC.forAllShrink (QC.choose (1, 4) :: Gen Int) (filter (>= 1) . QC.shrink) $ \n ->
+  QC.forAllShrink genFfiOwnedBytes QC.shrink $ \bs ->
+    QC.ioProperty $ do
+      run    <- runFfiOwnedSource (ffiOwnedMultiUniqueSource n bs)
+      absRun <- ffiOwnedExpectRight "multi-consume RC-abstract" (forAbs run)
+      cRun   <- ffiOwnedExpectRight "multi-consume RC-CHeap" (forC run)
+      let expectedText = T.pack
+            (show (sum (replicate n (toInteger (ffiOwnedExpectedChecksum bs)))))
+          absText      = RCM.rcOutput absRun
+          cText        = RCM.rcOutput cRun
+          absSt        = RCM.rcStats absRun
+          absBaseline  = RCM.rcBaseline absRun
+          cSt          = RCM.rcStats cRun
+          cBaseline    = RCM.rcBaseline cRun
+          balancedAbs  = St.stLive absSt == absBaseline
+                           && St.stAllocs absSt - St.stFrees absSt == absBaseline
+          balancedC    = St.stLive cSt == cBaseline
+                           && St.stAllocs cSt - St.stFrees cSt == cBaseline
+      pure $ QC.conjoin
+        [ QC.counterexample
+            ("multi-consume (n=" <> show n <> "): abstract=" <> T.unpack absText
+              <> " cheap=" <> T.unpack cText <> " expected=" <> T.unpack expectedText)
+            (absText == expectedText && cText == expectedText)
+        , QC.counterexample "multi-consume: RC-abstract accounting must balance" balancedAbs
+        , QC.counterexample "multi-consume: RC-CHeap accounting must balance" balancedC
+        ]
+
+-- | Registration: modest 'QuickCheckTests' (each iteration is a full
+-- compile+elaborate+run across THREE backends, so this is deliberately far
+-- below the 500-800 counts the pure-IR Suite F/rc-string/rc-cont-store
+-- property groups use) -- still enough samples to cover empty/small/multi-KB
+-- 'Bytes' and to shrink a deliberate regression down to a small counterexample.
+ffiOwnedIntoCPropertyTests :: TestTree
+ffiOwnedIntoCPropertyTests =
+  localOption (QuickCheckTests 60) $
+    testGroup "FFI Slice 4: owned-INTO-C properties"
+      [ testProperty "P1: backend parity (reference == RC-abstract == RC-CHeap), both branches"
+          prop_ffiOwnedBackendParity
+      , testProperty "P2: semantic -- unique(MOVE) checksum == referenceFNV1a bs"
+          prop_ffiOwnedSemanticChecksum
+      , testProperty "P3: branch-invariance -- MOVE and COPY yield the identical checksum"
+          prop_ffiOwnedBranchInvariance
+      , testProperty "P4: copy-fidelity -- original Bytes still reads correctly after a COPY consume"
+          prop_ffiOwnedCopyFidelity
+      , testProperty "P5: accounting balance -- allocs==frees, stLive==baseline on both RC backends"
+          prop_ffiOwnedAccountingBalance
+      , testProperty "P6: zero-copy saving (differential) -- MOVE charges 1x the buffer, COPY charges 2x"
+          prop_ffiOwnedZeroCopySaving
+      , testProperty "P7: multi-consume -- n independent unique consumes all == referenceFNV1a bs"
+          prop_ffiOwnedMultiConsume
+      ]
+
 -- | FFI Slice 3 Task 6 (stored-continuation route, Q4). A borrow-capturing
 -- continuation that ESCAPES its op-arm body (aliased then `__cont_store`'d) must be
 -- rejected at the M3 continuation-escape boundary (`firstOrderNoHandlerViolations`),
@@ -17048,7 +17651,7 @@ allMentionedUniques = go
       RRecord _ fl -> Set.unions (map (atomVars . snd) fl)
       RProj _ a    -> atomVars a
       RReuseCon{}             -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
-      RForeignCall _ _ _ _ as -> Set.unions (map atomVars as)
+      RForeignCall _ _ _ _ _ as -> Set.unions (map atomVars as)
 
 -- | All sub-expressions of @e@ (including @e@ itself), so the drift guard probes
 -- 'captureEscapesBody' at every body position, not just the top.
@@ -24781,6 +25384,37 @@ rcFfiBytesSoundness = testGroup "ffi bytes soundness"
             (RCM.rcOutput a) (RCM.rcOutput c)
         (Left e, _) -> assertFailure ("abstract FAILED: " <> show e)
         (_, Left e) -> assertFailure ("C FAILED (possible escape UAF): " <> show e)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- FFI Slice 4 Task 3: wok_bytes_fnv1a (FNV-1a) cross-check.
+-- Verifies that the C implementation of FNV-1a matches the Haskell reference.
+-- ---------------------------------------------------------------------------
+
+rcBytesChecksumTests :: TestTree
+rcBytesChecksumTests = testGroup "ffi bytes checksum (slice 4 task 3)"
+  [ testCase "wok_bytes_fnv1a: FNV-1a matches referenceFNV1a" $ do
+      hp <- Heap.wokHeapNew
+      let testData = BS.pack [0, 1, 2, 3, 255]
+      cellPtr <- Heap.wokBytesAlloc hp (fromIntegral (BS.length testData))
+      -- Fill the cell with test data
+      dataPtr <- Heap.wokBytesData cellPtr
+      BS.useAsCString testData $ \cstr ->
+        copyBytes (castPtr dataPtr) (castPtr cstr) (BS.length testData)
+      -- Call the C checksum function
+      cChecksum <- Heap.wokBytesFnv1a cellPtr
+      -- Compute the expected value using the Haskell reference
+      let expectedChecksum = FM.referenceFNV1a testData
+      -- Assert C result matches Haskell reference
+      assertEqual
+        "C wok_bytes_fnv1a == Haskell referenceFNV1a"
+        expectedChecksum
+        cChecksum
+      -- Clean up: drop the cell (rc -> 0), free it, then free the heap.
+      rc0 <- Heap.wokDec cellPtr
+      assertEqual "rc at zero before free" (0 :: Word64) rc0
+      Heap.wokFree hp cellPtr
+      Heap.wokHeapFree hp
   ]
 
 -- ---------------------------------------------------------------------------

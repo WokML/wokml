@@ -9,7 +9,7 @@ module Wok.Interp.RC.Heap
   , wokArrayAlloc, wokArrayLen, wokArrayElemKind, wokArraySlotGet, wokArraySlotSet
   , wokStringAlloc, wokStringLen, wokStringData, wokStringByteGet
   , wokStringViewAlloc, wokStringViewParent, wokStringViewOffset, wokStringViewLen
-  , wokBytesAlloc, wokBytesLen, wokBytesData, wokBytesByteGet
+  , wokBytesAlloc, wokBytesLen, wokBytesData, wokBytesByteGet, wokBytesFnv1a
   , wokForeignBytesAlloc, wokForeignBytesPtr, wokForeignBytesLen
   , wokBorrowViewAlloc, wokBorrowViewPtr, wokBorrowViewLen
   , wokBorrowDemoLend, wokBorrowDemoClose
@@ -62,6 +62,7 @@ foreign import ccall unsafe "wok_bytes_alloc"    wokBytesAlloc    :: Ptr WokHeap
 foreign import ccall unsafe "wok_bytes_len"      wokBytesLen      :: Ptr WokObj -> IO Word64
 foreign import ccall unsafe "wok_bytes_data"     wokBytesData     :: Ptr WokObj -> IO (Ptr Word8)
 foreign import ccall unsafe "wok_bytes_byte_get" wokBytesByteGet  :: Ptr WokObj -> Word64 -> IO Word64
+foreign import ccall unsafe "wok_bytes_fnv1a" wokBytesFnv1a :: Ptr WokObj -> IO Word64
 foreign import ccall unsafe "wok_foreign_bytes_alloc" wokForeignBytesAlloc :: Ptr WokHeap -> Ptr Word8 -> Word64 -> IO (Ptr WokObj)
 foreign import ccall unsafe "wok_foreign_bytes_ptr"   wokForeignBytesPtr   :: Ptr WokObj -> IO (Ptr Word8)
 foreign import ccall unsafe "wok_foreign_bytes_len"   wokForeignBytesLen   :: Ptr WokObj -> IO Word64

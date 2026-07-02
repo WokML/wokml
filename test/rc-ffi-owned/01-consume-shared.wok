@@ -1,0 +1,20 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 4: the SHARED (copy) router branch. The Bytes is consumed AND
+-- read again (`length b`), so Perceus dups it before the consume -> the runtime
+-- refcount is > 1 at the call -> the router COPIES: it hands C a fresh buffer
+-- (charging `length b` copy bytes), frees that copy, and merely DECREMENTS the
+-- original -- which stays live and readable, so `length b` still yields 3. The
+-- consume checksum equals FNV-1a of [65,66,67] on all three backends (the copy
+-- branch never changes the observable result), and accounting balances (the
+-- original and the boundary copy are each freed exactly once).
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> U64 with IO
+
+main : U64
+main =
+  let b = fromList [65, 66, 67] in
+  let h = Sink.consume b in
+  let n = length b in
+  h + n

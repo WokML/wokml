@@ -33,7 +33,11 @@ import Wok.IR.Reachable (firstOrderNoHandlerViolations)
 import Wok.IR.Region (Placement (..), RegionPlan (..), SliceRep (..), planRegions)
 import Wok.FFI.Blessed (ReturnDisp (..))
 import Wok.Interp.ForeignModels (foreignMemchr, foreignStrndup)
-import Wok.Interp.RC.Prim (rcPrimTable, allocBorrowDemoLend)
+#if defined(WOK_FFI_OWNED_NOGUARD_NEGCTRL) || defined(WOK_FFI_OWNED_DOUBLEFREE_NEGCTRL)
+import Wok.Interp.RC.Prim (rcPrimTable, allocBorrowDemoLend, consumeChecksum)
+#else
+import Wok.Interp.RC.Prim (rcPrimTable, allocBorrowDemoLend, consumeChecksum, bytesBytes)
+#endif
 import Wok.Interp.RC.Value
 import qualified Wok.Interp.RC.Heap as H
 import Wok.Interp.Value (RuntimeError (..))
@@ -44,6 +48,24 @@ import Data.Map.Strict (Map)
 import Data.Word (Word8, Word64)
 import Foreign.C.Types (CInt, CSize)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, minusPtr)
+#if defined(WOK_FFI_OWNED_NOGUARD_NEGCTRL) && defined(WOK_FFI_OWNED_DOUBLEFREE_NEGCTRL)
+#error "ffi-owned-noguard-negctrl and ffi-owned-doublefree-negctrl are mutually exclusive negative controls (enable at most one at a time; the symConsume mutation arms are #ifdef/#elif, so both-on would silently discard the doublefree arm)"
+#endif
+-- Both negctrl mutations below call libc 'free()' directly on a cell pointer,
+-- bypassing wok's allocator. That is well-defined ONLY when the C runtime's
+-- CHeap backend is the real system 'malloc' (the WOK_RC_MALLOC build, set by
+-- the cabal 'asan' flag alongside '-fsanitize=address' -- see wok.cabal, which
+-- ALSO forwards WOK_RC_MALLOC to this GHC CPP pass via 'cpp-options' for
+-- exactly this guard). Against the default slab-arena allocator, 'free()' on a
+-- cell pointer is UB (the arena never handed that pointer to libc malloc), so
+-- building a negctrl flag WITHOUT '-fasan' would silently corrupt the slab
+-- instead of raising the intended ASan fault. Fail loud at compile time instead.
+#if (defined(WOK_FFI_OWNED_NOGUARD_NEGCTRL) || defined(WOK_FFI_OWNED_DOUBLEFREE_NEGCTRL)) && !defined(WOK_RC_MALLOC)
+#error "owned-INTO-C negctrl flags require the WOK_RC_MALLOC backend (build with -fasan); free() on an arena pointer is UB"
+#endif
+#if defined(WOK_FFI_OWNED_NOGUARD_NEGCTRL) || defined(WOK_FFI_OWNED_DOUBLEFREE_NEGCTRL)
+import Foreign.Marshal.Alloc (free)
+#endif
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -374,8 +396,25 @@ evalRhsRC env b rhs body sc k s = case rhs of
   -- Foreign call on the RC machine: dispatches to either the pure Haskell model
   -- (AbstractHeap) or real ccall (CHeap), using 'disp' to determine how to wrap
   -- the return value and 'mfree' to name the free function for DispAdopt.
-  -- Args are owned positions, resolved via 'resolveRCAtomsAlloc'. Task 6.
-  RForeignCall lib sym disp mfree as -> do
+  -- Args are owned positions, resolved via 'resolveRCAtomsAlloc'.
+  --
+  -- LINCHPIN (FFI Slice 4 Task 4): the @[ArgTransfer]@ list is NOT threaded here
+  -- (bound as '_xfer' and deliberately discarded) because the transfer
+  -- distinction lives ENTIRELY inside 'rcForeignDispatch' (a (lib,sym) guard,
+  -- exactly like the borrow-out memchr/strndup arms). Perceus treats EVERY
+  -- foreign-call arg as an owned MOVE ('ownedOccs': the arg is counted, so
+  -- 'consumedHere' removes it from @delta@ and NO @__rc_drop@ is emitted for
+  -- it), making the DISPATCH the sole dropper. This is precisely correct for
+  -- BOTH transfers: a TransferNone (borrow-out) arm drops post-call (memchr),
+  -- and a MoveOut arm runs the rc==1 router below -- no per-arg Perceus
+  -- routing / drop-suppression is needed. (Empirically anchored: memchr's explicit
+  -- 'dropAddr' is ASan-clean; the consume ASan-positive corpus re-confirms it.)
+  -- This is INTENTIONAL, not a stub: '_xfer' is forward-looking metadata for a
+  -- future CODEGEN backend to dispatch on per-argument; the REFERENCE
+  -- INTERPRETER routes on the (lib,sym) pair instead and is not expected to
+  -- ever read this field (generalizing it here would be YAGNI for the single
+  -- 'MoveOut' symbol it currently serves).
+  RForeignCall lib sym disp _xfer mfree as -> do
     (vs, s1) <- resolveRCAtomsAlloc sc as s
     rcForeignDispatch lib sym disp mfree vs s1 cont
   where
@@ -533,6 +572,126 @@ rcForeignDispatch lib sym disp mfree vs s cont
           (a, s1) <- allocBorrowDemoLend n s
           cont (RVBox a) s1
         _ -> throwE (PrimError (Tx.pack "lendBuffer (RC): expected (U64)"))
+  -- 'Sink.consume' (FFI Slice 4): the transfer-full (owned) move-out. The blessed
+  -- table pins @("wok","consume")@ to @BlessedSig DispScalar [MoveOut]@ and the
+  -- typecheck-time owned<->MoveOut coherence guarantees the single arg is a
+  -- @owned Bytes@, so the dispatch owns the buffer's SINGLE free (the linchpin
+  -- note at the 'RForeignCall' site: Perceus emits no drop for a foreign-call arg).
+  -- The router (spec §7.1) peeks the runtime refcount via 'arrayUnique':
+  --   * rc==1 (unique, counted cell) -> MOVE: hand C the buffer, free it once
+  --     ('dropAddr'); 0 copy bytes. This is the zero-copy saving (P6).
+  --   * rc>1 / uncounted (shared) -> COPY: allocate a fresh 'NBytes' modelling
+  --     C's owned copy, free THAT, and merely DECREMENT the original (wok keeps
+  --     it live for its other holder). Charges 'length b' copy bytes.
+  --     NOTE: an R1-region (arena) 'Bytes' can NEVER reach this router in the
+  --     first place, so its non-arrival here is not something 'arrayUnique'
+  --     itself guarantees. 'arrayUnique's uncounted guard ('isUncounted') only
+  --     covers the STATIC/INLINE tiers, not 'isArenaAddr' -- an arena address is
+  --     never even passed to it, because 'Wok.IR.Escape.escapingAtomsRhs' marks
+  --     EVERY foreign-call argument as escaping (no exemption), which forces an
+  --     @owned Bytes@ onto the counted heap at its build site; an arena Bytes is
+  --     therefore never the argument atom here. Defensively, 'dropAddr' also has
+  --     its own 'isArenaAddr' no-op, so even if this invariant were ever violated
+  --     a drop of an arena cell here would stay inert rather than double-free
+  --     (belt-and-braces, not the load-bearing reason).
+  -- 'consumeChecksum' is a PURE READ (does not free); the C consumer never frees
+  -- (design i-b) -- Haskell drives every free here, synchronously, so the books
+  -- balance automatically (reverse of adopt, spec §7.6).
+  | lib == libWok, sym == symConsume =
+      case vs of
+        [RVBox bAddr] -> do
+          csum   <- consumeChecksum bAddr s
+          unique <- arrayUnique bAddr s
+          s1 <- if unique
+                  then dropAddr bAddr s              -- MOVE: free the original once
+#ifdef WOK_FFI_OWNED_NOGUARD_NEGCTRL
+                  -- NEGATIVE CONTROL ONLY (asan-runtime.sh `interp` gate; flag
+                  -- ffi-owned-noguard-negctrl, default False, NEVER in production).
+                  -- Defeat the copy-when-shared guard: model a C consumer that took
+                  -- the RAW shared buffer and called libc 'free' on it directly,
+                  -- bypassing wok's refcount entirely -- exactly the codegen-era
+                  -- hazard the copy branch exists to prevent.
+                  --
+                  -- WHY NOT "just call dropAddr unconditionally" (the naive
+                  -- force-move mutation): 'dropAddr' is refcount-SAFE -- it calls
+                  -- 'H.wokDec', which only frees the cell when the count reaches 0.
+                  -- At rc==2 that merely decrements to 1; the buffer survives and
+                  -- NOTHING faults. The interpreter is memory-safe by construction
+                  -- via 'dropAddr', so a mutation that stays inside 'dropAddr' can
+                  -- never demonstrate the hazard. This mutation instead reaches
+                  -- PAST 'dropAddr' (and past 'H.wokFree', whose own
+                  -- "rc!=0 -> abort" assertion would just abort loudly rather than
+                  -- corrupt state) and calls the real allocator's 'free' straight on
+                  -- the cell pointer -- precisely what an un-instrumented C
+                  -- consumer would do with a raw shared pointer it was handed.
+                  -- Any later touch of this address (a sibling's normal
+                  -- Perceus-emitted drop reading the now-freed header, or a
+                  -- sibling's C read via 'Libc.memchr') is then a genuine
+                  -- ASan-reported fault. Non-'CAddr' addresses (AbstractHeap) have
+                  -- no C allocation to hard-free; fall back to the safe decrement so
+                  -- the reference-interpreter path stays inert under this flag.
+                  -- STATS: this raw 'free' bypasses wok's byte-accounting, so
+                  -- '--dump-rc-stats' will NOT balance under this flag (stCurBytes
+                  -- stays counted) -- expected for a death-test control; do NOT wire
+                  -- a stats-diff check onto the death corpus.
+                  else case bAddr of
+                    CAddr p -> liftIO (free (castPtr p)) >> pure s
+                    _       -> dropAddr bAddr s
+#elif defined(WOK_FFI_OWNED_DOUBLEFREE_NEGCTRL)
+                  -- NEGATIVE CONTROL ONLY (asan-runtime.sh `interp` gate; flag
+                  -- ffi-owned-doublefree-negctrl, default False, NEVER in
+                  -- production). The DOUBLE-FREE-class sibling of the noguard
+                  -- control above: instead of a single hard-free (whose fault
+                  -- only surfaces as a use-after-free on a LATER read), free the
+                  -- cell pointer TWICE back-to-back. ASan intercepts the SECOND
+                  -- 'free' on the already-freed pointer and reports a genuine
+                  -- `attempting double-free` -- a DISTINCT class from the
+                  -- use-after-free, with no intervening poisoned read. This models
+                  -- the move-out double-free hazard directly: the buffer freed by
+                  -- BOTH the C consumer and wok. Non-'CAddr' addresses
+                  -- (AbstractHeap) have no C allocation to free; fall back to the
+                  -- safe decrement so the reference-interpreter path stays inert.
+                  -- STATS: these raw 'free's bypass wok's byte-accounting, so
+                  -- '--dump-rc-stats' will NOT balance under this flag (stCurBytes
+                  -- stays counted) -- expected for a death-test control; do NOT wire
+                  -- a stats-diff check onto the death corpus.
+                  else case bAddr of
+                    CAddr p -> liftIO (free (castPtr p) >> free (castPtr p)) >> pure s
+                    _       -> dropAddr bAddr s
+#else
+                  else do                            -- COPY: fresh buffer for C.
+                    -- CHeap over a genuine owned-Bytes C cell (native 'WokBytes'
+                    -- 0xFFFC, or an adopted 'WokForeignBytes' 0xFFFB): a SINGLE
+                    -- C-to-C memcpy via 'allocNBytesFromPtr', not the two-copy
+                    -- 'bytesBytes' (C->ByteString) + 'alloc (NBytes _)'
+                    -- (ByteString->C) round-trip. AbstractHeap (no C pointers)
+                    -- and any other CAddr (defensive; per 'escapingAtomsRhs's
+                    -- always-escape rule an owned-Bytes arg is never an arena/
+                    -- non-Bytes cell here) keep the ByteString-mediated path.
+                    (cpy, sC) <- case (stBackend s, bAddr) of
+                      (CHeap hp, CAddr p) -> do
+                        tid <- liftIO (H.wokTag p)
+                        if tid == wokBytesTag
+                          then do
+                            len <- liftIO (H.wokBytesLen p)
+                            src <- liftIO (H.wokBytesData p)
+                            allocNBytesFromPtr hp src len s
+                          else if tid == wokForeignBytesTag
+                            then do
+                              len <- liftIO (H.wokForeignBytesLen p)
+                              src <- liftIO (H.wokForeignBytesPtr p)
+                              allocNBytesFromPtr hp src len s
+                            else do
+                              bs <- bytesBytes (RVBox bAddr) s
+                              alloc (NBytes bs) s
+                      _ -> do
+                        bs <- bytesBytes (RVBox bAddr) s
+                        alloc (NBytes bs) s
+                    sC1       <- dropAddr cpy sC      -- free the copy (models C's free)
+                    dropAddr bAddr sC1               -- decrement the original (kept live)
+#endif
+          cont (RVLit (LInt (fromIntegral csum))) s1
+        _ -> throwE (PrimError (Tx.pack "consume (RC): expected (owned Bytes)"))
   | otherwise =
       throwE (PrimError
         (Tx.pack "foreign symbol not available in the RC interpreter: "
@@ -543,6 +702,7 @@ rcForeignDispatch lib sym disp mfree vs s cont
     symStrndup    = Tx.pack "strndup"
     libWok        = Tx.pack "wok"
     symLendBuffer = Tx.pack "lendBuffer"
+    symConsume    = Tx.pack "consume"
 
 -- | Allocate the result of a DispAdopt/DispCopy/DispScalar return on AbstractHeap.
 -- DispAdopt => 'NForeignBytes' (24 B handle); DispCopy => 'NBytes'; DispScalar
@@ -1199,7 +1359,7 @@ bodyLendsBorrow = go
     goAlt (AltCon _ _ e)  = go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e
-    goRhs (RForeignCall _ _ DispBorrow _ _) = True
+    goRhs (RForeignCall _ _ DispBorrow _ _ _) = True
     -- An 'RLam' RHS is a DIFFERENT activation: do not look inside it.
     goRhs RLam{}          = False
     goRhs _               = False

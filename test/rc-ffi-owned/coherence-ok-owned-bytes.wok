@@ -1,0 +1,12 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, POSITIVE case. `consume` is blessed
+-- (("wok","consume"), DispScalar, [MoveOut]); the surface signature declares
+-- its single parameter `owned Bytes`, so the surface transfer marker and the
+-- blessed MoveOut AGREE at position 0. This type-checks cleanly -- the anchor
+-- the three reject fixtures are measured against.
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> U64 with IO
+
+main = Sink.consume (fromList [65, 66, 67])

@@ -212,7 +212,7 @@ rhsMaxU (ROp m _ _ as)   = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
 rhsMaxU (RRecord _ flds) = foldr (max . atomMaxU . snd) (-1) flds
 rhsMaxU (RProj _ a)      = atomMaxU a
 rhsMaxU (RReuseCon tok _ as) = foldr (max . atomMaxU) (atomMaxU tok) as
-rhsMaxU (RForeignCall _ _ _ _ as) = foldr (max . atomMaxU) (-1) as
+rhsMaxU (RForeignCall _ _ _ _ _ as) = foldr (max . atomMaxU) (-1) as
 
 atomMaxU :: Atom -> Int
 atomMaxU (AVar n) = uOf n
@@ -1127,8 +1127,14 @@ ownedOccs ctx delta rhs = case rhs of
   ROp _ _ _ as   -> count as
   -- Foreign call: treat args as owned moves (like 'RApp' arguments). No call-head
   -- borrow because the callee is identified by (lib, sym) text, not an 'Atom'.
-  -- Task 6 will refine per-argument borrow semantics; for now, all args are moves.
-  RForeignCall _ _ _ _ as -> count as
+  -- FFI Slice 4 (resolved): the @[ArgTransfer]@ list is deliberately NOT consulted
+  -- here. Treating every foreign arg as an owned move is exactly correct for BOTH
+  -- transfers -- 'consumedHere' removes the arg from @delta@ so NO @__rc_drop@ is
+  -- emitted, leaving the RC DISPATCH the sole dropper (a TransferNone/borrow-out
+  -- arm drops post-call; a MoveOut arm runs the rc==1 router). The transfer
+  -- distinction lives entirely in the dispatch, so per-arg Perceus routing is
+  -- unnecessary; a MoveOut arg is already a consuming/terminal use (below).
+  RForeignCall _ _ _ _ _ as -> count as
   where
     -- A BORROWED operand (a 'LetRec' member / borrowed capture, in 'ctxBorrow') is
     -- NEVER an owned move --- even when its 'Unique' also names the shared env's
@@ -1167,7 +1173,10 @@ moveOperandUniques rhs = case rhs of
   RLam ps e      ->
     Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps))
   ROp _ _ _ as   -> atomUs as
-  RForeignCall _ _ _ _ as -> atomUs as
+  -- FFI Slice 4 (resolved): every foreign-call arg is a consuming move regardless
+  -- of its 'ArgTransfer' (a MoveOut consume is terminal; a borrow-out arg is
+  -- dispatch-dropped). No per-arg @[ArgTransfer]@ handling is needed here.
+  RForeignCall _ _ _ _ _ as -> atomUs as
   where
     atomUs atoms = [ nameUniq n | AVar n <- atoms ]
 
@@ -1996,7 +2005,9 @@ moveAtoms resume rhs = case rhs of
     | u <- Set.toList (freeVarsExpr e `Set.difference` Set.fromList (map binderUnique ps)) ]
   ROp _ _ _ as             -> as
   -- All args are consuming moves (no call-head exemption; callee is (lib,sym) text).
-  RForeignCall _ _ _ _ as  -> as
+  -- FFI Slice 4 (resolved): a MoveOut consume is a terminal/consuming use here just
+  -- like any other foreign arg -- no per-arg @[ArgTransfer]@ handling is needed.
+  RForeignCall _ _ _ _ _ as  -> as
   where
     resumeHead (AVar n) | nameUniq n `Set.member` resume = [AVar n]
     resumeHead _ = []

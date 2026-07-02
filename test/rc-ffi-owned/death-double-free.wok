@@ -1,0 +1,26 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 6: mutation-confirmed ASan death-test (DOUBLE-FREE).
+--
+-- Same shape as the positive `01-consume-shared.wok`: `b` is `Sink.consume`d
+-- AND read again (`length b`), so Perceus dups it before the consume -> the
+-- runtime refcount is > 1 at the call -> the UNMUTATED router COPIES, and this
+-- file is CLEAN under the normal build.
+--
+-- Under `-fffi-owned-doublefree-negctrl`, the shared branch is mutated to free
+-- the original cell pointer TWICE back-to-back (bypassing wok's refcount),
+-- modeling the move-out double-free hazard: the buffer freed by BOTH the C
+-- consumer and wok. The double-free happens INSIDE the dispatch (before any
+-- sibling access), so ASan intercepts the SECOND `free` on the already-freed
+-- pointer and MUST report `attempting double-free` naming this buffer -- a
+-- DISTINCT class from the use-after-move control (which faults on a later read).
+foreign module Sink "wok" where
+  consume "consume" : owned Bytes -> U64 with IO
+
+main : U64
+main =
+  let b = fromList [65, 66, 67] in
+  let h = Sink.consume b in
+  let n = length b in
+  h + n

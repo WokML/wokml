@@ -1,0 +1,13 @@
+module Main
+import Std.Bytes
+
+-- FFI Slice 4 Task 1 coherence, REJECT: OwnedModifierMisplaced via `owned`
+-- NESTED inside a compound parameter type (`[owned Bytes]`, a List of owned
+-- Bytes) rather than at the parameter HEAD. `classifyOwnedParams` only
+-- strips `owned` at a parameter head (`argOf`); a nested `owned` is left
+-- untouched, and unlike a param head it is not a `Bytes` parameter at all --
+-- `translateSig` rejects the leftover `TOwned` it finds inside the list.
+foreign module Sink "wok" where
+  bad3 "consume" : [owned Bytes] -> U64 with IO
+
+main = Sink.bad3 [fromList [65, 66, 67]]
