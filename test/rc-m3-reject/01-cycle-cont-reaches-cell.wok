@@ -26,7 +26,7 @@ effect Park = { park : U64 }
 runPark : (Park -> U64 with Park + eff e) -> U64 with eff e
 runPark c =
   with self = Park
-    { cell = __cont_cell_new ()
+    { var cell = __cont_cell_new ()
     ; park k ->
         let filled = __cont_store cell k in
         let k2 = __cont_take filled in

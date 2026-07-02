@@ -7,8 +7,8 @@ effect IO = { read : String -> String, write : String -> () }
 -- entry. A second one is rejected with a dedicated DuplicateHandlerParam
 -- error rather than the misleading DuplicateReturnArm.
 bad comp =
-  with { s = 0
-       ; s = 1
+  with { var s = 0
+       ; var s = 1
        ; IO.read p -> resume(s, p)
        ; IO.write m -> resume(s, ())
        ; v -> v }

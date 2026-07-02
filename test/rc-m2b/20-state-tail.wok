@@ -9,7 +9,7 @@ import Std.Base
 effect State s = { get : s, set : s -> () }
 
 runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
-runState i c = with State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
+runState i c = with State { var s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
 
 prog : () -> (U64, U64) with State U64
 prog u =

@@ -5,10 +5,10 @@ effect State  s = { get : s, set : s -> () }
 effect Writer w = { tell : w -> () }
 
 state  : s -> (() -> a with State s + eff e) -> (a, s) with eff e
-state  i c = with State  { s = i ;   get -> s ; set x k -> k x () ; v -> (v, s) } c ()
+state  i c = with State  { var s = i ;   get -> s ; set x k -> k x () ; v -> (v, s) } c ()
 
 writer : (() -> a with Writer [w] + eff e) -> (a, [w]) with eff e
-writer c = with Writer { log = [] ; tell w k -> k (log ++ w) () ; v -> (v, log) } c ()
+writer c = with Writer { var log = [] ; tell w k -> k (log ++ w) () ; v -> (v, log) } c ()
 
 both : () -> U64 with State U64 + Writer [U64]
 both u =

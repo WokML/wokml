@@ -562,6 +562,7 @@ rewriteMethodRefs classMethods dictNm idx = go
     goArm (Abs.HArm c v ps a) = Abs.HArm c v ps (go a)
     goArm (Abs.HUArm v ps a)  = Abs.HUArm v ps (go a)
     goArm (Abs.HParam v a)    = Abs.HParam v (go a)
+    goArm (Abs.HParamV v a)   = Abs.HParamV v (go a)
 
 -- | The parameter 'Abs.AtomPat's of a function LHS, in order. (Duplicated
 -- here rather than imported from 'Infer' to avoid an import cycle.)

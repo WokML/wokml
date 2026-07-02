@@ -40,6 +40,9 @@ import GeneratedParser.Wok.Layout (nextPos)
 tokenLine :: Token -> Int
 tokenLine t = case tokenPosn t of Pn _ l _ -> l
 
+tokenCol :: Token -> Int
+tokenCol t = case tokenPosn t of Pn _ _ c -> c
+
 -- | The reserved-symbol token for @,@.
 --
 -- The Happy parser matches symbol tokens by their numeric @tsID@ (its @TokSymbol@
@@ -158,6 +161,12 @@ data BraceCtx
         -- ^ Line of the @{@ token itself.
       , bcLastLine :: Int
         -- ^ Line of the last token we emitted inside this brace.
+      , bcRefCol :: Int
+        -- ^ Column of the first arm token (the arm-start reference column). For
+        -- a handler brace, a new line whose leading token is at-or-left-of this
+        -- column starts a new arm (insert a separator); a strictly deeper line
+        -- continues the current arm's body (no separator). Record braces ignore
+        -- this and keep the line-only behaviour.
       , bcIsHandler :: Bool
         -- ^ True => handler brace (insert @;@); False => record brace (@,@).
       }
@@ -204,8 +213,9 @@ insertRecordVirtualCommas toks = go [] [] toks
                (next : _) ->
                  if tokenLine next > tokenLine t
                  then
-                   -- Block mode: first entry is on the next line.
-                   let ctx = BlockBrace (tokenLine t) (tokenLine t) isHandler
+                   -- Block mode: first entry is on the next line. The first
+                   -- entry token's column is the arm-start reference column.
+                   let ctx = BlockBrace (tokenLine t) (tokenLine t) (tokenCol next) isHandler
                    in t : go (t : prefix) (ctx : stack) ts
                  else
                    -- Inline mode.
@@ -217,15 +227,24 @@ insertRecordVirtualCommas toks = go [] [] toks
     -- Any other token: maybe insert a virtual separator.
     | otherwise =
         case stack of
-          BlockBrace openLine lastLine isHandler : rest ->
+          BlockBrace openLine lastLine refCol isHandler : rest ->
             let curLine = tokenLine t
                 isSepTok  = if isHandler then isSemi  else isComma
                 sepTokFor = if isHandler then semiTok else commaTok
                 prevIsSep = case prefix of
                   (p : _) -> isSepTok p
                   []      -> False
+                -- Handler braces are indentation-sensitive: a new line whose
+                -- leading token is strictly deeper than the arm reference column
+                -- is a continuation of the current arm's body, NOT a new arm, so
+                -- it gets no separator. Record braces keep the line-only rule.
+                startsNewEntry = not isHandler || tokenCol t <= refCol
+                -- Advancing @lastLine@ to the current token's line; identical in
+                -- both branches, so bound once here.
+                newCtx = BlockBrace openLine curLine refCol isHandler
             in if curLine > lastLine && lastLine > openLine
                   && not (isSepTok t) && not prevIsSep
+                  && startsNewEntry
                then
                  -- New line inside a block brace, and we have already seen at
                  -- least one entry (lastLine > openLine), with no literal
@@ -235,13 +254,12 @@ insertRecordVirtualCommas toks = go [] [] toks
                  let sep = case prefix of
                                (p : _) -> sepAfter sepTokFor p
                                []      -> PT (Pn 0 curLine 1) sepTokFor
-                     newCtx = BlockBrace openLine curLine isHandler
                  in sep : t : go (t : prefix) (newCtx : rest) ts
                else
                  -- Either same line, first entry (lastLine == openLine), the
-                 -- current token is a separator, or the previous token already
-                 -- was one: just update lastLine.
-                 let newCtx = BlockBrace openLine curLine isHandler
-                 in t : go (t : prefix) (newCtx : rest) ts
+                 -- current token is a separator, a body continuation (deeper than
+                 -- the arm column), or the previous token already was a separator:
+                 -- just advance lastLine.
+                 t : go (t : prefix) (newCtx : rest) ts
           _ ->
             t : go (t : prefix) stack ts

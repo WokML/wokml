@@ -13,7 +13,7 @@ effect State s = { get : s, set : s -> () }
 effect Reader = { ask : U64 }
 
 runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
-runState i c = with State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
+runState i c = with State { var s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } c ()
 
 runReader : U64 -> (Reader -> a with Reader + eff e) -> a with eff e
 runReader e c = with self = Reader { ask -> e } in c self

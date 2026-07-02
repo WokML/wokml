@@ -21,7 +21,7 @@ effect Writer = { tell1 : U64 -> (), tell2 : U64 -> () }
 runWriter : (() -> a with Writer + eff e) -> (a, Pair) with eff e
 runWriter c =
   with Writer
-    { log = Pair 0 0
+    { var log = Pair 0 0
     ; tell1 w k -> let newLog = addToLog log w in k newLog ()
     ; tell2 w k -> let newLog = setSecond log w in k newLog ()
     ; v -> (v, log)

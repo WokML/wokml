@@ -460,6 +460,7 @@ HUArm.    HandlerArm ::= VarId [AtomPat] "->" Exp ;
 -- Handler-local parameter: a `name = init` seed entry inside the handler block.
 -- `=` distinguishes it from the `->` of op/value arms (HUArm/HArm). slice 4a.
 HParam.   HandlerArm ::= VarId "=" Exp ;
+HParamV.  HandlerArm ::= "var" VarId "=" Exp ;
 separator HandlerArm ";" ;
 separator ConId "" ;
 

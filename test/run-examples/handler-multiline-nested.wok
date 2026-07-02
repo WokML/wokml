@@ -1,0 +1,40 @@
+module Main
+import Std.Base
+
+-- Task-2 capability under NESTED handlers: both the State and Writer handlers
+-- have multi-line arm bodies, and they are nested (writer inside state). Proves
+-- the block-scope layout is per-brace (stack-scoped) and composes.
+
+effect State  s = { get : s, set : s -> () }
+effect Writer w = { tell : w -> () }
+
+state : s -> (() -> a with State s + eff e) -> (a, s) with eff e
+state i c = with State {
+    var s = i
+    get -> s
+    set x k ->
+      let next = x in
+      k next ()
+    v -> (v, s)
+  } c ()
+
+writer : (() -> a with Writer [w] + eff e) -> (a, [w]) with eff e
+writer c = with Writer {
+    var log = []
+    tell w k ->
+      let extended = log ++ w in
+      k extended ()
+    v -> (v, log)
+  } c ()
+
+both : () -> U64 with State U64 + Writer [U64]
+both u =
+  let a  = State.get in
+  let x1 = Writer.tell [a] in
+  let x2 = State.set (a + 5) in
+  let b  = State.get in
+  let x3 = Writer.tell [b] in
+  a + b
+
+main : ((U64, [U64]), U64)
+main = state 100 (\u -> writer both)

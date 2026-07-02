@@ -29,13 +29,13 @@ data LayoutDelimiters
 layoutWords :: [(TokSymbol, LayoutDelimiters)]
 layoutWords =
   [ ( TokSymbol "let" 39
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 55)) (Just (TokSymbol "}" 57))
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 56)) (Just (TokSymbol "}" 58))
     )
-  , ( TokSymbol "where" 53
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 55)) (Just (TokSymbol "}" 57))
+  , ( TokSymbol "where" 54
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 56)) (Just (TokSymbol "}" 58))
     )
   , ( TokSymbol "of" 43
-    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 55)) (Just (TokSymbol "}" 57))
+    , LayoutDelimiters (TokSymbol ";" 9) (Just (TokSymbol "{" 56)) (Just (TokSymbol "}" 58))
     )
   ]
 

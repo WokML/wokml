@@ -477,6 +477,7 @@ instance Print GeneratedParser.Wok.Abs.HandlerArm where
     GeneratedParser.Wok.Abs.HArm conid varid atompats exp -> prPrec i 0 (concatD [prt 0 conid, doc (showString "."), prt 0 varid, prt 0 atompats, doc (showString "->"), prt 0 exp])
     GeneratedParser.Wok.Abs.HUArm varid atompats exp -> prPrec i 0 (concatD [prt 0 varid, prt 0 atompats, doc (showString "->"), prt 0 exp])
     GeneratedParser.Wok.Abs.HParam varid exp -> prPrec i 0 (concatD [prt 0 varid, doc (showString "="), prt 0 exp])
+    GeneratedParser.Wok.Abs.HParamV varid exp -> prPrec i 0 (concatD [doc (showString "var"), prt 0 varid, doc (showString "="), prt 0 exp])
 
 instance Print [GeneratedParser.Wok.Abs.HandlerArm] where
   prt _ [] = concatD []

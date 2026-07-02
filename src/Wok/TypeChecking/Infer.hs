@@ -2458,7 +2458,12 @@ classifyArm env header arm = case arm of
   -- Handler-local parameter `name = init` (slice 4a). Bind `name` at a fresh
   -- type sigma in scope of every arm and the value arm; `init` is checked at
   -- sigma; control arms see `resume : sigma -> T -> R`.
-  Abs.HParam (Abs.VarId (pos, name)) initExp ->
+  -- Bare `name = init` handler state is rejected: it must be written `var name
+  -- = init`. (`initExp` is ignored — the binder never reaches elaboration.)
+  Abs.HParam (Abs.VarId (pos, name)) _initExp ->
+    throwError (BareHandlerParam (Just pos) name)
+  -- `var name = init`: the accepted handler-local state form.
+  Abs.HParamV (Abs.VarId (pos, name)) initExp ->
     pure (ParamArmC name initExp pos)
   where
     declaresOp e en op = case lookupEffect en e of

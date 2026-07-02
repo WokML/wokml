@@ -2,6 +2,6 @@ module Main
 import Std.Base
 effect State s = { get : s, set : s -> () }
 bad : s -> (() -> a with State s + eff e) -> (a, s) with eff e
-bad i c = with State { s = i ; get -> s ; set x k -> k () x ; v -> (v, s) } c ()
+bad i c = with State { var s = i ; get -> s ; set x k -> k () x ; v -> (v, s) } c ()
 main : U64
 main = 0

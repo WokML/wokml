@@ -76,11 +76,12 @@ import qualified Data.Text
   'tighter'  { PT _ (TS _ 50)    }
   'type'     { PT _ (TS _ 51)    }
   'use'      { PT _ (TS _ 52)    }
-  'where'    { PT _ (TS _ 53)    }
-  'with'     { PT _ (TS _ 54)    }
-  '{'        { PT _ (TS _ 55)    }
-  '|'        { PT _ (TS _ 56)    }
-  '}'        { PT _ (TS _ 57)    }
+  'var'      { PT _ (TS _ 53)    }
+  'where'    { PT _ (TS _ 54)    }
+  'with'     { PT _ (TS _ 55)    }
+  '{'        { PT _ (TS _ 56)    }
+  '|'        { PT _ (TS _ 57)    }
+  '}'        { PT _ (TS _ 58)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -468,6 +469,7 @@ HandlerArm
   : ConId '.' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HArm $1 $3 $4 $6 }
   | VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HUArm $1 $2 $4 }
   | VarId '=' Exp { GeneratedParser.Wok.Abs.HParam $1 $3 }
+  | 'var' VarId '=' Exp { GeneratedParser.Wok.Abs.HParamV $2 $4 }
 
 ListHandlerArm :: { [GeneratedParser.Wok.Abs.HandlerArm] }
 ListHandlerArm

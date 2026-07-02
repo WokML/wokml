@@ -1055,6 +1055,8 @@ typedExprForTest env = goE
       Typed.TReturnArm (tpa (Typed.TPVar v)) (goE body)
     goArm (Abs.HParam _ _) =
       error "typedExprForTest: handler-local parameter (slice 4a) not supported in tests"
+    goArm (Abs.HParamV _ _) =
+      error "typedExprForTest: handler-local parameter (slice 4a) not supported in tests"
 
     goDecls :: [Abs.LocalDecl] -> [Typed.TLocalDecl Ty.CType]
     goDecls decls =

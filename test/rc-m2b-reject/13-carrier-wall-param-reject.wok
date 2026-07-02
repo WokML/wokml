@@ -14,7 +14,7 @@ effect St s = { get : s, set : s -> () }
 runSt : s -> (() -> a with St s) -> (a, s)
 runSt i c =
   with St
-    { s = i
+    { var s = i
     ; get -> s
     ; set x k -> k k ()
     ; v -> (v, s)

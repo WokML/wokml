@@ -5,7 +5,7 @@ effect State s = { get : s, set : s -> () }
 
 runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
 runState i c = with State {
-    s = i
+    var s = i
     get -> s
     set x k -> k x ()
     v -> (v, s)

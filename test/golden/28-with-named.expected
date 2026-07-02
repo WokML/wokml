@@ -2,7 +2,7 @@ module Main;
 prog count total = total;
 state i c = with self = State
 {
-  s = i;
+  var s = i;
   get -> s;
   set x k -> k x ();
   v -> (v, s)

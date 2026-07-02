@@ -122,6 +122,10 @@ data TypeError
   | DuplicateHandlerParam SourceSpan
     -- ^ A parameterized handler block declares more than one @name = init@
     --   entry; a handler block may declare at most one such parameter.
+  | BareHandlerParam SourceSpan Text
+    -- ^ A handler-local state entry was written in the bare @name = init@ form;
+    --   it must be declared with @var@ (@var name = init@). Carries the offending
+    --   binder name so the message points at it.
   | UnknownClass Text
     -- ^ An instance references a class that has not been declared.
   | DuplicateClass Text

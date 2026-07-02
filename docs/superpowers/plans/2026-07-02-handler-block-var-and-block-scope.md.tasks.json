@@ -1,0 +1,45 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-02-handler-block-var-and-block-scope.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Grammar HParamV + regen + accept both forms",
+      "status": "pending",
+      "description": "Add `var s = i` handler-arm syntax; regen bnfc; reapply Layout.hs + Par.y hand patches; route HParamV in classifyArm + Class.hs goArm; keep bare form parseable. Verify: cabal build + var/bare probes print (42,42).",
+      "metadata": {"files": ["grammar/Wok.cf", "src-generated/GeneratedParser/Wok/", "src/Wok/TypeChecking/Infer.hs", "src/Wok/TypeChecking/Class.hs"], "verifyCommand": "cabal build 2>&1 | tail -5", "modelTier": "standard", "model": "sonnet"}
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Column-aware block-scope for arm bodies",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "RecordLayout.hs: add tokenCol, add reference-column to BlockBrace, suppress virtual separator on deeper-indented continuation lines for handler braces only. Verify: multi-line-body probe (42,42); suite green.",
+      "metadata": {"files": ["src/Wok/RecordLayout.hs"], "verifyCommand": "cabal test 2>&1 | tail -20", "modelTier": "standard", "model": "sonnet"}
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Migrate prelude + tests to var",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "Rewrite every stateful handler baton `name = init` to `var name = init` across prelude/Std/Control.wok + ~24 test .wok fixtures. Leave stateless handlers + record literals. Verify: no bare batons remain; cabal test green.",
+      "metadata": {"files": ["prelude/Std/Control.wok", "test/"], "verifyCommand": "cabal test 2>&1 | tail -20", "modelTier": "mechanical", "model": "sonnet"}
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Positive tests for the new surface",
+      "status": "pending",
+      "blockedBy": [2, 3],
+      "description": "Add fixtures: multi-line arm body, nested handler with multi-line body, single-baton (var) still DuplicateHandlerParam. Wire into test/Spec.hs if needed. Verify: cabal test green.",
+      "metadata": {"files": ["test/run-examples/handler-multiline-body.wok", "test/run-examples/handler-multiline-nested.wok", "test/Spec.hs", "test/typecheck-fail-examples/49-duplicate-handler-param.wok"], "verifyCommand": "cabal test 2>&1 | tail -20", "modelTier": "mechanical", "model": "sonnet"}
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Reject the bare baton with a hint",
+      "status": "pending",
+      "blockedBy": [3, 4],
+      "description": "Error.hs: add BareHandlerParam SourceSpan Text with a 'use var' hint render. Infer.hs classifyArm: throw it on Abs.HParam. Add negative fixture. Final: cabal test green + differential RC oracle equal.",
+      "metadata": {"files": ["src/Wok/TypeChecking/Error.hs", "src/Wok/TypeChecking/Infer.hs", "test/typecheck-fail-examples/handler-bare-param.wok", "test/Spec.hs"], "verifyCommand": "cabal test 2>&1 | tail -30", "modelTier": "standard", "model": "sonnet"}
+    }
+  ],
+  "lastUpdated": "2026-07-02"
+}

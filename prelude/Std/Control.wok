@@ -7,11 +7,11 @@ reader e c = with self = Reader { ask -> e } in c self
 
 effect State s = { get : s, set : s -> () }
 state : s -> (State s -> a with State s + eff e) -> (a, s) with eff e
-state i c = with self = State { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
+state i c = with self = State { var s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
 
 effect Writer w = { tell : w -> () }
 writer : (Writer [w] -> a with Writer [w] + eff e) -> (a, [w]) with eff e
-writer c = with self = Writer { log = [] ; tell w k -> k (log ++ w) () ; v -> (v, log) } in c self
+writer c = with self = Writer { var log = [] ; tell w k -> k (log ++ w) () ; v -> (v, log) } in c self
 
 effect Except e = { throw : e -> Never }
 except : (Except e -> a with Except e + eff r) -> Result a e with eff r

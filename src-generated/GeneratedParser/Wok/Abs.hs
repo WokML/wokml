@@ -218,6 +218,7 @@ data HandlerArm
     = HArm ConId VarId [AtomPat] Exp
     | HUArm VarId [AtomPat] Exp
     | HParam VarId Exp
+    | HParamV VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data LocalDecl

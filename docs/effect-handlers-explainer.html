@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wok effect-surface — remaining debt</title>
+<style>
+  :root{ --ink:#1d2127; --mut:#6b7280; --line:#dfe3e8; --bg:#fff; --soft:#f5f7f9; --accent:#2f6fb0; --warn:#c0392b; --ok:#2e7d54; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,sans-serif}
+  .wrap{max-width:820px;margin:0 auto;padding:46px 22px 90px}
+  h1{font-size:1.9rem;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:1.2rem;margin:46px 0 2px}
+  .sub,.cap{color:var(--mut)}
+  .sub{margin:.2em 0 0}
+  .cap{font-size:.8rem;text-align:center;margin-top:8px}
+  .mono,code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:.86em}
+  pre{background:#0f141a;color:#d7e0ea;border-radius:8px;padding:14px 16px;overflow-x:auto;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;margin:14px 0}
+  pre .k{color:#7fb2e6}
+  pre .c{color:#6b7d8f;font-style:italic}
+  pre .s{color:#c7935a}
+  pre .hl{color:#f1c15b;font-weight:600}
+
+  .flow{display:flex;flex-direction:column;align-items:center;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:9px 16px;text-align:center;min-width:230px}
+  .box small{display:block;color:var(--mut);font-size:.76em}
+  .box.hi{border-color:var(--accent);background:#eef4fb}
+  .arrow{color:var(--mut);margin:3px 0;font-size:1.05rem}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:18px 0}
+  .card{border:1px solid var(--line);border-radius:8px;padding:13px}
+  .card h3{margin:0 0 6px;font-size:.98rem}
+  .card p{margin:.3em 0;font-size:.9rem}
+  .card.debt{border-left:3px solid var(--warn)}
+  .card.debt h3{color:var(--warn)}
+  .card.closed{border-left:3px solid var(--ok)}
+  .card.closed h3{color:var(--ok)}
+
+  .label{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+  .note{border-left:3px solid var(--accent);background:var(--soft);border-radius:6px;padding:12px 16px;margin:18px 0}
+  .note b{color:var(--accent)}
+  .done{border-left:3px solid var(--ok);background:#f2f8f4;border-radius:6px;padding:10px 16px;margin:18px 0;font-size:.9rem;color:var(--mut)}
+  .done b{color:var(--ok)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>wok effect-surface — remaining debt</h1>
+  <p class="sub">Pending correctness &amp; foundation debt on the effect-handler surface. Three items remain; item&nbsp;1 is the load-bearing one and the next slice.</p>
+
+  <div class="done"><b>Just closed:</b> the <code>var</code> state-member + block-scope-arm-body slice shipped (merged to main), so the "handlers must be one line" debt is resolved. Earlier soundness fixes — carrier-escape via equation-form local fn, the M2b raw-abort leak, and the value-position multishot false-positive — are also done. None of those are pending.</div>
+
+  <h2>The three remaining items</h2>
+  <div class="grid">
+    <div class="card debt"><span class="label">open &middot; type soundness</span><h3>1 &middot; Resume launders effects</h3><p>A generic resume/await driver hides the resumed code's effects from its own type — the type lies. The next slice; detailed below.</p></div>
+    <div class="card debt"><span class="label">open &middot; runtime trap</span><h3>2 &middot; Conc drops the handler context</h3><p>A spawned child, or the root's own tail, performing a non-<code>Conc</code> effect across a suspension traps at runtime, not compile time.</p></div>
+    <div class="card debt"><span class="label">open &middot; feature interaction</span><h3>3 &middot; Regions can't meet handlers</h3><p>Function-local arenas and the FFI borrow tier disable in any module that contains a handler.</p></div>
+  </div>
+
+  <!-- 1: resume launders (the next slice) -->
+  <h2>1 &middot; Resume launders effects — the next slice</h2>
+  <p>The one real soundness-of-the-type-surface hole. A <code>Suspension</code> is "a function you can call to continue" — but a driver that resumes it can silently absorb the parked tail's effects and present itself as pure. The fix is parity: make resuming demand its effects exactly like calling a function does.</p>
+  <div class="flow">
+    <div class="box">program performs a residual row <code>e</code><small>even a <em>bare row variable</em>, deep in a coroutine tail</small></div>
+    <div class="arrow">&darr; stop silently absorbing it; treat <code>e</code> like any effect row</div>
+    <div class="box hi">the enclosing function's row must be <code>&gt;= e</code><small>the existing, sound row-unification already does this</small></div>
+    <div class="arrow">&darr; so every driver over the tail inherits the obligation</div>
+    <div class="box"><code>run</code> / <code>step</code> / <code>resume</code> / <code>await</code> gain <code>with eff e</code><small>caller needs a handler in scope — just like calling a function value</small></div>
+  </div>
+
+  <p class="label" style="color:var(--warn)">&#9679; today &mdash; the type lies (accepted)</p>
+<pre><span class="c">-- `run` performs the parked tail's effects `e` on resume...</span>
+<span class="c">-- ...but this signature is inferred effect-polymorphic / pure-looking.</span>
+replay : <span class="s">Suspension</span> U64 U64 U64 (<span class="k">row</span> e) -&gt; U64
+replay g = run g 0     <span class="c">-- the residual `e` is ABSORBED. the type hides it.</span></pre>
+
+  <p class="label" style="color:var(--ok)">&#9679; proposed &mdash; the type is honest (obligation surfaced)</p>
+<pre>replay : <span class="s">Suspension</span> U64 U64 U64 (<span class="k">row</span> e) -&gt; U64 <span class="hl">with eff e</span>
+replay g = run g 0     <span class="c">-- `with eff e` now MANDATORY; callers must handle the tail.</span></pre>
+
+  <p>The payoff appears the moment a scheduler exists — it can no longer claim purity while running effectful tasks:</p>
+<pre>runNext : <span class="s">Queue</span> (<span class="k">row</span> e) -&gt; () <span class="hl">with eff e</span>
+<span class="c">--                              ^^^^^^^^^ forced: a "pure" scheduler that</span>
+<span class="c">--   secretly runs effectful tasks becomes a type error, not a silent hole.</span></pre>
+
+  <p>Two shapes were considered; take <b>B</b>, defer <b>C</b>:</p>
+  <div class="grid">
+    <div class="card closed"><span class="label">chosen &middot; general</span><h3>B &mdash; load-bearing row</h3><p>Performing a residual row obligates the enclosing row. One localized emitter change, reuses the sound row-unification, and <strong>generalizes</strong> to <code>Task</code>/<code>Stream</code>/scheduler. Ripples to effect-polymorphic code (a declare-<code>with eff e</code> audit) — the honest cost of honest types.</p></div>
+    <div class="card debt"><span class="label">deferred &middot; coro-only</span><h3>C &mdash; split before/after rows</h3><p>Two rows on the coro types (effects before vs after a suspend). More precise, makes <code>cancel</code> free — but needs a control-flow-sensitive analysis (not free in HM), changes the coro type shape, and does <strong>not</strong> generalize to <code>Task</code>/<code>Stream</code>. YAGNI for now.</p></div>
+  </div>
+  <div class="note"><b>Shape of the slice:</b> type-only. The one change is in the effect emitter — stop absorbing bare row variables. The interpreter is untouched (<code>e</code> stays phantom at runtime), no codegen, no first-class carriers. The only visible fallout: <code>coro-resume-driver.wok</code>'s golden consciously flips and effect-polymorphic drivers must declare <code>with eff e</code>. Design: <code>docs/superpowers/specs/2026-06-11-resume-site-control-and-heap-continuations-design.md</code>.</div>
+
+  <!-- 2: Conc -->
+  <h2>2 &middot; Conc drops the handler context</h2>
+  <p>The <code>Conc</code> provider scheduler (<code>__drive_conc</code>) resumes coroutine segments under a fresh continuation <em>without</em> the ambient handler context. So a spawned/async child — or the root's own tail — that performs any <em>non-<code>Conc</code></em> effect across a suspension (yield/await/…) traps at <strong>runtime</strong> with an unhandled-effect error, not a type error. The type system accepts programs the scheduler cannot run. It's a soundness-adjacent gap (runtime trap on a type-accepted program), and it interacts with item&nbsp;1: a truly explicit layer-3 scheduler needs the load-bearing residual row first.</p>
+
+  <!-- 3: regions -->
+  <h2>3 &middot; Regions can't meet handlers</h2>
+  <p>Function-local arenas (region slice R1) and the FFI borrow tier both <strong>disable in any module that contains a handler</strong> — the arena/borrow analyses are gated off module-wide when a handler is present. Two foundation features that don't yet coexist per-module. Lifting this is its own slice (arena&nbsp;&harr;&nbsp;continuations interaction), lower priority than item&nbsp;1.</p>
+
+  <div class="note"><b>Next up:</b> item&nbsp;1 — make the residual effect row load-bearing (Option&nbsp;B), a self-contained type-only slice that closes the one real type-soundness hole on this surface and de-risks every future layer-3 consumer. Items&nbsp;2 and&nbsp;3 are lower-priority and separately scoped.</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,29 @@
+module Main
+import Std.Base
+
+-- Task-2 capability: a handler arm whose BODY spans multiple lines. The `set`
+-- arm's body is a `let ... in k ... ()` split across lines and indented deeper
+-- than the arm-start column, so the block-scope layout must treat it as a
+-- continuation (no spurious separator).
+
+effect State s = { get : s, set : s -> () }
+
+state : s -> (() -> a with State s + eff e) -> (a, s) with eff e
+state i c = with State {
+    var s = i
+    get -> s
+    set x k ->
+      let next = x in
+      k next ()
+    v -> (v, s)
+  } c ()
+
+prog : () -> U64 with State U64
+prog u =
+  let a = State.get in
+  let b = State.set 10 in
+  let c = State.get in
+  a + c
+
+main : (U64, U64)
+main = state 3 prog

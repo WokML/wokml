@@ -22,7 +22,7 @@ effect Outer = { oop : U64 -> Never }
 effect St s = { get : s, set : s -> () }
 
 runSt : s -> (St s -> a with St s + eff e) -> (a, s) with eff e
-runSt i c = with self = St { s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
+runSt i c = with self = St { var s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
 
 runOuter : (Outer -> a with Outer + eff e) -> Result a U64 with eff e
 runOuter c = with self = Outer { oop n k -> Err n ; v -> Ok v } in c self
