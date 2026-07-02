@@ -1,5 +1,13 @@
 # Resume-launders-effects — rung 2 (residual provenance / escape analysis)
 
+> **SUPERSEDED (2026-07-03).** Rung 2 is IMPLEMENTED. The chosen mechanism (caller-root
+> residual provenance) and its final design live in
+> `2026-07-03-resume-launders-rung2-caller-root-provenance-design.md`; the plan is
+> `docs/superpowers/plans/2026-07-03-resume-launders-rung2-caller-root-provenance.md`.
+> This doc is kept for its problem statement and the CLOSED/OPEN table, but its
+> "candidate mechanisms" section and OPEN status are historical. The remaining gap
+> is the inner-abstraction family (`docs/superpowers/2026-07-02-lambda-effect-laundering-note.md`).
+
 Status: **OPEN — needs its own brainstorm** (2026-07-02). This is the second rung of
 the "resume launders effects" epic. Rung 1 (the load-bearing residual row for the
 DIRECT + arm-hosted positions) is implemented and merged-pending on

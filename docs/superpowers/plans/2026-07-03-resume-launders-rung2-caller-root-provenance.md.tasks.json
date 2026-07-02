@@ -1,0 +1,29 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-03-resume-launders-rung2-caller-root-provenance.md",
+  "tasks": [
+    {
+      "id": 6,
+      "subject": "Rung2-T1: Caller-root provenance mechanism (replace exempt machinery)",
+      "status": "completed",
+      "description": "ctxCallerResidualRoots collected at seed (callerRootRefs walks nested arrows/type-args); emitResidualTail records iff residual tail rep in roots (reprRowRef both sides); retired ctxExemptRows + ctxEffRowDeclaredClosed + 3 wrap sites. Commit 49d3ffd. Per-task soundness review: FAITHFUL+SOUND, no over-reject (structural: (row VarId) slots can't hold concrete effects). modelTier: frontier.",
+      "note": "Deviation from literal design (seed-gate + fire-at-every-emit vs check-at-discharge) reviewed sound: check visibility changed not location; closeRow severs provenance at discharge so perform-site is correct."
+    },
+    {
+      "id": 7,
+      "subject": "Rung2-T2: Flip leak characterizations to death tests + pin deferred family",
+      "status": "completed",
+      "blockedBy": [6],
+      "description": "3 handler-position leaks git mv'd to typecheck-fail-examples (UndischargedEffect death tests); 2 inner-abstraction leaks (lambda-param, sigless-local) pinned green as deferred-family characterizations. Commit b6e081f, suite 2130 green. modelTier: mechanical."
+    },
+    {
+      "id": 8,
+      "subject": "Rung2-T3: Regression + edge-case positives",
+      "status": "completed",
+      "blockedBy": [6, 7],
+      "description": "rung2-nested-fn-ok (internal residual accepts) + rung2-nested-arrow-root (callF: (() -> U64 with eff e) -> U64 rejects with UndischargedEffect, guards nested-arrow root collection). Commit 4e5a9d9, suite 2134 green. Flagged out-of-scope: sigless-local let helper hits pre-existing RowMismatch row-generalization gap (adjacent to deferred inner-abstraction family). modelTier: standard.",
+      "note": "Phase-6 whole-branch review (rung1+rung2) in progress at time of writing."
+    }
+  ],
+  "epic": "resume-launders-effects. Rung 1 (direct + arm-hosted) + Rung 2 (caller-root provenance for handler-discharge positions) both on feat/resume-launders-loadbearing. NEXT: inner-abstraction effect-propagation slice (lambda-param + sigless-local), a DIFFERENT mechanism. See docs/superpowers/2026-07-02-lambda-effect-laundering-note.md.",
+  "lastUpdated": "2026-07-03"
+}

@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Control
+-- rung-2 DEATH TEST (was the rung-1 boundary): this handler-position residual
+-- laundering is now REJECTED with UndischargedEffect by the caller-root provenance
+-- rule. `run g 0` performs the parked tail's effects `e` in the HANDLED-EXPRESSION
+-- position of a handler; `driveHandledExpr` declares a closed row yet performs `e`.
+-- See docs/superpowers/specs/2026-07-02-resume-launders-rung2-provenance.md
+effect Ask = { ask : U64 }
+driveHandledExpr : Suspension U64 U64 U64 (row e) -> U64
+driveHandledExpr g = with { Ask.ask -> 0 } (run g 0)
+main : U64
+main = 0

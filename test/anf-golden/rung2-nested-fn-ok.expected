@@ -1,0 +1,29 @@
+producer u =
+  let t.3 = Coro.suspend(7)
+  let x = t.3
+  let t.2 = Log.emit(x)
+  let v = t.2
+  let t.1 = +(x, 100)
+  t.1
+
+resumeVia g =
+  let t = run(g, 5)
+  t
+
+drive u =
+  let t.1 = start(producer)
+  case t.1 of
+    Completed r -> r
+    Suspended _ g ->
+      let t.2 = resumeVia(g)
+      t.2
+  with {
+    return v -> v
+    Log.emit(n, resume) ->
+      let t.3 = resume(())
+      t.3
+  }
+
+main =
+  let t = drive(())
+  t

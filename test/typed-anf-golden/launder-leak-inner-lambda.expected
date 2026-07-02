@@ -1,0 +1,8 @@
+driver g : Suspension U64 U64 U64 =
+  let t.2 : Suspension U64 U64 U64 -> U64 = \h : Suspension U64 U64 U64 -> let t.1 : U64 = run(h, 0)
+  t.1
+  let t.3 : U64 = t.2(g)
+  t.3
+
+main =
+  0

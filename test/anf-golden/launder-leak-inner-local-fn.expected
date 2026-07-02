@@ -1,0 +1,10 @@
+drive g =
+  letrec
+    go u =
+      let t.2 = run(g, 0)
+      t.2
+  let t.1 = go(())
+  t.1
+
+main =
+  0

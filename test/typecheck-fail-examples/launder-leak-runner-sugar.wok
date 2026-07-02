@@ -1,10 +1,11 @@
 module Main
 import Std.Base
 import Std.Control
--- KNOWN LEAK (resume launders effects, rung-1 boundary): TYPECHECKS today, type
--- LIES. The runner-sugar form `with s = <runner> in body` launders the body's
+-- rung-2 DEATH TEST (was the rung-1 boundary): this handler-position residual
+-- laundering is now REJECTED with UndischargedEffect by the caller-root provenance
+-- rule. The runner-sugar form `with s = <runner> in body` launders the body's
 -- residual `e` (supplied by callback `f`) through the runner's own terminal
--- exemption; `driveSugar` declares closed yet performs `e`. Awaits rung-2 provenance.
+-- exemption; `driveSugar` declares closed yet performs `e`.
 -- See docs/superpowers/specs/2026-07-02-resume-launders-rung2-provenance.md
 driveSugar : (() -> U64 with eff e) -> (U64, U64)
 driveSugar f = with s = state 0 in f ()

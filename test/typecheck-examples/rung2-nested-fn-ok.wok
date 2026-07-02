@@ -1,0 +1,42 @@
+module Main
+import Std.Base
+import Std.Control
+
+effect Log = { emit : U64 -> () }
+
+-- producer suspends with 7, then performs Log in the tail, returns x + 100
+-- where x is the resume value (so the result is sensitive to resumption, not a
+-- constant). The Log residual is captured into the Step and performed on resume.
+producer : () -> U64 with Coro U64 U64 + Log
+producer u =
+  let x = Coro.suspend 7 in
+  let v = Log.emit x in
+  x + 100
+
+-- helper: resumes a parked continuation, itself declaring the row-polymorphic
+-- residual it performs (matches the coro-resume-driver.wok pattern). It is NOT
+-- the top-level function under test -- it is a callee that `drive` routes
+-- through.
+resumeVia : Suspension U64 U64 U64 (row e) -> U64 with eff e
+resumeVia g = run g 5
+
+-- rung-2 edge case (must ACCEPT): `drive` has NO row-typed parameter at all,
+-- so its own declared signature contributes no caller-root. The resume site is
+-- routed through the HELPER `resumeVia` (a different function, with its own
+-- open `with eff e` signature) instead of calling `run` directly at the `case`
+-- site. At the call site inside `with Log {...}`, `resumeVia`'s `e` unifies to
+-- the concrete `Log` and is fully discharged there -- `drive`'s own body has
+-- no leftover residual. This guards against a false positive where the
+-- caller-root walk might mistake "a callee's OWN row-polymorphic signature"
+-- for "a residual rooted in drive's own declared parameter/result types":
+-- `drive`'s caller-root set must be computed from `drive`'s signature alone,
+-- not from types reachable through its call graph.
+drive : () -> U64
+drive u =
+  with Log { emit n k -> k () }
+    (case start producer of
+       Completed r   -> r
+       Suspended _ g -> resumeVia g)
+
+main : U64
+main = drive ()

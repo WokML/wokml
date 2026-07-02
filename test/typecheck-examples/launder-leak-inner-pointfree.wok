@@ -1,0 +1,17 @@
+module Main
+import Std.Base
+import Std.Control
+-- KNOWN LEAK (inner-abstraction family, DEFERRED to the slice after rung 2):
+-- TYPECHECKS today, the type LIES. `helper` is a POINT-FREE 0-arg binding whose
+-- body is a lambda performing the caller-supplied residual `e`. It is accepted
+-- (`forall a. Suspension U64 U64 U64 a -> U64`) even though the eta-equivalent
+-- explicit-param form `helper g = run g 0` is correctly REJECTED. Cause:
+-- typeEquationWith's zero-parameter branch never collects caller-roots, and the
+-- lambda body absorbs the residual. Same family as launder-leak-inner-lambda;
+-- needs the inner-abstraction propagation fix (which must also extend root
+-- collection to the 0-arg branch), NOT rung-2's provenance rule.
+-- See docs/superpowers/2026-07-02-lambda-effect-laundering-note.md
+helper : Suspension U64 U64 U64 (row e) -> U64
+helper = \ g -> run g 0
+main : U64
+main = 0

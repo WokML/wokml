@@ -1,9 +1,30 @@
-# Note: lambda effect-laundering (pre-existing, separate from the resume-launders epic)
+# Note: inner-abstraction effect-laundering (pre-existing; the slice after rung 2)
 
-Status: **OBSERVED, not scheduled** (2026-07-02). Surfaced during the rung-1 review
-of the "resume launders effects" slice (Gate 3, position iv). Recorded so it is not
-lost; it is NOT part of the resume-launders epic and would not be fixed by that
-epic's rung-2 provenance analysis.
+Status: **OBSERVED, scoped as the slice after rung 2** (2026-07-02; broadened
+2026-07-03). Surfaced during rung-1 review (Gate 3), broadened by the rung-2
+adversarial design check. This is a distinct family from the caller-root provenance
+work (rung 2): any INNER ABSTRACTION with its own open ambient — a lambda OR a
+sigless local function — absorbs a residual before it reaches the enclosing
+declared-closed row, so neither rung 1 nor rung 2's caller-root rule catches it.
+Two confirmed members:
+
+- **Lambda-parameter:** `driver g = (\h -> run h 0) g` (below).
+- **Sigless local function:** `drive g = let go u = run g 0 in go ()` — performs the
+  OUTER function's caller-root residual `e` under `go`'s own inferred-open ambient;
+  accepted today as pure `drive : Suspension … (row e) -> U64`, the type lies.
+- **Point-free 0-arg binding:** `helper = \g -> run g 0` with a closed row-arrow sig
+  `Suspension … (row e) -> U64` — accepted today (`forall a. Suspension … a -> U64`),
+  even though the eta-equivalent explicit-param form `helper g = run g 0` is
+  correctly REJECTED. Surfaced by the rung-2 line-by-line review: `typeEquationWith`'s
+  zero-parameter branch (`Infer.hs`, the `pTys == []` case) never calls
+  `callerRootRefs`/`withCallerRoots`, so a function-typed 0-arg binding tracks no
+  roots. The inner-abstraction fix must ALSO extend root collection to that branch,
+  handling the wrinkle that the effect row that matters sits on the binding's
+  declared ARROW, not on the binding's own (pure) evaluation.
+
+Both stem from the same root cause: the inner abstraction does not PROPAGATE its
+body's residual effects onto its inferred arrow / into the enclosing ambient. The
+fix is effect-propagation, orthogonal to rung 2's provenance rule.
 
 ## The observation
 

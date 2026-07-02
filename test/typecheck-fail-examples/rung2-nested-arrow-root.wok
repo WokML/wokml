@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+import Std.Control
+-- rung-2 edge case (must REJECT): guards that `callerRootRefs` walks into
+-- NESTED arrow positions, not just top-level parameter types. `callF`'s
+-- parameter `f` is itself a FUNCTION whose own arrow carries the residual
+-- root `e` (`() -> U64 with eff e`), nested one level inside `callF`'s outer
+-- arrow. Calling `f ()` genuinely PERFORMS `e` at that nested-arrow root, but
+-- `callF`'s declared signature is closed (no `with eff e` on the outer arrow),
+-- so this must be rejected with UndischargedEffect.
+callF : (() -> U64 with eff e) -> U64
+callF f = f ()
+main : U64
+main = 0

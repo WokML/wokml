@@ -1,10 +1,11 @@
 module Main
 import Std.Base
 import Std.Control
--- KNOWN LEAK (resume launders effects, rung-1 boundary): TYPECHECKS today, type
--- LIES. Same handled-expression laundering as launder-leak-handled-expr, compounded
+-- rung-2 DEATH TEST (was the rung-1 boundary): this handler-position residual
+-- laundering is now REJECTED with UndischargedEffect by the caller-root provenance
+-- rule. Same handled-expression laundering as launder-leak-handled-expr, compounded
 -- through NESTED handlers. `run g 0`'s residual `e` escapes both handlers' discharge
--- sites; `driveNested` declares closed yet performs `e`. Awaits rung-2 provenance.
+-- sites; `driveNested` declares closed yet performs `e`.
 -- See docs/superpowers/specs/2026-07-02-resume-launders-rung2-provenance.md
 effect Ask = { ask : U64 }
 effect Tell = { tell : U64 -> () }

@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Control
+-- KNOWN LEAK (inner-abstraction family, DEFERRED to the slice after rung 2):
+-- TYPECHECKS today, the type LIES. `run g 0` performs the caller-supplied residual
+-- `e`, but it sits inside a SIGLESS LOCAL FUNCTION `go` whose own inferred-open
+-- ambient absorbs it before it reaches drive's declared-closed row. Same family as
+-- launder-leak-inner-lambda; needs the inner-abstraction propagation fix, NOT
+-- rung-2's provenance rule. See docs/superpowers/2026-07-02-lambda-effect-laundering-note.md
+drive : Suspension U64 U64 U64 (row e) -> U64
+drive g = let go u = run g 0 in go ()
+main : U64
+main = 0

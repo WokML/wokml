@@ -24,10 +24,8 @@ module Wok.TypeChecking.Monad
   , takeConstraints
   , currentEffRow
   , withEffRow
-  , withEffRowSig
-  , currentEffRowDeclaredClosed
-  , withExemptRows
-  , currentExemptRows
+  , withCallerRoots
+  , currentCallerResidualRoots
   , recordPendingResidual
   , takePendingResiduals
   ) where
@@ -45,9 +43,10 @@ import Wok.TypeChecking.Types
   ( Kind (..), Level (..), Row, Scheme, TVar (..), Type (..) )
 
 -- | A mutable effect-row-variable cell (the 'STRef' inside a 'TVar' of kind
--- 'KEffect'). Used to exempt specific handler-plumbing rows (resume-continuation
--- rows, a handler's own sub-ambient tail) from the residual-obligation check by
--- pointer identity -- never a whole subtree.
+-- 'KEffect'). Used to identify the caller-supplied residual roots (the row
+-- variables occurring in the enclosing equation's declared parameter and result
+-- types) so a bare residual tail can be matched against them by representative
+-- identity -- see 'ctxCallerResidualRoots'.
 type RowRef s = STRef s (TVar s)
 
 -- | A constraint collected during inference; its argument is still a mutable
@@ -69,31 +68,28 @@ data TCCtx s = TCCtx
     -- checked: an open-tailed 'Row' that operation calls and effectful
     -- applications extend. 'Nothing' outside any equation body (e.g. while
     -- translating signatures or at the top level), where effects are ignored.
-  , ctxEffRowDeclaredClosed :: Bool
-    -- ^ Was the CURRENT ambient seeded from a DECLARED-CLOSED signature effect
-    -- row (a sig with no @with eff e@ / @..@ open tail)? Captured at seed time
-    -- because the live ambient cell is mutated during body checking (an open
-    -- @with eff e@ sig's throwaway body copy legitimately closes to empty), so
-    -- the residual-obligation verdict cannot read it live. 'False' for every
-    -- freshly-installed open ambient (inferred equations, lambdas, handler
-    -- sub-ambients, top-level values); 'True' only under a declared-closed sig.
-  , ctxExemptRows  :: [RowRef s]
-    -- ^ Effect-row-variable cells that are handler PLUMBING and must NOT be
-    -- recorded as residual obligations even under a declared-closed ambient: a
-    -- handler arm's resume-continuation row(s) (invoking @resume@/@k@) and a
-    -- handler's own sub-ambient tail. Scoped by 'withExemptRows' to exactly the
-    -- subexpression where that specific row is the plumbing; matched by pointer
-    -- identity (after 'force'), never by suppressing a whole subtree -- so a
-    -- genuine residual performed in the same scope (e.g. @run g 0@ in an arm)
-    -- is still recorded and rejected.
+  , ctxCallerResidualRoots :: [RowRef s]
+    -- ^ The representative cells of every 'KEffect' row VARIABLE occurring in the
+    -- enclosing equation's DECLARED parameter and result types -- its
+    -- "caller-supplied roots" -- OR the empty list when that equation's declared
+    -- effect row is OPEN (an open row discharges any residual through its own open
+    -- tail, so nothing is an obligation). A bare residual effect-row tail is an
+    -- undischarged obligation IFF its representative is one of these (a
+    -- caller-supplied polymorphic row cannot be handled internally). Every OTHER
+    -- bare tail (a handler sub-ambient leftover, a resume-continuation row, a
+    -- runner thunk's leftover) is internal, not a root, and closes to empty --
+    -- benign. Set per equation by 'withCallerRoots' (SETTING, not accumulating:
+    -- each equation gets its own params/result, and a nested sub-ambient does NOT
+    -- reset the set -- so a root performed under an open handler sub-ambient is
+    -- still recognised, which is what makes the handler-discharge leaks visible).
   , ctxConstraints :: STRef s [ConstraintS s]
     -- ^ Constraints accumulated during inference. Prepended in emission order;
     -- 'takeConstraints' reverses to restore insertion order.
   , ctxPendingResiduals :: STRef s [(SourceSpan, Text)]
     -- ^ Undischarged residual-effect-row obligations recorded during inference.
-    -- When a callee performs a bare residual effect-row variable under a
-    -- DECLARED-CLOSED ambient row ('ctxEffRowDeclaredClosed'), the verdict is
-    -- recorded HERE rather than thrown immediately, so the module-level
+    -- When a callee performs a bare residual effect-row variable that is one of
+    -- the enclosing equation's caller-supplied roots ('ctxCallerResidualRoots'),
+    -- the verdict is recorded HERE rather than thrown immediately, so the module-level
     -- carrier/affine post-passes report first. Drained by 'takePendingResiduals'
     -- after those passes; the first entry is the reported obligation. Prepended
     -- in emission order; 'takePendingResiduals' reverses.
@@ -118,7 +114,7 @@ runTC env action = runST $ do
   warnsRef <- newSTRef []
   consRef  <- newSTRef []
   residRef <- newSTRef []
-  let ctx = TCCtx freshRef (Level 0) env warnsRef Nothing False [] consRef residRef
+  let ctx = TCCtx freshRef (Level 0) env warnsRef Nothing [] consRef residRef
   result <- runExceptT (runReaderT (unTC action) ctx)
   case result of
     Left err -> pure (Left err)
@@ -154,37 +150,22 @@ currentEffRow :: TC s (Maybe (STRef s (Row s)))
 currentEffRow = asks ctxEffRow
 
 -- | Run an action with the given ambient effect-row cell installed. Operation
--- calls and effectful applications inside the action extend that cell. Any such
--- freshly-installed ambient is treated as OPEN for the residual-obligation
--- verdict (@ctxEffRowDeclaredClosed = False@); use 'withEffRowSig' to install a
--- sig-seeded ambient whose declared-closed status is known.
+-- calls and effectful applications inside the action extend that cell. Whether a
+-- residual performed here is an obligation is decided by the caller-supplied
+-- roots ('ctxCallerResidualRoots'), which are installed once per equation by
+-- 'withCallerRoots' and are NOT reset by a freshly-installed sub-ambient.
 withEffRow :: STRef s (Row s) -> TC s a -> TC s a
-withEffRow ref = local (\c -> c { ctxEffRow = Just ref, ctxEffRowDeclaredClosed = False })
+withEffRow ref = local (\c -> c { ctxEffRow = Just ref })
 
--- | Install a sig-seeded ambient, recording whether its DECLARED effect row is
--- closed (no @with eff e@ / @..@ tail). A residual performed under a
--- declared-closed row is an undischarged obligation; under a declared-open row
--- it is dischargeable even though the throwaway body copy may close to empty.
-withEffRowSig :: Bool -> STRef s (Row s) -> TC s a -> TC s a
-withEffRowSig declClosed ref =
-  local (\c -> c { ctxEffRow = Just ref, ctxEffRowDeclaredClosed = declClosed })
+-- | Run an action with the given caller-supplied residual roots installed (see
+-- 'ctxCallerResidualRoots'). SETS the set (does not accumulate): each equation
+-- installs exactly the roots of its OWN declared parameter and result types.
+withCallerRoots :: [RowRef s] -> TC s a -> TC s a
+withCallerRoots refs = local (\c -> c { ctxCallerResidualRoots = refs })
 
--- | Was the current ambient seeded from a declared-closed signature effect row?
-currentEffRowDeclaredClosed :: TC s Bool
-currentEffRowDeclaredClosed = asks ctxEffRowDeclaredClosed
-
--- | Run an action with the given effect-row cells added to the plumbing-exempt
--- set (see 'ctxExemptRows'). A residual whose forced representative is one of
--- these rows is NOT recorded as an obligation; every OTHER residual in the same
--- scope is still checked normally. Scope this to exactly the subexpression where
--- the rows are the handler's own plumbing (an arm body for its resume rows, the
--- discharge re-emit for the sub-ambient tail).
-withExemptRows :: [RowRef s] -> TC s a -> TC s a
-withExemptRows refs = local (\c -> c { ctxExemptRows = refs ++ ctxExemptRows c })
-
--- | The effect-row cells currently exempt from residual-obligation recording.
-currentExemptRows :: TC s [RowRef s]
-currentExemptRows = asks ctxExemptRows
+-- | The caller-supplied residual roots currently in scope.
+currentCallerResidualRoots :: TC s [RowRef s]
+currentCallerResidualRoots = asks ctxCallerResidualRoots
 
 freshUniq :: TC s Int
 freshUniq = do

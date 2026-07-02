@@ -1,0 +1,10 @@
+drive g : Suspension U64 U64 U64 =
+  letrec
+    go : U64 u : a0 =
+      let t.2 : U64 = run(g, 0)
+      t.2
+  let t.1 : U64 = go(())
+  t.1
+
+main =
+  0
