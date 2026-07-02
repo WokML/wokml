@@ -1,0 +1,16 @@
+module Main
+import Std.Base
+import Std.Control
+-- KNOWN LEAK (resume launders effects, rung-1 boundary): this program TYPECHECKS
+-- today but the type LIES. `run g 0` performs the parked tail's effects `e` in the
+-- HANDLED-EXPRESSION position of a handler; `driveHandledExpr` declares a closed
+-- row yet performs `e`. The rung-1 fix (declared-closed + row-identity exemption)
+-- does NOT catch residuals routed through a handler's discharge site -- closing it
+-- needs the rung-2 provenance/escape analysis. Pinned GREEN so the boundary is
+-- regression-visible; rung-2 will flip this to UndischargedEffect.
+-- See docs/superpowers/specs/2026-07-02-resume-launders-rung2-provenance.md
+effect Ask = { ask : U64 }
+driveHandledExpr : Suspension U64 U64 U64 (row e) -> U64
+driveHandledExpr g = with { Ask.ask -> 0 } (run g 0)
+main : U64
+main = 0

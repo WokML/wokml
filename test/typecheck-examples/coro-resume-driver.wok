@@ -17,7 +17,7 @@ import Std.Control
 -- explicit (force resume drivers to declare `with eff e`), this golden flips
 -- from an effect-polymorphic scheme to one carrying the residual -- a conscious
 -- gate on that decision.
-replay : Suspension U64 U64 U64 (row e) -> U64
+replay : Suspension U64 U64 U64 (row e) -> U64 with eff e
 replay g = run g 0
 
 main : U64

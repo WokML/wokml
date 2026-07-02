@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST: the laundering `run g 0` sits INSIDE a handler arm under a closed
+-- sig. Must still be rejected (the arm-body exemption is narrowed to the resume
+-- continuation row only, so a caller-supplied Suspension's residual is caught).
+effect Ask = { ask : U64 }
+driveInArm : Suspension U64 U64 U64 (row e) -> U64
+driveInArm g = with { Ask.ask -> run g 0 } Ask.ask
+main : U64
+main = 0

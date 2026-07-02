@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST: laundering `run g 0` inside a NAMED handler arm under a closed sig.
+effect Ask = { ask : U64 }
+driveNamed : Suspension U64 U64 U64 (row e) -> U64
+driveNamed g = with s = Ask { ask -> run g 0 } in s.ask
+main : U64
+main = 0

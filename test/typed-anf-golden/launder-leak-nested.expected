@@ -1,0 +1,18 @@
+driveNested g : Suspension U64 U64 U64 =
+  let t.1 : U64 = run(g, 0)
+  t.1
+  with {
+    return v.1 : U64 -> v.1
+    Tell.tell(x : U64, resume.1 : () -> U64) ->
+      let t.2 : U64 = resume.1(())
+      t.2
+  }
+  with {
+    return v.2 : U64 -> v.2
+    Ask.ask(resume.2 : U64 -> U64) ->
+      let res : U64 = resume.2(0)
+      res
+  }
+
+main =
+  0

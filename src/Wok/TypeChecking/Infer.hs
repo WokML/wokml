@@ -46,7 +46,7 @@ import Wok.TypeChecking.Env
   , lookupRecordCon, lookupTyCon, lookupVar )
 import qualified Wok.FFI.Blessed as Blessed
 import Wok.TypeChecking.Error (SourceSpan, TypeError (..), Warning (..))
-import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
+import Wok.TypeChecking.Monad (TC, ConstraintS (..), RowRef, addConstraint, addWarning, currentEffRow, currentEffRowDeclaredClosed, currentEnv, currentExemptRows, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, recordPendingResidual, runTC, takeConstraints, takePendingResiduals, withEffRow, withEffRowSig, withEnv, withExemptRows)
 import Wok.TypeChecking.Unify (force, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
 import Wok.TypeChecking.Types
   ( CRow, CType (..), Constraint (..), Kind (..), Level (..), Row
@@ -2359,8 +2359,12 @@ inferExprW mono (Abs.EWithNamed (Abs.VarId (npos, name)) fVar wargs body) = do
           unify Nothing bodyT bodyResultTy
           -- The runner's own effects (whatever calling `runner` performs, e.g.
           -- the residual `eff e`) propagate into the enclosing ambient, mirroring
-          -- the application path ('EApp').
-          emitRow Nothing appRow
+          -- the application path ('EApp'). Any CONCRETE label still records via
+          -- 'emitEffect'; only appRow's own bare TAIL is the runner-thunk's
+          -- sub-ambient leftover (unified into `bodyRow` above, a fresh var that
+          -- closes with the runner), so we exempt exactly that row identity.
+          appTerminal <- rowTerminal appRow
+          withExemptRows (rowRefs [appTerminal]) (emitRow Nothing appRow)
           -- Rebuild the typed node as `runner (\name -> body)` so Task 4's
           -- TApp/TLam lowering is reused verbatim; the lambda binder carries
           -- `name : handleTy`, and `bodyNode` already holds the correctly
@@ -2522,14 +2526,26 @@ texpMentions name = goE
 -- Perceus pass would omit its drop on a discard arm, leaking the captured owned
 -- set (spec docs/superpowers/specs/2026-06-19-m2b-resume-binder-type-leak-fix).
 -- Shared by 'inferHandler' (ambient) and 'inferNamedHandler' (named).
-resumeContTyFor :: Maybe (Type s) -> Type s -> Type s -> TC s (Type s)
+-- Returns the continuation type AND the effect-row cells it carries (the resume
+-- row, plus the param row for a two-arg parameterized resume). Invoking @resume@
+-- performs those rows; the caller adds them to the plumbing-exempt set while
+-- checking the arm body so a resume call is not mistaken for an undischarged
+-- residual obligation, WITHOUT exempting other residuals performed in the arm.
+resumeContTyFor :: Maybe (Type s) -> Type s -> Type s -> TC s (Type s, [RowRef s])
 resumeContTyFor mParamTy resultTy answerT = do
   resumeRow <- freshRVar
   case mParamTy of
     Just paramTy -> do
       paramRow <- freshRVar
-      pure (arrowT paramTy paramRow (arrowT resultTy resumeRow answerT))
-    Nothing -> pure (arrowT resultTy resumeRow answerT)
+      pure ( arrowT paramTy paramRow (arrowT resultTy resumeRow answerT)
+           , rowRefs [resumeRow, paramRow] )
+    Nothing -> pure (arrowT resultTy resumeRow answerT, rowRefs [resumeRow])
+
+-- | The mutable cells of the given rows that are bare (unbound) row variables.
+-- A freshly-allocated 'freshRVar' is always a @TVar ref@, so this extracts the
+-- refs used to key the plumbing-exempt set.
+rowRefs :: [Row s] -> [RowRef s]
+rowRefs rows = [ ref | TVar ref <- rows ]
 
 inferHandler :: Map.Map Text (Type s) -> [Text] -> Maybe (Int, Int) -> Abs.Exp -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
 inferHandler mono header headerPos e arms = do
@@ -2636,13 +2652,13 @@ inferHandler mono header headerPos e arms = do
           -- The resume binder's continuation type (see 'resumeContTyFor'),
           -- threaded onto every arm shape so the elaborator types it as the
           -- always-boxed arrow it is, not the answer type R.
-          resumeContTy <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
+          (resumeContTy, resumeRefs) <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
           case binderPs of
             [] -> do
               -- AUTO-RESUME: no continuation binder. The arm body has the op's
               -- RESULT type and is implicitly resumed with it (today's behaviour).
               -- The empty resume name signals the auto-wrap path to the elaborator.
-              (bodyT, bodyNode) <- inferExprW mono1 body
+              (bodyT, bodyNode) <- withExemptRows resumeRefs (inferExprW mono1 body)
               unify (Just pos) bodyT resultTy
               pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
             [Abs.APWild] -> do
@@ -2653,15 +2669,17 @@ inferHandler mono header headerPos e arms = do
               -- path (body is R, no auto-wrap). `"_"` is just a non-empty name
               -- routing to the control path; binding the surface name `_` is
               -- harmless because the body never references it.
-              (bodyT, bodyNode) <- inferExprW mono1 body
+              (bodyT, bodyNode) <- withExemptRows resumeRefs (inferExprW mono1 body)
               unify (Just pos) bodyT answerT
               pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
             [Abs.APVar (Abs.VarId (_, kname))] -> do
               -- CONTROL: the trailing pattern is the continuation binder `k`, typed
               -- with the shared 'resumeContTy' (`T -> R`) above so applying it in
-              -- the body flows its effects into the outer ambient.
+              -- the body flows its effects into the outer ambient. Invoking `k`
+              -- performs its 'resumeRefs' rows; those are plumbing-exempt, but any
+              -- OTHER residual in the body is still recorded.
               let mono2 = Map.insert kname resumeContTy mono1
-              (bodyT, bodyNode) <- inferExprW mono2 body
+              (bodyT, bodyNode) <- withExemptRows resumeRefs (inferExprW mono2 body)
               unify (Just pos) bodyT answerT
               -- Forgotten-resume lint: a NAMED binder, unreferenced in the body,
               -- on a RETURNING op (result /= Never). Wildcard arms (above) are the
@@ -2676,10 +2694,15 @@ inferHandler mono header headerPos e arms = do
               -- binder: not a valid operation arm shape.
               throwError (MalformedHandlerArm (Just pos) en op)
   -- Discharge the handled effects from the handled expression's row, leaving
-  -- the residual effects to flow outward.
+  -- the residual effects to flow outward. Any CONCRETE unhandled label still
+  -- surfaces via 'emitEffect' as normal; only the residual's own bare TAIL is
+  -- the handler's sub-ambient leftover -- a fresh var that closes with the
+  -- handler -- so we exempt exactly that row (its current representative, since
+  -- growing the sub-ambient re-tailed it) from the obligation check.
   subRow <- liftST (readSTRef subRef)
   residual <- dischargeEffects subRow handledEffects
-  emitRow Nothing residual
+  resTerminal <- rowTerminal residual
+  withExemptRows (rowRefs [resTerminal]) (emitRow Nothing residual)
   -- A parameter arm, when present, is emitted into the typed arm list so the
   -- elaborator (Task 4) can see the seed. It is inert at the type level here.
   let paramArmNodes = case mParam of
@@ -2784,19 +2807,19 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
           Nothing -> throwError (UnknownOperation (Just pos) en op)
         -- The resume binder's continuation type (see 'resumeContTyFor'), threaded
         -- onto every arm shape (same as the ambient-handler path above).
-        resumeContTy <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
+        (resumeContTy, resumeRefs) <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
         case binderPs of
           [] -> do
-            (bodyT, bodyNode) <- inferExprW mono1 b
+            (bodyT, bodyNode) <- withExemptRows resumeRefs (inferExprW mono1 b)
             unify (Just pos) bodyT resultTy
             pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
           [Abs.APWild] -> do
-            (bodyT, bodyNode) <- inferExprW mono1 b
+            (bodyT, bodyNode) <- withExemptRows resumeRefs (inferExprW mono1 b)
             unify (Just pos) bodyT answerT
             pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
           [Abs.APVar (Abs.VarId (_, kname))] -> do
             let mono2 = Map.insert kname resumeContTy mono1
-            (bodyT, bodyNode) <- inferExprW mono2 b
+            (bodyT, bodyNode) <- withExemptRows resumeRefs (inferExprW mono2 b)
             unify (Just pos) bodyT answerT
             resultTy' <- force resultTy
             let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
@@ -2936,7 +2959,102 @@ emitRow sp row = do
     RowExtend l t rest -> do
       emitEffect sp l t
       emitRow sp rest
-    _                  -> pure ()  -- RowEmpty or open tail: no concrete effects to add
+    RowEmpty           -> pure ()  -- closed callee row: nothing more to add
+    TVar ref           -> do
+      -- The callee's row terminates in a variable. If it is a bare, unbound
+      -- residual effect-row tail (KEffect), it carries a polymorphic effect
+      -- obligation the caller must discharge -- handle it explicitly rather
+      -- than silently dropping it (the laundering loophole).
+      cell <- liftST (readSTRef ref)
+      case cell of
+        Unbound _ _ KEffect -> emitResidualTail sp ref
+        _                   -> pure ()
+    _                  -> pure ()  -- non-row / bound var: nothing to add
+
+-- | Discharge a callee's bare residual effect-row tail (whose cell is @resRef@)
+-- against the current ambient. The open/closed VERDICT is taken from the
+-- ambient's DECLARED status, not its live tail: the live cell is mutated during
+-- body checking (an OPEN @with eff e@ sig's throwaway body copy closes to empty),
+-- so it cannot be trusted here.
+--
+--   * @resRef@ is plumbing-exempt (its forced representative is one of the
+--     handler's resume-continuation rows or its own sub-ambient tail) -- skip;
+--     invoking @resume@ or a handler's leftover self-row is not this function's
+--     obligation. The exemption is by ROW IDENTITY, so a genuine residual (e.g.
+--     @run g 0@) performed in the very same arm is NOT exempt.
+--   * ambient live-OPEN (tail is still an unbound KEffect row variable) -- the
+--     residual is trivially dischargeable; leave it (closed with the ambient's
+--     own tail at the binding boundary). We deliberately do NOT unify the
+--     residual into the ambient tail: the tail is often a SHARED variable the
+--     surrounding row machinery still needs to grow with concrete labels, and
+--     aliasing it corrupts that ordering (it made a `State` label undischarged in
+--     `Std.Control.state`). A bare tail with no concrete labels threads nothing
+--     observable into the final closed scheme anyway.
+--   * ambient live-CLOSED (terminates in 'RowEmpty') -- consult the DECLARED
+--     status. An inferred / lambda / handler-sub ambient, or the throwaway body
+--     copy of an OPEN `with eff e` sig, legitimately closes to empty during body
+--     checking (no record). Only when the enclosing binding DECLARED a closed
+--     effect row (no `with eff e` / `..` tail) does the residual have nowhere to
+--     go: record an undischarged obligation. The verdict is deferred (recorded,
+--     not thrown) so the module-level carrier/affine post-passes report first.
+emitResidualTail :: BNFC'Position -> RowRef s -> TC s ()
+emitResidualTail sp resRef = do
+  exempt <- rowRefExempt resRef
+  if exempt
+    then pure ()
+    else do
+      mref <- currentEffRow
+      case mref of
+        Nothing     -> pure ()  -- no ambient (e.g. top-level value sig): ignore
+        Just ambRef -> do
+          ambient  <- liftST (readSTRef ambRef)
+          terminal <- rowTerminal ambient
+          case terminal of
+            RowEmpty -> do
+              declClosed <- currentEffRowDeclaredClosed
+              -- A bare residual row variable carries no nameable effect label
+              -- (that is the whole point -- it launders a polymorphic tail), so
+              -- the 'UndischargedEffect' payload is the conventional row-variable
+              -- placeholder @e@ rather than a real effect name.
+              when declClosed $ recordPendingResidual sp (Tx.pack "e")
+            _        -> pure ()  -- live-open ambient: dischargeable, see note
+
+-- | Is @resRef@ the representative cell of one of the plumbing-exempt rows? Each
+-- exempt row is 'force'd to its current representative (unification may have
+-- linked it since it was registered), then compared by pointer identity.
+rowRefExempt :: RowRef s -> TC s Bool
+rowRefExempt resRef = do
+  refs <- currentExemptRows
+  reps <- mapM reprRowRef refs
+  pure (resRef `elem` catMaybes reps)
+
+-- | Force a row-variable cell to its representative cell, or 'Nothing' if it has
+-- been solved to a non-variable row (e.g. 'RowEmpty').
+reprRowRef :: RowRef s -> TC s (Maybe (RowRef s))
+reprRowRef ref = do
+  r <- force (TVar ref)
+  case r of
+    TVar rr -> pure (Just rr)
+    _       -> pure Nothing
+
+-- | Force @row@ and walk its concrete labels to the terminal: 'RowEmpty' for a
+-- closed row, or the forced (unbound) row variable it ends in for an open one.
+rowTerminal :: Row s -> TC s (Row s)
+rowTerminal row = do
+  row' <- force row
+  case row' of
+    RowExtend _ _ rest -> rowTerminal rest
+    other              -> pure other
+
+-- | Is @row@ a CLOSED effect row -- terminates in 'RowEmpty' with no open
+-- variable tail? Used at equation-seed time to record whether the enclosing
+-- function's DECLARED effect row can absorb a residual.
+isRowClosed :: Row s -> TC s Bool
+isRowClosed row = do
+  t <- rowTerminal row
+  case t of
+    RowEmpty -> pure True
+    _        -> pure False
 
 -- | Look up an infix operator; monomorphic bindings are checked first.
 -- Returns the operator's type and its name (for building the typed node).
@@ -3565,8 +3683,13 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
       ambient0 <- case mSigEffRow of
         Just r  -> pure r
         Nothing -> freshRVar
+      -- Capture the DECLARED-closed verdict from the seed, BEFORE the body
+      -- mutates the ambient cell: an inferred equation (no sig row) is open; a
+      -- sig with a `with eff e` / `..` tail is open; only a sig whose effect row
+      -- is closed marks a performed residual as an undischarged obligation.
+      declClosed <- maybe (pure False) isRowClosed mSigEffRow
       effRef <- liftST (newSTRef ambient0)
-      (bodyT, bodyNode) <- withEffRow effRef runBody
+      (bodyT, bodyNode) <- withEffRowSig declClosed effRef runBody
       ambient <- liftST (readSTRef effRef)
       closeRow ambient
       pure (arrowsWithEffect pTys bodyT ambient, mkDecl bodyNode)
@@ -3842,6 +3965,16 @@ inferProgramTC seedEnv origin decls = do
     forM_ tds $ \td ->
       either throwError pure
         (checkFutureAffine (AffineCarrierTys affineCarrierTys) ownNonExtern (declSpan td) (tdName td) (tdClauses td))
+    -- Load-bearing residual-row obligation (deferred verdict): a bare residual
+    -- effect-row variable performed under a CLOSED declared row was recorded
+    -- during inference (see 'emitResidualTail'). Report it AFTER the carrier and
+    -- affine passes above, so a program violating both a multiplicity rule and
+    -- the residual rule surfaces the multiplicity error first. First recorded
+    -- obligation wins.
+    pending <- takePendingResiduals
+    case pending of
+      ((sp, label) : _) -> throwError (UndischargedEffect sp label)
+      []                -> pure ()
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
 

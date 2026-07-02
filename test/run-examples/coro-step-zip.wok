@@ -5,7 +5,7 @@ gen : U64 -> U64 -> () with Coro U64 ()
 gen lo hi = case eqU64 lo hi of
   True  -> ()
   False -> let u = Coro.suspend lo in gen (lo + 1) hi
-zipSum : Step U64 () () (row e) -> Step U64 () () (row e) -> U64
+zipSum : Step U64 () () (row e) -> Step U64 () () (row e) -> U64 with eff e
 zipSum sa sb = case sa of
   Completed _    -> 0
   Suspended xa ga -> case sb of

@@ -1,0 +1,2 @@
+driveSugar : forall a. (() -> U64 with eff a) -> (U64, U64)
+main : U64
