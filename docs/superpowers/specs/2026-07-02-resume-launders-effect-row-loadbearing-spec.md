@@ -1,5 +1,11 @@
 # Resume-launders-effects slice — make the residual effect row load-bearing (Option B)
 
+> **SUPERSEDED END-STATE (added 2026-07-05).** The rung-1/2/3 emitter/provenance
+> apparatus this epic built was DELETED (2026-07-03) and replaced by scoped rigid
+> skolemization of trapped effect vars — see
+> `2026-07-03-rung3-rework-scoped-rigid-trapped-effect-skolemization-spec.md`.
+> This doc is retained as design history (problem statement + rung-1 scope).
+
 Status: **IMPLEMENTED as RUNG 1 (2026-07-02)** — scope narrower than this spec
 originally claimed; see the boldface Scope-Reality note below. Direction LOCKED.
 Supersedes the GIST (`…-loadbearing-GIST.md`). Two open questions resolved by the

@@ -17,8 +17,9 @@ producer u =
 -- The whole `case start … of … run g 5` sits inside `with Log`, because `start`
 -- itself carries `with Log` and `run g 5` performs the parked tail's Log.
 -- The suspension `g` is CONSUMED inside the handler scope (exercises the residual
--- gate, not the carrier-escape rule). Explicitly-typed helper, not main, because
--- main does not obligate effect rows.
+-- gate, not the carrier-escape rule). Explicitly-typed helper for clarity;
+-- since 2026-07-05 main ALSO obligates (top-level 0-arg bindings check
+-- against the closed {IO} entry ambient), so this would be caught either way.
 drive : () -> U64
 drive u =
   with Log { emit n k -> k () }

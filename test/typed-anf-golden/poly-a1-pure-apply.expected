@@ -1,0 +1,11 @@
+outer n : U64 =
+  letrec
+    apply : a1 f : a0 -> a1 x : a0 =
+      let t.3 : a1 = f(x)
+      t.3
+  let t.1 : U64 -> U64 = \y : U64 -> y
+  let t.2 : U64 = apply(t.1, n)
+  t.2
+
+main =
+  0

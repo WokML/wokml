@@ -1,0 +1,7 @@
+foo n : U64 =
+  let t.2 : Suspension U64 U64 U64 -> U64 = \g : Suspension U64 U64 U64 -> let t.1 : U64 = run(g, 0)
+  t.1
+  t.2
+
+main =
+  0

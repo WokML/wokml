@@ -1,0 +1,15 @@
+module Main
+import Std.Base
+import Std.Control
+-- Closed-sig leaking form pinned after future-helper-double-consume was
+-- reclassified to trip the double-consume check via `with eff e` on both
+-- `useit` and `bad`: with the channels removed, the laundering check fires
+-- first. Expect UndischargedEffect.
+useit : Suspension U64 U64 U64 (row e) -> U64
+useit f = run f 1
+bad : Step U64 U64 U64 (row e) -> U64
+bad s = case s of
+  Completed r   -> r
+  Suspended x g -> useit g + useit g
+main : U64
+main = 0

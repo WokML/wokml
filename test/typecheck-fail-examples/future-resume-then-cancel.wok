@@ -3,7 +3,7 @@ import Std.Base
 import Std.Control
 -- C1: a Suspension consumed by BOTH cancel and run => Many. Expect
 -- FutureConsumedTwice.
-bad : Step U64 U64 U64 (row e) -> U64
+bad : Step U64 U64 U64 (row e) -> U64 with eff e
 bad s = case s of
   Completed r   -> r
   Suspended x g -> let u = cancel g in run g 1

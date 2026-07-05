@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST (inner-abstraction family, rung 3 — enclosing-parameter carrier).
+-- The laundering lambda is passed through the identity combinator before being
+-- applied. The residual is caught at its perform site inside the lambda, not at
+-- any use site, so the wrapping is irrelevant.
+driver : Suspension U64 U64 U64 (row e) -> U64
+driver g = ((\ f -> f) (\ h -> run h 0)) g
+main : U64
+main = 0

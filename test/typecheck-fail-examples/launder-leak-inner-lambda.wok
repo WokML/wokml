@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST (inner-abstraction family, rung 3): REJECTED with UndischargedEffect.
+-- `run h 0` performs the caller-supplied residual `e`, but it sits inside a LAMBDA
+-- applied to `g` (a beta-redex). Rung 3 checks the redex in CHECKING MODE, so `h`
+-- is refined from `g`'s type BEFORE the body -- the residual is then `e` at its
+-- perform site and the caller-root rule fires, exactly as for the direct
+-- `driver g = run g 0`. See docs/superpowers/specs/2026-07-03-inner-abstraction-effect-laundering-design.md
+driver : Suspension U64 U64 U64 (row e) -> U64
+driver g = (\ h -> run h 0) g
+main : U64
+main = 0

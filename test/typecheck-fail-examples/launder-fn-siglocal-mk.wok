@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+-- A local 0-arg `mk` returns a lambda that traps `run g 0`; applying `mk ()`
+-- point-freely at the sig launders e. Expect UndischargedEffect.
+helper : Suspension U64 U64 U64 (row e) -> U64
+helper = let mk u = \ g -> run g 0 in mk ()
+main : U64
+main = 0

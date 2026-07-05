@@ -1,0 +1,39 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-03-rung3-rework-scoped-rigid-trapped-effect-skolemization.md",
+  "tasks": [
+    {
+      "id": 6,
+      "subject": "Task 1: Swap the laundering detector (enable scoped-rigid, delete apparatus)",
+      "status": "completed",
+      "description": "**Goal:** Make scoped rigid skolemization unconditional and delete the entire rung-1/2/3 structural apparatus, so the 9 reproducers get correct verdicts and no accept-corpus program regresses.\n\n**Files:** Modify src/Wok/TypeChecking/Infer.hs (remove rigidKEffectSkolems switch; delete apparatus per spec \u00a74); Modify src/Wok/TypeChecking/Monad.hs (delete 4 TCCtx fields + 8 accessors + exports; shrink runTC).\n\n**Acceptance Criteria:** classifier arm unconditional + switch gone; all apparatus symbols deleted (spec \u00a74); build + hlint clean; dangling-ref grep empty (AS3); 9 reproducers correct (A-1/FP-1/PROBE-2 accept, FN-1/2/3/4/A-2/PROBE-1 reject); 0 accept-corpus regressions.\n\n**Verify:** cabal build exe:wok; run 9 reproducers; grep dangling refs \u2192 clean.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\", \"src/Wok/TypeChecking/Monad.hs\"], \"verifyCommand\": \"cabal build exe:wok && (grep -rnE 'callerRootRefs|emitResidualTail|rigidKEffectSkolems' src/ && echo DANGLING || echo clean)\", \"acceptanceCriteria\": [\"classifier arm unconditional, switch removed\", \"all apparatus symbols deleted (spec \u00a74)\", \"build + hlint clean\", \"no dangling refs\", \"9 reproducers correct verdicts\", \"0 accept-corpus regressions\"], \"modelTier\": \"frontier\"}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 2: Positioned laundering diagnostic (spec D3)",
+      "status": "completed",
+      "blockedBy": [
+        6
+      ],
+      "description": "**Goal:** Map the trapped-skolem reconciliation failure from raw RigidEscape to positioned UndischargedEffect <defnSpan> \"e\".\n\n**Files:** Modify src/Wok/TypeChecking/Infer.hs (finalizeGroup ~:3540, finalizeGroupTyped ~:3603).\n\n**Acceptance Criteria:** trapped leak reports UndischargedEffect (Just (l,c)) \"e\" at defn site; KStar over-promise unchanged; build + hlint clean.\n\n**Verify:** run resume-launders-undeclared.wok \u2192 positioned UndischargedEffect line.\n\n```json:metadata\n{\"files\": [\"src/Wok/TypeChecking/Infer.hs\"], \"verifyCommand\": \"BIN=$(cabal list-bin exe:wok); wok_datadir=$PWD $BIN test/typecheck-fail-examples/resume-launders-undeclared.wok 2>&1 | grep -oE 'UndischargedEffect \\\\(Just'\", \"acceptanceCriteria\": [\"trapped leak reports positioned UndischargedEffect (Just (l,c)) \\\"e\\\"\", \"KStar over-promise error unchanged\", \"build + hlint clean\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 3: Reclassify tests, add fixtures, regenerate goldens (spec D4, \u00a79)",
+      "status": "completed",
+      "blockedBy": [
+        7
+      ],
+      "description": "**Goal:** Bring the whole 2135-test suite green: reclassify 6 subsumed death tests, migrate FN/FP reproducers, add Q3 two-named-effect fixtures, regenerate goldens.\n\n**Files:** Modify 6 subsumed future-*/conc-* fail-examples (add with eff e); Create FN/FP fixtures + leaking forms + Q3 fixtures; Regenerate typecheck-fail-golden + typed-anf-golden.\n\n**Acceptance Criteria:** 6 reclassified reject via original FutureConsumedTwice/CarrierEscape; new fail-examples reject via positioned UndischargedEffect; new accept fixtures + two-named-effects-ok accept; full suite green.\n\n**Verify:** cabal test wok-tests \u2192 0 failed.\n\n```json:metadata\n{\"files\": [\"test/typecheck-fail-examples/\", \"test/typecheck-examples/\", \"test/typecheck-fail-golden/\", \"test/typed-anf-golden/\"], \"verifyCommand\": \"cabal test wok-tests 2>&1 | tail -5\", \"acceptanceCriteria\": [\"6 reclassified tests reject via original FutureConsumedTwice/CarrierEscape\", \"new fail-examples reject via positioned UndischargedEffect\", \"new accept fixtures + two-named-effects-ok accept\", \"full 2135-suite green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 4: Full-branch review + merge (load-bearing gate)",
+      "status": "pending",
+      "blockedBy": [
+        8
+      ],
+      "description": "**Goal:** One whole-branch adversarial soundness pass + user /code-review, then merge per the CLAUDE.md workflow.\n\n**Files:** none (review + merge).\n\n**Acceptance Criteria:** whole-branch Opus adversarial review (runnable reproducers + test-soundness) no unresolved correctness finding; hlint clean + suite green; user /code-review addressed; merged to main.\n\n**Verify:** cabal test wok-tests green + reviewer SHIP + user /code-review clean.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cabal test wok-tests 2>&1 | tail -3\", \"acceptanceCriteria\": [\"whole-branch adversarial review SHIP (runnable reproducers + test-soundness)\", \"hlint clean + suite green\", \"user /code-review addressed\", \"merged to main\"], \"modelTier\": \"frontier\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-07-04"
+}

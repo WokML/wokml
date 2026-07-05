@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+-- A curried function returns an OPEN arrow (`with eff e`) so the trapped
+-- continuation's row is properly channeled through. Must accept.
+foo : U64 -> (Suspension U64 U64 U64 (row e) -> U64 with eff e)
+foo n = \ g -> run g 0
+main : U64
+main = 0

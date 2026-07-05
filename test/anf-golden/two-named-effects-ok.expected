@@ -1,0 +1,15 @@
+prog =
+  let t.7 = \s -> let t.4 = \r -> let t.2 = r.Reader.ask()
+  let t.3 = s.State.set(t.2)
+  let u = t.3
+  let t.1 = s.State.get()
+  t.1
+  let t.5 = reader(10)
+  let t.6 = t.5(t.4)
+  t.6
+  let t.8 = state(0)
+  let t.9 = t.8(t.7)
+  t.9
+
+main =
+  prog

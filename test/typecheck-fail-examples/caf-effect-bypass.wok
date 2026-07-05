@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+-- H1 death test (2026-07-05): a top-level zero-arg binding (CAF) performs a
+-- concrete effect. Pre-fix this TYPECHECKED (the 0-arg branch seeded an open
+-- ambient that was closed but never reconciled -- the entire effect
+-- discipline was bypassed) and crashed at --run with NoMatchingHandler.
+-- Post-fix the entry ambient is the closed row {IO}, so any other effect a
+-- CAF performs is rejected at the emit site.
+effect Log = { emit : U64 -> () }
+bad : U64
+bad = let v = Log.emit 1 in 2
+main : U64
+main = bad

@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+import Std.Control
+-- A generic local `apply` combinator with no trapped effect anywhere;
+-- purely polymorphic higher-order application. Must accept.
+outer : U64 -> U64
+outer n = let apply f x = f x in apply (\ y -> y) n
+main : U64
+main = 0

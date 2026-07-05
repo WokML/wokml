@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST (inner-abstraction family, rung 3 — enclosing-parameter carrier).
+-- The laundering lambda is let-bound then applied, so no checking-mode fires; the
+-- carrier catches the own-parameter residual at `run h 0` regardless of where `k`
+-- is later applied.
+driver : Suspension U64 U64 U64 (row e) -> U64
+driver g = let k = (\ h -> run h 0) in k g
+main : U64
+main = 0

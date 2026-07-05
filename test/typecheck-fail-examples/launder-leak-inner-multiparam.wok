@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST (inner-abstraction family, rung 3 — enclosing-parameter carrier).
+-- A dummy first parameter defeats the direct-redex checking-mode path (only one
+-- arrow is materialised per application step), but the own-parameter carrier
+-- ('ctxLambdaParams') records the residual on `b` at the `run b 0` perform site.
+driver : Suspension U64 U64 U64 (row e) -> U64
+driver g = (\ a b -> run b 0) 0 g
+main : U64
+main = 0

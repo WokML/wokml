@@ -1,7 +1,7 @@
-useIt s : Suspension U64 U64 U64 a4 =
+useIt s : Suspension U64 U64 U64 a0 =
   ()
 
-passes s : Suspension U64 U64 U64 a6 =
+passes s : Suspension U64 U64 U64 a0 =
   let t : () = useIt(s)
   t
 

@@ -1,5 +1,11 @@
 # Resume-launders-effects — rung 2 (residual provenance / escape analysis)
 
+> **SUPERSEDED END-STATE (added 2026-07-05).** The rung-1/2/3 apparatus this doc
+> describes was DELETED (2026-07-03) and replaced by scoped rigid skolemization of
+> trapped effect vars — see
+> `2026-07-03-rung3-rework-scoped-rigid-trapped-effect-skolemization-spec.md`.
+> Retained as design history.
+
 > **SUPERSEDED (2026-07-03).** Rung 2 is IMPLEMENTED. The chosen mechanism (caller-root
 > residual provenance) and its final design live in
 > `2026-07-03-resume-launders-rung2-caller-root-provenance-design.md`; the plan is

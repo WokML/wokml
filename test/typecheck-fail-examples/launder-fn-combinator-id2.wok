@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- The trapped-effect lambda is routed through a generic identity combinator
+-- before reaching the sig; the combinator must not launder e. Expect
+-- UndischargedEffect.
+id2 f = f
+helper : Suspension U64 U64 U64 (row e) -> U64
+helper = id2 (\ g -> run g 0)
+main : U64
+main = 0

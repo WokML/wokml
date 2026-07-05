@@ -1,5 +1,10 @@
 # Resume-launders-effects rung 2 — caller-root residual provenance (design)
 
+> **SUPERSEDED END-STATE (added 2026-07-05).** The rung-1/2/3 apparatus this doc
+> describes was DELETED (2026-07-03) and replaced by scoped rigid skolemization of
+> trapped effect vars — see
+> `2026-07-03-rung3-rework-scoped-rigid-trapped-effect-skolemization-spec.md`.
+> Retained as design history.
 Status: **DESIGN / for review** (2026-07-03). Rung 2 of the "resume launders
 effects" epic. Supersedes the mechanism sketch in
 `2026-07-02-resume-launders-rung2-provenance.md` §3 (that doc's problem statement

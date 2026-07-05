@@ -1,0 +1,15 @@
+prog =
+  let t.7 : TcEffect "State" U64 -> U64 = \s : TcEffect "State" U64 -> let t.4 : TcEffect "Reader" U64 -> U64 = \r : TcEffect "Reader" U64 -> let t.2 : U64 = r.Reader.ask()
+  let t.3 : () = s.State.set(t.2)
+  let u : () = t.3
+  let t.1 : U64 = s.State.get()
+  t.1
+  let t.5 : TcEffect "Reader" U64 -> U64 -> U64 = reader(10)
+  let t.6 : U64 = t.5(t.4)
+  t.6
+  let t.8 : TcEffect "State" U64 -> U64 -> (U64, U64) = state(0)
+  let t.9 : (U64, U64) = t.8(t.7)
+  t.9
+
+main =
+  prog

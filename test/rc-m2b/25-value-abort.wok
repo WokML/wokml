@@ -9,7 +9,10 @@ import Std.Base
 -- Expected output: None; heap returns to baseline.
 effect Exn = { throw : U64 -> Never }
 
-prog : Exn -> U64 with Exn
+-- Capability style: the handle argument carries the effect; no `with Exn`
+-- row (a row here would demand ambient discharge that a NAMED handler
+-- correctly does not provide by label -- performs route through the handle).
+prog : Exn -> U64
 prog e = e.throw 5
 
 main : Option U64

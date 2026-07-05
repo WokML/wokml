@@ -1,0 +1,20 @@
+module Main
+import Std.Base
+import Std.Control
+-- H1 death test (2026-07-05): the rung-3 spec's F2 shape. A CAF starts a
+-- coroutine locally and resumes it, performing the producer's concrete Log
+-- residual with no handler. Pre-fix this typechecked (the 0-arg bypass; the
+-- SAME body as a one-parameter function was already correctly rejected) and
+-- crashed at --run with NoMatchingHandler "Log" "emit".
+effect Log = { emit : U64 -> () }
+producer : () -> U64 with Coro U64 U64 + Log
+producer u =
+  let x = Coro.suspend 7 in
+  let v = Log.emit x in
+  x + 100
+drive : U64
+drive = case start producer of
+  Completed r   -> r
+  Suspended a g -> run g 5
+main : U64
+main = drive

@@ -23,7 +23,7 @@ module Wok.TypeChecking.Infer
 
 import qualified Control.Monad.ST
 import Control.Monad (foldM, forM, forM_, msum, unless, when)
-import Control.Monad.Except (throwError)
+import Control.Monad.Except (catchError, throwError)
 import Data.Maybe (catMaybes, fromMaybe, isNothing, listToMaybe, mapMaybe)
 import Data.List (foldl', nub)
 import qualified Data.List
@@ -46,7 +46,7 @@ import Wok.TypeChecking.Env
   , lookupRecordCon, lookupTyCon, lookupVar )
 import qualified Wok.FFI.Blessed as Blessed
 import Wok.TypeChecking.Error (SourceSpan, TypeError (..), Warning (..))
-import Wok.TypeChecking.Monad (TC, ConstraintS (..), RowRef, addConstraint, addWarning, currentCallerResidualRoots, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, recordPendingResidual, runTC, takeConstraints, takePendingResiduals, withCallerRoots, withEffRow, withEnv)
+import Wok.TypeChecking.Monad (TC, ConstraintS (..), addConstraint, addWarning, currentEffRow, currentEnv, currentLevel, enterLevel, extendVarTC, freshRVar, freshTVar, freshUniq, liftST, runTC, takeConstraints, withEffRow, withEnv)
 import Wok.TypeChecking.Unify (force, freeze, freezeTolerant, rewriteRow, unify, unifyRow, rewriteRowStrict)
 import Wok.TypeChecking.Types
   ( CRow, CType (..), Constraint (..), Kind (..), Level (..), Row
@@ -343,17 +343,81 @@ substCTypeWith m = goT
 -- Row variables (KEffect slots, CTGen) become fresh RowVars rather than
 -- being dropped as RowEmpty. This ensures two uses of the same row variable
 -- in a sig (e.g. `Point + row r -> Point + row r`) share the same RowVar.
-freezeSig :: Scheme -> TC s (Type s)
-freezeSig s = fst <$> freezeSigSkolems s
-
--- | Like 'freezeSig', but also returns the mapping from each declared scheme
--- variable index to the @uniq@ of the 'Rigid' skolem minted for it. The signed
+--
+-- Also returns the mapping from each declared scheme variable index to the
+-- @uniq@ of the 'Rigid' skolem minted for it. The signed
 -- path needs this to entail a body's accumulated class constraints BY ARGUMENT
 -- (not merely by class name): a declared @Eq a@ promises a dictionary for the
 -- skolem standing for @a@, so a body constraint on a DIFFERENT skolem (or an
 -- unbound metavar) is under-entailed and must be rejected. Type (KStar) vars
 -- only; row (KEffect) vars do not carry class constraints.
-freezeSigSkolems :: Scheme -> TC s (Type s, Map.Map Int Int)
+
+-- | The KEffect quantifier indices that appear as an arrow's effect-row tail in a
+-- POSITIVE (result-side) position of a signature -- i.e. the function has its OWN
+-- declared channel to perform them (`... -> R with eff e`, including returned
+-- functions). A var NOT in this set is "trapped": it occurs in the signature (e.g.
+-- inside a `Suspension a b r (row e)` argument, or as a `with eff e` on a
+-- PARAMETER arrow -- which is the CALLER's promise, not this function's channel)
+-- but the function itself never declares it can perform it, so performing it is a
+-- leak. Polarity flips at each arrow domain. Used by 'freezeSigSkolems' to
+-- rigidify only trapped effect-row vars.
+dischargeableRowVars :: CType -> Set.Set Int
+dischargeableRowVars = pos
+  where
+    -- Positive position: an arrow's effect-row tail here IS a discharge channel.
+    pos (CTArr a eff b)  = Set.unions [effTail eff, neg a, pos b]
+    pos (CTCon _ ts)     = Set.unions (map pos ts)
+    pos (CTRecord _ row) = pos row
+    pos (CRExtend _ p r) = Set.union (pos p) (pos r)
+    pos CREmpty          = Set.empty
+    pos (CTGen _)        = Set.empty
+    -- Negative position (a parameter): an arrow's effect-row tail here is the
+    -- caller's obligation, NOT a channel -- do not collect it. The domain flips
+    -- back to positive; the codomain stays negative.
+    neg (CTArr a _ b)    = Set.union (pos a) (neg b)
+    neg (CTCon _ ts)     = Set.unions (map neg ts)
+    neg (CTRecord _ row) = neg row
+    neg (CRExtend _ p r) = Set.union (neg p) (neg r)
+    neg CREmpty          = Set.empty
+    neg (CTGen _)        = Set.empty
+    -- The terminal row var of an arrow's effect-row slot, if any.
+    effTail (CRExtend _ _ r) = effTail r
+    effTail (CTGen i)        = Set.singleton i
+    effTail _                = Set.empty
+
+-- | The KEffect quantifier indices that are genuinely EFFECT-relevant: a var
+-- appearing as an arrow effect-row tail (EITHER polarity) or as a row-arg of a
+-- CARRIER type constructor (Suspension/Step/ContCell/... -- identified by the
+-- 'tcCarrier' env marker, NOT a name string). After the kinded-Ty merge, record
+-- rows and DATA row params are ALSO KEffect, so a var occurring only as a record
+-- row tail (@Point + row r@) or as a row param of a NON-carrier user data type
+-- (@Box (row e)@) is ordinary row-polymorphism, NOT an effect, and must NEVER be
+-- rigidified. 'freezeSigSkolems' rigidifies a var iff it is effect-relevant AND
+-- not dischargeable ('dischargeableRowVars') -- so record/data row polymorphism
+-- is untouched while a genuine trapped effect residual is caught.
+effectRelevantRowVars :: (Text -> Bool) -> CType -> Set.Set Int
+effectRelevantRowVars isCarrier = go
+  where
+    go (CTArr a eff b)  = Set.unions [effTail eff, go a, go eff, go b]
+    go (CTCon tc ts)    = Set.union (Set.unions (map go ts)) (carrierArgs tc ts)
+    go (CTRecord _ row) = go row
+    go (CRExtend _ p r) = Set.union (go p) (go r)
+    go CREmpty          = Set.empty
+    go (CTGen _)        = Set.empty
+    -- A carrier tycon's row-args ARE effect residuals; a non-carrier's are not.
+    carrierArgs (TcUser n) ts | isCarrier n = Set.unions (map effTail ts)
+    carrierArgs _          _                = Set.empty
+    effTail (CRExtend _ _ r) = effTail r
+    effTail (CTGen i)        = Set.singleton i
+    effTail _                = Set.empty
+
+-- | The third component is the set of 'Rigid' skolem uniqs minted for
+-- TRAPPED KEffect (row) variables -- i.e. those that occur in the signature
+-- but have no dischargeable arrow effect-row channel (see
+-- 'dischargeableRowVars'). A 'RigidEscape' whose uniq is in this set is a
+-- laundering leak (the body performs an effect the sig never declared),
+-- remapped to 'UndischargedEffect' at the two reconciliation call sites.
+freezeSigSkolems :: Scheme -> TC s (Type s, Map.Map Int Int, Set.Set Int)
 freezeSigSkolems (Scheme vars _ body) = do
   -- Mint each skolem at the CURRENT level: it stands for a variable universally
   -- quantified by this signature, introduced at the scope where the signature is
@@ -366,14 +430,37 @@ freezeSigSkolems (Scheme vars _ body) = do
                      ref <- liftST $ newSTRef (Rigid u lvl k)
                      pure (i, (u, TVar ref))
                   ) [ (i, k) | (i, k) <- vars, k /= KEffect ]
+  -- Rigid-residual skolemization (2026-07-03): mint a KEffect
+  -- (effect-row) signature var as a RIGID skolem ONLY when it is TRAPPED -- it
+  -- occurs in the signature but never as a dischargeable arrow effect-row tail
+  -- (`with eff e`), so the function has no declared channel to perform it. A
+  -- trapped var performed by the body launders to `{}`; the rigid declared skolem
+  -- then clashes with `{}` at reconciliation (`RigidEscape`) = the leak.
+  -- Dischargeable (open-tail) vars stay flexible so open-sig runners
+  -- (reader/state/run/start ...) are unaffected. Record/data row polymorphism is
+  -- untouched: a var is rigidified only when it is EFFECT-RELEVANT (an arrow
+  -- eff-slot tail or a carrier row-arg) AND not dischargeable, so a record tail
+  -- (`Point + row r`) or a non-carrier data row param (`Box (row e)`) stays
+  -- flexible ('effectRelevantRowVars').
+  env <- currentEnv
+  let isCarrier n = maybe False tcCarrier (lookupTyCon n env)
+      discharg    = dischargeableRowVars body
+      effRel      = effectRelevantRowVars isCarrier body
   rowVars <- mapM (\(i, _) -> do
-                     r <- freshRVar
-                     pure (i, r)
+                     if Set.member i effRel && not (Set.member i discharg)
+                       then do
+                         u   <- freshUniq
+                         ref <- liftST $ newSTRef (Rigid u lvl KEffect)
+                         pure (i, TVar ref, Just u)
+                       else do
+                         r <- freshRVar
+                         pure (i, r, Nothing)
                   ) [ (i, k) | (i, k) <- vars, k == KEffect ]
-  let tySubst   = Map.fromList [ (i, t) | (i, (_, t)) <- skolems ]
-      rowSubst  = Map.fromList rowVars
-      uniqOfVar = Map.fromList [ (i, u) | (i, (u, _)) <- skolems ]
-  pure (substInCType tySubst rowSubst body, uniqOfVar)
+  let tySubst      = Map.fromList [ (i, t) | (i, (_, t)) <- skolems ]
+      rowSubst     = Map.fromList [ (i, t) | (i, t, _) <- rowVars ]
+      uniqOfVar    = Map.fromList [ (i, u) | (i, (u, _)) <- skolems ]
+      trappedUniqs = Set.fromList [ u | (_, _, Just u) <- rowVars ]
+  pure (substInCType tySubst rowSubst body, uniqOfVar, trappedUniqs)
   where
     -- One walk over the folded CType. A gen index is a type skolem (looked up
     -- in m) or a row var (looked up in rm); a row index missing from rm maps to
@@ -2362,8 +2449,8 @@ inferExprW mono (Abs.EWithNamed (Abs.VarId (npos, name)) fVar wargs body) = do
           -- the application path ('EApp'). Any CONCRETE label still records via
           -- 'emitEffect'; appRow's own bare TAIL is the runner-thunk's sub-ambient
           -- leftover (unified into `bodyRow` above, a fresh var that closes with
-          -- the runner) -- it is not a caller-supplied root, so the caller-root
-          -- rule in 'emitResidualTail' skips it for free (no exemption needed).
+          -- the runner) -- an open tail carries no concrete label, so 'emitRow'
+          -- drops it.
           emitRow Nothing appRow
           -- Rebuild the typed node as `runner (\name -> body)` so Task 4's
           -- TApp/TLam lowering is reused verbatim; the lambda binder carries
@@ -2393,13 +2480,16 @@ inferNormalApp mono f x = do
   (xT, xNode) <- inferExprW mono x
   rT     <- freshTVar KStar
   effRow <- freshRVar
-  unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
-  emitRow Nothing effRow
-  closeRow effRow
-  let node = case fNode of
-        Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
-        _                          -> Ty.TApp fNode [xNode]
-  pure (rT, Ty.Texp rT node)
+  finishApp fT fNode xT xNode rT effRow
+  where
+    finishApp fT fNode xT xNode rT effRow = do
+      unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
+      emitRow Nothing effRow
+      closeRow effRow
+      let node = case fNode of
+            Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
+            _                          -> Ty.TApp fNode [xNode]
+      pure (rT, Ty.Texp rT node)
 
 -- | Type-check a foreign member call where the full arg list is exactly
 -- saturated (length args == arity of the member type). Each arg is inferred
@@ -2690,10 +2780,8 @@ inferHandler mono header headerPos e arms = do
   -- Discharge the handled effects from the handled expression's row, leaving
   -- the residual effects to flow outward. Any CONCRETE unhandled label still
   -- surfaces via 'emitEffect' as normal; the residual's own bare TAIL is the
-  -- handler's sub-ambient leftover -- a fresh var that closes with the handler,
-  -- not a caller-supplied root -- so the caller-root rule in 'emitResidualTail'
-  -- skips it for free. A genuinely-unhandled caller residual reaching here (its
-  -- tail IS a caller root, e.g. @with H (run g 0)@) is still recorded.
+  -- handler's sub-ambient leftover -- a fresh var that closes with the handler --
+  -- and, being an open tail with no concrete label, is dropped by 'emitRow'.
   subRow <- liftST (readSTRef subRef)
   residual <- dischargeEffects subRow handledEffects
   emitRow Nothing residual
@@ -2954,114 +3042,7 @@ emitRow sp row = do
       emitEffect sp l t
       emitRow sp rest
     RowEmpty           -> pure ()  -- closed callee row: nothing more to add
-    TVar ref           -> do
-      -- The callee's row terminates in a variable. If it is a bare, unbound
-      -- residual effect-row tail (KEffect), it carries a polymorphic effect
-      -- obligation the caller must discharge -- handle it explicitly rather
-      -- than silently dropping it (the laundering loophole).
-      cell <- liftST (readSTRef ref)
-      case cell of
-        Unbound _ _ KEffect -> emitResidualTail sp ref
-        _                   -> pure ()
-    _                  -> pure ()  -- non-row / bound var: nothing to add
-
--- | Discharge a callee's bare residual effect-row tail (whose cell is @resRef@).
--- Record an undischarged obligation IFF @resRef@'s representative is one of the
--- enclosing equation's CALLER-SUPPLIED ROOTS ('currentCallerResidualRoots' -- a
--- row variable from its declared parameter or result types). A caller-supplied
--- polymorphic row cannot be handled internally (you cannot write a handler for an
--- unknown row variable), so performing it is a genuine obligation -- regardless
--- of the live ambient it is currently performed under (a handler sub-ambient is
--- open, but it will be closed by the handler and the polymorphic tail dropped;
--- catching it AT the perform site is what makes the handler-discharge leaks
--- visible). Every other bare tail -- a handler sub-ambient leftover, a
--- resume-continuation row, a runner thunk's leftover -- is internal, not a root,
--- so it is not in the set and is skipped for free.
---
--- The set is empty under an OPEN declared row (installed only when 'declClosed';
--- an open sig discharges any residual through its own open tail), so this is a
--- pure membership test with no separate open/closed gate here. The roots and the
--- candidate tail are BOTH forced to their representative cells before comparing:
--- unification may have re-linked either since seed time. The verdict is deferred
--- (recorded, not thrown) so the module-level carrier/affine post-passes report
--- first.
-emitResidualTail :: BNFC'Position -> RowRef s -> TC s ()
-emitResidualTail sp resRef = do
-  roots <- currentCallerResidualRoots
-  unless (null roots) $ do
-    mResRep  <- reprRowRef resRef
-    rootReps <- catMaybes <$> mapM reprRowRef roots
-    case mResRep of
-      -- A bare residual row variable carries no nameable effect label (that is
-      -- the whole point -- it launders a polymorphic tail), so the
-      -- 'UndischargedEffect' payload is the conventional row-variable placeholder
-      -- @e@ rather than a real effect name.
-      Just resRep | resRep `elem` rootReps ->
-        recordPendingResidual sp (Tx.pack "e")
-      _ -> pure ()  -- internal (non-caller-root) tail: benign, skip
-
--- | Collect the representative cells of every 'KEffect' row VARIABLE occurring in
--- the enclosing equation's declared parameter and result types -- its
--- "caller-supplied roots" ('ctxCallerResidualRoots'). A residual whose tail is
--- one of these cannot be discharged internally (you cannot write a handler for an
--- unknown polymorphic row variable), so performing it under a declared-closed sig
--- is a genuine obligation. The walk MUST descend into nested arrows (a
--- function-typed parameter's own effect row -- e.g. the runner-sugar root inside
--- @(() -> U64 with eff e) -> ...@), type arguments (e.g. the @(row e)@ inside
--- @Suspension a b r (row e)@), records, and rows; a head-only scan under-collects.
-callerRootRefs :: [Type s] -> Type s -> TC s [RowRef s]
-callerRootRefs pTys resultTy = do
-  refs <- concat <$> mapM collect (resultTy : pTys)
-  pure (nub refs)
-  where
-    collect :: Type s -> TC s [RowRef s]
-    collect ty = do
-      ty' <- force ty
-      case ty' of
-        TVar ref -> do
-          cell <- liftST (readSTRef ref)
-          case cell of
-            -- Only UNBOUND KEffect metavariables are caller roots. The sole call
-            -- site seeds this from 'instantiate'-derived declared types, whose
-            -- row variables are unbound metavariables (never 'Rigid' skolems), so
-            -- a 'Rigid _ _ KEffect' case is unreachable here; if a future call
-            -- site ever feeds 'freezeSig'-derived skolems, this must also match
-            -- 'Rigid' or it will silently under-collect roots.
-            Unbound _ _ KEffect -> pure [ref]
-            _                   -> pure []
-        TArr dom eff cod         -> concat <$> mapM collect [dom, eff, cod]
-        TCon _ args              -> concat <$> mapM collect args
-        TRecord _ row            -> collect row
-        RowExtend _ payload rest -> (++) <$> collect payload <*> collect rest
-        RowEmpty                 -> pure []
-
--- | Force a row-variable cell to its representative cell, or 'Nothing' if it has
--- been solved to a non-variable row (e.g. 'RowEmpty').
-reprRowRef :: RowRef s -> TC s (Maybe (RowRef s))
-reprRowRef ref = do
-  r <- force (TVar ref)
-  case r of
-    TVar rr -> pure (Just rr)
-    _       -> pure Nothing
-
--- | Force @row@ and walk its concrete labels to the terminal: 'RowEmpty' for a
--- closed row, or the forced (unbound) row variable it ends in for an open one.
-rowTerminal :: Row s -> TC s (Row s)
-rowTerminal row = do
-  row' <- force row
-  case row' of
-    RowExtend _ _ rest -> rowTerminal rest
-    other              -> pure other
-
--- | Is @row@ a CLOSED effect row -- terminates in 'RowEmpty' with no open
--- variable tail? Used at equation-seed time to record whether the enclosing
--- function's DECLARED effect row can absorb a residual.
-isRowClosed :: Row s -> TC s Bool
-isRowClosed row = do
-  t <- rowTerminal row
-  case t of
-    RowEmpty -> pure True
-    _        -> pure False
+    _                  -> pure ()  -- open tail / non-row / bound var: nothing to add
 
 -- | Look up an infix operator; monomorphic bindings are checked first.
 -- Returns the operator's type and its name (for building the typed node).
@@ -3406,8 +3387,11 @@ finalizeGroup
 finalizeGroup sigMap (name, tv) =
   case Map.lookup name sigMap of
     Just declared -> do
-      declT <- freezeSig declared
-      unify Nothing declT tv
+      (declT, _, trappedUniqs) <- freezeSigSkolems declared
+      unify Nothing declT tv `catchError` \e -> case e of
+        RigidEscape _ u | Set.member u trappedUniqs ->
+          throwError (UndischargedEffect Nothing (Tx.pack "e"))
+        _ -> throwError e
       pure (Right (name, declared))
     Nothing -> do
       Level outer <- currentLevel
@@ -3469,8 +3453,11 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
       -- argument -- once forced -- resolves to the very skolem standing for the
       -- declared var it constrains (or to a different skolem / metavar, which is
       -- exactly the under-entailed case we must reject).
-      (declT, varUniq) <- freezeSigSkolems declared
-      unify Nothing declT tv
+      (declT, varUniq, trappedUniqs) <- freezeSigSkolems declared
+      unify Nothing declT tv `catchError` \e -> case e of
+        RigidEscape _ u | Set.member u trappedUniqs ->
+          throwError (UndischargedEffect Nothing (Tx.pack "e"))
+        _ -> throwError e
       -- Freeze the inferred tree for its node types. The accumulated constraints
       -- are validated below against the still-mutable 'accCs' (whose arguments
       -- are the skolems/metavars above), NOT against any re-folded CTGen copy:
@@ -3665,14 +3652,20 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
           (bodyT, bodyNode) <- runBody
           pure (bodyT, mkDecl bodyNode)
         Nothing -> do
-          -- Top-level zero-arg binding: no enclosing ambient. Use a local one
-          -- and close it; a top-level value performing effects has nowhere to
-          -- discharge them, so closing to its concrete effects is correct.
-          ambient0 <- freshRVar
-          effRef <- liftST (newSTRef ambient0)
+          -- Top-level zero-arg binding: no enclosing ambient, and no arrow to
+          -- carry a `with` row, so its contract is the ENTRY ambient -- the
+          -- closed row containing exactly the ground IO effect, which is
+          -- discharged by running the program (see 'isGroundIO'), never by a
+          -- handler. Any other effect a top-level value performs has nowhere
+          -- to be discharged and is rejected at the emit site
+          -- (UndischargedEffect), exactly as a no-`with` function sig rejects
+          -- one. Previously this seeded a fresh OPEN row that was closed but
+          -- never reconciled against anything, so top-level values (main
+          -- included) silently bypassed the effect discipline entirely and
+          -- crashed at run time (NoMatchingHandler).
+          let entryAmbient = RowExtend (Tx.pack "IO") (TCon TcUnit []) RowEmpty
+          effRef <- liftST (newSTRef entryAmbient)
           (bodyT, bodyNode) <- withEffRow effRef runBody
-          ambient <- liftST (readSTRef effRef)
-          closeRow ambient
           pure (bodyT, mkDecl bodyNode)
     _ -> do
       -- Seed the ambient from the declared sig's effect row when there is one,
@@ -3690,31 +3683,8 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
       ambient0 <- case mSigEffRow of
         Just r  -> pure r
         Nothing -> freshRVar
-      -- Capture the DECLARED-closed verdict from the seed, BEFORE the body
-      -- mutates the ambient cell: an inferred equation (no sig row) is open; a
-      -- sig with a `with eff e` / `..` tail is open; only a sig whose effect row
-      -- is closed marks a performed residual as an undischarged obligation.
-      declClosed <- maybe (pure False) isRowClosed mSigEffRow
-      -- Collect this equation's CALLER-SUPPLIED residual roots -- the row
-      -- variables in its declared parameter types (`pTys`) and declared result
-      -- type (`mBodyHint`, the peeled codomain). A bare residual performed with a
-      -- tail among these is an undischarged obligation (see
-      -- 'emitResidualTail'/'callerRootRefs'); set per equation (SET, not
-      -- accumulate) so a nested/`where` function gets its OWN roots.
-      --
-      -- The roots are consulted ONLY under a declared-closed row (an open sig
-      -- discharges any residual through its own open tail), so we install them
-      -- ONLY when 'declClosed' and leave the set empty otherwise. That keeps
-      -- 'emitResidualTail' a pure membership test with no separate open/closed
-      -- gate at each emit site -- and, because a nested sub-ambient does NOT reset
-      -- the set, a caller root performed under an open handler sub-ambient is
-      -- still caught (the handler-discharge laundering the exempt machinery
-      -- previously hid).
-      roots <- if declClosed
-                 then callerRootRefs pTys (fromMaybe RowEmpty mBodyHint)
-                 else pure []
       effRef <- liftST (newSTRef ambient0)
-      (bodyT, bodyNode) <- withCallerRoots roots (withEffRow effRef runBody)
+      (bodyT, bodyNode) <- withEffRow effRef runBody
       ambient <- liftST (readSTRef effRef)
       closeRow ambient
       pure (arrowsWithEffect pTys bodyT ambient, mkDecl bodyNode)
@@ -3990,16 +3960,6 @@ inferProgramTC seedEnv origin decls = do
     forM_ tds $ \td ->
       either throwError pure
         (checkFutureAffine (AffineCarrierTys affineCarrierTys) ownNonExtern (declSpan td) (tdName td) (tdClauses td))
-    -- Load-bearing residual-row obligation (deferred verdict): a bare residual
-    -- effect-row variable performed under a CLOSED declared row was recorded
-    -- during inference (see 'emitResidualTail'). Report it AFTER the carrier and
-    -- affine passes above, so a program violating both a multiplicity rule and
-    -- the residual rule surfaces the multiplicity error first. First recorded
-    -- obligation wins.
-    pending <- takePendingResiduals
-    case pending of
-      ((sp, label) : _) -> throwError (UndischargedEffect sp label)
-      []                -> pure ()
     let finalEnv = foldr (\td e -> extendVar (tdName td) (tdScheme td) e) env2 tds
     pure (finalEnv, tds)
 

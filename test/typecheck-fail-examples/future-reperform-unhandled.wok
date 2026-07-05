@@ -2,10 +2,12 @@ module Main
 import Std.Base
 import Std.Control
 -- A live Step (the producer suspended, so its carrier is still resumable) is
--- returned from `main`, escaping the producer scope => CarrierEscape. The carrier
+-- returned from `leak`, escaping the producer scope => CarrierEscape. The carrier
 -- rule fires before any resume-site row obligation can apply. (The residual-effect
 -- obligation at a resume site is exercised directly by coro-residual-escapes.wok.)
 producer : () -> U64 with Coro U64 U64
 producer u = let x = Coro.suspend 42 in x
-main : Step U64 U64 U64 (row e)
-main = start producer
+leak : () -> Step U64 U64 U64 (row e) with eff e
+leak u = start producer
+main : U64
+main = 0

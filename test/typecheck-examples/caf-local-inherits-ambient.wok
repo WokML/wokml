@@ -1,0 +1,14 @@
+module Main
+import Std.Base
+-- H1 scope pin (2026-07-05): a LOCAL zero-arg binding still inherits the
+-- enclosing ambient (the `both u = let a = useIO () ...` rule). Only
+-- TOP-LEVEL zero-arg bindings get the closed {IO} entry ambient; a let-bound
+-- value performing a declared effect inside a `with Log` function stays
+-- accepted.
+effect Log = { emit : U64 -> () }
+inherits : () -> U64 with Log
+inherits u =
+  let a = Log.emit 1 in
+  2
+main : U64
+main = 0

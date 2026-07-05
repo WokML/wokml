@@ -1,7 +1,17 @@
 # Note: inner-abstraction effect-laundering (pre-existing; the slice after rung 2)
 
-Status: **OBSERVED, scoped as the slice after rung 2** (2026-07-02; broadened
-2026-07-03). Surfaced during rung-1 review (Gate 3), broadened by the rung-2
+Status: **SHIPPED as rung 3** (2026-07-03). Superseded by the design doc
+`docs/superpowers/specs/2026-07-03-inner-abstraction-effect-laundering-design.md`
+and validated on `feat/resume-launders-loadbearing` (all three leaks reject, full
+suite 2131 green). NOTE: the "Candidate direction" at the bottom of this file (make
+inner abstractions PRESERVE the residual on their arrow) was **refuted by a spike** —
+`inferNormalApp` closes each application's effect row at the perform site, so nothing
+survives to ride. The shipped mechanism is instead *inherit-roots + checking-mode
+param refinement*; see the design doc §2-3.
+
+Original observation (retained for history):
+
+Surfaced during rung-1 review (Gate 3), broadened by the rung-2
 adversarial design check. This is a distinct family from the caller-root provenance
 work (rung 2): any INNER ABSTRACTION with its own open ambient — a lambda OR a
 sigless local function — absorbs a residual before it reaches the enclosing

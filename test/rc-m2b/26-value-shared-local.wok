@@ -16,7 +16,10 @@ import Std.Base
 -- heap returns to baseline.
 effect Reader = { ask : U64 }
 
-prog : Reader -> U64 with Reader
+-- Capability style: the handle argument carries the effect; no `with Reader`
+-- row (a row here would demand ambient discharge that a NAMED handler
+-- correctly does not provide by label -- performs route through the handle).
+prog : Reader -> U64
 prog r = let m = r.ask in m + 1
 
 main : Option U64

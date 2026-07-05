@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+import Std.Control
+-- Closed-sig leaking form pinned after conc-producer-capture was
+-- reclassified to trip the CarrierEscape check via `with eff e` on the
+-- returned thunk arrow: with the channel removed, the laundering check
+-- fires first. Expect UndischargedEffect.
+leak : Suspension () () U64 (row e) -> () -> Step () () U64 (row e)
+leak s = \ () -> step s ()
+main : U64
+main = 0

@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Control
+-- Closed-sig leaking form pinned after future-reperform-unhandled was
+-- restructured to wrap the escape in `leak : () -> Step U64 U64 U64 (row e)
+-- with eff e`: without the wrapper (a bare polymorphic `main` sig), this now
+-- trips the laundering check before CarrierEscape can fire. Expect
+-- UndischargedEffect.
+producer : () -> U64 with Coro U64 U64
+producer u = let x = Coro.suspend 42 in x
+main : Step U64 U64 U64 (row e)
+main = start producer

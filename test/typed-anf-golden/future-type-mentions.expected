@@ -1,4 +1,4 @@
-ignore _ : Suspension U64 U64 U64 a3 =
+ignore _ : Suspension U64 U64 U64 a0 =
   ()
 
 main =

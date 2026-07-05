@@ -40,11 +40,18 @@ Three things ship:
 
 ## 2. Why this, why now, what it buys
 
-- **Soundness without a value restriction.** The polymorphic-reference unsoundness (a
-  multi-shot resume re-runs a computation that captured mutable/parameterized-handler state
-  and re-observes it at two types) requires *duplication* of the continuation. No-dup removes
-  the precondition, so **the value restriction becomes unnecessary** and is dropped from the
-  roadmap rather than deferred.
+- **Soundness without a value restriction.** (Argument tightened 2026-07-05; the
+  conclusion is unchanged.) The classic ML+callcc counterexample (Harper–Lillibridge)
+  breaks polymorphism with a continuation thrown exactly ONCE — the hazard is not
+  duplicate *invocation* but the generalization CONTEXT being entered twice: undelimited
+  callcc RETURNS NORMALLY at capture and can later be re-entered by the throw, so the
+  polymorphic `let` binds twice at two types. wok is safe because delimited `perform`
+  has NO normal-return path separate from resume: it returns exactly as many times as
+  the arm resumes. With resume ≤ 1 (this law), every let-generalization context
+  evaluates at most once, so no polymorphic re-binding can occur. (M3 stored
+  continuations DELAY the resume but cannot add a second one — the store/take/one-shot
+  guards keep the total at ≤ 1.) Hence **the value restriction becomes unnecessary**
+  and is dropped from the roadmap rather than deferred.
 - **A simpler compiled backend (future).** One-shot-as-law means every continuation
   *contifies* (stack-switch / join-point jump, consumed once); the *reified, copyable*
   multi-shot representation is **never built**. The elimination lands as an *absence* in the
@@ -267,6 +274,9 @@ multi-shot is the same immutability that keeps the interpreter simple. So:
   on a second resume) as a runtime **oracle** that crashes on any multi-shot the static law
   missed. Cheap differential cross-check on the analysis's soundness; gated behind a debug/test
   flag so production runs keep the free multi-shot capability.
+  *(Status check 2026-07-05: still NOT implemented — no single-use guard exists in
+  `src/Wok/Interp/`. Tracked as Phase D of
+  `docs/superpowers/2026-07-05-effect-safety-holes-fix-plan.md`.)*
 
 ## 10. Corpus findings (empirical, on the live repo)
 

@@ -1,0 +1,12 @@
+module Main
+import Std.Base
+import Std.Control
+-- DEATH TEST (inner-abstraction family, rung 3 — ACCUMULATED carrier).
+-- The residual is performed on a NON-innermost lambda's parameter `f` (an
+-- effect-polymorphic function, not an affine future, so FutureConsumedTwice does
+-- not fire), inside a deeper lambda, reached indirectly. Caught only because the
+-- carrier ACCUMULATES every enclosing parameter rather than shadowing.
+drv : (() -> U64 with eff e) -> U64
+drv h = let m = (\ f -> (\ k -> f ()) 5) in m h
+main : U64
+main = 0
