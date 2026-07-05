@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+-- A user-declared `effect IO` override is an ordinary HANDLEABLE effect, not
+-- the ground IO the entry ambient discharges. Performing it in a top-level
+-- 0-arg binding must reject at the emit site like any other effect -- seeding
+-- the entry ambient by LABEL alone re-opened the CAF bypass for exactly this
+-- shape (typechecked, then NoMatchingHandler at --run; 2026-07-06 whole-branch
+-- review finding). The identical body as a 1-arg function already rejects.
+effect IO = { launch : U64 -> () }
+bad : U64
+bad = let v = IO.launch 1 in 2
+main : U64
+main = bad

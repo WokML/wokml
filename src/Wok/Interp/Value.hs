@@ -17,6 +17,9 @@ module Wok.Interp.Value
   , PrimTable
   , RuntimeError (..)
   , CafFailure (..)
+  , OneShotFlag
+  , mkOneShotFlag
+  , assertOneShot
   , resolveAtom
   , bindBinder
   , bindBinders
@@ -25,9 +28,12 @@ module Wok.Interp.Value
 
 import Control.Exception (Exception)
 import qualified Data.ByteString as BS
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import System.Environment (lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.Text as Tx
 import Wok.IR.Anf (Atom (..), Binder (..), Expr, Handler (..), Lit (..))
 import Wok.IR.Name (JoinId, Name (..), Unique, nameHint, nameUniq)
@@ -60,8 +66,8 @@ data Value
   | VRecord Text (Map Text Value)
   | VClosure ~Env [Binder] Expr
   | VPrim Prim
-  | VCont (Kont -> Kont)   -- a captured deep continuation; arg is the post-resume kont
-  | VContP (Value -> Kont -> Kont)   -- parameter-aware resume: \newParam after -> kont
+  | VCont OneShotFlag (Kont -> Kont)   -- a captured deep continuation; arg is the post-resume kont
+  | VContP OneShotFlag (Value -> Kont -> Kont)   -- parameter-aware resume: \newParam after -> kont
   | VInst Unique !Int      -- a named effect-instance handle. Identity = the
                            -- handler self-binder Unique (the install SITE) paired
                            -- with a per-ACTIVATION tag (the Kont depth at install).
@@ -164,7 +170,58 @@ data RuntimeError
   | PrimError Text
   | ArityError Text
   | UnsupportedCaf Text
+  | OneShotViolation
+      -- the WOK_DEBUG_ONESHOT oracle observed a continuation applied twice
   deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- One-shot runtime oracle (one-shot spec section 9)
+
+-- | Per-capture used-marker for the one-shot runtime oracle: 'Just' a flag
+-- when the oracle is enabled (@WOK_DEBUG_ONESHOT=1@, read once per process),
+-- 'Nothing' otherwise. The default-off setting keeps the machine's free
+-- multi-shot capability -- the static multiplicity law is production's only
+-- guard; the oracle is a differential check on that law, aborting with
+-- 'OneShotViolation' if the same captured continuation is ever applied twice
+-- at run time.
+type OneShotFlag = Maybe (IORef Bool)
+
+{-# NOINLINE oneShotOracleOn #-}
+oneShotOracleOn :: Bool
+oneShotOracleOn = unsafePerformIO (fmap (== Just "1") (lookupEnv "WOK_DEBUG_ONESHOT"))
+
+-- | Mint a fresh used-flag at continuation capture when the oracle is on.
+-- NOINLINE plus the dependence of the allocation on the argument are the
+-- documented 'unsafePerformIO' mitigations: they stop GHC floating or CSE'ing
+-- one shared 'IORef' across distinct captures, so every dynamic call
+-- allocates its own flag.
+--
+-- The initial value MUST be an expression the simplifier cannot reduce to a
+-- constant. @tag `seq` False@ is NOT enough: strictness analysis rewrites it
+-- to a case wrapper around the constant @newIORef False@, which full laziness
+-- then floats to the top level -- collapsing every capture onto ONE shared
+-- process-global flag (observed empirically: 86/2168 failures under
+-- WOK_DEBUG_ONESHOT=1, with single-apply programs aborting because unrelated
+-- earlier applies had marked the global ref). @tag < 0@ keeps a genuine
+-- runtime dependence on @tag@; it always evaluates to False because the tag
+-- is a 'kontDepth' (>= 0 by construction).
+{-# NOINLINE mkOneShotFlag #-}
+mkOneShotFlag :: Int -> OneShotFlag
+mkOneShotFlag tag
+  | oneShotOracleOn = Just (unsafePerformIO (newIORef (tag < 0)))
+  | otherwise       = Nothing
+
+-- | Assert the oracle at a continuation application: flip the used-flag and
+-- fail on a second application of the same continuation value. A 'Nothing'
+-- flag (oracle off) is free. The IO depends on the ref argument, so it cannot
+-- be floated out of the application site.
+{-# NOINLINE assertOneShot #-}
+assertOneShot :: OneShotFlag -> Either RuntimeError ()
+assertOneShot Nothing = Right ()
+assertOneShot (Just r) =
+  if unsafePerformIO (atomicModifyIORef' r (\used -> (True, used)))
+    then Left OneShotViolation
+    else Right ()
 
 -- | A user-written 0-arity binding (CAF) whose body raised a 'RuntimeError'
 -- when forced. Because a CAF lives in the lazy 'gEnv' 'Map' as a pure 'Value'

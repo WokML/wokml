@@ -352,6 +352,15 @@ substCTypeWith m = goT
 -- unbound metavar) is under-entailed and must be rejected. Type (KStar) vars
 -- only; row (KEffect) vars do not carry class constraints.
 
+-- | The terminal row var of an effect-row slot, if any. Shared by BOTH
+-- classifiers below -- 'freezeSigSkolems' rigidifies a var iff it is
+-- effect-relevant AND not dischargeable, so the two must agree on what a
+-- row's tail is; one definition keeps them from drifting.
+effTailVar :: CType -> Set.Set Int
+effTailVar (CRExtend _ _ r) = effTailVar r
+effTailVar (CTGen i)        = Set.singleton i
+effTailVar _                = Set.empty
+
 -- | The KEffect quantifier indices that appear as an arrow's effect-row tail in a
 -- POSITIVE (result-side) position of a signature -- i.e. the function has its OWN
 -- declared channel to perform them (`... -> R with eff e`, including returned
@@ -365,7 +374,7 @@ dischargeableRowVars :: CType -> Set.Set Int
 dischargeableRowVars = pos
   where
     -- Positive position: an arrow's effect-row tail here IS a discharge channel.
-    pos (CTArr a eff b)  = Set.unions [effTail eff, neg a, pos b]
+    pos (CTArr a eff b)  = Set.unions [effTailVar eff, neg a, pos b]
     pos (CTCon _ ts)     = Set.unions (map pos ts)
     pos (CTRecord _ row) = pos row
     pos (CRExtend _ p r) = Set.union (pos p) (pos r)
@@ -380,10 +389,6 @@ dischargeableRowVars = pos
     neg (CRExtend _ p r) = Set.union (neg p) (neg r)
     neg CREmpty          = Set.empty
     neg (CTGen _)        = Set.empty
-    -- The terminal row var of an arrow's effect-row slot, if any.
-    effTail (CRExtend _ _ r) = effTail r
-    effTail (CTGen i)        = Set.singleton i
-    effTail _                = Set.empty
 
 -- | The KEffect quantifier indices that are genuinely EFFECT-relevant: a var
 -- appearing as an arrow effect-row tail (EITHER polarity) or as a row-arg of a
@@ -398,18 +403,15 @@ dischargeableRowVars = pos
 effectRelevantRowVars :: (Text -> Bool) -> CType -> Set.Set Int
 effectRelevantRowVars isCarrier = go
   where
-    go (CTArr a eff b)  = Set.unions [effTail eff, go a, go eff, go b]
+    go (CTArr a eff b)  = Set.unions [effTailVar eff, go a, go eff, go b]
     go (CTCon tc ts)    = Set.union (Set.unions (map go ts)) (carrierArgs tc ts)
     go (CTRecord _ row) = go row
     go (CRExtend _ p r) = Set.union (go p) (go r)
     go CREmpty          = Set.empty
     go (CTGen _)        = Set.empty
     -- A carrier tycon's row-args ARE effect residuals; a non-carrier's are not.
-    carrierArgs (TcUser n) ts | isCarrier n = Set.unions (map effTail ts)
+    carrierArgs (TcUser n) ts | isCarrier n = Set.unions (map effTailVar ts)
     carrierArgs _          _                = Set.empty
-    effTail (CRExtend _ _ r) = effTail r
-    effTail (CTGen i)        = Set.singleton i
-    effTail _                = Set.empty
 
 -- | The third component is the set of 'Rigid' skolem uniqs minted for
 -- TRAPPED KEffect (row) variables -- i.e. those that occur in the signature
@@ -1343,8 +1345,21 @@ processEffectDecls env0 decls = foldM registerEffect env0 effectDecls
         -- Any other already-present effect (a prelude effect inherited via
         -- imports, a same-pass duplicate, or an already-overridden IO that now
         -- has ops) is a duplicate.
+        --
+        -- The override must declare at least one operation: override-ONCE
+        -- depends on the override NOT satisfying 'isGroundIO' afterwards, and
+        -- an empty `effect IO = {}` still would -- letting a SECOND override
+        -- slip past the duplicate check below. The zero-op effect is also
+        -- unusable by construction (nothing to perform; unhandleable via the
+        -- ground-IO gate), so rejecting it costs nothing.
         Just ei
-          | isGroundIO name ei -> register
+          | isGroundIO name ei ->
+              if null fields
+                then throwError (UnsupportedFeature (Just pos)
+                       (Tx.pack "an `effect IO` override must declare at least \
+                                \one operation; the ground IO cannot be \
+                                \re-declared empty"))
+                else register
           | otherwise          -> throwError (DuplicateTyCon (Just pos) name)
         Nothing -> register
       where
@@ -2480,16 +2495,13 @@ inferNormalApp mono f x = do
   (xT, xNode) <- inferExprW mono x
   rT     <- freshTVar KStar
   effRow <- freshRVar
-  finishApp fT fNode xT xNode rT effRow
-  where
-    finishApp fT fNode xT xNode rT effRow = do
-      unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
-      emitRow Nothing effRow
-      closeRow effRow
-      let node = case fNode of
-            Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
-            _                          -> Ty.TApp fNode [xNode]
-      pure (rT, Ty.Texp rT node)
+  unify (expPos (Abs.EApp f x)) fT (TArr xT effRow rT)
+  emitRow Nothing effRow
+  closeRow effRow
+  let node = case fNode of
+        Ty.Texp _ (Ty.TApp h args) -> Ty.TApp h (args ++ [xNode])
+        _                          -> Ty.TApp fNode [xNode]
+  pure (rT, Ty.Texp rT node)
 
 -- | Type-check a foreign member call where the full arg list is exactly
 -- saturated (length args == arity of the member type). Each arg is inferred
@@ -2616,11 +2628,14 @@ texpMentions name = goE
 -- Perceus pass would omit its drop on a discard arm, leaking the captured owned
 -- set (spec docs/superpowers/specs/2026-06-19-m2b-resume-binder-type-leak-fix).
 -- Shared by 'inferHandler' (ambient) and 'inferNamedHandler' (named).
--- Returns the continuation type AND the effect-row cells it carries (the resume
--- row, plus the param row for a two-arg parameterized resume). Invoking @resume@
--- performs those rows; the caller adds them to the plumbing-exempt set while
--- checking the arm body so a resume call is not mistaken for an undischarged
--- residual obligation, WITHOUT exempting other residuals performed in the arm.
+-- The continuation's effect rows (the resume row, plus the param row for a
+-- two-arg parameterized resume) are minted as fresh OPEN vars: an arm body
+-- that invokes @resume@ performs whatever the resumed tail performs, and the
+-- open rows absorb it during arm checking. No emit-site bookkeeping guards
+-- these rows any more -- the rung-era plumbing-exempt set was deleted with
+-- the rest of that apparatus (b1e3a26); a residual laundered through a
+-- TRAPPED signature var is now caught later, at reconciliation, by the
+-- rigid-skolem clash ('freezeSigSkolems'/'reconcileDeclared').
 resumeContTyFor :: Maybe (Type s) -> Type s -> Type s -> TC s (Type s)
 resumeContTyFor mParamTy resultTy answerT = do
   resumeRow <- freshRVar
@@ -3192,12 +3207,17 @@ inferLetGroup mono decls k = do
                                             then m
                                             else Map.insert n tv m)
                         mono placeholders
-    mapM (unifyGroupWith monoRec sigMap) placeholders
+    mapM (\ph@(_, _, phEqns) -> do
+            (n, tv, ds) <- unifyGroupWith monoRec sigMap ph
+            pure (n, tv, ds, eqnDefnSpan phEqns))
+         placeholders
   -- The typed local decls for every equation across all groups, in source
   -- order, available to the continuation for building TLet/where nodes.
-  let declNodes = concatMap (\(_, _, ds) -> ds) unified
-  -- Phase 2: back at outer level, generalize or check sig.
-  results <- withEnv extendSig $ mapM (\(n, tv, _) -> finalizeGroup sigMap (n, tv)) unified
+  let declNodes = concatMap (\(_, _, ds, _) -> ds) unified
+  -- Phase 2: back at outer level, generalize or check sig; the definition
+  -- span rides along to anchor the trapped-effect diagnostic.
+  results <- withEnv extendSig $
+    mapM (\(n, tv, _, sp) -> finalizeGroup sigMap (n, tv, sp)) unified
   -- Bodyless sigs in this let block become visible bindings with the
   -- declared scheme verbatim (NO freezeSig). Warnings are NOT emitted
   -- here in v1 -- let-block bodyless diagnostics are deferred to a
@@ -3377,21 +3397,40 @@ hasOuterScopeVar outer = go
             Link _ -> error "hasOuterScopeVar: TVar was Link after force (caller invariant violation)"
     firstM = foldr (\m acc -> do { r <- m; maybe acc (pure . Just) r }) (pure Nothing)
 
+-- | Verify a declared sig against the inferred type. A 'RigidEscape' on a
+-- skolem minted for a TRAPPED effect-row var ('freezeSigSkolems') is a
+-- laundering leak -- the body performs an effect the sig never declared --
+-- surfaced as an 'UndischargedEffect' POSITIONED at the binding's
+-- definition site (rung-3 spec D3). Other escapes (KStar over-promises)
+-- pass through unchanged. Shared by 'finalizeGroup'/'finalizeGroupTyped' so
+-- the two finalization paths cannot drift.
+reconcileDeclared :: BNFC'Position -> Type s -> Type s -> Set.Set Int -> TC s ()
+reconcileDeclared defnSp declT tv trappedUniqs =
+  unify Nothing declT tv `catchError` \e -> case e of
+    RigidEscape _ u | Set.member u trappedUniqs ->
+      throwError (UndischargedEffect defnSp (Tx.pack "e"))
+    _ -> throwError e
+
+-- | The definition span of a binding group: the first equation's LHS
+-- position, used to anchor reconciliation diagnostics ('reconcileDeclared').
+eqnDefnSpan :: [Abs.LocalDecl] -> BNFC'Position
+eqnDefnSpan decls = case [ lhs | Abs.LDEqn lhs _ _ <- decls ] of
+  lhs : _ -> lhsPos lhs
+  []      -> Nothing
+
 -- | Back at outer level: generalize an inferred type or verify a sig.
 -- Returns Left (name, tv) for monomorphic bindings (escape detected),
--- Right (name, scheme) for genuinely polymorphic ones.
+-- Right (name, scheme) for genuinely polymorphic ones. @defnSp@ anchors
+-- the trapped-effect diagnostic at the binding's definition site.
 finalizeGroup
   :: Map.Map Text Scheme
-  -> (Text, Type s)
+  -> (Text, Type s, BNFC'Position)
   -> TC s (Either (Text, Type s) (Text, Scheme))
-finalizeGroup sigMap (name, tv) =
+finalizeGroup sigMap (name, tv, defnSp) =
   case Map.lookup name sigMap of
     Just declared -> do
       (declT, _, trappedUniqs) <- freezeSigSkolems declared
-      unify Nothing declT tv `catchError` \e -> case e of
-        RigidEscape _ u | Set.member u trappedUniqs ->
-          throwError (UndischargedEffect Nothing (Tx.pack "e"))
-        _ -> throwError e
+      reconcileDeclared defnSp declT tv trappedUniqs
       pure (Right (name, declared))
     Nothing -> do
       Level outer <- currentLevel
@@ -3423,9 +3462,9 @@ finalizeGroup sigMap (name, tv) =
 -- 'finalizeGroup' this returns a 'TypedDecl' directly.
 finalizeGroupTyped
   :: Map.Map Text Scheme
-  -> (Text, Type s, [Ty.TLocalDecl (Type s)], [ConstraintS s])
+  -> (Text, Type s, [Ty.TLocalDecl (Type s)], [ConstraintS s], BNFC'Position)
   -> TC s TypedDecl
-finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
+finalizeGroupTyped sigMap (name, tv, eqDecls, accCs, defnSp) = do
   (arity, clauseList) <- case eqDecls of
     [] -> error ("finalizeGroupTyped: no typed equations for " ++ Tx.unpack name)
     (Ty.TLocalDecl _ firstParamsS _ : _) ->
@@ -3454,10 +3493,7 @@ finalizeGroupTyped sigMap (name, tv, eqDecls, accCs) = do
       -- declared var it constrains (or to a different skolem / metavar, which is
       -- exactly the under-entailed case we must reject).
       (declT, varUniq, trappedUniqs) <- freezeSigSkolems declared
-      unify Nothing declT tv `catchError` \e -> case e of
-        RigidEscape _ u | Set.member u trappedUniqs ->
-          throwError (UndischargedEffect Nothing (Tx.pack "e"))
-        _ -> throwError e
+      reconcileDeclared defnSp declT tv trappedUniqs
       -- Freeze the inferred tree for its node types. The accumulated constraints
       -- are validated below against the still-mutable 'accCs' (whose arguments
       -- are the skolems/metavars above), NOT against any re-folded CTGen copy:
@@ -3663,7 +3699,22 @@ typeEquationWith monoRec mSig (Abs.LDEqn lhs body mw) = do
           -- never reconciled against anything, so top-level values (main
           -- included) silently bypassed the effect discipline entirely and
           -- crashed at run time (NoMatchingHandler).
-          let entryAmbient = RowExtend (Tx.pack "IO") (TCon TcUnit []) RowEmpty
+          --
+          -- The IO entry is included ONLY while the IO in scope is the GROUND
+          -- one: 'emitEffect' discharges by label, and a user `effect IO =
+          -- { ... }` override (permitted once, 'processEffectDecls') is an
+          -- ordinary handleable effect that the entry ambient cannot
+          -- discharge -- seeding its label here would re-open the CAF bypass
+          -- for exactly that effect (typechecks, then NoMatchingHandler at
+          -- run time; found by the 2026-07-06 whole-branch review). With IO
+          -- overridden the entry ambient is the closed EMPTY row.
+          env <- currentEnv
+          let ioIsGround =
+                maybe False (isGroundIO (Tx.pack "IO"))
+                            (lookupEffect (Tx.pack "IO") env)
+              entryAmbient
+                | ioIsGround = RowExtend (Tx.pack "IO") (TCon TcUnit []) RowEmpty
+                | otherwise  = RowEmpty
           effRef <- liftST (newSTRef entryAmbient)
           (bodyT, bodyNode) <- withEffRow effRef runBody
           pure (bodyT, mkDecl bodyNode)
@@ -4105,10 +4156,10 @@ inferTopLetGroup origin externs localDecls = do
     -- group-mates' unification; they are frozen at outer level in
     -- 'finalizeGroupTyped'. (Bindings with no constrained use drain [], so the
     -- non-class path is byte-identical.)
-    forM placeholders $ \ph -> do
+    forM placeholders $ \ph@(_, _, phEqns) -> do
       (n, tv, ds) <- unifyGroupWith monoRec sigMap ph
       cs <- takeConstraints
-      pure (n, tv, ds, cs)
+      pure (n, tv, ds, cs, eqnDefnSpan phEqns)
   -- Finalize each binding at the top level: generalize (or verify its sig) AND
   -- freeze its typed params + body into a TypedDecl under one quantification
   -- mapping (so node CTGens agree with the scheme). The top level has no outer

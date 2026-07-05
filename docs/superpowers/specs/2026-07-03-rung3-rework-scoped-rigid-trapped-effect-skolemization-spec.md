@@ -166,7 +166,10 @@ over-promises) keep their existing `RigidEscape` message.
 
 ## 6. Subsumption + test reclassification (the one real interaction)
 
-Scoped rigidity is STRICTER than the old apparatus: it correctly rejects 6 existing
+Scoped rigidity and the old apparatus are INCOMPARABLE (not "stricter" — rung-1
+emit-site recording caught the staged-perform shape F3 that skolemization does not,
+while skolemization catches the 21 leak classes below that rung-1/2/3 missed; it is
+stricter on the tested corpus). On that corpus it correctly rejects 6 existing
 death tests that were written to isolate OTHER checks but that genuinely ALSO leak a
 trapped effect — `future-recursive-consume`, `future-await-twice`,
 `future-helper-double-consume`, `future-resume-then-cancel` (intended:
@@ -293,9 +296,21 @@ polymorphic and concrete effects disagree about staging. Dynamically backstopped
 today (eager `start` demands the residual at its own site; second-class carriers
 keep resumes inside the discharging handler — verified: the exploiting caller is
 rejected at the `start` site, the under-handler form runs correctly), so this is
-a type-honesty hole of the F1 class, not a crash. Candidate fix: depth-indexed
-dischargeability (a spine eff-tail is a channel iff at arrow depth == equation
-arity, where `effRowAtDepth` already reads the ambient seed); the honest forms
-`mkOk g x = run g x` and `mk g = \ x -> run g x` stay accepting (the returned
-lambda's row reconciles separately). Needs a C1-style prototype gate. Plan:
-`docs/superpowers/2026-07-05-effect-safety-holes-fix-plan.md` (H2/Phase B).</open_question>
+a type-honesty hole of the F1 class, not a crash.
+**Candidate fix FALSIFIED (2026-07-06, Phase B prototype gate — D-C STOP):**
+depth-indexed dischargeability (channel iff spine depth == equation arity)
+rejects the staged form correctly but ALSO rejects the honest returned-lambda
+forms — `mk g = \ x -> run g x`, a pure `\ x -> x` under the same sig, the
+shipped FP-1 pin `poly-fp1-open-return-arrow`, and it masks
+`conc-producer-capture`'s intended `CarrierEscape`. The "returned lambda's row
+reconciles separately" reasoning was wrong: the app-site `closeRow`
+(`Infer.hs:2492-2494`), `emitRow`'s bare-residual drop (`:3051`), and the
+lambda sub-ambient close (`:2191`) erase the staged/honest distinction before
+reconciliation — both forms reconcile with IDENTICAL types, so NO
+classifier-only rule can separate them; the distinction is emit-site
+(inference-trace) information. Remaining directions (emit-site bare-residual
+check on a closed ambient, row-plumbing rework, or accepting the dynamic
+backstop):
+`docs/superpowers/2026-07-06-h2-depth-indexed-prototype-findings.md`. Plan:
+`docs/superpowers/2026-07-05-effect-safety-holes-fix-plan.md` (H2/Phase B,
+OUTCOME note).</open_question>

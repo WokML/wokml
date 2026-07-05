@@ -1,10 +1,14 @@
 # Effect-safety holes — executable fix plan (2026-07-05)
 
-Status: **Phase A DONE (commit 6af0663) + Phase C mostly done (C1/C5 open).
-Phase B and D not started.** Plain checklist plan — deliberately NOT a
-superpowers plan/tracker; execute tasks top-to-bottom in this file, tick the
-boxes, commit per task. Written against branch `feat/resume-launders-loadbearing`
-(tip 795b74d).
+Status: **Phase A DONE (commit 6af0663) + Phase C done except C5. Phase B
+EXECUTED AND FALSIFIED (2026-07-06): the D-C prototype gate STOPPED it — the
+depth-indexed classifier was built, gated, and REVERTED (false positives the
+rule cannot express; see
+`2026-07-06-h2-depth-indexed-prototype-findings.md`). H2 remains OPEN,
+dynamically backstopped. Phase D not started.** Plain checklist plan —
+deliberately NOT a superpowers plan/tracker; execute tasks top-to-bottom in
+this file, tick the boxes, commit per task. Written against branch
+`feat/resume-launders-loadbearing` (tip 795b74d).
 
 **Execution findings (2026-07-05, Phase A):**
 - The entry ambient is `{IO}` (closed), NOT `{}`: ground IO is discharged by
@@ -140,7 +144,26 @@ inlined below; nothing depends on files outside the repo).
 
 ## Phase B — H2: depth-indexed dischargeability (type-honesty)
 
-- [ ] **B1. Thread equation arity to the classifier.**
+**OUTCOME (2026-07-06): FALSIFIED at the B2 gate; D-C STOP invoked; B1
+reverted; B3-B5 not applicable.** The depth rule rejected the staged form
+correctly but ALSO rejected the honest controls: `mkLam` (this plan's own
+must-stay-accepting fixture), a pure-lambda probe (`mkPure g = \ x -> x` —
+no perform anywhere), and two shipped fixtures (`poly-fp1-open-return-arrow`
+= the FP-1 idiom pin, and `conc-producer-capture`, whose intended
+`CarrierEscape` it masks). Root cause: the staged/honest distinction is a
+property of the inference TRACE (which ambient was active at the `run`
+application), and inference erases it before reconciliation — the app-site
+`closeRow` (`Infer.hs:2492-2494`) collapses the shared row var, `emitRow`
+drops bare residuals (`:3051`), and the lambda sub-ambient closes to `{}`
+(`:2191`) — so both forms reconcile with IDENTICAL types. No classifier-only
+rule can express the difference; D-B's "verified reasoning" for `mkLam` was
+wrong in detail. Full trace, gate table, and future directions (emit-site
+bare-residual check / row-plumbing rework / accept the dynamic backstop):
+`docs/superpowers/2026-07-06-h2-depth-indexed-prototype-findings.md`.
+H2 stays OPEN and dynamically backstopped; suite back to 2165 green.
+
+- [x] **B1. Thread equation arity to the classifier.** (built, gated, then
+      REVERTED per the B2 verdict — see OUTCOME above)
       `dischargeableRowVars` (`Infer.hs:364`) gains an `Int` arity parameter:
       the `pos` walk tracks spine depth (increment when descending `pos b` of a
       spine `CTArr`); collect `effTail` ONLY at depth == arity. Non-spine
@@ -155,38 +178,30 @@ inlined below; nothing depends on files outside the repo).
       Pattern binds and 0-arg bindings: arity 0. Multi-clause groups: clauses
       share arity (verify; if a mixed-arity group is representable, take the
       minimum and leave a comment).
-- [ ] **B2. Prototype gate (D-C).** Before deleting anything: run the full
-      suite + `typecheck-examples` + `run-examples` + prelude with the new
-      classifier active. Triage every flip:
-      newly-rejected accept fixture = genuine staged leak (reclassify with a
-      D4-style `with eff e`-channel variant + keep the leaking form as a death
-      test) OR a false positive → STOP per D-C. Pay attention to prelude
-      combinators whose equation arity is smaller than their sig's arrow count
-      (`asCoro`, `par`, `race`, `step` partial forms) — these are exactly the
-      risk class.
-- [ ] **B3. Fixtures.** Death test `launder-staged-perform.wok` (the H2 `mk`
-      reproducer) → `UndischargedEffect`. Accept fixtures: `mkOk g x = run g x`
-      (channel at depth == arity, the honest curried form) and the
-      returned-lambda honest form `mk g = \ x -> run g x` (channel below
-      activation but perform inside the returned closure). All three verified
-      shapes from the pressure-test session.
-- [ ] **B4. Update claims.** In the rung-3 spec: reword C2/AS3 to scope
-      completeness to "vars with no positive channel at the body's activation
-      depth" and drop "§6 scoped rigidity is STRICTER than the old apparatus"
-      (they are incomparable — rung-1 caught the staged form, skolemization
-      pre-B1 did not). Add H2 as resolved follow-up F3.
-- [ ] **B5. Commit** (`fix(effects): depth-indexed dischargeability — a
-      channel below the activation arrow no longer launders staged performs`).
+- [x] **B2. Prototype gate (D-C).** RAN; verdict = STOP. 4/2165 failed, all
+      false positives (see OUTCOME above); prelude itself survived (the risk
+      class `asCoro`/`par`/`race`/`step` all have arity == channel depth).
+- [ ] ~~**B3. Fixtures.**~~ NOT APPLICABLE — the rule was reverted, so the
+      `launder-staged-perform` death test cannot be added (the staged form
+      still accepts today) and `mkOk`/`mkLam` accepts would pin nothing new.
+- [x] **B4. Update claims.** Done for the falsified outcome: rung-3 spec §6
+      "STRICTER" claim dropped (incomparable), C2/AS3 completeness scope
+      already amended by the 2026-07-05 header note, F3 updated to
+      OPEN-with-falsified-candidate (NOT "resolved" — the plan's original
+      wording assumed the fix shipped).
+- [ ] ~~**B5. Commit**~~ superseded — no compiler change to commit; the
+      findings doc + plan/spec sync commit stands in its place.
 
 ## Phase C — H3: documentation truth (mechanical, can interleave)
 
-- [ ] **C1. Explainer rewrite** (`docs/effect-handlers-explainer.html`, item 1
+- [x] **C1. Explainer rewrite** (`docs/effect-handlers-explainer.html`, item 1
       + header sub). New state: rungs 1-3 shipped THEN superseded — the whole
       apparatus was deleted for scoped rigid skolemization of trapped effect
       vars (branch `feat/resume-launders-loadbearing`); remaining open =
-      F1 (wrapped carrier), F2→H1 (now: the 0-arg bypass, fixed in Phase A if
-      done), H2 staged-perform (fixed in Phase B if done). Keep the historical
-      rung narrative but mark it superseded, matching the doc's own style.
+      F1 (wrapped carrier), F2→H1 (now: the 0-arg bypass, fixed in Phase A),
+      H2 staged-perform (OPEN — Phase B falsified at the gate; explainer says
+      so and points at the findings doc). Historical rung narrative kept,
+      marked superseded. (Done 2026-07-06.)
 - [x] **C2. Rung-3 spec sync**
       (`docs/superpowers/specs/2026-07-03-rung3-rework-scoped-rigid-trapped-effect-skolemization-spec.md`):
       status `in_review` → implemented/shipped-on-branch with a dated header
@@ -218,32 +233,87 @@ inlined below; nothing depends on files outside the repo).
       re-binding; M3 stored continuations delay but cannot duplicate the
       resume. Add a dated note to §9 that the recommended runtime oracle is
       shipped/not-shipped depending on Phase D's outcome.
-- [ ] **C5. Memory hygiene** (assistant-side, zero repo cost): update the
+- [x] **C5. Memory hygiene** (assistant-side, zero repo cost): update the
       `explicit-resume-effect-laundering` memory (no longer OPEN) and trim
       MEMORY.md under its 24.4KB limit so the index stops truncating.
+      (Done 2026-07-06: memory updated with the Phase-B falsification;
+      MEMORY.md 27.1KB → 20.0KB, detail verified present in topic files
+      before trimming index lines.)
 
 ## Phase D — optional: the one-shot runtime oracle
 
-- [ ] **D1. Single-use continuation guard.** A mutable used-flag on the
-      continuation value (`VCont`/`VContP`, `src/Wok/Interp/Machine.hs`),
-      asserted on second application; gated (env var `WOK_DEBUG_ONESHOT=1` or
-      a cabal flag alongside `asan`) so production keeps the free multi-shot
-      capability per the one-shot spec §9. Enable it under the existing test
-      harness for the `multiplicity-*` and effect corpora as a differential
-      check on the static law. Mutation-confirm the oracle itself (hand-run a
-      multi-shot arm with the frontend check disabled → must abort), per the
-      repo's negative-control convention.
-- [ ] **D2. Update one-shot spec §9 note** (folds into C4).
+- [x] **D1. Single-use continuation guard.** (Done 2026-07-06.) Per-capture
+      `OneShotFlag` on `VCont`/`VContP` (minted in `dispatchOp` with the
+      activation tag, asserted in `enter` → new `OneShotViolation` error),
+      gated by `WOK_DEBUG_ONESHOT=1` read once per process — default OFF, so
+      production keeps the free multi-shot capability per the one-shot spec
+      §9. Enablement is a FULL-SUITE oracle run (`scripts/oneshot-oracle.sh`,
+      mirroring the `asan-runtime.sh` convention — a strict superset of the
+      planned multiplicity+effect corpora), because the suite deliberately
+      pins the machine's free-multi-shot semantics in one hand-built-IR test;
+      that test now self-adapts and under the env var expects
+      `OneShotViolation`, doubling as the END-TO-END negative control (it IS
+      a multi-shot arm with the frontend check bypassed). Three `enter`-level
+      unit tests mutation-confirm the assert + pin that a flag-less
+      continuation stays multi-shot. DIFFERENTIAL VERDICT: the law-admitted
+      corpus is violation-free; exactly SIX run-golden `*multishot*` fixtures
+      abort — law-REJECTED programs (`--run` refuses them via
+      `elaborateCheckedFull`; the run-golden harness deliberately uses the
+      UNCHECKED elaborator to pin machine capability) — so the script asserts
+      set-equality on them as six wok-source negative controls (a missing
+      abort = oracle decay; an extra failure = a law miss — both exit
+      non-zero). EXECUTION FINDING: the first flag
+      implementation initialized the ref with `tag `seq` False`; strictness
+      analysis + full laziness collapsed EVERY capture onto one floated
+      process-global IORef (86/2168 oracle-run failures, single-apply
+      programs aborting from unrelated tests' applies) — fixed with a
+      non-foldable initial value (`tag < 0`), documented in
+      `Value.hs:mkOneShotFlag`. The RC machine needs no oracle (its
+      `moveOutCont` frees the shell at first resume).
+- [x] **D2. Update one-shot spec §9 note** (folds into C4). (Done 2026-07-06:
+      §9 status note now records the shipped oracle + script + negative
+      control.)
 
 ## Ship gate (whole plan)
 
-- [ ] Full suite green (~2135 + new fixtures), `hlint` clean, no ASan needed
-      for A/B/C (type-checker only); D touches the interpreter → run the
-      existing sanitizer script once if D ships.
-- [ ] The H1 and H2 reproducers reject; the three honest-form controls accept;
-      `--run` corpus unchanged.
-- [ ] ONE whole-branch adversarial review before merge (per CLAUDE.md; the
-      load-bearing gate), then user-run `/code-review`.
+- [x] Full suite green (2168 = 2165 + 3 oracle unit tests), `hlint` clean on
+      the new code (pre-existing hints untouched); D shipped → sanitizer run
+      2026-07-06: C-runtime portion of `asan-runtime.sh` clean; the `interp`
+      ASan mode consciously SKIPPED — D's diff touches only the pure-Haskell
+      reference machine (no RC-machine or C-runtime code in the diff), which
+      that mode does not exercise.
+- [x] The H1 reproducers reject; the honest-form controls accept; `--run`
+      corpus unchanged. (H2's reproducer STILL ACCEPTS by design — Phase B was
+      falsified at the gate; H2 is open + dynamically backstopped.)
+- [x] ONE whole-branch adversarial review before merge (per CLAUDE.md; the
+      load-bearing gate) — RAN 2026-07-06 on the post-795b74d commits
+      (6af0663 H1 fix + 8e9daea Phase-D oracle): verdict SHIP-WITH-FIXES,
+      all findings FIXED in a87d910. MAJOR: a user `effect IO` override
+      re-opened the CAF bypass (entry ambient seeded by LABEL; emitEffect
+      discharges by label; the permitted override is handleable) — 7-line
+      reproducer typechecked then crashed at --run; fixed by consulting
+      isGroundIO at the seed (override ⇒ closed empty entry ambient) + death
+      test caf-user-io-override-bypass. MINOR: oracle script leaf-name
+      collision brittleness — now asserts each expected failure is a unique
+      "run golden" leaf. NIT: documented why the 7th multishot fixture
+      (37-known-reentrant, dynamically single-shot) is excluded. The review
+      also verified: handled-CAF/point-free/pattern-bind non-bypasses, oracle
+      false-positive hunt (200-capture same-hTag loop clean), all appliers
+      route through enter, death-test load-bearing-ness by mutation. Suite
+      2169 green + oracle script green after fixes. The gate caught a real
+      soundness hole AGAIN (4th consecutive slice).
+- [x] User-run `/code-review high` (2026-07-06): 8 finder angles + 1-vote
+      verify → 8 CONFIRMED (all quality/diagnostic, no soundness blocker) +
+      2 PLAUSIBLE (accepted as-is: oracle-script tasty-format coupling fails
+      loud; NOINLINE micro-cost). All CONFIRMED fixed in 6eb4fe4: positioned
+      trapped-effect diagnostics via shared reconcileDeclared (spec D3/Q1
+      finally fulfilled; 27 goldens regenerated), shared effTailVar, empty
+      `effect IO = {}` override rejected (override-once now airtight),
+      resumeContTyFor comment rewritten, RowRef + finishApp dead code
+      removed, assertApplyOk test helper. Known-filed F1/H2/A4 were
+      surfaced-and-excluded as already documented. Suite 2170 green.
+      **MERGED to main (clean FF e395d34..6eb4fe4, 2026-07-06, local not
+      pushed).**
 
 ## Reproducer appendix (for fixtures; all verified 2026-07-05)
 
@@ -277,7 +347,7 @@ main : U64
 main = drive
 ```
 
-H2 staged launder (must reject after B1):
+H2 staged launder (STILL ACCEPTS — Phase B falsified at the gate):
 ```
 module Main
 import Std.Base
@@ -288,7 +358,8 @@ main : U64
 main = 0
 ```
 
-H2 honest controls (must stay accepting after B1):
+H2 honest controls (accepting; under the B1 prototype, `mkLam` REJECTED —
+the false positive that triggered the D-C STOP):
 ```
 mkOk : Suspension U64 U64 U64 (row e) -> U64 -> U64 with eff e
 mkOk g x = run g x

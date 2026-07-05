@@ -1,0 +1,11 @@
+module Main
+import Std.Base
+-- An `effect IO` override must declare at least one operation. An EMPTY
+-- override would still satisfy isGroundIO (no ops), so a SECOND override
+-- could slip past the override-once duplicate check -- and the zero-op
+-- effect is unusable anyway (nothing to perform; unhandleable via the
+-- ground-IO gate). 2026-07-06 /code-review finding.
+effect IO = {}
+effect IO = { launch : U64 -> () }
+main : U64
+main = 0

@@ -6,7 +6,6 @@
 module Wok.TypeChecking.Monad
   ( TC
   , TCCtx (..)
-  , RowRef
   , ConstraintS (..)
   , runTC
   , runTC_
@@ -37,10 +36,6 @@ import Wok.TypeChecking.Env (Env, extendVar)
 import Wok.TypeChecking.Error (TypeError, Warning (RowShadow))
 import Wok.TypeChecking.Types
   ( Kind (..), Level (..), Row, Scheme, TVar (..), Type (..) )
-
--- | A mutable effect-row-variable cell (the 'STRef' inside a 'TVar' of kind
--- 'KEffect').
-type RowRef s = STRef s (TVar s)
 
 -- | A constraint collected during inference; its argument is still a mutable
 -- 'Type s' and is frozen to 'CType' at the binding's generalization.

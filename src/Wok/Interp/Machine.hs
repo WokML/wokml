@@ -208,11 +208,11 @@ enter prims sup fv args k = case fv of
           PRDrive thunk   -> do
             (v, sup') <- Sched.driveConc enter run prims sup thunk
             if null over then Right (Return v k, sup') else enter prims sup' v over k
-  VCont kb -> case args of
-    [v] -> Right (Return v (kb k), sup)
+  VCont fl kb -> case args of
+    [v] -> assertOneShot fl >> Right (Return v (kb k), sup)
     _   -> Left (ArityError (Tx.pack "continuation expects exactly one argument"))
-  VContP f -> case args of
-    [param, result] -> Right (Return result (f param k), sup)
+  VContP fl f -> case args of
+    [param, result] -> assertOneShot fl >> Right (Return result (f param k), sup)
     _ -> Left (ArityError (Tx.pack "parameterized continuation expects exactly two arguments"))
   _ -> Left (NotAFunction (renderValue fv))
 
@@ -268,9 +268,11 @@ dispatchOp mTarget lbl op argVals kCur =
               -- body still id-routes to this same activation.
               resumeVal = case hParam h of
                 Nothing ->
-                  VCont (\after -> above (KHandle h hTag (answerRebind after hsc) after))
+                  VCont (mkOneShotFlag hTag)
+                    (\after -> above (KHandle h hTag (answerRebind after hsc) after))
                 Just pb ->
-                  VContP (\newParam after ->
+                  VContP (mkOneShotFlag hTag)
+                    (\newParam after ->
                     let hsc' = (answerRebind after hsc)
                                  { scEnv = bindBinder pb newParam (scEnv hsc) }
                     in above (KHandle h hTag hsc' after))

@@ -80,7 +80,9 @@ import qualified System.Directory as Dir
 import qualified Control.Monad
 import qualified Control.Exception
 import Control.Monad.Except (throwError)
+import Data.IORef (newIORef)
 import Data.Unique (newUnique, hashUnique)
+import System.Environment (lookupEnv)
 import Data.Bifunctor (first)
 import qualified Data.List
 import qualified Data.Maybe
@@ -278,6 +280,7 @@ main = do
     , interpCafTests
     , interpMachineTests
     , interpEffectTests
+    , oneShotOracleTests
     , interpEntryTests
     , interpWholeProgramTests
     , elaborateBasicTests
@@ -5542,12 +5545,24 @@ interpEffectTests = testGroup "InterpEffect"
             pure (Anf.Handle comp hdlr)
       in assertEval Map.empty e (T.pack "7")
 
-  , testCase "multi-shot: resume invoked twice, results summed" $
+  , testCase "multi-shot: resume invoked twice, results summed" $ do
       -- handle ( let b = Flip.flip () in case b of { 0 -> ret 10 ; _ -> ret 20 } ) of
       --   Flip.flip(p, resume) ->
       --       let r0 = resume 0 in let r1 = resume 1 in let s = r0 + r1 in ret s
       --   return v -> v
       -- resume 0 -> downstream picks 10 ; resume 1 -> downstream picks 20 ; sum 30.
+      --
+      -- MODE-DEPENDENT expectation (one-shot spec section 9). This hand-built
+      -- IR bypasses the frontend's static one-shot law, so it is the machine's
+      -- multi-shot capability characterization AND the runtime oracle's
+      -- end-to-end negative control, in one fixture:
+      --   * default (oracle off): the machine's free multi-shot semantics run
+      --     both resumes -> 30;
+      --   * under WOK_DEBUG_ONESHOT=1 (scripts/oneshot-oracle.sh runs the
+      --     whole suite this way): the second resume of the SAME captured
+      --     continuation must abort with OneShotViolation -- this mutation-
+      --     confirms the oracle through the full dispatchOp/enter path.
+      oracleOn <- (== Just "1") <$> lookupEnv "WOK_DEBUG_ONESHOT"
       let e = runFresh $ do
             b <- freshName (T.pack "b"); p <- freshName (T.pack "p")
             resume <- freshName (T.pack "resume")
@@ -5567,7 +5582,12 @@ interpEffectTests = testGroup "InterpEffect"
                         [Anf.Binder p Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])] (Anf.Binder resume Anf.Unrestricted (Ty.CTCon Ty.TcUnit [])) armBody
                 hdlr = Anf.Handler (Anf.Binder v Anf.Unrestricted (Ty.CTCon Ty.TcUnit []), Anf.Ret (Anf.AVar v)) [arm] Nothing Nothing Nothing
             pure (Anf.Handle comp hdlr)
-      in assertEval Map.empty e (T.pack "30")
+      if oracleOn
+        then case IM.evalExprWith Map.empty e of
+          Left IV.OneShotViolation -> pure ()
+          other -> assertFailure
+            ("oracle on: second resume must abort OneShotViolation, got " <> show other)
+        else assertEval Map.empty e (T.pack "30")
 
   , testCase "deep handler: handler is re-installed so a SECOND op is still handled" $
       -- handle ( let x = E.op () in let y = E.op () in let s = x + y in ret s ) of
@@ -5658,6 +5678,45 @@ interpEffectTests = testGroup "InterpEffect"
       case IM.evalExprWith env e of
         Right v -> IV.renderValue v @?= expected
         Left err -> assertFailure ("eval failed: " <> show err)
+
+-- ---------------------------------------------------------------------------
+-- oneShotOracleTests
+
+-- | Phase D (one-shot spec section 9): unit tests of the runtime one-shot
+-- oracle at the 'IM.enter' apply site, with hand-made flags so they hold in
+-- BOTH suite modes (default and the scripts/oneshot-oracle.sh run). Laziness
+-- caveat: each application must be a syntactically distinct 'IM.enter' call
+-- forced in order -- naming one 'Either' and casing on it twice would memoize
+-- the first application's result and never re-run the flag check.
+oneShotOracleTests :: TestTree
+oneShotOracleTests = testGroup "one-shot runtime oracle"
+  [ testCase "flagged VCont: first apply ok, second aborts OneShotViolation" $ do
+      fl <- Just <$> newIORef False
+      let v = IV.VCont fl id
+      assertApplyOk (IM.enter IP.primTable 0 v [IV.VLit (Anf.LInt 1)] IV.KDone)
+      case IM.enter IP.primTable 0 v [IV.VLit (Anf.LInt 2)] IV.KDone of
+        Left IV.OneShotViolation -> pure ()
+        other -> assertFailure ("second apply must abort: " <> showEither other)
+
+  , testCase "flagged VContP: first apply ok, second aborts OneShotViolation" $ do
+      fl <- Just <$> newIORef False
+      let v = IV.VContP fl (\_ k -> k)
+      assertApplyOk (IM.enter IP.primTable 0 v [IV.VLit (Anf.LInt 1), IV.VLit (Anf.LInt 2)] IV.KDone)
+      case IM.enter IP.primTable 0 v [IV.VLit (Anf.LInt 3), IV.VLit (Anf.LInt 4)] IV.KDone of
+        Left IV.OneShotViolation -> pure ()
+        other -> assertFailure ("second apply must abort: " <> showEither other)
+
+  , testCase "flag-less VCont: multi-shot capability preserved (oracle off is free)" $ do
+      let v = IV.VCont Nothing id
+      assertApplyOk (IM.enter IP.primTable 0 v [IV.VLit (Anf.LInt 1)] IV.KDone)
+      assertApplyOk (IM.enter IP.primTable 0 v [IV.VLit (Anf.LInt 2)] IV.KDone)
+  ]
+  where
+    assertApplyOk r = case r of
+      Right _  -> pure ()
+      Left err -> assertFailure ("apply must succeed: " <> show err)
+    showEither (Left err) = "Left " <> show err
+    showEither (Right _)  = "Right <config>"
 
 -- ---------------------------------------------------------------------------
 -- interpEntryTests
@@ -13314,6 +13373,7 @@ errCtorTag e = case e of
   IV.PrimError{}         -> T.pack "PrimError"
   IV.ArityError{}        -> T.pack "ArityError"
   IV.UnsupportedCaf{}    -> T.pack "UnsupportedCaf"
+  IV.OneShotViolation{}  -> T.pack "OneShotViolation"
 
 -- ---------------------------------------------------------------------------
 -- Suite A: differential run over the no-handler / first-order corpus (Task 8)

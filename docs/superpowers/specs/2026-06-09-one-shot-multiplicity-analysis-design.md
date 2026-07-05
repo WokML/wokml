@@ -274,9 +274,21 @@ multi-shot is the same immutability that keeps the interpreter simple. So:
   on a second resume) as a runtime **oracle** that crashes on any multi-shot the static law
   missed. Cheap differential cross-check on the analysis's soundness; gated behind a debug/test
   flag so production runs keep the free multi-shot capability.
-  *(Status check 2026-07-05: still NOT implemented — no single-use guard exists in
-  `src/Wok/Interp/`. Tracked as Phase D of
-  `docs/superpowers/2026-07-05-effect-safety-holes-fix-plan.md`.)*
+  *(Status 2026-07-06: SHIPPED as Phase D of
+  `docs/superpowers/2026-07-05-effect-safety-holes-fix-plan.md`. `VCont`/`VContP` carry a
+  per-capture used-flag (`OneShotFlag`, minted in `dispatchOp`, asserted in `enter` →
+  `OneShotViolation`), gated by `WOK_DEBUG_ONESHOT=1` read once per process — default off, so
+  production keeps the free multi-shot capability above. `scripts/oneshot-oracle.sh` re-runs
+  the FULL suite under the flag as the differential check. First-run verdict: the law-ADMITTED
+  corpus is violation-free; exactly the six run-golden `*multishot*` fixtures abort — they are
+  law-REJECTED programs the run-golden harness runs through the UNCHECKED elaborator precisely
+  to pin the free multi-shot capability above (the masking this section warned about, made
+  visible). The script asserts set-equality on those six as end-to-end negative controls, and
+  the hand-built-IR machine test "multi-shot: resume invoked twice" self-adapts to expect
+  `OneShotViolation` under the flag — genuine multi-shot arms with the frontend check bypassed
+  must abort, satisfying the repo's mutation-confirmation convention. The RC machine needs no
+  oracle: its `moveOutCont` already frees the `NCont` shell at first resume, so a second
+  resume faults structurally.)*
 
 ## 10. Corpus findings (empirical, on the live repo)
 
