@@ -226,6 +226,9 @@ main = do
     , sourceOriginTests
     , preludeTests
     , modPathTests
+    , importParseTests
+    , qualifiedAccessTests
+    , qualifiedImportPipelineTests
     , monadSmokeTests
     , unifyWalksTests
     , unifyTests
@@ -1690,6 +1693,278 @@ modPathTests = testGroup "modPath"
       let mp = Abs.MPDot (Abs.MPName (Abs.ConId ((42, 7), T.pack "Std")))
                          (Abs.ConId ((42, 11), T.pack "Base"))
       in I.modPathPos mp @?= (42, 7)
+  ]
+
+-- ---------------------------------------------------------------------
+-- Parser-level tests for the qualified-imports-minimal surface syntax.
+-- Phase A: verify the Alex/Happy output parses the three new import forms
+-- (plain, list, alias) and REJECTS the as+list combination at the grammar
+-- level (Q1: structural impossibility). The ImportMod field is ignored by
+-- the loader at this phase; these tests pin the AST shape so later phases
+-- can rely on it.
+-- ---------------------------------------------------------------------
+
+-- | Extract the first DImport's (ModPath, ImportMod) from a decl list.
+importDeclOf :: [Decl] -> Maybe (ModPath, ImportMod)
+importDeclOf [] = Nothing
+importDeclOf (DImport mp im : _) = Just (mp, im)
+importDeclOf (_ : rest) = importDeclOf rest
+
+-- | Position-insensitive summary of an ImportMod, for equality testing.
+-- * IMPlain        -> "plain"
+-- * IMList [..]    -> "list:" ++ intercalate "," names
+-- * IMAs (ConId a) -> "as:"   ++ a
+importModSummary :: ImportMod -> T.Text
+importModSummary Abs.IMPlain                 = T.pack "plain"
+importModSummary (Abs.IMList names)          =
+  T.pack "list:" <> T.intercalate (T.pack ",") (map importNameText names)
+importModSummary (Abs.IMAs (Abs.ConId (_, a))) = T.pack "as:" <> a
+
+importNameText :: ImportName -> T.Text
+importNameText (Abs.INVar (Abs.VarId (_, n))) = n
+
+-- | Parse, pretty-print via Print.hs, re-parse, and assert the two
+-- printed forms agree. Mirrors the parseToBS round-trip discipline.
+roundTripParses :: T.Text -> Assertion
+roundTripParses src =
+  case parse src of
+    Left err -> assertFailure ("initial parse failed: " ++ err)
+    Right ast1 ->
+      let printed1 = Pr.printTree ast1
+      in case parse (T.pack printed1) of
+           Left err -> assertFailure
+             ("round-trip parse failed: " ++ err ++ "\n---printed---\n" ++ printed1)
+           Right ast2
+             | Pr.printTree ast2 == printed1 -> pure ()
+             | otherwise -> assertFailure
+                 ("round-trip mismatch\n---first---\n" ++ printed1
+                  ++ "\n---second---\n" ++ Pr.printTree ast2)
+
+importParseTests :: TestTree
+importParseTests = testGroup "import-parse"
+  [ testCase "import M parses to DImport with IMPlain" $
+      let src = T.pack "module Main\nimport Std.Base\n"
+      in case parse src of
+           Left err -> assertFailure ("parse failed: " ++ err)
+           Right (Module decls) -> case importDeclOf decls of
+             Just (mp, im) -> do
+               I.modPathText mp @?= T.pack "Std.Base"
+               importModSummary im @?= T.pack "plain"
+             Nothing -> assertFailure "no DImport decl found"
+
+  , testCase "import M (x, y) parses to IMList [x, y]" $
+      let src = T.pack "module Main\nimport Std.Base (map, filter)\n"
+      in case parse src of
+           Left err -> assertFailure ("parse failed: " ++ err)
+           Right (Module decls) -> case importDeclOf decls of
+             Just (mp, im) -> do
+               I.modPathText mp @?= T.pack "Std.Base"
+               importModSummary im @?= T.pack "list:map,filter"
+             Nothing -> assertFailure "no DImport decl found"
+
+  , testCase "import M () parses to IMList [] (empty list)" $
+      let src = T.pack "module Main\nimport Std.Base ()\n"
+      in case parse src of
+           Left err -> assertFailure ("parse failed: " ++ err)
+           Right (Module decls) -> case importDeclOf decls of
+             Just (mp, im) -> do
+               I.modPathText mp @?= T.pack "Std.Base"
+               importModSummary im @?= T.pack "list:"
+             Nothing -> assertFailure "no DImport decl found"
+
+  , testCase "import M as A parses to IMAs A" $
+      let src = T.pack "module Main\nimport Std.Base as Base\n"
+      in case parse src of
+           Left err -> assertFailure ("parse failed: " ++ err)
+           Right (Module decls) -> case importDeclOf decls of
+             Just (mp, im) -> do
+               I.modPathText mp @?= T.pack "Std.Base"
+               importModSummary im @?= T.pack "as:Base"
+             Nothing -> assertFailure "no DImport decl found"
+
+  , testCase "import M as A (x, y) is a PARSE ERROR (structural impossibility, Q1)" $ do
+      -- The grammar's ImportMod is a single sum nonterminal: the parser cannot
+      -- attach both a list and an alias. This must fail at parse time, not
+      -- typecheck time.
+      let src = T.pack "module Main\nimport Std.Base as Base (map, filter)\n"
+      case parse src of
+        Left _  -> pure ()  -- expected: parse fails
+        Right _ -> assertFailure
+          "expected parse failure for `import M as A (x, y)` (Q1: structural impossibility)"
+
+  , testCase "import round-trips through Print.hs (plain)" $
+      roundTripParses (T.pack "module Main\nimport Std.Base\n")
+
+  , testCase "import round-trips through Print.hs (list)" $
+      roundTripParses (T.pack "module Main\nimport Std.Base (map, filter)\n")
+
+  , testCase "import round-trips through Print.hs (alias)" $
+      roundTripParses (T.pack "module Main\nimport Std.Base as Base\n")
+
+  , testCase "import round-trips through Print.hs (empty list)" $
+      roundTripParses (T.pack "module Main\nimport Std.Base ()\n")
+  ]
+
+-- ---------------------------------------------------------------------
+-- Phase B: typechecker tests for qualified-value access, alias-only,
+-- and explicit-list filter semantics. These exercise the envQualifiers
+-- field, the pipeline's buildQualifierMap, and the Infer.hs qualifier-
+-- first arm. Each test constructs a qualifier-bearing env directly (no
+-- full pipeline) to isolate the typecheck behavior.
+-- ---------------------------------------------------------------------
+
+-- | Build an env with one registered qualifier exposing the given vars.
+-- The env is seeded from B.initialEnv (so U64, Bool, etc. are in scope).
+qualEnv :: T.Text -> T.Text -> [(T.Text, Ty.Scheme)] -> TE.Env
+qualEnv qual src vars =
+  B.initialEnv { TE.envQualifiers = Map.singleton qual (src, Map.fromList vars) }
+
+-- | Parse a module source and typecheck it against the given env.
+-- Returns the raw inferProgramWith result.
+inferWith :: TE.Env -> T.Text -> Either TErr.TypeError (TE.Env, [I.TypedDecl], [TC.Warning])
+inferWith env src =
+  case parse src of
+    Left err -> error ("parse failed in test: " ++ err)
+    Right m  -> TC.inferProgramWith env (SO.UserFile "<test>") m
+
+u64Scheme :: Ty.Scheme
+u64Scheme = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
+
+u64ToU64Scheme :: Ty.Scheme
+u64ToU64Scheme = Ty.mkScheme []
+  (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty (Ty.CTCon Ty.TcU64 []))
+
+qualifiedAccessTests :: TestTree
+qualifiedAccessTests = testGroup "qualified-access"
+  [ testCase "Foo.bar resolves when Foo is a registered qualifier" $
+      let env = qualEnv (T.pack "Foo") (T.pack "Foo")
+                  [ (T.pack "bar", u64Scheme) ]
+          src = T.pack "module Main\nf : U64\nf = Foo.bar\n"
+      in case inferWith env src of
+           Right _  -> pure ()
+           Left err -> assertFailure ("expected typecheck OK, got: " ++ show err)
+
+  , testCase "Foo.add 1 resolves as a saturated qualified call" $
+      let env = qualEnv (T.pack "Foo") (T.pack "Foo")
+                  [ (T.pack "inc", u64ToU64Scheme) ]
+          src = T.pack "module Main\nf : U64\nf = Foo.inc 1\n"
+      in case inferWith env src of
+           Right _  -> pure ()
+           Left err -> assertFailure ("expected typecheck OK, got: " ++ show err)
+
+  , testCase "Foo.bar fails when bar is not in Foo's vars" $
+      let env = qualEnv (T.pack "Foo") (T.pack "Foo") []
+          src = T.pack "module Main\nf : U64\nf = Foo.bar\n"
+      in case inferWith env src of
+           Left _  -> pure ()
+           Right _ -> assertFailure "expected UnknownVar for Foo.bar (not in Foo)"
+
+  , testCase "Foo.bar falls through when Foo is not a registered qualifier" $
+      let env = B.initialEnv  -- no qualifiers
+          src = T.pack "module Main\nf : U64\nf = Foo.bar\n"
+      in case inferWith env src of
+           Left _  -> pure ()
+           Right _ -> assertFailure "expected failure (Foo not a qualifier/effect/foreign)"
+
+  , testCase "alias-only: bare bar is NOT in scope when only F alias registered" $
+      let env = qualEnv (T.pack "F") (T.pack "Foo")
+                  [ (T.pack "bar", u64Scheme) ]
+          src = T.pack "module Main\nf : U64\nf = bar\n"
+      in case inferWith env src of
+           Left _  -> pure ()
+           Right _ -> assertFailure "expected UnknownVar for bare bar (alias-only)"
+
+  , testCase "F.bar resolves under alias" $
+      let env = qualEnv (T.pack "F") (T.pack "Foo")
+                  [ (T.pack "bar", u64Scheme) ]
+          src = T.pack "module Main\nf : U64\nf = F.bar\n"
+      in case inferWith env src of
+           Right _  -> pure ()
+           Left err -> assertFailure ("expected typecheck OK for F.bar, got: " ++ show err)
+
+  , testCase "Foo.bar fails when only F alias is registered (original name not a qualifier)" $
+      let env = qualEnv (T.pack "F") (T.pack "Foo")
+                  [ (T.pack "bar", u64Scheme) ]
+          src = T.pack "module Main\nf : U64\nf = Foo.bar\n"
+      in case inferWith env src of
+           Left _  -> pure ()
+           Right _ -> assertFailure "expected failure for Foo.bar (only F registered, not Foo)"
+
+  , testCase "qualifier wins over a same-named foreign module in application position" $
+      -- Name `M` registered as BOTH a qualifier (var `mem : U64 -> U64`) and a
+      -- foreign module (member `mem : U64 -> U64 -> U64`, arity 2). Applying
+      -- `M.mem 1` must resolve via the qualifier (one arg, U64 result). If the
+      -- EApp arm consulted the foreign table first it would see arity 2 with one
+      -- arg and reject with ForeignMemberPartialApp -- the pre-fix behavior.
+      let memInfo = TE.ForeignMemberInfo
+                      (Ty.mkScheme []
+                        (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty
+                          (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty
+                            (Ty.CTCon Ty.TcU64 []))))
+                      (T.pack "mem") False []
+          fmi = TE.ForeignModuleInfo (T.pack "c") Nothing
+                  (Map.fromList [(T.pack "mem", memInfo)])
+          env = (qualEnv (T.pack "M") (T.pack "M") [ (T.pack "mem", u64ToU64Scheme) ])
+                  { TE.envForeignModules = Map.singleton (T.pack "M") fmi }
+          src = T.pack "module Main\nf : U64\nf = M.mem 1\n"
+      in case inferWith env src of
+           Right _  -> pure ()
+           Left err -> assertFailure ("expected qualifier to win, got: " ++ show err)
+  ]
+
+-- ---------------------------------------------------------------------
+-- End-to-end pipeline tests for qualified imports. Unlike
+-- 'qualifiedAccessTests' (which builds envQualifiers directly), these run
+-- the REAL Loader -> pipeline path so they exercise 'buildQualifierMap'
+-- (single-seg plain / alias registration) and 'filterImportEnv' (the
+-- unqualified-scope filter and alias name removal), plus the import-list
+-- validation. A shared provider module `Prov` (13-qi-prov.wok) exports two
+-- vars; each entry fixture is a distinct import scenario.
+-- ---------------------------------------------------------------------
+
+-- | Load an entry fixture (with Prov as the extra module), typecheck it via
+-- the real pipeline, and hand the Either String result to the assertion.
+withQiPipeline :: FilePath -> (Either String ([TC.TypedDecl], [TC.Warning]) -> Assertion) -> Assertion
+withQiPipeline entry k = do
+  res <- Loader.loadProgram entry ["test/loader-fixtures/13-qi-prov.wok"]
+  case res of
+    Left lerr -> assertFailure ("unexpected loader error: " ++ show lerr)
+    Right (entryName, ms) -> k (Pipeline.typecheckProgram entryName ms)
+
+qualifiedImportPipelineTests :: TestTree
+qualifiedImportPipelineTests = testGroup "qualified-import-pipeline"
+  [ testCase "import M (x): listed var is bare, unlisted reachable via qualifier" $
+      withQiPipeline "test/loader-fixtures/13-qi-list-ok.wok" $ \r -> case r of
+        Right _ -> pure ()
+        Left s  -> assertFailure ("expected pipeline success, got: " ++ s)
+
+  , testCase "import M (x): unlisted var is NOT in the unqualified scope" $
+      withQiPipeline "test/loader-fixtures/13-qi-list-bare-fail.wok" $ \r -> case r of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected failure: bare `triple` is not in the import list"
+
+  , testCase "import M as A: qualified A.x resolves" $
+      withQiPipeline "test/loader-fixtures/13-qi-alias-ok.wok" $ \r -> case r of
+        Right _ -> pure ()
+        Left s  -> assertFailure ("expected pipeline success, got: " ++ s)
+
+  , testCase "import M as A: bare names are NOT in scope" $
+      withQiPipeline "test/loader-fixtures/13-qi-alias-bare-fail.wok" $ \r -> case r of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected failure: alias import puts no bare names in scope"
+
+  , testCase "import M (plain single-seg): registers M as a qualifier" $
+      withQiPipeline "test/loader-fixtures/13-qi-plain-qualifier.wok" $ \r -> case r of
+        Right _ -> pure ()
+        Left s  -> assertFailure ("expected pipeline success, got: " ++ s)
+
+  , testCase "import M (typo): unknown import-list entry is a pipeline error" $
+      withQiPipeline "test/loader-fixtures/13-qi-list-unknown.wok" $ \r -> case r of
+        Left s
+          | "import list" `Data.List.isInfixOf` s
+            && "nosuchvar" `Data.List.isInfixOf` s -> pure ()
+          | otherwise -> assertFailure ("wrong error for unknown import-list entry: " ++ s)
+        Right _ -> assertFailure "expected failure: `nosuchvar` is not exported by Prov"
   ]
 
 monadSmokeTests :: TestTree

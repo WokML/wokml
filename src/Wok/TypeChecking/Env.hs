@@ -21,6 +21,7 @@ module Wok.TypeChecking.Env
   , lookupInstances
   , classOfMethod
   , lookupForeignModule
+  , lookupQualifier
   , extendVar
   , extendCon
   , extendTyCon
@@ -157,11 +158,22 @@ data Env = Env
     -- origin (e.g. envs built directly via 'extendVar' in unit tests); in
     -- that case 'overlayEnvs' falls back to comparing 'Scheme's.
     envVarOrigin  :: Map Text Text
+  , -- | Qualified-value access: qualifier name -> (source module name,
+    -- var-name -> scheme snapshot). Built FRESHLY per module by the
+    -- pipeline from that module's own 'import' declarations (non-
+    -- transitive: 'overlayEnvs' does NOT merge this field -- qualifiers
+    -- don't propagate through diamond merges). A bare 'import Foo'
+    -- (single-segment) registers Foo; 'import M as A' registers A;
+    -- 'import Std.Base' (multi-seg plain) registers nothing (single-seg
+    -- qualifier only). The typechecker consults this map at the
+    -- 'EProj (ECon q) label' arm before falling through to effect /
+    -- foreign-module / record projection.
+    envQualifiers :: Map Text (Text, Map Text Scheme)
   }
   deriving (Eq, Show)
 
 emptyEnv :: Env
-emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty Map.empty [] Map.empty Map.empty
+emptyEnv = Env Map.empty Map.empty Map.empty Map.empty Map.empty Map.empty [] Map.empty Map.empty Map.empty
 
 -- | Tag for which of the Env namespaces a name lives in.
 -- Used by 'overlayEnvs' to attribute collisions.
@@ -204,8 +216,8 @@ data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect | NsClass
 -- level since we reject any actual differing overlap rather than silently
 -- picking a side.
 overlayEnvs :: Env -> Env -> Either [(EnvNs, Text)] Env
-overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 fm1 o1)
-            (Env v2 c2 tc2 rc2 ef2 cl2 ii2 fm2 o2) =
+overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 fm1 o1 q1)
+            (Env v2 c2 tc2 rc2 ef2 cl2 ii2 fm2 o2 _q2) =
   let differing m1 m2 =
         Map.keys (Map.filter id (Map.intersectionWith (/=) m1 m2))
       -- A shared var clashes when its origins are known and differ (a
@@ -234,10 +246,11 @@ overlayEnvs (Env v1 c1 tc1 rc1 ef1 cl1 ii1 fm1 o1)
                ++ [ (NsForeignModule, k) | k <- fmClash  ]
   in case clashes of
        [] -> Right (Env (Map.union v1 v2) (Map.union c1 c2) (Map.union tc1 tc2)
-                        (Map.union rc1 rc2) (Map.union ef1 ef2)
-                        (Map.union cl1 cl2) (nub (ii1 ++ ii2))
-                        (Map.union fm1 fm2)
-                        (Map.union o1 o2))
+                         (Map.union rc1 rc2) (Map.union ef1 ef2)
+                         (Map.union cl1 cl2) (nub (ii1 ++ ii2))
+                         (Map.union fm1 fm2)
+                         (Map.union o1 o2)
+                         q1)
        _  -> Left clashes
 
 lookupVar :: Text -> Env -> Maybe Scheme
@@ -294,3 +307,9 @@ lookupForeignModule k = Map.lookup k . envForeignModules
 
 extendForeignModule :: Text -> ForeignModuleInfo -> Env -> Env
 extendForeignModule k v e = e { envForeignModules = Map.insert k v (envForeignModules e) }
+
+-- | Look up a registered qualifier. Returns the source module name and the
+-- var-scheme snapshot for qualified-value resolution (e.g. @A.x@ after
+-- @import M as A@).
+lookupQualifier :: Text -> Env -> Maybe (Text, Map Text Scheme)
+lookupQualifier k = Map.lookup k . envQualifiers

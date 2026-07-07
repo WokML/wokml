@@ -186,6 +186,11 @@ prettyWarning (TC.ForgottenResume pos eff op) =
     <> ": the `" <> Tx.unpack eff <> "." <> Tx.unpack op <> "` arm binds a continuation it never uses."
     <> "\n  the computation will be aborted without resuming the continuation; use `_` to"
     <> "\n  discard intentionally, or reference the continuation to resume."
+prettyWarning (TC.QualifierShadowsExisting qual src ns) =
+  "warning: qualifier `" <> Tx.unpack qual <> "` (from `" <> Tx.unpack src
+    <> "`) shadows an existing " <> Tx.unpack ns <> " of the same name."
+    <> "\n  the qualifier takes precedence in qualified access (e.g. `" <> Tx.unpack qual
+    <> ".x`); rename the alias if this is unintended."
 
 showPos :: TC.BNFC'Position -> String
 showPos (Just (l, c)) = " at line " <> show l <> ", col " <> show c

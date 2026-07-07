@@ -330,4 +330,9 @@ data Warning
     -- ^ An operation arm binds a NAMED continuation never referenced in its
     --   body, on a RETURNING operation (result /= Never). Args: position,
     --   effect, operation. Suppress with a `_` (wildcard) binder.
+  | QualifierShadowsExisting Text Text Text
+    -- ^ An import qualifier name collides with an existing in-scope name
+    -- (effect, foreign module, or record constructor). The qualifier wins
+    -- (takes precedence in the typecheck arm); this warns the user. Args:
+    -- qualifier name, source module name, shadowed-namespace description.
   deriving (Eq, Show)

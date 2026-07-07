@@ -1,0 +1,6 @@
+module Main
+import Prov (double)
+
+-- `triple` is not in the import list, so it is NOT in the unqualified scope.
+f : U64
+f = triple 1

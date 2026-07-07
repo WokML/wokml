@@ -7,6 +7,7 @@
 module Wok.Loader
   ( ModuleName
   , LoadedModule (..)
+  , ImportSpec (..)
   , ModuleMap
   , LoaderError (..)
   , loadProgram
@@ -19,7 +20,6 @@ import Data.Bifunctor (first)
 import qualified Data.Graph as G
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text.IO as TIO
 import System.IO.Error (isDoesNotExistError)
@@ -35,11 +35,22 @@ import qualified Wok.TypeChecking.Infer as I
 type ModuleName = Text
 type ModuleMap  = Map ModuleName LoadedModule
 
+-- | One parsed `import` declaration, carrying the target module's dotted
+-- path text and the 'ImportMod' modifier (plain / list / alias). The
+-- pipeline reads 'isMod' to filter the unqualified scope and register the
+-- qualifier; the topo sort reads 'isModule' for cycle / missing-target
+-- detection (keyed on the REAL module name, never the alias).
+data ImportSpec = ImportSpec
+  { isModule :: ModuleName
+  , isMod    :: ImportMod
+  }
+  deriving (Show)
+
 data LoadedModule = LoadedModule
   { lmName     :: ModuleName
   , lmOrigin   :: Origin
   , lmAst      :: Module       -- post-parse, PRE-reorder
-  , lmImports  :: [ModuleName] -- deduped, source order
+  , lmImports  :: [ImportSpec] -- source order; NOT deduped (distinct modifiers on the same M are kept)
   , lmFixities :: FixityTable
   }
   deriving (Show)
@@ -122,16 +133,9 @@ extractModuleName :: Module -> Maybe ModuleName
 extractModuleName (Module (DModule mp : _)) = Just (I.modPathText mp)
 extractModuleName _                          = Nothing
 
-extractImports :: Module -> [ModuleName]
+extractImports :: Module -> [ImportSpec]
 extractImports (Module decls) =
-  let names = [ I.modPathText mp | DImport mp <- decls ]
-  in dedupe names
-  where
-    dedupe = go Set.empty
-    go _ [] = []
-    go seen (x : xs)
-      | Set.member x seen = go seen xs
-      | otherwise         = x : go (Set.insert x seen) xs
+  [ ImportSpec (I.modPathText mp) imod | DImport mp imod <- decls ]
 
 -- ---------------------------------------------------------------
 -- Map + topo sort
@@ -158,16 +162,17 @@ buildMap = foldl' step (Right Map.empty)
 -- module it depends on).
 topoSort :: ModuleMap -> Either LoaderError [LoadedModule]
 topoSort mm = do
-  let missing =
+  let importNames lm = map isModule (lmImports lm)
+      missing =
         [ (lmName lm, target)
         | lm <- Map.elems mm
-        , target <- lmImports lm
+        , target <- importNames lm
         , not (Map.member target mm)
         ]
   case missing of
     ((importer, target) : _) -> Left (LoadImportUnknown importer target)
     [] -> do
-      let nodes = [ (lm, lmName lm, lmImports lm) | lm <- Map.elems mm ]
+      let nodes = [ (lm, lmName lm, importNames lm) | lm <- Map.elems mm ]
           sccs  = G.stronglyConnComp nodes
       -- Look for cyclic SCCs (including a single self-imported module).
       case [cyclic | scc <- sccs, Just cyclic <- [asCycle scc]] of
@@ -184,5 +189,5 @@ topoSort mm = do
   where
     asCycle (G.CyclicSCC ms) = Just ms
     asCycle (G.AcyclicSCC lm)
-      | lmName lm `elem` lmImports lm = Just [lm]  -- self-import
+      | lmName lm `elem` map isModule (lmImports lm) = Just [lm]  -- self-import
       | otherwise = Nothing

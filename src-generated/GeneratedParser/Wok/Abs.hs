@@ -30,7 +30,7 @@ data Decl
     | DInstance InstHead [InstEntry]
     | DForeign ConId String ForeignFree [ForeignMember]
     | DModule ModPath
-    | DImport ModPath
+    | DImport ModPath ImportMod
     | DUse ModPath
     | DLocal Decl
     | DReserved ReservedKw
@@ -63,6 +63,12 @@ data Constraint = Constraint ConId [Type]
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data ModPath = MPName ConId | MPDot ModPath ConId
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ImportMod = IMPlain | IMList [ImportName] | IMAs ConId
+  deriving (C.Eq, C.Ord, C.Show, C.Read)
+
+data ImportName = INVar VarId
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data ReservedKw

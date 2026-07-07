@@ -1,0 +1,8 @@
+module Main
+import Prov (double)
+
+-- `double` is in the unqualified scope (listed); `triple` is NOT, but is
+-- reachable via the single-segment qualifier `Prov` that the plain/list
+-- import registers. Success proves both the list filter and the qualifier.
+f : U64
+f = double (Prov.triple 1)

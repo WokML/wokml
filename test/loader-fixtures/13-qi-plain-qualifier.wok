@@ -1,0 +1,7 @@
+module Main
+import Prov
+
+-- Plain single-segment import registers `Prov` as a qualifier in addition to
+-- bringing bare names into scope; `Prov.double` must resolve.
+f : U64
+f = Prov.double 1

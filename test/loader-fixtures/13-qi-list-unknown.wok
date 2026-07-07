@@ -1,0 +1,5 @@
+module Main
+import Prov (nosuchvar)
+
+f : U64
+f = 1

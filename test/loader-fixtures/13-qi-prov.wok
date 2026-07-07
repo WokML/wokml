@@ -1,0 +1,7 @@
+module Prov
+
+double : U64 -> U64
+double x = x
+
+triple : U64 -> U64
+triple x = x

@@ -161,7 +161,7 @@ instance Print GeneratedParser.Wok.Abs.Decl where
     GeneratedParser.Wok.Abs.DInstance insthead instentrys -> prPrec i 0 (concatD [doc (showString "instance"), prt 0 insthead, doc (showString "where"), doc (showString "{"), prt 0 instentrys, doc (showString "}")])
     GeneratedParser.Wok.Abs.DForeign conid str foreignfree foreignmembers -> prPrec i 0 (concatD [doc (showString "foreign"), doc (showString "module"), prt 0 conid, printString str, prt 0 foreignfree, doc (showString "where"), doc (showString "{"), prt 0 foreignmembers, doc (showString "}")])
     GeneratedParser.Wok.Abs.DModule modpath -> prPrec i 0 (concatD [doc (showString "module"), prt 0 modpath])
-    GeneratedParser.Wok.Abs.DImport modpath -> prPrec i 0 (concatD [doc (showString "import"), prt 0 modpath])
+    GeneratedParser.Wok.Abs.DImport modpath importmod -> prPrec i 0 (concatD [doc (showString "import"), prt 0 modpath, prt 0 importmod])
     GeneratedParser.Wok.Abs.DUse modpath -> prPrec i 0 (concatD [doc (showString "use"), prt 0 modpath])
     GeneratedParser.Wok.Abs.DLocal decl -> prPrec i 0 (concatD [doc (showString "local"), prt 0 decl])
     GeneratedParser.Wok.Abs.DReserved reservedkw -> prPrec i 0 (concatD [prt 0 reservedkw])
@@ -233,6 +233,21 @@ instance Print GeneratedParser.Wok.Abs.ModPath where
   prt i = \case
     GeneratedParser.Wok.Abs.MPName conid -> prPrec i 0 (concatD [prt 0 conid])
     GeneratedParser.Wok.Abs.MPDot modpath conid -> prPrec i 0 (concatD [prt 0 modpath, doc (showString "."), prt 0 conid])
+
+instance Print GeneratedParser.Wok.Abs.ImportMod where
+  prt i = \case
+    GeneratedParser.Wok.Abs.IMPlain -> prPrec i 0 (concatD [])
+    GeneratedParser.Wok.Abs.IMList importnames -> prPrec i 0 (concatD [doc (showString "("), prt 0 importnames, doc (showString ")")])
+    GeneratedParser.Wok.Abs.IMAs conid -> prPrec i 0 (concatD [doc (showString "as"), prt 0 conid])
+
+instance Print GeneratedParser.Wok.Abs.ImportName where
+  prt i = \case
+    GeneratedParser.Wok.Abs.INVar varid -> prPrec i 0 (concatD [prt 0 varid])
+
+instance Print [GeneratedParser.Wok.Abs.ImportName] where
+  prt _ [] = concatD []
+  prt _ [x] = concatD [prt 0 x]
+  prt _ (x:xs) = concatD [prt 0 x, doc (showString ","), prt 0 xs]
 
 instance Print GeneratedParser.Wok.Abs.ReservedKw where
   prt i = \case

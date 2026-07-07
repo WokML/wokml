@@ -1,0 +1,6 @@
+module Main
+import Prov as P
+
+-- Alias-only import: bare names are not in scope, `P.double` is.
+f : U64
+f = P.double 1

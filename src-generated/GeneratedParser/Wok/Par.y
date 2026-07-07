@@ -126,7 +126,7 @@ Decl
   | 'instance' InstHead 'where' '{' ListInstEntry '}' { GeneratedParser.Wok.Abs.DInstance $2 $5 }
   | 'foreign' 'module' ConId String ForeignFree 'where' '{' ListForeignMember '}' { GeneratedParser.Wok.Abs.DForeign $3 $4 $5 $8 }
   | 'module' ModPath { GeneratedParser.Wok.Abs.DModule $2 }
-  | 'import' ModPath { GeneratedParser.Wok.Abs.DImport $2 }
+  | 'import' ModPath ImportMod { GeneratedParser.Wok.Abs.DImport $2 $3 }
   | 'use' ModPath { GeneratedParser.Wok.Abs.DUse $2 }
   | 'local' Decl { GeneratedParser.Wok.Abs.DLocal $2 }
   | ReservedKw { GeneratedParser.Wok.Abs.DReserved $1 }
@@ -202,6 +202,21 @@ ModPath :: { GeneratedParser.Wok.Abs.ModPath }
 ModPath
   : ConId { GeneratedParser.Wok.Abs.MPName $1 }
   | ModPath '.' ConId { GeneratedParser.Wok.Abs.MPDot $1 $3 }
+
+ImportMod :: { GeneratedParser.Wok.Abs.ImportMod }
+ImportMod
+  : {- empty -} { GeneratedParser.Wok.Abs.IMPlain }
+  | '(' ListImportName ')' { GeneratedParser.Wok.Abs.IMList $2 }
+  | 'as' ConId { GeneratedParser.Wok.Abs.IMAs $2 }
+
+ImportName :: { GeneratedParser.Wok.Abs.ImportName }
+ImportName : VarId { GeneratedParser.Wok.Abs.INVar $1 }
+
+ListImportName :: { [GeneratedParser.Wok.Abs.ImportName] }
+ListImportName
+  : {- empty -} { [] }
+  | ImportName { (:[]) $1 }
+  | ImportName ',' ListImportName { (:) $1 $3 }
 
 ReservedKw :: { GeneratedParser.Wok.Abs.ReservedKw }
 ReservedKw
@@ -279,18 +294,18 @@ RecordFieldPat :: { GeneratedParser.Wok.Abs.RecordFieldPat }
 RecordFieldPat
   : VarId '=' Pat { GeneratedParser.Wok.Abs.RFPat $1 $3 }
 
-ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
-ListRecordFieldPat
-  : {- empty -} { [] }
-  | RecordFieldPat { (:[]) $1 }
-  | RecordFieldPat ',' ListRecordFieldPat { (:) $1 $3 }
-
 -- PATCH: left-recursive NEListRecordFieldPat to avoid shift/reduce conflict
 --        with the trailing comma before `..` in PRecordOpen. Built reversed.
 NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
 NEListRecordFieldPat
   : RecordFieldPat { [$1] }
   | NEListRecordFieldPat ',' RecordFieldPat { $3 : $1 }
+
+ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
+ListRecordFieldPat
+  : {- empty -} { [] }
+  | RecordFieldPat { (:[]) $1 }
+  | RecordFieldPat ',' ListRecordFieldPat { (:) $1 $3 }
 
 PatRowTail :: { GeneratedParser.Wok.Abs.PatRowTail }
 PatRowTail

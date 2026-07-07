@@ -43,6 +43,7 @@ import Wok.TypeChecking.Env
   , extendCon, extendEffect, extendForeignModule
   , extendRecordCon, extendTyCon, extendVar
   , lookupCon, lookupEffect, lookupForeignModule
+  , lookupQualifier
   , lookupRecordCon, lookupTyCon, lookupVar )
 import qualified Wok.FFI.Blessed as Blessed
 import Wok.TypeChecking.Error (SourceSpan, TypeError (..), Warning (..))
@@ -2140,23 +2141,32 @@ inferExprW mono (Abs.EApp f x) = do
   case strippedHead of
     Abs.EProj (Abs.ECon (Abs.ConId (_, modName))) (Abs.VarId (mpos, label)) -> do
       env <- currentEnv
-      case lookupForeignModule modName env of
-        Just fmi ->
-          case Map.lookup label (fmMembers fmi) of
-            Nothing -> throwError (ForeignModuleMemberUnknown (Just mpos) modName label)
-            Just minfo -> do
-              memberTy <- instantiate (fmiScheme minfo)
-              arity    <- arrowArity memberTy
-              let nArgs = length allArgs
-              case compare nArgs arity of
-                LT -> throwError (ForeignMemberPartialApp (Just mpos) modName label)
-                EQ -> inferForeignSaturatedCall mono modName label memberTy allArgs
-                GT ->
-                  -- Over-applied: fall through to the normal per-step logic.
-                  -- The member's return type is never a function, so the extra
-                  -- application will produce a normal unification type error.
-                  inferNormalApp mono f x
-        Nothing -> inferNormalApp mono f x
+      -- Qualified-value access wins over foreign-module member resolution, so
+      -- the `qualifier-wins` rule holds in application position exactly as it
+      -- does for a bare projection (the EProj arm checks `lookupQualifier`
+      -- first). When `modName` is a registered qualifier, skip the
+      -- foreign-module interception and fall through to normal application;
+      -- the head `modName.label` then resolves via the EProj qualifier arm.
+      case lookupQualifier modName env of
+        Just _  -> inferNormalApp mono f x
+        Nothing ->
+          case lookupForeignModule modName env of
+            Just fmi ->
+              case Map.lookup label (fmMembers fmi) of
+                Nothing -> throwError (ForeignModuleMemberUnknown (Just mpos) modName label)
+                Just minfo -> do
+                  memberTy <- instantiate (fmiScheme minfo)
+                  arity    <- arrowArity memberTy
+                  let nArgs = length allArgs
+                  case compare nArgs arity of
+                    LT -> throwError (ForeignMemberPartialApp (Just mpos) modName label)
+                    EQ -> inferForeignSaturatedCall mono modName label memberTy allArgs
+                    GT ->
+                      -- Over-applied: fall through to the normal per-step logic.
+                      -- The member's return type is never a function, so the extra
+                      -- application will produce a normal unification type error.
+                      inferNormalApp mono f x
+            Nothing -> inferNormalApp mono f x
     _ -> inferNormalApp mono f x
 inferExprW mono (Abs.EIf c a b) = do
   (cT, cNode) <- inferExprW mono c
@@ -2231,40 +2241,63 @@ inferExprW mono (Abs.EExpr head_ tails) = do
 -- 'processForeignDecls' ensures a ConId cannot be both).
 inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (pos, label))) = do
   env <- currentEnv
-  case lookupEffect ename env of
-    Just eInfo
-      | Just opScheme <- Map.lookup label (eiOps eInfo) -> do
-          -- Instantiate the effect's parameters once; reuse the same
-          -- substitution for the op's type AND the effect-row label's carried
-          -- type, so e.g. `State a`'s `get : () -> a` ties `a` to the `State a`
-          -- in the row.
-          paramSubst <- instantiateParamSubst (eiParams eInfo)
-          opTy <- freshenNeverResult (substCTypeWith paramSubst (schemeBody opScheme))
-          let labelTy = case eiParams eInfo of
-                []      -> TCon TcUnit []
-                [(i,_)] -> Map.findWithDefault (TCon TcUnit []) i paramSubst
-                ps      -> TCon (TcTuple (length ps))
-                             [ Map.findWithDefault (TCon TcUnit []) i paramSubst
-                             | (i, _) <- ps ]
-          emitEffect (Just pos) ename labelTy
-          pure (opTy, Ty.Texp opTy (Ty.TProjCon ename label))
-      | otherwise -> throwError (UnknownOperation (Just pos) ename label)
+  -- Qualified-value access: if `ename` is a registered import qualifier
+  -- (e.g. `Base` from `import Std.Base as Base`, or `Foo` from a plain
+  -- single-seg `import Foo`), resolve `label` against the source module's
+  -- var schemes. Checked FIRST so the user's explicit qualifier registration
+  -- wins over any same-named effect or foreign module (Q2: qualifier-wins,
+  -- shadow warning emitted at pipeline time).
+  case lookupQualifier ename env of
+    Just (_srcMod, varSchemes) ->
+      case Map.lookup label varSchemes of
+        Just s -> do
+          (t, cs) <- instantiateQ s
+          node <- emitQVarNode (ename <> Tx.pack "." <> label) cs
+          pure (t, Ty.Texp t node)
+        Nothing -> throwError (UnknownVar (Just pos) (ename <> Tx.pack "." <> label))
     Nothing ->
-      -- Not an effect: check the foreign-module table before falling through to
-      -- the generic projection (record-field / named-perform) path.
-      --
-      -- NOTE: a bare foreign-member projection (not the direct function of an
-      -- EApp) is REJECTED here. Foreign members are not closures; they must be
-      -- used as the direct head of a saturated call. The EApp arm above
-      -- intercepts `M.mem arg` and resolves the member type inline, bypassing
-      -- this arm. Any other use (bare reference, let-binding, passing as an
-      -- argument) reaches this arm and produces a clean typecheck error.
-      case lookupForeignModule ename env of
-        Just fmi ->
-          case Map.lookup label (fmMembers fmi) of
-            Nothing -> throwError (ForeignModuleMemberUnknown (Just pos) ename label)
-            Just _  -> throwError (ForeignMemberPartialApp (Just pos) ename label)
-        Nothing -> inferProjection mono headE pos label
+      -- Operation invocation `E.op`: when the head is a constructor naming a
+      -- declared effect and @op@ is one of its operations, this is an operation
+      -- reference, not record-field access. Its type is the operation's scheme;
+      -- it contributes the effect @E@ to the enclosing equation's ambient row.
+      -- Foreign-module member access `M.mem` resolves via the foreign-module
+      -- table when the head is a declared foreign module (checked AFTER the
+      -- effect arm so effects take priority for unambiguous names; the
+      -- ambiguity gate in 'processForeignDecls' ensures a ConId cannot be both).
+      case lookupEffect ename env of
+        Just eInfo
+          | Just opScheme <- Map.lookup label (eiOps eInfo) -> do
+              -- Instantiate the effect's parameters once; reuse the same
+              -- substitution for the op's type AND the effect-row label's carried
+              -- type, so e.g. `State a`'s `get : () -> a` ties `a` to the `State a`
+              -- in the row.
+              paramSubst <- instantiateParamSubst (eiParams eInfo)
+              opTy <- freshenNeverResult (substCTypeWith paramSubst (schemeBody opScheme))
+              let labelTy = case eiParams eInfo of
+                    []      -> TCon TcUnit []
+                    [(i,_)] -> Map.findWithDefault (TCon TcUnit []) i paramSubst
+                    ps      -> TCon (TcTuple (length ps))
+                                 [ Map.findWithDefault (TCon TcUnit []) i paramSubst
+                                 | (i, _) <- ps ]
+              emitEffect (Just pos) ename labelTy
+              pure (opTy, Ty.Texp opTy (Ty.TProjCon ename label))
+          | otherwise -> throwError (UnknownOperation (Just pos) ename label)
+        Nothing ->
+          -- Not an effect: check the foreign-module table before falling through to
+          -- the generic projection (record-field / named-perform) path.
+          --
+          -- NOTE: a bare foreign-member projection (not the direct function of an
+          -- EApp) is REJECTED here. Foreign members are not closures; they must be
+          -- used as the direct head of a saturated call. The EApp arm above
+          -- intercepts `M.mem arg` and resolves the member type inline, bypassing
+          -- this arm. Any other use (bare reference, let-binding, passing as an
+          -- argument) reaches this arm and produces a clean typecheck error.
+          case lookupForeignModule ename env of
+            Just fmi ->
+              case Map.lookup label (fmMembers fmi) of
+                Nothing -> throwError (ForeignModuleMemberUnknown (Just pos) ename label)
+                Just _  -> throwError (ForeignMemberPartialApp (Just pos) ename label)
+            Nothing -> inferProjection mono headE pos label
 inferExprW mono (Abs.EProj e (Abs.VarId (pos, label))) =
   inferProjection mono e pos label
 inferExprW _ (Abs.EProjC _ (Abs.ConId (pos, _))) =
