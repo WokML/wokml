@@ -85,7 +85,27 @@ evalExpr prims sup expr sc k = case expr of
                 <> Tx.pack (show (length ps)) <> Tx.pack " argument(s), got "
                 <> Tx.pack (show (length vs))))
         | otherwise ->
-            Right (Eval jbody jsc { scEnv = bindBinders ps vs (scEnv jsc) } jk, sup)
+            -- SELF-VISIBLE JOIN (recursive joins). Mirrors the RC machine's 'Jump'
+            -- arm exactly (spec 2026-07-21-ir-tail-representation): 'jsc' is the
+            -- scope captured at the 'LetJoin' and does NOT contain @j@ itself, so a
+            -- BACK EDGE (@jbody@ jumping to its own @j@) used to fail with
+            -- 'UnboundVar'. Re-inserting @j@ into the scope @jbody@ runs under makes
+            -- a join a recursive label.
+            --
+            -- RECONSTRUCTED INLINE, NOT STORED -- the same reason as in the RC
+            -- machine: tying the knot at the 'LetJoin' would make 'JoinPoint' hold a
+            -- scope containing itself, and a cyclic structure inside a 'Scope' is
+            -- exactly what wok's RC discipline avoids (it prevents cycles rather than
+            -- collecting them). Rebuilding the entry here keeps every stored
+            -- 'JoinPoint' acyclic.
+            --
+            -- KEPT IN LOCKSTEP WITH THE RC MACHINE ON PURPOSE: these two evaluators
+            -- are each other's differential oracle ('rcDifferentialHarness'), and a
+            -- control-flow form one accepts and the other rejects disables that
+            -- oracle for every program using it.
+            let jsc' = jsc { scEnv   = bindBinders ps vs (scEnv jsc)
+                           , scJoins = Map.insert j (JoinPoint jsc ps jbody jk) (scJoins jsc) }
+            in Right (Eval jbody jsc' jk, sup)
 
   Handle e h ->
     -- A named handler binds its self-instance binder to a VInst carrying the

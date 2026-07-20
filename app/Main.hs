@@ -9,16 +9,20 @@ import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
-import Wok.IR.Anf (prettyModuleTyped)
+import qualified Data.Map.Strict as Map
+
+import Wok.IR.Anf (CoreModule (..), TopBind (..), prettyModuleTyped)
 import Wok.IR.Multiplicity (prettyMultiplicity)
 import Wok.IR.PrimNames (onceSinkNames)
 import qualified Wok.IR.Perceus as Perceus
-import Wok.IR.Reachable (pruneToReachable)
+import Wok.IR.Reachable (firstOrderNoHandlerViolations, pruneToReachable)
+import Wok.IR.Region
+  ( Placement (..), RegionPlan (..), capturesContinuation, exprHasHandle, planRegions )
 import Wok.IR.ReusePairing (reusePairing)
 import qualified Wok.Interp as Interp
 import qualified Wok.Interp.RC.Heap as Heap
 import qualified Wok.Interp.RC.Machine as RCM
-import Wok.Interp.RC.Value (HeapBackend (..))
+import Wok.Interp.RC.Value (HeapBackend (..), Stats (..))
 import Wok.Loader (LoaderError (..), loadProgram)
 import qualified Wok.Pipeline as Pipeline
 import qualified Wok.TypeChecking as TC
@@ -28,7 +32,7 @@ import qualified Wok.TypeChecking as TC
 -- ----------------------------------------------------------------
 
 usage :: String
-usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --dump-perceus | --dump-multiplicity | --dump-rc-stats | --run]"
+usage = "usage: wok <entry.wok> [-I <file.wok>]... [--dump-anf | --dump-perceus | --dump-multiplicity | --dump-rc-stats | --dump-region | --run]"
 
 data CliMode
   = ModePrintSchemes
@@ -36,6 +40,8 @@ data CliMode
   | ModeDumpPerceus
   | ModeDumpMultiplicity
   | ModeDumpRcStats
+  | ModeDumpRegion
+  | ModeDumpKontDepth
   | ModeRun
 
 main :: IO ()
@@ -56,6 +62,8 @@ parseCli = go Nothing [] ModePrintSchemes
     go e        xs _  ("--dump-perceus" : rest) = go e xs ModeDumpPerceus rest
     go e        xs _  ("--dump-multiplicity" : rest) = go e xs ModeDumpMultiplicity rest
     go e        xs _  ("--dump-rc-stats" : rest) = go e xs ModeDumpRcStats rest
+    go e        xs _  ("--dump-region" : rest) = go e xs ModeDumpRegion rest
+    go e        xs _  ("--dump-kont-depth" : rest) = go e xs ModeDumpKontDepth rest
     go e        xs _  ("--run" : rest)      = go e xs ModeRun rest
     go Nothing  xs md (a : rest)           = go (Just a) xs md rest
     go (Just _) _  _  (a : _)             =
@@ -109,6 +117,32 @@ runApp entry extras mode = do
           case rcResult of
             Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure
             Right run -> TIO.putStr (RCM.renderRcStats run)
+      -- Report the region routing plan the RC machine would install. Mirrors
+      -- 'ModeDumpRcStats' exactly (whole-program elaboration -> prune to reachable
+      -- -> Perceus -> reuse pairing) so the reported plan is the one that actually
+      -- runs, then re-derives the two gates the machine consults so an all-'Heap'
+      -- verdict can be attributed to the gate that caused it. Pure reporting:
+      -- 'planRegions' is idempotent and heap-independent, so nothing is executed.
+      ModeDumpRegion -> case Pipeline.elaborateProgramFull entryName ms of
+        Left msg  -> hPutStrLn stderr msg >> exitFailure
+        Right cm  -> putStr (renderRegionPlan (reusePairing (Perceus.insertRC (pruneToReachable cm))))
+      -- Peak continuation depth for the run. Same pipeline as 'ModeDumpRcStats',
+      -- reported through a SEPARATE renderer: 'renderRcStats' output is compared
+      -- byte-for-byte by the Suite B goldens, so the depth line must not join it.
+      -- Measures the TRMC constant-depth property (spec 2026-07-20-trmc-design C7).
+      ModeDumpKontDepth -> case Pipeline.elaborateProgramFull entryName ms of
+        Left msg  -> hPutStrLn stderr msg >> exitFailure
+        Right cm  -> do
+          rcResult <- Control.Exception.bracket
+            Heap.wokHeapNew
+            Heap.wokHeapFree
+            -- 'True' switches on the depth diagnostic; it is off everywhere else
+            -- because sampling walks the continuation each step (see 'rceKontStat').
+            (\hp -> RCM.runModuleRCWithKontStat True (CHeap hp)
+                      (reusePairing (Perceus.insertRC (pruneToReachable cm))))
+          case rcResult of
+            Left rerr -> hPutStrLn stderr ("runtime error: " <> show rerr) >> exitFailure
+            Right run -> putStrLn ("kontPeak = " <> show (stKontPeak (RCM.rcStats run)))
       ModeRun -> case Pipeline.elaborateCheckedFull entryName ms of
         Left msg -> hPutStrLn stderr msg >> exitFailure
         Right cm -> case Interp.runModule cm of
@@ -195,3 +229,42 @@ prettyWarning (TC.QualifierShadowsExisting qual src ns) =
 showPos :: TC.BNFC'Position -> String
 showPos (Just (l, c)) = " at line " <> show l <> ", col " <> show c
 showPos Nothing       = ""
+
+-- ----------------------------------------------------------------
+-- Region plan report (--dump-region)
+-- ----------------------------------------------------------------
+
+-- | Render the region routing plan for an already-instrumented module, in a
+-- flat @key: value@ form so a sweep over a corpus can be aggregated with grep.
+--
+-- Reports the two gates the RC machine consults before installing a plan, in
+-- the order they apply, because an all-'Heap' verdict is uninformative without
+-- knowing which gate produced it:
+--
+--   1. @gate.firstOrder@  -- 'firstOrderNoHandlerViolations': every bind reachable
+--      from @main@ must be handler-free. A violation makes the machine install an
+--      EMPTY plan (Machine.hs), so every allocation takes the counted path.
+--   2. @gate.effectFence@ -- 'exprHasHandle' over the module: 'planRegions' forces
+--      all-'Heap' if ANY bind contains a handler, even one the guard admitted.
+--
+-- 'bodies.fenced' counts top-level bodies stopped by the per-body continuation
+-- fence ('capturesContinuation'), which is the third and finest-grained gate.
+renderRegionPlan :: CoreModule -> String
+renderRegionPlan cm@(CoreModule binds) = unlines $
+  [ "gate.firstOrder: " <> if null viols then "OK" else "VIOLATIONS " <> show (length viols)
+  , "gate.effectFence: " <> if fenced then "FIRED" else "OK"
+  , "bodies.total: " <> show (length binds)
+  , "bodies.fenced: " <> show (length [ () | b <- binds, capturesContinuation (tbBody b) ])
+  , "binders.total: " <> show (Map.size placements)
+  , "binders.arena: " <> show (count Arena)
+  , "binders.heap: " <> show (count Heap)
+  ]
+  ++ [ "  violation:" <> Tx.unpack v | v <- viols ]
+  where
+    viols      = firstOrderNoHandlerViolations cm
+    fenced     = any (exprHasHandle . tbBody) binds
+    -- Mirror Machine.hs: the plan is installed only when the guard admits the
+    -- module; otherwise every allocation falls through to the counted path.
+    placements | null viols = rpPlacement (planRegions cm)
+               | otherwise  = Map.empty
+    count p    = length [ () | v <- Map.elems placements, v == p ]

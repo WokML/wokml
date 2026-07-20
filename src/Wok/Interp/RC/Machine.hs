@@ -10,6 +10,7 @@ module Wok.Interp.RC.Machine
   , runModuleRCWith
   , runModuleRCUnchecked
   , runModuleRCUncheckedWith
+  , runModuleRCWithKontStat
   , RCRun (..)
   , renderRcStats
   ) where
@@ -110,6 +111,13 @@ data RCEnv = RCEnv
   , rceDeathTest   :: Bool
     -- ^ the death-test flag. 'False' in release (and the default test seam): the
     -- window-set bracket is never installed, so behaviour is exactly today's.
+  , rceKontStat    :: Bool
+    -- ^ the continuation-depth DIAGNOSTIC flag, for @--dump-kont-depth@ only.
+    -- MUST default to 'False': sampling walks the continuation on every machine
+    -- step, so leaving it on makes a deep-continuation program quadratic. The
+    -- suite has a 100_000-cell deep-list test, which took the run from 34s to
+    -- "does not finish" when this was unconditional. Nothing but the diagnostic
+    -- reads the resulting counter.
   }
 
 -- | A single small-step. Halts on a return into the empty continuation.
@@ -232,7 +240,35 @@ evalExprRC env expr sc k s = case expr of
                 <> Tx.pack (show (length ps)) <> Tx.pack " argument(s), got "
                 <> Tx.pack (show (length vs))))
         | otherwise ->
-            pure (REval jbody jsc { rscEnv = bindRCBinders ps vs (rscEnv jsc) } jk s2)
+            -- SELF-VISIBLE JOIN (recursive joins; spec 2026-07-21-ir-tail-representation).
+            -- 'jsc' is the scope captured at the 'LetJoin', which does NOT contain @j@
+            -- itself, so a BACK EDGE (@jbody@ jumping to its own @j@) used to fail with
+            -- 'UnboundVar'. We re-insert @j@ into the scope @jbody@ runs under, which
+            -- makes a join a recursive label.
+            --
+            -- RECONSTRUCTED INLINE, NOT STORED. The obvious alternative -- tying a lazy
+            -- knot at the 'LetJoin' so the stored 'RCJoin' captures a scope containing
+            -- itself -- is BOTH unavailable and undesirable here:
+            --
+            --   * unavailable: 'RCJoin's scope field is strict (repo-wide 'StrictData')
+            --     and 'rscJoins' is a 'Data.Map.Strict', whose 'insert' forces the value
+            --     to WHNF. The knot would be an immediate '<<loop>>' unless the field
+            --     were made lazy with '~'.
+            --   * undesirable: it would put a CYCLIC Haskell structure inside 'RCScope',
+            --     and an 'RCScope' is reachable from a COUNTED cell ('NCont prefix
+            --     (h, hTag, hsc)' allocated by 'rcDispatchOp'). That is safe today only
+            --     because 'cascadeChildren' matches '(NCont prefix _)' and discards the
+            --     scope -- an incidental margin resting on one wildcard. Rebuilding the
+            --     entry inline keeps every stored 'RCJoin' acyclic, so no drop path can
+            --     ever meet a cycle regardless of what it later chooses to walk.
+            --
+            -- This mirrors the M2a-2 'LetRec' treatment exactly (a sibling call
+            -- reconstructs the sibling handles inline at entry rather than storing a
+            -- self-reference), and for the same reason: wok's RC prevents cycles, it
+            -- does not collect them.
+            let jsc' = jsc { rscEnv   = bindRCBinders ps vs (rscEnv jsc)
+                           , rscJoins = Map.insert j (RCJoin jsc ps jbody jk) (rscJoins jsc) }
+            in pure (REval jbody jsc' jk s2)
 
   LetRec defs body ->
     -- SHARED-ENV + CODE-POINTER representation (M2a-2 Task 3). A local group of
@@ -379,7 +415,7 @@ evalRhsRC env b rhs body sc k s = case rhs of
     -- string-literal argument allocates a fresh counted cell. The call HEAD @f@ is
     -- resolved separately in 'callFn' (a borrow, never allocated here).
     (vs, s1) <- resolveRCAtomsAlloc sc as s
-    callFn env sc f vs (KLetRC b body sc k) s1
+    callFn env sc f vs (callKont env b body sc k) s1
 
   -- An effect OPERATION (M2b-1 Task 4): the RC analogue of the reference
   -- 'Wok.Interp.Machine' 'ROp' arm. Resolve the args and the optional named-
@@ -1383,6 +1419,46 @@ bodyLendsBorrow = go
 -- flag is on AND (the planner routed it 'Window' OR the test forced it via
 -- 'rceForceWindow'). With the flag off this is always 'False' (no registration, no
 -- bracket), so the release behaviour is byte-identical to the counted-only path.
+-- | The continuation a CALL runs under: the ordinary 'KLetRC' frame, or --- when
+-- the call is in TAIL POSITION --- the caller's own continuation, unchanged.
+--
+-- TAIL-CALL CONTRACTION (spec 2026-07-20-trmc-design D0b). ANF names every
+-- intermediate, so a source-level tail call arrives here as
+--
+-- >  let t = f(args)
+-- >  t                       -- i.e. Let t (RApp f args) (Ret (AVar t))
+--
+-- whose 'KLetRC' frame does nothing but rebind @t@ and hand the same value to @k@
+-- (see 'returnToRC's 'KLetRC' arm). Pushing it makes every tail call grow the
+-- continuation: measured, @loop n = case n of 0 -> 0 ; _ -> loop (n-1)@ reached
+-- depth N+1. Passing @k@ straight through makes tail recursion constant-depth.
+--
+-- WHY THIS IS RC-SAFE. The hazard for a reference-counted language is owing a
+-- @drop@ *after* the call returns, which a tail transfer would skip. That cannot
+-- arise here: the precondition is that the body is EXACTLY @Ret (AVar b)@, so
+-- there is no post-call code at all --- no drop, no dup, nothing. Perceus already
+-- emits the drops before the call (its "drop at last use" placement naturally
+-- hoists them above the call), and any shape where a value is still live across
+-- the call keeps that code after the 'Let' and therefore is NOT @Ret (AVar b)@.
+-- The contraction is conservative by construction: it fires only when there is
+-- provably nothing left to do.
+--
+-- WHY THE DEATH-TEST GUARD. Under 'rceDeathTest', 'KLetRC's return arm is not
+-- inert --- it registers a 'Window'-routed view in the activation's window-set.
+-- Eliding the frame would skip that registration and silently weaken the very
+-- check the flag exists to perform, so the contraction stands down whenever
+-- 'windowRouted' holds. Off the flag (every production path) this is never taken.
+callKont :: RCEnv -> Binder -> Expr -> RCScope -> RCKont -> RCKont
+callKont env b body sc k
+  | isTailReturn b body, not (windowRouted env b) = k
+  | otherwise                                     = KLetRC b body sc k
+
+-- | Is this let-body exactly @Ret b@ for THIS binder --- i.e. does the 'Let' bind a
+-- value only to hand it straight back? Sole precondition of 'callKont'.
+isTailReturn :: Binder -> Expr -> Bool
+isTailReturn b (Ret (AVar n)) = nameUniq n == binderUnique b
+isTailReturn _ _              = False
+
 windowRouted :: RCEnv -> Binder -> Bool
 windowRouted env b =
   rceDeathTest env
@@ -1432,10 +1508,36 @@ runRC :: RCEnv -> RCConfig -> RC (RCValue, Store)
 runRC env = loop
   where
     loop cfg = do
-      st <- stepRC env cfg
+      st <- stepRC env (if rceKontStat env then sampleKontPeak cfg else cfg)
       case st of
         RDone v s -> pure (v, s)
         RMore c   -> loop c
+
+-- | Fold the configuration's continuation depth into the store's high-water mark
+-- ('stKontPeak'). Sampled once per machine step by 'runRC'.
+--
+-- DIAGNOSTIC ONLY. Nothing in the evaluator reads 'stKontPeak' and it is not part
+-- of 'renderRcStats', so this cannot change program behaviour or golden output.
+-- It exists so the TRMC constant-depth property is measured rather than asserted
+-- (spec 2026-07-20-trmc-design C7): a regression that reintroduces depth growth
+-- would otherwise be silent, and depth is that spec's entire point.
+--
+-- COST: 'kontDepth' walks the continuation, so sampling every step is O(depth)
+-- per step. That is acceptable for a diagnostic over the small corpora it is used
+-- on, and is the reason it is not threaded incrementally through every frame
+-- push/pop -- doing so would touch every transition for a number nothing depends
+-- on.
+sampleKontPeak :: RCConfig -> RCConfig
+sampleKontPeak cfg = case cfg of
+  REval e sc k s   -> REval e sc k (bump k s)
+  RReturn v k s    -> RReturn v k (bump k s)
+  where
+    bump k s =
+      let g = stStats s
+          d = kontDepth k
+      in if d > stKontPeak g
+           then s { stStats = g { stKontPeak = d } }
+           else s
 
 -- | Test seam: evaluate an Expr in a given environment over a starting store,
 -- returning the result value and the final store. The starting store is
@@ -1450,7 +1552,7 @@ runRC env = loop
 -- body.
 runExprRC :: RCPrimTable -> REnv -> Store -> Expr -> IO (Either RuntimeError (RCValue, Store))
 runExprRC prims env s e =
-  let renv = RCEnv prims Map.empty Map.empty Set.empty False
+  let renv = RCEnv prims Map.empty Map.empty Set.empty False False
   in runExceptT (runRC renv (REval e (RCScope env Map.empty) KDoneRC s))
 
 -- | Death-test test seam (String Slice E4 Task 5): evaluate an Expr like
@@ -1464,7 +1566,7 @@ runExprRCDeathTest
   :: RCPrimTable -> Map Unique SliceRep -> Set Unique -> REnv -> Store -> Expr
   -> IO (Either RuntimeError (RCValue, Store))
 runExprRCDeathTest prims sliceReps forceWindow env s e =
-  let renv = RCEnv prims Map.empty sliceReps forceWindow True
+  let renv = RCEnv prims Map.empty sliceReps forceWindow True False
   in runExceptT $ do
        cfg <- enterBodyRC renv e (RCScope env Map.empty) KDoneRC s
        runRC renv cfg
@@ -1535,7 +1637,14 @@ runModuleRC = runModuleRCWith AbstractHeap
 -- C runtime context. The caller owns the C heap's lifetime (create it with
 -- 'Wok.Interp.RC.Heap.wokHeapNew' before, free it with @wokHeapFree@ after).
 runModuleRCWith :: HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
-runModuleRCWith backend cm =
+runModuleRCWith = runModuleRCWithKontStat False
+
+-- | 'runModuleRCWith' with the continuation-depth diagnostic ('rceKontStat')
+-- switchable. Only @--dump-kont-depth@ passes 'True'; see 'rceKontStat' for why
+-- it must not be on by default.
+runModuleRCWithKontStat
+  :: Bool -> HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
+runModuleRCWithKontStat kontStat backend cm =
   -- 0. Boundary guard. The RC interpreter supports the handler-free fragment
   --    (closures/'RLam' are admitted as of M1.5; 'Handle'/'ROp' effect features
   --    remain out of scope, as does a standalone closure capturing a 'LetRec'
@@ -1545,7 +1654,7 @@ runModuleRCWith backend cm =
   --    pre-filter the corpus on the same predicate, so this is a no-op for
   --    in-scope programs.)
   case firstOrderNoHandlerViolations cm of
-    [] -> runModuleRCUncheckedWith backend cm
+    [] -> runModuleRCUncheckedWithKontStat kontStat backend cm
     violations ->
       pure (Left (PrimError
         (Tx.pack
@@ -1568,7 +1677,12 @@ runModuleRCUnchecked = runModuleRCUncheckedWith AbstractHeap
 -- | 'runModuleRCUnchecked' parameterized by the heap backend (see
 -- 'runModuleRCWith'). 'runModuleRCUnchecked' is the 'AbstractHeap' specialization.
 runModuleRCUncheckedWith :: HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
-runModuleRCUncheckedWith backend cm@(CoreModule binds) = runExceptT $ do
+runModuleRCUncheckedWith = runModuleRCUncheckedWithKontStat False
+
+-- | 'runModuleRCUncheckedWith' with the depth diagnostic switchable.
+runModuleRCUncheckedWithKontStat
+  :: Bool -> HeapBackend -> CoreModule -> IO (Either RuntimeError RCRun)
+runModuleRCUncheckedWithKontStat kontStat backend cm@(CoreModule binds) = runExceptT $ do
   -- 0. REGION ROUTING PLAN (Region Slice R1, spec §4.1-§4.2). The plan tags each
   --    allocation 'Arena' | 'Heap' and is the single artifact the alloc sites and
   --    the body bracket read. The plan is only INSTALLED when the boundary guard
@@ -1587,7 +1701,7 @@ runModuleRCUncheckedWith backend cm@(CoreModule binds) = runExceptT $ do
       -- (no window-set bracket installed), and the behaviour is the counted-only
       -- path (spec D2), byte-identical to before. The slice-rep map is threaded in
       -- (consistent with the plan) but only the flag-on test seam ever reads it.
-      renv = RCEnv rcPrimTable plan Map.empty Set.empty False
+      renv = RCEnv rcPrimTable plan Map.empty Set.empty False kontStat
   -- 1. Reserve a static address for every top-level bind, building the knotted
   --    static env (every global maps to its handle before any body runs) and a
   --    store pre-loaded with placeholder static cells. The store carries the

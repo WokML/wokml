@@ -30,6 +30,10 @@ module Wok.IR.Region
   , RegionPlan (..)
   , planRegions
   , sliceRep
+    -- * Fence predicates (exported for the @--dump-region@ diagnostic, which
+    -- attributes an all-'Heap' verdict to the fence that caused it).
+  , exprHasHandle
+  , capturesContinuation
   ) where
 
 import Data.Map.Strict (Map)

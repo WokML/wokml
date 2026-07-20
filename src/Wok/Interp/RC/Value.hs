@@ -910,6 +910,14 @@ data Stats = Stats
                          --   even though the interpreter's own call stack never grows
                          --   (TCO). Never reset; a monotonic high-water mark for the
                          --   whole run.
+  , stKontPeak  :: Int   -- ^ high-water mark of CONTINUATION DEPTH ('kontDepth' of
+                         --   the configuration's kont), sampled once per machine
+                         --   step by the 'runRC' driver. Diagnostic only: nothing
+                         --   in the evaluator reads it, and it is deliberately NOT
+                         --   part of 'renderRcStats' (whose output is compared
+                         --   byte-for-byte by the Suite B goldens). It exists to
+                         --   make the TRMC constant-depth claim measurable rather
+                         --   than asserted (spec 2026-07-20-trmc-design C7).
   }
   deriving (Eq, Show)
 
@@ -1103,7 +1111,7 @@ emptyStore = Store
   , stNext       = 0
   , stNextStatic = -1
   , stDead       = IS.empty
-  , stStats      = Stats 0 0 0 0 0 0 0 0 0 0 0
+  , stStats      = Stats 0 0 0 0 0 0 0 0 0 0 0 0
   , stBackend    = AbstractHeap
   , stTagFwd     = Map.empty
   , stTagRev     = IM.empty
