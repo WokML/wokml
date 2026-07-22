@@ -1,0 +1,22 @@
+-- v2 FINAL surface REJECT. The S1 collapse made loud in BOTH directions. The
+-- op's argument is itself a function; under the old binder-count convention the
+-- one-binder arm silently meant the ARGUMENT reading (Section E probe e-s1 ran
+-- and printed 42).
+module Main
+import Base
+
+effect Call
+  call : (U64 -> U64) -> U64
+
+useCall : () -> U64 with Call
+useCall () = Call.call (\n -> n + 1)
+
+bad : Handler Call a a
+bad = handler Call
+  once call k -> k 41
+-- EXPECT: E-ARITY `once call` binds 1 name but needs 2 (1 argument + the continuation)
+--         hint: argument reading:      call k -> k 41
+--         hint: continuation reading:  once call f k -> k (f 41)
+
+main : U64
+main = handle bad in useCall ()

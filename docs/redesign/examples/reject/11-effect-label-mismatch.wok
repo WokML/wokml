@@ -1,0 +1,27 @@
+-- v2 FINAL surface REJECT. The D17 guardrail: a CAPITALIZED label names an
+-- effect, and binding it requires a handler of THAT effect. `double` handles
+-- Tick; binding it under the label `State` is a deceptive name. Previously
+-- this failed only at a distant resolution site -- or never, if nothing
+-- performed through it. Blame belongs at the binding.
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+effect Tick
+  tick : U64 -> U64
+
+double : Handler Tick a a
+double = handler Tick
+  tick x -> x * 2
+
+main : U64
+main =
+  handle State = double
+  0
+-- EXPECT: E-LABEL label `State` names effect State, but the installed handler
+--         handles Tick (bound 22:10)
+--         hint: bind it under a role label (`handle t = double`) or under its
+--         own effect head (`handle Tick = double`)

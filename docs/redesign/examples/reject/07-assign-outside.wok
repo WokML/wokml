@@ -1,0 +1,14 @@
+-- v2 FINAL surface REJECT. `:=` targets a `var` baton and is legal only in
+-- clause bodies of the handler that declares it (C4). wok has no mutable
+-- local variables; block sequencing does not change that.
+module Main
+import Base
+
+main : U64
+main =
+  let s = 5
+  s := 6
+  s
+-- EXPECT: E-VARSCOPE `:=` target `s` (bound 9:7) is not a `var` baton of an
+--         enclosing handler
+--         note: `:=` is handler frame state, not general mutation

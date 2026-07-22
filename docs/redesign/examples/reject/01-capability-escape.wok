@@ -1,0 +1,24 @@
+-- v2 FINAL surface REJECT. Using a capability label as an expression. Under D9
+-- labels are not terms, so this dies in name resolution -- the escape is
+-- grammatically inexpressible, not mode-checked.
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get      -> cur
+  set x    -> cur := x
+  return v -> (v, cur)
+
+main : U64
+main =
+  let x = (handle c = state 0 in c)
+  0
+-- EXPECT: E-LABEL capability label `c` (bound 20:19) used as an expression at 20:34
+--         note: labels appear only as dot receivers (`c.get`) or in
+--         `use c as ... in`; capabilities are not values

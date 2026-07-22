@@ -1,0 +1,28 @@
+-- v2 FINAL surface REJECT. Named handles bind their OWN labels; a
+-- default-label call finds no `State` label. Loud, with hints -- the old
+-- nearest-wins silent grab and the two-cells ambiguity are both gone.
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get      -> cur
+  set x    -> cur := x
+  return v -> (v, cur)
+
+needsAmbient : () -> U64 with State U64
+needsAmbient () = State.get
+
+main : ((U64, U64), U64)
+main =
+  handle a = state 1
+  handle b = state 2
+  needsAmbient ()
+-- EXPECT: E-AMBIENT no label `State` in scope for the call at 25:3
+--         hint: labels `a`, `b` : State U64 are in scope; bridge with
+--         `use a as State` or rename a handle

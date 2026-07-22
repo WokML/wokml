@@ -1,0 +1,21 @@
+-- v2 FINAL surface. Redesign of examples/coroutine.wok. The coroutine surface
+-- is PRIMITIVE (D8); under labeled rows and the final surface this file differs
+-- from current wok only in `producer () =` (unit pattern head). The
+-- convergence is the point.
+module Main
+import Base
+import Control
+
+producer : () -> U64 with Coro U64 U64
+producer () = (Coro.suspend 42) + 1
+
+main : U64
+main = case start producer of
+  Completed r   -> r
+  Suspended x g -> run g (x * 10)
+-- EXPECT OUTPUT: 421
+-- The Suspension g is second-class and affine under the ONE mode checker:
+-- consuming it twice is E-AFFINE, and storing it in USER data is E-ESCAPE.
+-- Its arrival inside `Suspended` is legal because Step is the sole
+-- language-defined carrier wrapper (D16): it propagates second-classness
+-- rather than laundering it, and `case` re-binds g into the arm.

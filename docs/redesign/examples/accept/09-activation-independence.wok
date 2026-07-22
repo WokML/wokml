@@ -1,0 +1,26 @@
+-- v2 FINAL surface. Activation independence (C12): ONE handler value
+-- installed TWICE yields two independent activations. `var cur = init` is
+-- the per-activation copy point that guarantees it -- under the rejected
+-- parameter-mutation design (rejected.md A6) this program would print
+-- (1, 1), leaking state between installs of the same value.
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get      -> cur
+  set x    -> cur := x
+  return v -> (v, cur)
+
+main : (U64, U64)
+main =
+  let h = state 0
+  let (x, s1) = (handle h in State.set 1)
+  let (y, s2) = (handle h in State.get)
+  (s1, s2)
+-- EXPECT OUTPUT: (1, 0)

@@ -1,0 +1,31 @@
+-- v2 FINAL surface (NOT compilable by current wok). Redesign of
+-- examples/state-accumulate.wok. Shows: layout effect decl, handler value with
+-- explicit answer type, labeled row (D9), block sequencing (D11).
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+-- `cur` is a TERM binder (the activation's frame slot); the `s` in the
+-- signature is a TYPE variable. Separate namespaces, alpha-convertible.
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get      -> cur
+  set x    -> cur := x
+  return v -> (v, cur)
+
+sumList : [U64] -> () with (st : State U64)
+sumList xs = case xs of
+  []      -> ()
+  y :: ys ->
+    st.set (st.get + y)
+    sumList ys
+
+main : U64
+main =
+  let (u, total) = (handle st = state 0 in sumList [3, 1, 4, 1, 5, 9, 2, 6])
+  total
+-- EXPECT OUTPUT: 31

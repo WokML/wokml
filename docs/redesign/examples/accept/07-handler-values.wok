@@ -1,0 +1,35 @@
+-- v2 FINAL surface. The C9 split: Handler values are FIRST-CLASS data --
+-- selected at runtime AND passed to functions as ordinary arguments (recipe
+-- designation). The callee installs its own fresh activation via the elided
+-- inline form (D13 two-tier): the default label is read off `h`'s type.
+module Main
+import Base
+
+effect Tick
+  tick : U64 -> U64
+
+double : Handler Tick a a
+double = handler Tick
+  tick x -> x * 2
+
+addTen : Handler Tick a a
+addTen = handler Tick
+  tick x -> x + 10
+
+pick : Bool -> Handler Tick a a
+pick loud = case loud of
+  True  -> double
+  False -> addTen
+
+useTick : () -> U64 with Tick
+useTick () = Tick.tick 16
+
+-- A handler value crossing a FUNCTION boundary: the callee installs its own
+-- fresh activation. Monomorphic answer type because useTick forces U64 (the
+-- reject/03 & reject/08 lesson: a rigid `a` here would be a type error).
+runTick : Handler Tick U64 U64 -> U64
+runTick h = handle h in useTick ()
+
+main : (U64, U64)
+main = (runTick (pick True), runTick addTen)
+-- EXPECT OUTPUT: (32, 26)

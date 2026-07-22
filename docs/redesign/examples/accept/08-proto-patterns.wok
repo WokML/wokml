@@ -1,0 +1,26 @@
+-- v2 FINAL surface. D14: patterns in op-argument positions. Multiple clauses
+-- per op dispatch on constructors and desugar to one clause + case (decision
+-- trees). Coverage of the argument type is required; each clause's k resumes
+-- at most once, and the branches join at max (V2), so the one-shot law holds.
+module Main
+import Base
+
+type Msg   = Ping U64 | Close
+type Reply = Pong U64 | Bye
+
+effect Proto
+  req : Msg -> Reply
+
+server : Handler Proto a a
+server = handler Proto
+  once req (Ping n) k -> k (Pong n)
+  once req Close    k -> k Bye
+
+client : () -> U64 with Proto
+client () = case Proto.req (Ping 41) of
+  Pong n -> n + 1
+  Bye    -> 0
+
+main : U64
+main = handle server in client ()
+-- EXPECT OUTPUT: 42

@@ -1,0 +1,21 @@
+-- v2 FINAL surface REJECT. C2's remaining blast radius after D9: capabilities
+-- are no longer terms, so class propagation guards CONSUMING CARRIERS. A
+-- closure capturing a Suspension is second-class; storing it is an escape.
+module Main
+import Base
+import Control
+
+producer : () -> U64 with Coro U64 U64
+producer () = (Coro.suspend 42) + 1
+
+main : U64
+main = case start producer of
+  Completed r   -> r
+  Suspended x g ->
+    let resumeLater = \u -> run g (x * 10)
+    let fs = [resumeLater]
+    99
+-- EXPECT: E-ESCAPE second-class value `resumeLater` (function capturing
+--         suspension `g`, bound 15:9) stored in a list at 16:9
+--         note: a function capturing a second-class value is itself
+--         second-class (C2); consume `g` directly or cancel it

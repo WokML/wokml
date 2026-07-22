@@ -1,0 +1,24 @@
+-- v2 FINAL surface REJECT. The S2 collapse made loud: shadowing a live
+-- continuation binder. Under the old surface this compiled silently as a
+-- zero-shot arm (Section E probe e-s2 printed 83; --dump-multiplicity showed 0).
+module Main
+import Base
+
+effect Tick
+  tick : U64 -> U64
+
+-- Signature is monomorphic (Handler Tick U64 U64) so the shadowed body's U64
+-- result matches the answer type: E-SHADOW must be this file's ONLY fault (D6).
+bad : Handler Tick U64 U64
+bad = handler Tick
+  once tick x k ->
+    let k = \y -> y + x
+    k (k 1)
+-- EXPECT: E-SHADOW continuation `k` (bound 14:15) shadowed at 15:9 while unconsumed
+--         hint: rename the local binding; the continuation is affine and still live
+
+useTick : () -> U64 with Tick
+useTick () = Tick.tick 41
+
+main : U64
+main = handle bad in useTick ()

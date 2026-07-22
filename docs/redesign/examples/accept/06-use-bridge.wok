@@ -1,0 +1,37 @@
+-- v2 FINAL surface. Per-call CELL DESIGNATION: `use ... as` in its inline form
+-- routes EACH call of a default-label helper to a different live cell --
+-- scope resolution is only the default, not a limitation. The inline form
+-- keeps every bridge adjacent to the call it feeds.
+-- NOTE: with a single cell the zero-ceremony spelling is
+-- `handle State = state 10` and no bridge is needed at all. The bridge is
+-- IRREDUCIBLE only at two-vocabulary boundaries: one cell that one callee
+-- knows as a role (`to`) and another as the default (`State`) -- there no
+-- initial naming avoids a rename in one direction or the other.
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get      -> cur
+  set x    -> cur := x
+  return v -> (v, cur)
+
+-- Default-label helper: knows nothing about the caller's role names.
+bumpAmbient : () -> () with State U64
+bumpAmbient () = State.set (State.get + 1)
+
+main : (U64, U64)
+main =
+  let ((u2, bFinal), aFinal) =
+        handle a = state 10
+        handle b = state 20
+        use a as State in bumpAmbient ()
+        use b as State in bumpAmbient ()
+        ()
+  (aFinal, bFinal)
+-- EXPECT OUTPUT: (11, 21)

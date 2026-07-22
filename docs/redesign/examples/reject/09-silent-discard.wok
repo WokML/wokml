@@ -1,0 +1,12 @@
+-- v2 FINAL surface REJECT. The discard law (D11): a non-final, non-unit line
+-- in a block must be explicitly discarded with `_ =`. Nothing is dropped
+-- silently -- the surface twin of the runtime counting every value.
+module Main
+import Base
+
+main : U64
+main =
+  1 + 2
+  0
+-- EXPECT: E-DISCARD value of type U64 discarded at 9:3
+--         hint: write `_ = 1 + 2` to discard explicitly, or use the value

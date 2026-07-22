@@ -1,0 +1,29 @@
+-- v2 FINAL surface REJECT. The classic V1 (sequential double resume), showing
+-- the UNIFIED renderer: same E-AFFINE template as a twice-consumed Suspension,
+-- with BOTH consumption sites named. (Today this is a positionless
+-- `multishot resume` message.)
+module Main
+import Base
+
+effect Tick
+  tick : U64 -> U64
+
+-- Signature is monomorphic (Handler Tick U64 U64) because the arm feeds k's
+-- result into arithmetic and back into k, which forces the answer type; a
+-- rigid `a` would add a second, unrelated type error. E-AFFINE must be this
+-- file's ONLY fault (D6).
+bad : Handler Tick U64 U64
+bad = handler Tick
+  once tick x k ->
+    let a = k (x + 1)
+    k (a + 1)
+-- EXPECT: E-AFFINE continuation `k` (of `tick`, bound 17:15) consumed twice:
+--         first at 18:13, again at 19:5
+--         note: branches join at max, sequences add; the one-shot law admits
+--         at most one resume per path
+
+useTick : () -> U64 with Tick
+useTick () = Tick.tick 41
+
+main : U64
+main = handle bad in useTick ()
