@@ -80,6 +80,9 @@ foreign module Libc "c"
 `extern` remains the prelude-only trust anchor for compiler holes; analyses
 trust the marker, never name strings.
 
+Declarations read FORWARD ONLY (D23): a signature must precede the equation it
+describes, per declaration block. `f = 1` then `f : U64` is an error.
+
 ## 4. Blocks and sequencing (D11)
 
 An indented block is a SEQUENCE. Statement forms:
@@ -112,7 +115,8 @@ indented block.
 - `class Ord a` ships alongside Eq (same dictionary machinery), giving
   `<  <=  >  >=` — branching on equality-plus-mod ends.
 - Function-equation `where` bindings: unchanged from current wok.
-- Literals, tuples, records with dot projection: unchanged.
+- Literals, tuples, records with dot projection: unchanged. Braces are
+  confined to records, and `{- -}` is a comment the grammar never sees (D22).
 - Dot resolution (spec 1.5): qualifier/label collision is E-LABEL; otherwise
   qualifier > row label > projection.
 
@@ -204,6 +208,7 @@ main =
 | `with` (4 meanings) | `with` = rows only | D1; `handler`/`handle`/`use` carry the rest |
 | equality-only branching | `Ord` + comparison operators | classes already exist; same dictionary road |
 | silent value drops possible | `_ = e` required (E-DISCARD) | nothing dropped silently, surface twin of Perceus |
+| `;` as an item separator | layout only | D22; a block's items are delimited by columns and nothing else |
 
 Everything not in this table is deliberately UNCHANGED — three rounds of
 pressure testing kept converging back to the current surface (layout, case,

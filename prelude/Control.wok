@@ -1,5 +1,5 @@
-module Std.Control
-import Std.Base
+module Control
+import Base
 
 effect Reader r = { ask : r }
 reader : r -> (Reader r -> a with Reader r + eff e) -> a with eff e

@@ -1,0 +1,28 @@
+module Main
+import Base
+import Control
+
+type Cmd = Inc U64 | Snapshot | Boom
+
+tick : Cmd -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+tick cmd = case cmd of
+  Inc n ->
+    State.set (State.get + Reader.ask * n)
+    1
+  Snapshot ->
+    Writer.tell [State.get]
+    1
+  Boom -> Except.throw "machine hit a Boom"
+
+walk : [Cmd] -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
+walk cmds = case cmds of
+  [] -> 0
+  cmd :: rest -> tick cmd + walk rest
+
+main : Result ((U64, U64), [U64]) String
+main =
+  handle Except = except
+  handle Reader = reader 10
+  handle Writer = writer
+  handle State = state 0
+  walk [Inc 1, Snapshot, Inc 2, Snapshot]

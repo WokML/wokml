@@ -1,5 +1,5 @@
-module Std.Borrow
-import Std.Base
+module Borrow
+import Base
 
 -- FOREIGN BORROW (prelude-declared `extern`; FFI Slice 3 Task 1).
 --

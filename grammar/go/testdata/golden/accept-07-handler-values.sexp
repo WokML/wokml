@@ -1,0 +1,18 @@
+(module Main)
+(import Base)
+(effect Tick (params) (op tick (-> U64 U64)))
+(sig (names double) (app Handler Tick a a))
+(def double (params) (handler Tick (clause tick (args x) (infix x (* 2)))))
+(sig (names addTen) (app Handler Tick a a))
+(def addTen (params) (handler Tick (clause tick (args x) (infix x (+ 10)))))
+(sig (names pick) (-> Bool (app Handler Tick a a)))
+(def
+  pick
+  (params loud)
+  (case loud (alt (pcon True) double) (alt (pcon False) addTen)))
+(sig (names useTick) (with (-> (unit) U64) (row (slot Tick))))
+(def useTick (params (unit)) (app (dot Tick tick) 16))
+(sig (names runTick) (-> (app Handler Tick U64 U64) U64))
+(def runTick (params h) (handle-in (elided) h (app useTick (unit))))
+(sig (names main) (tuple U64 U64))
+(def main (params) (tuple (app runTick (app pick True)) (app runTick addTen)))

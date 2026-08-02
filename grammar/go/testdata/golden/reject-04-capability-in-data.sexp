@@ -1,0 +1,6 @@
+(module Main)
+(import Base)
+(effect State (params s) (op get s) (op set (-> s (unit))))
+(type Holder (params) (con Holder (app State U64)))
+(sig (names main) U64)
+(def main (params) 0)

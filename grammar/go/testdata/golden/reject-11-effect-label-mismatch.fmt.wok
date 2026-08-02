@@ -1,0 +1,18 @@
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+effect Tick
+  tick : U64 -> U64
+
+double : Handler Tick a a
+double = handler Tick
+  tick x -> x * 2
+
+main : U64
+main =
+  handle State = double
+  0

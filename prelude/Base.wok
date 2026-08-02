@@ -1,4 +1,4 @@
-module Std.Base
+module Base
 
 fixity + left
 fixity - left

@@ -1,0 +1,14 @@
+module Main
+import Base
+
+type Msg = Ping U64 | Close
+
+effect Proto
+  req : Msg -> U64
+
+partial : Handler Proto a a
+partial = handler Proto
+  once req (Ping n) k -> k n
+
+main : U64
+main = handle partial in Proto.req Close

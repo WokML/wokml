@@ -1,5 +1,5 @@
-module Std.Array
-import Std.Base
+module Array
+import Base
 
 -- Array a is a fixed-size, homogeneous array with boxed element slots.
 -- The tycon is pre-registered in the compiler's initial environment

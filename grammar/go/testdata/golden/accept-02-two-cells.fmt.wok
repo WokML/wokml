@@ -1,0 +1,25 @@
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get -> cur
+  set x -> cur := x
+  return v -> (v, cur)
+
+transfer : () -> () with (from : State U64) + (to : State U64)
+transfer () =
+  let amt = from.get
+  from.set 0
+  to.set (to.get + amt)
+
+main : (((), U64), U64)
+main =
+  handle from = state 100
+  handle to = state 5
+  transfer ()

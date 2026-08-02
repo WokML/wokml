@@ -1,0 +1,101 @@
+module Main.Tour
+import Base
+import Geometry (area, Point, (<+>)) as G
+
+type Color = Red | Green | Blue
+
+type Point = { x : U64, y : U64 }
+
+type Tree a = Leaf | Node (Tree a) a (Tree a)
+
+alias Weighted = [(U64, U64)]
+
+alias Pair a b = (a, b)
+
+extern reset : () -> ()
+
+extern type Suspension a b r (row e)
+
+class Eq a
+  (==) : a -> a -> Bool
+  (/=) : a -> a -> Bool
+  x /= y = not (x == y)
+
+instance Eq Color
+  a == b = tag a == tag b
+
+instance (Eq a) => Eq (Tree a)
+  a == b = True
+
+foreign module Libc "c"
+  strlen : lend Bytes -> U64
+  free : own Bytes -> ()
+  getenv : String -> copy String
+  puts "wok_puts" : String -> ()
+
+effect Writer w
+  tell : w -> ()
+
+(<+>) : U64 -> U64 -> U64
+(<+>) a b = a + b
+
+x `plus` y = x + y
+
+xs ++ ys = concat xs ys
+
+total : (Eq a) => [U64] -> U64
+total xs = let start = 0 in foldr (+) start xs
+
+staged : U64
+staged =
+  let n =
+      seed ()
+      bump 1
+    in n * 2
+
+peek : Suspension a b r (row e) -> a
+peek s = head s
+
+shift : [U64] -> [U64]
+shift ns = map (\n -> n - 1) ns
+
+pick : Bool -> U64 -> U64
+pick loud n =
+  if loud then n `plus` bump else -n
+  where
+    bump = 10
+
+origin : Point
+origin = Point { x = 0, y = 0 }
+
+moveX : Point -> U64 -> Point
+moveX p d = Point { ..p, x = p.x + d }
+
+nameOf : Point -> U64
+nameOf p = case p of
+  Point { x = a, .. } -> a
+
+emptyish : Point -> Bool
+emptyish p = case p of
+  Point {} -> True
+  Point { ..rest } -> False
+
+firstTwo : [U64] -> [U64]
+firstTwo xs = case xs of
+  (a :: b :: _) as whole -> whole
+  [0] -> []
+  _ -> xs
+
+logging : Handler (Writer [String]) a a with (log : Writer [String])
+logging = handler Writer
+  tell w -> log.tell w
+
+run : () -> U64 with (c : State U64) + eff e
+run () =
+  use c as State
+  _ = bumpAmbient ()
+  let doubled =
+    let n = State.get
+    n * 2
+  State.set doubled
+  State.get

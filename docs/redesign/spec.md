@@ -487,7 +487,9 @@ first-class (C9), so one value installs many times:
 
 ```
 state init = handler State
-  get -> init ; set x -> init := x ; return v -> (v, init)
+  get      -> init
+  set x    -> init := x
+  return v -> (v, init)
 main =
   let h = state 0
   let (x, s1) = (handle h in State.set 1)
@@ -504,7 +506,7 @@ handlers (rejected.md A7/A8). Frame-state semantics (C4) plus the visible
 var stand; one-shot makes the slot uniquely owned (rc==1), so the backend
 compiles it to in-place update, and contified tail-resumptive handlers to a
 stack slot or register. Mutability ceremony is proportional to use:
-immutable captures need no var (`reader e = handler Reader { ask -> e }`).
+immutable captures need no var (`reader e = handler Reader ask -> e`).
 Conformance twin: examples/accept/09-activation-independence.wok pins
 (1, 0).
 </response>
@@ -679,7 +681,7 @@ Surface punctuation only, zero semantic change; requested in owner
 review.</decision>
 <decision id="D21">REPLAY SEARCH SHIPS AS A FENCED LIBRARY (resolves former
 Q1, option b). `Search.replay : (() -> a with Search) -> [a]` where
-`effect Search = { choose : [a] -> a, require : Bool -> () }` and the
+`effect Search` declares `choose : [a] -> a` and `require : Bool -> ()`, and the
 thunk's row is CLOSED over exactly Search — no polymorphic tail. The
 closed row is the static purity fence that makes replay sound by
 construction: re-running the thunk re-performs nothing but Search ops.
@@ -697,6 +699,64 @@ replay; an unfamiliar-but-plain use-case word prevents the false prior.
 Third application of the D10 finding (after `once` over `ctl`):
 familiarity is a liability precisely where it teaches the wrong
 law.</decision>
+<decision id="D23">FORWARD-ONLY DECLARATIONS: a signature must PRECEDE the
+equation it describes. `f = 1` followed by `f : U64` is an error; the reverse
+is the only legal order. The rule is per declaration BLOCK, so a `where`
+binding carries its own signature independently of the top level.
+
+Rationale, in three registers. For a READER: the type is met before the code
+it constrains, always, with no scanning back. For the FRONT END: declaration
+processing is single-pass — nothing needs a pre-scan to discover a signature
+that might appear later. For DIAGNOSTICS: a signature becomes the strongest
+resynchronisation anchor available, because `name : Type` at a block column
+is unambiguously a fresh declaration and can never be the tail of a damaged
+one. That last property is what lets error recovery collapse a misindented
+region into ONE fault instead of one per line.
+
+Empirical basis (2026-08-02): across all 642 `.wok` files in the repo, zero
+put a signature after its equation. The rule codifies universal existing
+practice and breaks nothing; the ordering freedom it removes was never used.
+
+Not adopted: requiring ADJACENCY (a signature immediately followed by its
+equation). Ordering carries the reading and single-pass benefits on its own,
+while adjacency would additionally forbid grouping a block of related
+signatures ahead of a block of definitions, which is a legitimate style with
+no trap attached. It remains available if evidence ever demands it.</decision>
+<decision id="D22">NO `;`: BLOCK ITEMS ARE DELIMITED BY COLUMNS ALONE.
+The item separator is removed from the surface. A layout block's items are
+now bounded by indentation and nothing else, so there is one layout rule
+instead of a rule plus an escape hatch. A single handler clause may still
+share its head's line (`handler Reader ask -> e`); more than one needs the
+block. The only `;` in this bundle was one C12 prose line, which was already
+non-conforming for a second reason (it used the brace handler form D12
+forbids); it is now written as a layout block. `;` is retained in the
+diagnostic table of removed lexemes, since it is legal v1 wok that a port
+will hit.
+
+RECORDS WERE MEASURED FOR REMOVAL AND KEPT. The question was whether braces
+earn their place, since records are their only job (a record type, a record
+literal or update, a record pattern) and `{- -}` is a comment the grammar
+never sees. Measured over the repo (2026-08-02): of 642 `.wok` files, 164 use
+braces, but 143 of those are v1's `effect E = { op : T }` form that D12 had
+already replaced with a layout block. Genuine record use is 12 files, ALL of
+them tests of the record feature itself — `prelude/`, `examples/` and
+`bench/` contain none, and neither do the 20 v2 conformance examples.
+
+Removal was implemented and reverted by owner decision. Recording what it
+would have bought and cost, since the measurement is the expensive part:
+removal would have deleted the third arm of 1.5's dot resolution, reducing
+C6's three-way overload (qualifier / ambient perform / projection) to two
+readings, and `..` would have become dead — its only uses are record spread
+and open record patterns. It would have cost named-field construction,
+row-polymorphic record extension, and a feature already implemented and
+tested in the v1 compiler. The half-measure — layout-based record TYPES with
+brace literals — is specifically rejected: a record LITERAL cannot be
+layout-based (`f Point x = 1` is unparseable) and parens and brackets are
+taken by tuples/grouping/row entries and lists, so that path ends at two
+spellings of one concept, the redundancy D20 refuses.
+
+Braces therefore stay, confined to records exactly as surface.md section 3
+already states.</decision>
 <decision id="D19">REJECTED-ALTERNATIVES LEDGER: rejected.md holds the
 counterfactual programs — each rejected design written in the syntax it
 would have had, exhibiting its failure. Bucket A: added ways to pass or

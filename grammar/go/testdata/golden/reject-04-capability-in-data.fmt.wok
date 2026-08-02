@@ -1,0 +1,11 @@
+module Main
+import Base
+
+effect State s
+  get : s
+  set : s -> ()
+
+type Holder = Holder (State U64)
+
+main : U64
+main = 0

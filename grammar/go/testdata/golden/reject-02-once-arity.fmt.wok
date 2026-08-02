@@ -1,0 +1,15 @@
+module Main
+import Base
+
+effect Call
+  call : (U64 -> U64) -> U64
+
+useCall : () -> U64 with Call
+useCall () = Call.call (\n -> n + 1)
+
+bad : Handler Call a a
+bad = handler Call
+  once call k -> k 41
+
+main : U64
+main = handle bad in useCall ()

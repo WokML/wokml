@@ -1,5 +1,5 @@
-module Std.Bytes
-import Std.Base
+module Bytes
+import Base
 
 -- A raw, unverified byte buffer (not necessarily valid UTF-8).
 -- The tycon is pre-registered in the compiler's initial environment
