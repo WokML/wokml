@@ -3,7 +3,7 @@
 -- Folds to the count of Some values. Uses eqU64 directly (no
 -- typeclass dict) for RC compatibility.
 module Main
-import Std.Base
+import Base
 
 data MyList = Nil | Cons (Option U64) MyList
 

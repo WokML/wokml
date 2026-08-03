@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Cross-heap cascade (Task 3): a constructor that HOLDS a closure AND a closure
 -- that CAPTURES a constructor, exercised together. Under the C backend the

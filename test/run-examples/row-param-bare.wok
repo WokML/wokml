@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Box (row e) = Box U64
 data Carry (row e) = Carry (Box e)   -- bare `e` (a KEffect param) in Box's row slot -- must be ACCEPTED

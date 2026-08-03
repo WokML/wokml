@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- toBytes on a String always produces valid UTF-8 (it is a reinterpretation of
 -- the internal UTF-8 storage).  fromBytes should therefore return Some.

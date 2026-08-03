@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 Task 4: the SHARED (copy) router branch. The Bytes is consumed AND
 -- read again (`length b`), so Perceus dups it before the consume -> the runtime

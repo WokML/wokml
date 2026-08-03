@@ -119,7 +119,7 @@ dropHint = PN.rcDropName
 -- now-empty 'NContCell' exactly once. Its RESULT is a continuation: a resume
 -- binder (added to 'ctxResume' in the 'Let' rule) whose application is a MOVE-OUT
 -- (the runtime 'moveOutCont' frees the 'NCont' shell), so NO @__rc_drop@ is placed
--- on the resume path. The elaborator routes a genuine @Std.Control.__cont_take@
+-- on the resume path. The elaborator routes a genuine @Control.__cont_take@
 -- reference to an 'APrim' carrying this @(module, name)@ key (backlog #12 §2.7),
 -- so the recognizers match the 'APrim' head by identity --- a user binding hinted
 -- @__cont_take@ resolves to an 'AVar' and is never matched. MUST match the impl

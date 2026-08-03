@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Block-form `data` decl: fields separated by newlines, no commas.
 data Shape

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Box (row e) = Box U64
 data Pair (row e) = Pair (Box (row e))

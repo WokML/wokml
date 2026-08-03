@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Regression for the FFI Slice 3 Task 4 review finding: the reference
 -- interpreter and the RC interpreter clamped `Demo.lendBuffer n` in

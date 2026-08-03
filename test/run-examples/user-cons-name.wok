@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Tri2 = Cons U64 U64 U64 | Empty2
 

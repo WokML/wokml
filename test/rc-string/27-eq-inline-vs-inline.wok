@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E3 inline-string corpus: eqString between inline strings (both <=7B).
 -- Both sides are inline, verifying that byte comparison works across

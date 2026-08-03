@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- A closure captures a boxed owned local (the list `xs`) and is called once.
 data List = Nil | Cons U64 List

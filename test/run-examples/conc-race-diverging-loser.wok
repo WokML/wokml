@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Regression: a race loser that diverges (re-enqueues itself via `yield`
 -- forever) must NOT hang the program. Root completion ends the program: as

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Value-CAF referenced from an arity>0 function (F2 regression). 'theList' is a
 -- 0-arity top-level bind whose body is a boxed value (a Cons spine); it is forced

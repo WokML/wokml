@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #7 (ESCAPING variant of #1, must STAY rejected):
 -- a LetRec group that BOTH CONSUMES (moves) an enclosing boxed capture 'b' AND

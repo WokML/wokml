@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- CASE-ON-BOOL regression (F3): `eqU64 1 1` allocates a boxed Bool (RVBox of
 -- NCon True/False) that is the scrutinee of a `case`. The RC interpreter ALWAYS

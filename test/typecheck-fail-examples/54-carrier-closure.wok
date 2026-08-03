@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Carrier rule: a closure that CAPTURES a handle and then ESCAPES (here it is
 -- returned as the result) is rejected. `\x -> count.set x` captures `count`;

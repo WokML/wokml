@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 POSITIVE guard: a LetRec group sibling 'f' used ONLY as a CALL HEAD
 -- ('f 3') is normal recursion / a normal in-place call, NOT an escape. The

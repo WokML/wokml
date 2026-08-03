@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 effect State s = { get : s, set : s -> () }
 bad : s -> (() -> a with State s + eff e) -> (a, s) with eff e
 bad i c = with State { var s = i ; get -> s ; set x k -> k () x ; v -> (v, s) } c ()

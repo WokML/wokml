@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- An escaping closure: returned from a helper, then applied by main. The capture
 -- must stay alive until the closure is dropped (ownership transfers out).

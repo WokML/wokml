@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Arena routing: the NCon Pair (two U64 scalars) is C-eligible and does NOT
 -- escape the body of 'sumPair' -- it is only matched in place as the scrutinee.

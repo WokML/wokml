@@ -98,8 +98,8 @@ buildFixityTable (Module decls) =
 -- genuine 'RedeclaredOp' (one entry per offending operator, @posA@ from the
 -- first table, @posB@ from the second) ONLY when the two entries DIFFER. Two
 -- structurally identical entries are the SAME declaration re-imported through a
--- diamond (Main imports Std.Base directly AND via Std.Control, both re-exporting
--- Std.Base's @+@): same origin => identical 'OpInfo' (including 'opPos'), so it
+-- diamond (Main imports Base directly AND via Control, both re-exporting
+-- Base's @+@): same origin => identical 'OpInfo' (including 'opPos'), so it
 -- is merged silently, mirroring how 'overlayEnvs' lets diamond re-exports merge
 -- on binding provenance. A real redeclaration sits at a DIFFERENT source
 -- position, so its 'OpInfo' differs and it still errors.

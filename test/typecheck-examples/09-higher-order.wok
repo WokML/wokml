@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 twice : (a -> a) -> a -> a
 twice f x = f (f x)

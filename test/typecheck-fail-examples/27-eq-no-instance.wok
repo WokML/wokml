@@ -1,5 +1,5 @@
 module Fail.NoInstance
-import Std.Base
+import Base
 
 data Foo = Foo U64
 

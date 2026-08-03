@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- FFI Slice 3 Task 5 (both arms of a case). `bodyLendsBorrow` sees the DispBorrow
 -- calls reachable in BOTH the scrutinee and the taken arm, so the body opens ONE

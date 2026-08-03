@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 effect IO = { read : String -> String, write : String -> () }
 

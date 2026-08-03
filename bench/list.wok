@@ -2,7 +2,7 @@
 -- list nodes and fold to its length. This is the simplest allocator
 -- workload -- no branching on content, pure Cons/Nil spine.
 module Main
-import Std.Base
+import Base
 
 data List = Nil | Cons U64 List
 

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- A single-member recursive group closing over an enclosing boxed local `b`.
 -- The group is non-escaping (it computes a U64; the member is only called),

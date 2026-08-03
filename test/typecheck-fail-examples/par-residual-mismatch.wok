@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 effect Foo = { foo : U64 -> () }
 effect Bar = { bar : U64 -> () }

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- NON-EMPTY-cap happy path: the value-position case elaborates to a merge join
 -- whose continuation `Cell h tag` captures the OUTER owned var `tag` (the join

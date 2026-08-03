@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 foreign module Libc "c" free "free" where
   owned strndup : Bytes -> U64 -> Bytes with IO
 -- Regression for the strndup heap-overread: a buffer with NO zero byte and

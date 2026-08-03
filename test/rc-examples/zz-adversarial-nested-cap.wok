@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Cell = Cell U64 [U64] [U64]
 

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- __ffi_demo_copy 6 and __ffi_demo_adopt 6 both yield bytes 0,1,2,3,4,5.
 -- Both equal fromList [0,1,2,3,4,5]. All three must compare equal.

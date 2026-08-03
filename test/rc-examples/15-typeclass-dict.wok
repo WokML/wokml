@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Typeclass / instance-dictionary baseline (Suite B, Task 9). A user class with
 -- a single method elaborates to a dictionary record constructor; the instance

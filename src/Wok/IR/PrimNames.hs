@@ -47,10 +47,10 @@ module Wok.IR.PrimNames
   , contTakeKey
   , coroSuspKey
     -- * Canonical prelude module names
-  , stdBaseModule
-  , stdControlModule
-    -- * Std.Array prim names
-  , stdArrayModule
+  , baseModule
+  , controlModule
+    -- * Array prim names
+  , arrayModule
   , arrayNewName
   , arrayFromListName
   , arrayToListName
@@ -58,8 +58,8 @@ module Wok.IR.PrimNames
   , arrayLengthName
   , arraySetName
   , arrayResizeName
-    -- * Std.String prim names
-  , stdStringModule
+    -- * String prim names
+  , stringModule
   , stringLengthName
   , stringIndexName
   , stringByteLengthName
@@ -74,8 +74,8 @@ module Wok.IR.PrimNames
   , decodeCharAtName
   , charWidthAtName
   , singletonName
-    -- * Std.Bytes prim names
-  , stdBytesModule
+    -- * Bytes prim names
+  , bytesModule
   , bytesFromListName
   , bytesToListName
   , bytesLengthName
@@ -86,8 +86,8 @@ module Wok.IR.PrimNames
     -- * FFI bytes-in Slice 1: host-blessed deterministic producers
   , ffiDemoCopyName
   , ffiDemoAdoptName
-    -- * Std.Borrow prim names (FFI Slice 3 Task 3)
-  , stdBorrowModule
+    -- * Borrow prim names (FFI Slice 3 Task 3)
+  , borrowModule
   , borrowLengthName
   , borrowByteAtName
   , borrowSliceName
@@ -134,7 +134,7 @@ contTakeName = Tx.pack "__cont_take"
 
 -- | The defining module of the genuine prelude continuation-sink @extern@s.
 contStoreModule :: Text
-contStoreModule = Tx.pack "Std.Control"
+contStoreModule = Tx.pack "Control"
 
 -- | @__coro_susp x k@: the coroutine escape sink (@start@ desugars to it). A
 -- genuine once-sink: it resumes its continuation argument at most once.
@@ -172,21 +172,21 @@ coroSuspKey = (contStoreModule, coroSuspName)
 
 -- | The defining module of the core/base prelude prims (arithmetic, comparison,
 -- @++@, @eqString@, ...).
-stdBaseModule :: Text
-stdBaseModule = Tx.pack "Std.Base"
+baseModule :: Text
+baseModule = Tx.pack "Base"
 
 -- | The defining module of the control/effect prims (coroutine and
 -- stored-continuation sinks). Same string as 'contStoreModule', which keeps the
 -- narrower once-sink trust-anchor name for the Multiplicity/Escape recognizers.
-stdControlModule :: Text
-stdControlModule = Tx.pack "Std.Control"
+controlModule :: Text
+controlModule = Tx.pack "Control"
 
 -- ---------------------------------------------------------------------------
--- Std.Array prim names
+-- Array prim names
 
 -- | The defining module of the Array prelude externs.
-stdArrayModule :: Text
-stdArrayModule = Tx.pack "Std.Array"
+arrayModule :: Text
+arrayModule = Tx.pack "Array"
 
 -- | @new k v@: allocate an array of length k filled with v (Array Slice A).
 arrayNewName :: Text
@@ -217,11 +217,11 @@ arrayResizeName :: Text
 arrayResizeName = Tx.pack "resize"
 
 -- ---------------------------------------------------------------------------
--- Std.String prim names
+-- String prim names
 
 -- | The defining module of the String prelude externs.
-stdStringModule :: Text
-stdStringModule = Tx.pack "Std.String"
+stringModule :: Text
+stringModule = Tx.pack "String"
 
 -- | @length s@: codepoint count (O(n), UTF-8 decode).
 stringLengthName :: Text
@@ -243,7 +243,7 @@ stringByteAtName = Tx.pack "byteAt"
 stringAppendName :: Text
 stringAppendName = Tx.pack "append"
 
--- | @eqString a b@: byte-equality comparison; defining module is 'Std.Base'.
+-- | @eqString a b@: byte-equality comparison; defining module is 'Base'.
 eqStringName :: Text
 eqStringName = Tx.pack "eqString"
 
@@ -284,11 +284,11 @@ singletonName :: Text
 singletonName = Tx.pack "singleton"
 
 -- ---------------------------------------------------------------------------
--- Std.Bytes prim names
+-- Bytes prim names
 
 -- | The defining module of the Bytes prelude externs.
-stdBytesModule :: Text
-stdBytesModule = Tx.pack "Std.Bytes"
+bytesModule :: Text
+bytesModule = Tx.pack "Bytes"
 
 -- | @fromList xs@: build a Bytes buffer from a list of U64 byte values.
 bytesFromListName :: Text
@@ -314,7 +314,7 @@ bytesFromBytesName = Tx.pack "fromBytes"
 bytesToBytesName :: Text
 bytesToBytesName = Tx.pack "toBytes"
 
--- | @eqBytes a b@: byte-equality comparison; defining module is 'Std.Base'.
+-- | @eqBytes a b@: byte-equality comparison; defining module is 'Base'.
 eqBytesName :: Text
 eqBytesName = Tx.pack "eqBytes"
 
@@ -334,11 +334,11 @@ ffiDemoAdoptName :: Text
 ffiDemoAdoptName = Tx.pack "__ffi_demo_adopt"
 
 -- ---------------------------------------------------------------------------
--- Std.Borrow prim names (FFI Slice 3 Task 3)
+-- Borrow prim names (FFI Slice 3 Task 3)
 
 -- | The defining module of the Borrow prelude externs.
-stdBorrowModule :: Text
-stdBorrowModule = Tx.pack "Std.Borrow"
+borrowModule :: Text
+borrowModule = Tx.pack "Borrow"
 
 -- | @length b@: the borrow's byte length, O(1).
 borrowLengthName :: Text

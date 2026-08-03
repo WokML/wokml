@@ -926,7 +926,7 @@ checkArgKinds pos name args paramKinds =
                 throwError (TyConArgKind (Just pos) name i pk (argKind a))
             | (i, a, pk) <- zip3 [0 ..] args paramKinds ]
 
--- | Flatten a dotted ModPath into its text key, e.g. Std.Base -> "Std.Base".
+-- | Flatten a dotted ModPath into its text key, e.g. Foo.Bar -> "Foo.Bar".
 -- Used by the module loader for module-name keys and by the typechecker
 -- for tycon/constructor lookup against env keys.
 modPathText :: Abs.ModPath -> Text
@@ -966,7 +966,7 @@ resolveTyCon name
   | otherwise                       = TcUser name
 
 -- | The concurrency carriers (spec §3.3) whose payload type is restricted to
--- effect-free, first-order data: 'Promise' and 'Chan' from @Std.Control@.
+-- effect-free, first-order data: 'Promise' and 'Chan' from @Control@.
 concCarrierTys :: [Text]
 concCarrierTys = [Tx.pack "Promise", Tx.pack "Chan"]
 
@@ -2242,7 +2242,7 @@ inferExprW mono (Abs.EExpr head_ tails) = do
 inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (pos, label))) = do
   env <- currentEnv
   -- Qualified-value access: if `ename` is a registered import qualifier
-  -- (e.g. `Base` from `import Std.Base as Base`, or `Foo` from a plain
+  -- (e.g. `B` from `import Foo as B`, or `Foo` from a plain
   -- single-seg `import Foo`), resolve `label` against the source module's
   -- var schemes. Checked FIRST so the user's explicit qualifier registration
   -- wins over any same-named effect or foreign module (Q2: qualifier-wins,
@@ -3895,7 +3895,7 @@ data TypedDecl = TypedDecl
 -- | Pipeline entry parameterised by the seed env and module origin.
 -- The seed env is the irreducible pre-env (from Builtins) overlaid with
 -- every imported module's exported env, as composed by the module loader.
--- Origin gates bodyless-sig warnings: silent for Embedded (Std.Base),
+-- Origin gates bodyless-sig warnings: silent for Embedded (Base),
 -- emitted for UserFile.
 inferProgramWith
   :: Env -> Origin -> Abs.Module
@@ -4003,7 +4003,7 @@ inferProgramTC seedEnv origin decls = do
                 Just ci -> Just (schemeParamTypes (conScheme ci))
                 Nothing -> Nothing
     -- A carrier PRODUCER exemption is granted ONLY to the standard prelude
-    -- (Embedded origin): @Std.Control@'s @start@/@step@ are the blessed
+    -- (Embedded origin): @Control@'s @start@/@step@ are the blessed
     -- constructors of a 'Step'. It covers TWO shapes, both origin-gated by the
     -- same boundary (the same trust boundary the Part 1 `extern` gate uses):
     --   * the clause-tail exemption: the tail of a clause body may be an
@@ -4084,7 +4084,7 @@ schemeParamTypes = go . schemeBody
 -- a CARRIER? (The @Affine@ in the name is legacy: this is fed the FULL carrier set,
 -- so it answers for any carrier — a coroutine 'Step'/'Suspension' AND the non-affine
 -- 'Borrow'.) Such a binding is a carrier PRODUCER (e.g. @start@/@step@ in
--- @Std.Control@ return a 'Step'; a 'Borrow'-returning prelude equation returns a
+-- @Control@ return a 'Step'; a 'Borrow'-returning prelude equation returns a
 -- fresh borrow), so the carrier rule permits the flat tail of its body to be an
 -- inline-produced carrier of that type (see 'checkCarriers' @resultIsCarrier@).
 -- It MUST use the full carrier set: it is the tail-position complement of
@@ -4199,7 +4199,7 @@ inferTopLetGroup origin externs localDecls = do
   -- scope, so freezing the whole tree here is safe and 'finalizeGroupTyped'
   -- never reports escape. Each binding carries its own drained constraints.
   topResults <- withEnv extendSig $ mapM (finalizeGroupTyped sigMap) unified
-  -- Emit a warning only for UserFile origin so Std.Base (Embedded) primitive
+  -- Emit a warning only for UserFile origin so Base (Embedded) primitive
   -- schemes stay silent.
   case origin of
     Embedded   -> pure ()
@@ -4250,7 +4250,7 @@ inferTopLetGroup origin externs localDecls = do
   -- `case` exprs). A group with a single variable head (e.g. `f x = case x of`)
   -- yields a one-row all-wildcard matrix -> exhaustive, no warning, which limits
   -- false positives. Warnings flow through the same channel as BodylessBinding.
-  -- Gated on UserFile origin: Embedded (Std.Base) modules are curated and must
+  -- Gated on UserFile origin: Embedded (Base) modules are curated and must
   -- not trigger coverage warnings.
   case origin of
     Embedded   -> pure ()

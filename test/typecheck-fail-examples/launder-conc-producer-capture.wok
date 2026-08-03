@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- Closed-sig leaking form pinned after conc-producer-capture was
 -- reclassified to trip the CarrierEscape check via `with eff e` on the
 -- returned thunk arrow: with the channel removed, the laundering check

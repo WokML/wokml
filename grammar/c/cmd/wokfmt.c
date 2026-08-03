@@ -68,7 +68,16 @@ static int process_text(const char *path, const char *src, usize n, Mode mode,
   // a continuation line changes the tree rather than the text, and the printer
   // says so at the moment it writes one.
   int rc = 0;
-  if (wok_print_fault_count() != 0) {
+  // INTERLOCK A0b: a node with no canonical form at all. Until this counter
+  // existed the only guard was that such a tree can reach here solely from a
+  // parse that already reported a diagnostic -- true, but by ORDERING rather
+  // than by check, so it held only as long as nobody added a second way in.
+  if (wok_print_unprintable_count() != 0) {
+    fprintf(stderr, "wok fmt: INTERNAL: %s holds a node with no canonical "
+                    "form; refusing to write\n", path);
+    rc = 2;
+  }
+  if (rc == 0 && wok_print_fault_count() != 0) {
     fprintf(stderr, "wok fmt: INTERNAL: %s was filled with an unsafe line "
                     "break; refusing to write\n", path);
     rc = 2;

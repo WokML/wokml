@@ -1,7 +1,7 @@
 module Main
-import Std.Base
-import Std.Borrow
-import Std.Control
+import Base
+import Borrow
+import Control
 
 -- FFI Slice 3 Task 6, STORED-CONTINUATION route (Q4). The honest result for this
 -- route differs from the other five: the carrier rule does NOT independently fire,

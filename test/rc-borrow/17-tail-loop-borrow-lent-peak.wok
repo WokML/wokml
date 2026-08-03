@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- FFI Slice 3 xhigh review Fix 1 characterization: a BOUNDED TAIL-recursive loop
 -- that lends one 64 KiB buffer per iteration and reads it (byteAt + memchr)

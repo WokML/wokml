@@ -54,7 +54,7 @@ mentionsAny r = any (mentionsAtom r)
 --
 -- @onceSinks@ is the set of qualified @(module, name)@ identities of the
 -- prelude's trusted once-sink @extern@ prims (the escape sinks that resume their
--- continuation argument at most once; e.g. @(Std.Control, "__coro_susp")@), the
+-- continuation argument at most once; e.g. @(Control, "__coro_susp")@), the
 -- static 'Wok.IR.PrimNames.onceSinkNames' in production. The trusted-once
 -- relaxation fires ONLY for an 'APrim' application head whose @(module, name)@ is
 -- in this set; a USER binding merely HINTED @__coro_susp@ resolves to an 'AVar'
@@ -129,7 +129,7 @@ cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
       -- @extern@ (e.g. @__coro_susp@) is One. The runtime guarantees the future
       -- created from the continuation is resumed at most once. The prelude @start@
       -- desugars to a suspend arm that hands @k@ to @__coro_susp@, so this clause is
-      -- LIVE whenever Std.Control's coro surface is used. The match is on the call
+      -- LIVE whenever Control's coro surface is used. The match is on the call
       -- head being an 'APrim' whose qualified @(module, name)@ identity is in the
       -- trusted once-sink set, NOT the hint text: a user-defined top-level
       -- @__coro_susp@ resolves to an 'AVar' (never 'APrim') and is correctly NOT

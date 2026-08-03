@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Out-of-bounds charWidthAt: exercises the offset >= byteLength guard in
 -- utf8Width. "abc" has byteLength 3; offset 9 is past the end, so both

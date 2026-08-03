@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- __borrow_demo 5 yields buf = [0,1,2,3,4]. Byte 99 is absent -> None.
 main : U64

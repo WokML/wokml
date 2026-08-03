@@ -1,18 +1,3 @@
-useEnv u =
-  let t = Env.get()
-  t
-
-main =
-  let t.1 = useEnv(())
-  t.1
-  with {
-    return v -> v
-    Env.get(resume) ->
-      let t.2 = Held(7)
-      let res = resume(t.2)
-      res
-  }
-
 id x =
   x
 
@@ -505,6 +490,21 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+useEnv u =
+  let t = Env.get()
+  t
+
+main =
+  let t.1 = useEnv(())
+  t.1
+  with {
+    return v -> v
+    Env.get(resume) ->
+      let t.2 = Held(7)
+      let res = resume(t.2)
+      res
+  }
 
 notFound =
   18446744073709551615

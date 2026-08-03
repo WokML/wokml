@@ -18,8 +18,8 @@
 -- The Suspension is second-class and affine: a compile error if consumed twice,
 -- returned from a function, put in a list, or stored in a constructor.
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Producer: suspends with 42; when resumed with v, returns v + 1.
 producer : () -> U64 with Coro U64 U64

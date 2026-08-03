@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Partial application leak (F4 regression). A top-level multi-clause function
 -- applied to FEWER arguments than its arity is a covered 'RApp' (no 'RLam'

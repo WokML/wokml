@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- DEATH TEST (FFI Slice 3 Task 6, RETURN route). The load-bearing confirmation
 -- that Task 1's carrier rule + Task 5's activation-scoped close are sound.

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- The bare `s = i` handler-state form is rejected; it must be `var s = i`.
 effect State s = { get : s, set : s -> () }

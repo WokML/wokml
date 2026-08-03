@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- SHARED-BOOL regression (F3): a boxed Bool bound to `b` is used TWICE (both
 -- operands of `&&`), so the Perceus pass must DUP it on the first use and let

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- String field as a POINTER cell (Slice E1, Task 3): a constructor with a
 -- 'String' field. A string literal now allocates a counted 'NString' cell, and

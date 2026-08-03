@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- H1 death test (2026-07-05): the rung-3 spec's F2 shape. A CAF starts a
 -- coroutine locally and resumes it, performing the producer's concrete Log
 -- residual with no handler. Pre-fix this typechecked (the 0-arg bypass; the

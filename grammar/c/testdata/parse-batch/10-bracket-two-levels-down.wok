@@ -1,0 +1,29 @@
+-- EXPECT-LINES: 24 25 27
+-- EXPECT-SOUND: 3
+-- THE LIMIT OF CONTAINMENT, recorded rather than assumed.
+--
+-- The same stray `(` as 09, but one block deeper: inside a `let` inside a case
+-- alternative. Here the bracket breaks out of the alternative before a DEDENT
+-- can act as the synchronisation point, so it costs the alternative it opened
+-- AND `1 -> 2` after it -- the case comes back with ONE alternative, an error
+-- node, where three were written.
+--
+-- The guarantee that still holds is the one worth having, and it is what this
+-- fixture is here to keep: the enclosing equation is still a declaration, and
+-- every later top-level declaration parses. `after` is damaged on its own
+-- account and `last` is sound.
+--
+-- If a future recovery slice narrows this to one alternative, this fixture is
+-- where that shows up -- as a changed expectation, deliberately, rather than
+-- as silence.
+module M
+
+pick cmd = case cmd of
+  0 ->
+    let a = 1
+    b ) c
+  1 -> 2
+
+after y := 9
+
+last = 10

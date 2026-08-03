@@ -308,7 +308,7 @@ data TypeError
 data Warning
   = BodylessBinding Text SourceSpan
     -- ^ A signature had no matching equation. Still enters the env verbatim;
-    -- only emitted for UserFile-origin modules (not Embedded / Std.Base).
+    -- only emitted for UserFile-origin modules (not Embedded / Base).
   | RowShadow SourceSpan Text CType CType
     -- ^ A row-variable instantiation introduced a label collision: the concrete
     -- part of the row already had the given label, and the substituted-in row

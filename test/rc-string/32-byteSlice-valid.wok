@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 3: byteSlice with valid boundaries (no split).
 -- s = "héllo": h(1B) + é(2B=0xC3 0xA9) + l(1B) + l(1B) + o(1B) = 6 bytes

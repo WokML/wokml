@@ -4,7 +4,7 @@
 -- per iteration. Uses eqU64 directly (no typeclass dict) for RC
 -- compatibility.
 module Main
-import Std.Base
+import Base
 
 -- Count down from n to 0; return the number of iterations where both
 -- mod-2 and mod-3 remainders are zero (i.e. multiples of 6).

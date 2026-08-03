@@ -131,7 +131,7 @@ main = do
   -- explicitly so the FBIP parity + targeted assertions reference each file by
   -- name. Fed to 'rcCBackendParity' for the output + abstract==C + balance-lint
   -- parity check.
-  -- Slice A Array corpus: programs importing Std.Array that exercise the seven
+  -- Slice A Array corpus: programs importing Array that exercise the seven
   -- ops end-to-end through both the reference interpreter and the RC interpreter.
   -- These are handler-free (no Handle/ROp), so they go into the same differential
   -- (Suite A) and heap-accounting (Suite B) groups as 'test/rc-examples'.
@@ -151,7 +151,7 @@ main = do
   -- additionally asserts the arena-specific invariants per-file.
   rcRegionFiles <- findByExtension [".wok"] "test/rc-region"
   -- String Slice E1 (Task 4): the differential-oracle corpus for the six String
-  -- ops. Programs are handler-free and string-only (no Std.Array import, to avoid
+  -- ops. Programs are handler-free and string-only (no Array import, to avoid
   -- the known length/index name conflict). Wired to the rc differential + rc stats
   -- + rcCBackendParity groups, matching the Array corpus pattern.
   rcStringFiles    <- findByExtension [".wok"] "test/rc-string"
@@ -878,7 +878,7 @@ multFailHarness path = do
 --
 -- @m3-store-once.wok@'s @Park.park@ arm hands its continuation to @__cont_store@
 -- exactly once; with the full once-sink set this is certified @1@ (no error).
--- Strip @(Std.Control, "__cont_store")@ from the once-sink keys and the SAME arm
+-- Strip @(Control, "__cont_store")@ from the once-sink keys and the SAME arm
 -- must flip to @\969@ (a 'Mult.MultishotResume' error) — proving the trust on the
 -- store route is what admits store-once, not some incidental accounting. The coro
 -- sink stays in the reduced set, so @__coro_susp@ is unaffected (the flip is
@@ -961,9 +961,9 @@ perceusLintHarness path = do
                  <> unlines (map T.unpack violations))
 
 -- | The "extended" env an ordinary user module sees: B.initialEnv with the
--- Std.Base prelude's decls layered on top. Used by unit tests that need to
+-- Base prelude's decls layered on top. Used by unit tests that need to
 -- look up names defined by the prelude (Bool, True, +, ++, ...). Loads + parses
--- + reorders + typechecks Std.Base via the same path the loader uses.
+-- + reorders + typechecks Base via the same path the loader uses.
 stdBaseExtendedEnv :: IO TE.Env
 stdBaseExtendedEnv = do
   src <- Prelude.preludeSource
@@ -1614,8 +1614,8 @@ envOverlayTests = testGroup "envOverlay"
 
   , testCase "byte-identical re-exported entries merge silently (diamond import)" $
       -- A name present in BOTH inputs with the SAME value is not a
-      -- collision: this is what lets `Main` import both `Std.Base` and a
-      -- module that re-exports `Std.Base` without every shared name
+      -- collision: this is what lets `Main` import both `Base` and a
+      -- module that re-exports `Base` without every shared name
       -- clashing.
       let s   = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           tci = TE.TyConInfo Ty.KStar 0 [] False True []
@@ -1641,10 +1641,10 @@ envOverlayTests = testGroup "envOverlay"
            Right _ -> assertFailure "expected Left (different origin)"
 
   , testCase "same name + same type + same ORIGIN merges silently (diamond re-export)" $
-      -- A re-exported Std.Base name keeps origin "Std.Base" on both sides.
+      -- A re-exported Base name keeps origin "Base" on both sides.
       let s = Ty.mkScheme [] (Ty.CTCon Ty.TcU64 [])
           mk = (TE.extendVar (T.pack "foo") s TE.emptyEnv)
-                 { TE.envVarOrigin = Map.fromList [(T.pack "foo", T.pack "Std.Base")] }
+                 { TE.envVarOrigin = Map.fromList [(T.pack "foo", T.pack "Base")] }
       in case TE.overlayEnvs mk mk of
            Right e  -> TE.lookupVar (T.pack "foo") e @?= Just s
            Left col -> assertFailure ("expected silent merge, got: " ++ show col)
@@ -1653,22 +1653,22 @@ envOverlayTests = testGroup "envOverlay"
 sourceOriginTests :: TestTree
 sourceOriginTests = testGroup "Wok.SourceOrigin"
   [ testCase "originPath Embedded is the placeholder tag" $
-      SO.originPath SO.Embedded @?= "<Std.Base>"
+      SO.originPath SO.Embedded @?= "<Base>"
   , testCase "originPath UserFile returns the path verbatim" $
       SO.originPath (SO.UserFile "foo/bar.wok") @?= "foo/bar.wok"
   ]
 
 preludeTests :: TestTree
 preludeTests = testGroup "Prelude"
-  [ testCase "preludeName is Std.Base" $
-      Prelude.preludeName @?= T.pack "Std.Base"
+  [ testCase "preludeName is Base" $
+      Prelude.preludeName @?= T.pack "Base"
   , testCase "preludeSource is non-empty" $ do
       src <- Prelude.preludeSource
       assertBool "expected non-empty preludeSource" (T.length src > 0)
   , testCase "preludeSource contains a module header" $ do
       src <- Prelude.preludeSource
-      assertBool "expected `module Std.Base` in source"
-                 (T.isInfixOf (T.pack "module Std.Base") src)
+      assertBool "expected `module Base` in source"
+                 (T.isInfixOf (T.pack "module Base") src)
   ]
 
 modPathTests :: TestTree
@@ -1678,9 +1678,9 @@ modPathTests = testGroup "modPath"
       in I.modPathText mp @?= T.pack "Foo"
 
   , testCase "modPathText on single dot" $
-      let mp = Abs.MPDot (Abs.MPName (Abs.ConId ((1, 1), T.pack "Std")))
-                         (Abs.ConId ((1, 5), T.pack "Base"))
-      in I.modPathText mp @?= T.pack "Std.Base"
+      let mp = Abs.MPDot (Abs.MPName (Abs.ConId ((1, 1), T.pack "A")))
+                         (Abs.ConId ((1, 5), T.pack "B"))
+      in I.modPathText mp @?= T.pack "A.B"
 
   , testCase "modPathText on double dot" $
       let mp = Abs.MPDot
@@ -1743,42 +1743,42 @@ roundTripParses src =
 importParseTests :: TestTree
 importParseTests = testGroup "import-parse"
   [ testCase "import M parses to DImport with IMPlain" $
-      let src = T.pack "module Main\nimport Std.Base\n"
+      let src = T.pack "module Main\nimport Base\n"
       in case parse src of
            Left err -> assertFailure ("parse failed: " ++ err)
            Right (Module decls) -> case importDeclOf decls of
              Just (mp, im) -> do
-               I.modPathText mp @?= T.pack "Std.Base"
+               I.modPathText mp @?= T.pack "Base"
                importModSummary im @?= T.pack "plain"
              Nothing -> assertFailure "no DImport decl found"
 
   , testCase "import M (x, y) parses to IMList [x, y]" $
-      let src = T.pack "module Main\nimport Std.Base (map, filter)\n"
+      let src = T.pack "module Main\nimport Base (map, filter)\n"
       in case parse src of
            Left err -> assertFailure ("parse failed: " ++ err)
            Right (Module decls) -> case importDeclOf decls of
              Just (mp, im) -> do
-               I.modPathText mp @?= T.pack "Std.Base"
+               I.modPathText mp @?= T.pack "Base"
                importModSummary im @?= T.pack "list:map,filter"
              Nothing -> assertFailure "no DImport decl found"
 
   , testCase "import M () parses to IMList [] (empty list)" $
-      let src = T.pack "module Main\nimport Std.Base ()\n"
+      let src = T.pack "module Main\nimport Base ()\n"
       in case parse src of
            Left err -> assertFailure ("parse failed: " ++ err)
            Right (Module decls) -> case importDeclOf decls of
              Just (mp, im) -> do
-               I.modPathText mp @?= T.pack "Std.Base"
+               I.modPathText mp @?= T.pack "Base"
                importModSummary im @?= T.pack "list:"
              Nothing -> assertFailure "no DImport decl found"
 
   , testCase "import M as A parses to IMAs A" $
-      let src = T.pack "module Main\nimport Std.Base as Base\n"
+      let src = T.pack "module Main\nimport Base as Base\n"
       in case parse src of
            Left err -> assertFailure ("parse failed: " ++ err)
            Right (Module decls) -> case importDeclOf decls of
              Just (mp, im) -> do
-               I.modPathText mp @?= T.pack "Std.Base"
+               I.modPathText mp @?= T.pack "Base"
                importModSummary im @?= T.pack "as:Base"
              Nothing -> assertFailure "no DImport decl found"
 
@@ -1786,23 +1786,23 @@ importParseTests = testGroup "import-parse"
       -- The grammar's ImportMod is a single sum nonterminal: the parser cannot
       -- attach both a list and an alias. This must fail at parse time, not
       -- typecheck time.
-      let src = T.pack "module Main\nimport Std.Base as Base (map, filter)\n"
+      let src = T.pack "module Main\nimport Base as Base (map, filter)\n"
       case parse src of
         Left _  -> pure ()  -- expected: parse fails
         Right _ -> assertFailure
           "expected parse failure for `import M as A (x, y)` (Q1: structural impossibility)"
 
   , testCase "import round-trips through Print.hs (plain)" $
-      roundTripParses (T.pack "module Main\nimport Std.Base\n")
+      roundTripParses (T.pack "module Main\nimport Base\n")
 
   , testCase "import round-trips through Print.hs (list)" $
-      roundTripParses (T.pack "module Main\nimport Std.Base (map, filter)\n")
+      roundTripParses (T.pack "module Main\nimport Base (map, filter)\n")
 
   , testCase "import round-trips through Print.hs (alias)" $
-      roundTripParses (T.pack "module Main\nimport Std.Base as Base\n")
+      roundTripParses (T.pack "module Main\nimport Base as Base\n")
 
   , testCase "import round-trips through Print.hs (empty list)" $
-      roundTripParses (T.pack "module Main\nimport Std.Base ()\n")
+      roundTripParses (T.pack "module Main\nimport Base ()\n")
   ]
 
 -- ---------------------------------------------------------------------
@@ -2083,10 +2083,10 @@ tableOf src k =
     Left err -> assertFailure $ "expected Right, got: " ++ show err
 
 builtinsTests :: TestTree
-builtinsTests = testGroup "Wok.TypeChecking.Builtins + Std.Base"
+builtinsTests = testGroup "Wok.TypeChecking.Builtins + Base"
   -- Builtins.initialEnv is the irreducible pre-env: only the tycons that
   -- can't be spelled in surface Wok (U64, (), [], (,)...(,..,)). Everything
-  -- else (Bool, Option, +, ++, ...) lives in Std.Base; these tests load the
+  -- else (Bool, Option, +, ++, ...) lives in Base; these tests load the
   -- prelude via stdBaseExtendedEnv to verify the user-visible contract.
   [ testCase "U64, (), [], tuple tycons in irreducible Builtins" $ do
       case TE.lookupTyCon (T.pack "U64") B.initialEnv of
@@ -2098,24 +2098,24 @@ builtinsTests = testGroup "Wok.TypeChecking.Builtins + Std.Base"
       case TE.lookupTyCon (T.pack "[]") B.initialEnv of
         Just info -> TE.tcArity info @?= 1
         Nothing -> assertFailure "list missing"
-  , testCase "Builtins has NO Bool/True/False/+/++ (Std.Base owns them)" $ do
+  , testCase "Builtins has NO Bool/True/False/+/++ (Base owns them)" $ do
       TE.lookupTyCon (T.pack "Bool") B.initialEnv @?= Nothing
       TE.lookupCon   (T.pack "True") B.initialEnv @?= Nothing
       TE.lookupVar   (T.pack "+")    B.initialEnv @?= Nothing
       TE.lookupVar   (T.pack "++")   B.initialEnv @?= Nothing
-  , testCase "Std.Base: Bool tycon with True/False cons" $ do
+  , testCase "Base: Bool tycon with True/False cons" $ do
       env <- stdBaseExtendedEnv
       case TE.lookupTyCon (T.pack "Bool") env of
         Just info -> do
           TE.tcArity info @?= 0
           TE.tcCons info @?= [T.pack "True", T.pack "False"]
         Nothing -> assertFailure "Bool missing"
-  , testCase "Std.Base: True/False are constructors of Bool" $ do
+  , testCase "Base: True/False are constructors of Bool" $ do
       env <- stdBaseExtendedEnv
       case TE.lookupCon (T.pack "True") env of
         Just info -> TE.conTyCon info @?= T.pack "Bool"
         Nothing -> assertFailure "True missing"
-  , testCase "Std.Base: + has scheme U64 -> U64 -> U64" $ do
+  , testCase "Base: + has scheme U64 -> U64 -> U64" $ do
       env <- stdBaseExtendedEnv
       case TE.lookupVar (T.pack "+") env of
         Just (Ty.Scheme [] _ body) -> case body of
@@ -2124,7 +2124,7 @@ builtinsTests = testGroup "Wok.TypeChecking.Builtins + Std.Base"
               pure ()
           _ -> assertFailure ("unexpected body: " ++ show body)
         _ -> assertFailure "+ missing or has quantifiers"
-  , testCase "Std.Base: ++ has one type quantifier" $ do
+  , testCase "Base: ++ has one type quantifier" $ do
       env <- stdBaseExtendedEnv
       case TE.lookupVar (T.pack "++") env of
         Just (Ty.Scheme [(_, Ty.KStar)] _ _) -> pure ()
@@ -2273,7 +2273,7 @@ data ArmShape = DiscardNamed | DiscardWild | ApplyNamed | AutoResume
 -- independently, as does the arm shape and whether the handler is AMBIENT
 -- (@with { E.op ... } e@, elaborated via 'inferHandler') or NAMED
 -- (@with self = E { ... } in@, via 'inferNamedHandler') -- both inference paths
--- thread the resume type. No 'Std.Base' import, so 'B.initialEnv' suffices for
+-- thread the resume type. No 'Base' import, so 'B.initialEnv' suffices for
 -- the in-memory typecheck.
 renderHandlerSrc :: Bool -> RTy -> RTy -> ArmShape -> String
 renderHandlerSrc ambient tRes rAns shape
@@ -3659,7 +3659,7 @@ dataTests = testGroup "Wok.TypeChecking.Infer (data decls)"
                    _ -> assertFailure "Just scheme malformed"
                Nothing -> assertFailure "Just missing"
            Left e -> assertFailure (show e)
-  , testCase "duplicate tycon (vs Std.Base Bool) errors" $ do
+  , testCase "duplicate tycon (vs Base Bool) errors" $ do
       env <- stdBaseExtendedEnv
       let pos = (0,0)
           vc s = Abs.ConId (pos, T.pack s)
@@ -3997,21 +3997,21 @@ loaderTests = testGroup "loader"
       case res of
         Right (entryName, modules) -> do
           entryName @?= T.pack "Main"
-          -- The embedded preludes are always loaded: Std.Base, Std.Control
-          -- (imports Std.Base), Std.Array (imports Std.Base), Std.String,
-          -- Std.Bytes, and Std.Borrow. Std.Base must come first (nothing it
+          -- The embedded preludes are always loaded: Base, Control
+          -- (imports Base), Array (imports Base), String,
+          -- Bytes, and Borrow. Base must come first (nothing it
           -- depends on); the others follow in some dependency-valid order.
           -- Assert the leading prelude + the full set rather than a brittle
           -- exact permutation of the tail.
           let names = map Loader.lmName modules
           case names of
-            (n0 : _) -> n0 @?= T.pack "Std.Base"
+            (n0 : _) -> n0 @?= T.pack "Base"
             []       -> assertFailure "expected a non-empty module list"
           Data.List.sort names @?=
             Data.List.sort
-              [ T.pack "Std.Base", T.pack "Std.Control"
-              , T.pack "Std.Array", T.pack "Std.String"
-              , T.pack "Std.Bytes", T.pack "Std.Borrow", T.pack "Main" ]
+              [ T.pack "Base", T.pack "Control"
+              , T.pack "Array", T.pack "String"
+              , T.pack "Bytes", T.pack "Borrow", T.pack "Main" ]
         Left err -> assertFailure ("unexpected error: " ++ show err)
 
   , testCase "rejects file missing a module header" $ do
@@ -4083,7 +4083,7 @@ loaderTests = testGroup "loader"
 --   * cross-module name conflict (two imports exporting the same
 --     name surfaces as an env-merge error);
 --   * BodylessBinding warning at pipeline level for UserFile origin;
---   * silent bodyless-sigs for Embedded (Std.Base) origin.
+--   * silent bodyless-sigs for Embedded (Base) origin.
 -- ---------------------------------------------------------------------
 
 crossModuleFixityTests :: TestTree
@@ -4091,7 +4091,7 @@ crossModuleFixityTests = testGroup "crossModuleFixity"
   [ testCase "external fixity table influences entry reassociation" $ do
       -- Extra declares `fixity ## left tighter than +` (and `(##) : ...`
       -- so the typechecker can find the operator scheme). Entry uses
-      -- `a + b ## c` and Std.Base provides `+`. The cross-module fixity
+      -- `a + b ## c` and Base provides `+`. The cross-module fixity
       -- overlay is what makes the chain unambiguous: without it the
       -- reorder pass cannot relate `+` and `##` and surfaces
       -- `IncomparableOps`. Thus "typecheck succeeds" is the load-bearing
@@ -4110,7 +4110,7 @@ crossModuleFixityTests = testGroup "crossModuleFixity"
         Left lerr -> assertFailure ("expected loader success, got: " ++ show lerr)
 
   , testCase "entry redeclaring an imported fixity surfaces as conflict" $ do
-      -- Std.Base declares `fixity + left`. Entry tries to redeclare it.
+      -- Base declares `fixity + left`. Entry tries to redeclare it.
       -- `reorderModuleWith` overlays the imported fixity table with the
       -- module's own table; the collision yields a RedeclaredOp error
       -- mentioning `+`.
@@ -4191,9 +4191,9 @@ bodylessUserWarningTests = testGroup "bodylessUser"
             Left s -> assertFailure ("pipeline unexpectedly failed: " ++ s)
         Left lerr -> assertFailure ("loader unexpectedly failed: " ++ show lerr)
 
-  , testCase "silentBodyless: Std.Base bodyless sigs produce zero pipeline warnings" $ do
-      -- Std.Base has many bodyless sigs ((+), (-), (*), ...). They MUST
-      -- be silent because the loader marks Std.Base with Origin=Embedded.
+  , testCase "silentBodyless: Base bodyless sigs produce zero pipeline warnings" $ do
+      -- Base has many bodyless sigs ((+), (-), (*), ...). They MUST
+      -- be silent because the loader marks Base with Origin=Embedded.
       -- The entry has no bodyless sigs of its own. Expect zero warnings.
       res <- Loader.loadProgram "test/loader-fixtures/11-bodyless-silent-prelude.wok" []
       case res of
@@ -4448,7 +4448,7 @@ runDataDeclsIn env src =
       let decls = case ast of Abs.Module ds -> ds
       in TM.runTC_ env (I.processDataDecls env decls)
 
--- | Convenience wrapper using the minimal builtins env (no Std.Base).
+-- | Convenience wrapper using the minimal builtins env (no Base).
 runDataDecls :: Text -> Either TErr.TypeError TE.Env
 runDataDecls = runDataDeclsIn B.initialEnv
 
@@ -4492,7 +4492,7 @@ recordDeclTests = testGroup "RecordDecl"
 
   , testCase "mixed positional and record constructors in one decl" $ do
       baseEnv <- stdBaseExtendedEnv
-      -- Use a distinct name to avoid clashing with Std.Base's Result/Ok/Err.
+      -- Use a distinct name to avoid clashing with Base's Result/Ok/Err.
       let src = T.pack "data Outcome a e = Good a | Bad { code : U64, flag : Bool }"
       case runDataDeclsIn baseEnv src of
         Left e  -> assertFailure ("unexpected error: " ++ show e)
@@ -5027,7 +5027,7 @@ forgottenResumeTests = testGroup "ForgottenResume"
   [ testCase "named unreferenced binder on returning op warns" $ do
       -- `State.get k -> 0`: get : s is a returning op and k is never used.
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "effect State s = { get : s }"
             , "prog : () -> U64 with State U64"
             , "prog u = State.get"
@@ -5042,7 +5042,7 @@ forgottenResumeTests = testGroup "ForgottenResume"
   , testCase "wildcard binder suppresses" $ do
       -- `State.get _ -> 0`: explicit intentional discard; no warning.
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "effect State s = { get : s }"
             , "prog : () -> U64 with State U64"
             , "prog u = State.get"
@@ -5056,11 +5056,11 @@ forgottenResumeTests = testGroup "ForgottenResume"
 
   , testCase "Never-result op is exempt" $ do
       -- `throw : U64 -> Never`: a non-returning op never resumes, so a
-      -- named-but-unused binder is fine. (Avoid Bool/if: the `import Std.Base`
+      -- named-but-unused binder is fine. (Avoid Bool/if: the `import Base`
       -- line is parsed but silently dropped by the inferProgramWith path, so
-      -- Std.Base names are NOT in scope -- only B.initialEnv primitives are.)
+      -- Base names are NOT in scope -- only B.initialEnv primitives are.)
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "effect Exn = { throw : U64 -> Never }"
             , "risky : () -> U64 with Exn"
             , "risky u = Exn.throw 1"
@@ -5075,7 +5075,7 @@ forgottenResumeTests = testGroup "ForgottenResume"
   , testCase "referenced binder does not warn" $ do
       -- `State.get k -> k 0`: the continuation is used, so the arm resumes.
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "effect State s = { get : s }"
             , "prog : () -> U64 with State U64"
             , "prog u = State.get"
@@ -5157,7 +5157,7 @@ matchWarningTests :: TestTree
 matchWarningTests = testGroup "MatchWarnings"
   [ testCase "partial single clause warns non-exhaustive" $ do
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "safeHead : [U64] -> U64"
             , "safeHead (x :: xs) = x" ]
       (_, ws) <- expectOKWithWarnings src
@@ -5165,7 +5165,7 @@ matchWarningTests = testGroup "MatchWarnings"
 
   , testCase "total function: no non-exhaustive warning" $ do
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "isNil : [U64] -> U64"
             , "isNil []        = 1"
             , "isNil (x :: xs) = 0" ]
@@ -5174,7 +5174,7 @@ matchWarningTests = testGroup "MatchWarnings"
 
   , testCase "shadowed clause warns redundant" $ do
       let src = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "f : U64 -> U64"
             , "f x = x"
             , "f 0 = 0" ]
@@ -5186,12 +5186,12 @@ matchWarningTests = testGroup "MatchWarnings"
       -- or not it carries an as-pattern; an as-pattern covers exactly what its
       -- inner pattern covers, so the diagnostic must be identical.
       let withAs = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "data Opt a = Non | Som a"
             , "f : Opt U64 -> U64"
             , "f (Som x) as w = x" ]
           without = T.unlines
-            [ "module Main", "import Std.Base"
+            [ "module Main", "import Base"
             , "data Opt a = Non | Som a"
             , "f : Opt U64 -> U64"
             , "f (Som x) = x" ]
@@ -5446,7 +5446,7 @@ interpValueTests = testGroup "InterpValue"
            @?= Left (IV.UnboundVar (T.pack "ghost"))
   , testCase "APrim resolves via the prim table" $
       case IV.resolveAtom IP.primTable (IV.Scope Map.empty Map.empty)
-             (Anf.APrim (T.pack "Std.Base", T.pack "+")) of
+             (Anf.APrim (T.pack "Base", T.pack "+")) of
         Right (IV.VPrim _) -> pure ()
         other -> assertFailure ("APrim + should resolve to a VPrim, got " <> show other)
   ]
@@ -5469,63 +5469,63 @@ interpPrimTests = testGroup "InterpPrim"
   [ testCase "table has exactly the bodyless operators" $
       Data.List.sort (Map.keys IP.primTable)
         @?= Data.List.sort
-              ( map (T.pack "Std.Base",)
+              ( map (T.pack "Base",)
                   ["+","-","*","/","div","mod","eqU64","eqU32","u32","&&","||","++","$","eqString","eqBytes"]
-              ++ map (T.pack "Std.Control",)
+              ++ map (T.pack "Control",)
                   ["__coro_susp","__coro_unwrap","__coro_resume","__coro_done"
                   ,"__coro_cancel","__coerce","__drive_conc"
                   ,"__cont_cell_new","__cont_store","__cont_take"]
-              ++ map (T.pack "Std.Array",)
+              ++ map (T.pack "Array",)
                   ["new","fromList","toList","index","length","set","resize"]
-              ++ map (T.pack "Std.String",)
+              ++ map (T.pack "String",)
                   ["length","index","byteLength","byteAt","append"
                   ,"indexOfFromRaw","hash","editDistance","slice","byteSlice"
                   ,"decodeCharAt","charWidthAt","singleton"]
-              ++ map (T.pack "Std.Bytes",)
+              ++ map (T.pack "Bytes",)
                   ["fromList","toList","length","index","fromBytes","toBytes"
                   ,"__ffi_demo_copy","__ffi_demo_adopt"]
-              ++ map (T.pack "Std.Borrow",)
+              ++ map (T.pack "Borrow",)
                   ["length","byteAt","slice","memchr","copy","__borrow_demo"]
               )
   , testCase "addition" $
-      case runPrim (T.pack "Std.Base", T.pack "+") [li 2, li 3] of
+      case runPrim (T.pack "Base", T.pack "+") [li 2, li 3] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "5"
         other -> assertFailure (show2 other)
   , testCase "equality true" $
-      case runPrim (T.pack "Std.Base", T.pack "eqU64") [li 4, li 4] of
+      case runPrim (T.pack "Base", T.pack "eqU64") [li 4, li 4] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
         other -> assertFailure (show2 other)
   , testCase "equality false" $
-      case runPrim (T.pack "Std.Base", T.pack "eqU64") [li 4, li 5] of
+      case runPrim (T.pack "Base", T.pack "eqU64") [li 4, li 5] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
         other -> assertFailure (show2 other)
   , testCase "u32 equality" $
-      case runPrim (T.pack "Std.Base", T.pack "eqU32") [li 4, li 4] of
+      case runPrim (T.pack "Base", T.pack "eqU32") [li 4, li 4] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "True"
         other -> assertFailure (show2 other)
   , testCase "u32 conversion is identity on the value" $
-      case runPrim (T.pack "Std.Base", T.pack "u32") [li 7] of
+      case runPrim (T.pack "Base", T.pack "u32") [li 7] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "7"
         other -> assertFailure (show2 other)
   , testCase "boolean and" $
-      case runPrim (T.pack "Std.Base", T.pack "&&") [IV.VCon (T.pack "True") [], IV.VCon (T.pack "False") []] of
+      case runPrim (T.pack "Base", T.pack "&&") [IV.VCon (T.pack "True") [], IV.VCon (T.pack "False") []] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "False"
         other -> assertFailure (show2 other)
   , testCase "division (non-negative)" $
-      case runPrim (T.pack "Std.Base", T.pack "/") [li 7, li 2] of
+      case runPrim (T.pack "Base", T.pack "/") [li 7, li 2] of
         Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "3"
         other -> assertFailure (show2 other)
   , testCase "division by zero is a PrimError" $
-      case runPrim (T.pack "Std.Base", T.pack "div") [li 1, li 0] of
+      case runPrim (T.pack "Base", T.pack "div") [li 1, li 0] of
         Left (IV.PrimError _) -> pure ()
         other -> assertFailure (show2 other)
   , testCase "list append" $
       let mkList = foldr (\x acc -> IV.VCon (T.pack "Cons") [li x, acc]) (IV.VCon (T.pack "Nil") [])
-      in case runPrim (T.pack "Std.Base", T.pack "++") [mkList [1,2], mkList [3]] of
+      in case runPrim (T.pack "Base", T.pack "++") [mkList [1,2], mkList [3]] of
            Right (IV.PRDone v) -> IV.renderValue v @?= T.pack "[1, 2, 3]"
            other -> assertFailure (show2 other)
   , testCase "dollar requests an application" $
-      case runPrim (T.pack "Std.Base", T.pack "$") [IV.VCon (T.pack "K") [], li 1] of
+      case runPrim (T.pack "Base", T.pack "$") [IV.VCon (T.pack "K") [], li 1] of
         Right (IV.PRApply (IV.VCon t []) [arg]) -> do
           t @?= T.pack "K"
           IV.renderValue arg @?= T.pack "1"
@@ -5539,14 +5539,14 @@ interpPrimTests = testGroup "InterpPrim"
   , testCase "Ref overflow: index 2^63 raises PrimError (out of range)" $
       let arr = IV.VCon (T.pack "Array") [li 0, li 1, li 2]
           idx = li (2^(63 :: Int))
-      in case runPrim (T.pack "Std.Array", T.pack "index") [arr, idx] of
+      in case runPrim (T.pack "Array", T.pack "index") [arr, idx] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow index: expected PrimError out-of-range, got: " <> show e)
            Right _ -> assertFailure "Ref overflow index: prim succeeded unexpectedly with 2^63"
   , testCase "Ref overflow: new size 2^63 raises PrimError (out of range)" $
       let kv = li (2^(63 :: Int))
-      in case runPrim (T.pack "Std.Array", T.pack "new") [kv, li 0] of
+      in case runPrim (T.pack "Array", T.pack "new") [kv, li 0] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow new: expected PrimError out-of-range, got: " <> show e)
@@ -5554,7 +5554,7 @@ interpPrimTests = testGroup "InterpPrim"
   , testCase "Ref overflow: set index 2^63 raises PrimError (out of range)" $
       let arr = IV.VCon (T.pack "Array") [li 0, li 1, li 2]
           idx = li (2^(63 :: Int))
-      in case runPrim (T.pack "Std.Array", T.pack "set") [arr, idx, li 99] of
+      in case runPrim (T.pack "Array", T.pack "set") [arr, idx, li 99] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow set: expected PrimError out-of-range, got: " <> show e)
@@ -5562,7 +5562,7 @@ interpPrimTests = testGroup "InterpPrim"
   , testCase "Ref overflow: resize size 2^63 raises PrimError (out of range)" $
       let arr = IV.VCon (T.pack "Array") [li 0, li 1]
           mv  = li (2^(63 :: Int))
-      in case runPrim (T.pack "Std.Array", T.pack "resize") [arr, mv, li 0] of
+      in case runPrim (T.pack "Array", T.pack "resize") [arr, mv, li 0] of
            Left (IV.PrimError m)
              | T.pack "out of range" `T.isInfixOf` m -> pure ()
            Left e  -> assertFailure ("Ref overflow resize: expected PrimError out-of-range, got: " <> show e)
@@ -6089,13 +6089,13 @@ interpEntryTests = testGroup "InterpEntry"
   [ testCase "arithmetic main" $ do
       r <- runSourceToValue (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "main = 2 + 3 * 4" ])
       r @?= Right (T.pack "14")
   , testCase "recursive factorial" $ do
       r <- runSourceToValue (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "fact n = case n of"
              , T.pack "  0 -> 1"
              , T.pack "  _ -> n * fact (n - 1)"
@@ -6104,7 +6104,7 @@ interpEntryTests = testGroup "InterpEntry"
   , testCase "missing main errors" $ do
       r <- runSourceToValue (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "helper x = x" ])
       case r of
         Left msg -> assertBool ("expected missing-main (UnboundVar) error, got: " <> msg)
@@ -6116,7 +6116,7 @@ interpEntryTests = testGroup "InterpEntry"
       -- instance dictionaries, which lower to 0-arity record values.
       r <- runSourceToValue (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "answer = 42"
              , T.pack "main = answer" ])
       r @?= Right (T.pack "42")
@@ -6125,7 +6125,7 @@ interpEntryTests = testGroup "InterpEntry"
       -- so `case 5 of 5 -> 100; _ -> 0` returned 0 instead of 100.
       r <- runSourceToValue (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "classify n = case n of"
              , T.pack "  5 -> 100"
              , T.pack "  _ -> 0"
@@ -6137,7 +6137,7 @@ interpEntryTests = testGroup "InterpEntry"
       -- list, a non-empty list literal pattern is rejected (as it was on main).
       r <- runSourceToValueForced (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "solo xs = case xs of"
              , T.pack "  [a] -> a"
              , T.pack "  _   -> 0"
@@ -6154,30 +6154,30 @@ interpWholeProgramTests = testGroup "InterpWholeProgram"
   [ testCase "main calls prelude id" $ do
       r <- runSourceWith Pipeline.elaborateProgramFull (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "main = id 99" ])
       r @?= Right (T.pack "99")
   , testCase "main calls prelude const" $ do
       r <- runSourceWith Pipeline.elaborateProgramFull (T.unlines
              [ T.pack "module Main"
-             , T.pack "import Std.Base"
+             , T.pack "import Base"
              , T.pack "main = const 7 99" ])
       r @?= Right (T.pack "7")
-  , testCase "builtin (+) elaborates to APrim (Std.Base, +)" $ do
+  , testCase "builtin (+) elaborates to APrim (Base, +)" $ do
       -- The elaborator routes a value-level prelude extern reference to APrim by
       -- extern identity. `1 + 2` lowers `(+)` to its prelude extern, so the
-      -- elaborated IR must contain APrim ("Std.Base", "+") and NOT a bare AVar "+".
+      -- elaborated IR must contain APrim ("Base", "+") and NOT a bare AVar "+".
       cm <- elaborateSourceFull (T.unlines
               [ T.pack "module Main"
-              , T.pack "import Std.Base"
+              , T.pack "import Base"
               , T.pack "main = 1 + 2" ])
       case cm of
         Left s   -> assertFailure s
         Right m  ->
           let keys = aprimKeysInModule m
-          in assertBool ("expected APrim (Std.Base, +) in elaborated IR, got APrims: "
+          in assertBool ("expected APrim (Base, +) in elaborated IR, got APrims: "
                            <> show keys)
-                        ((T.pack "Std.Base", T.pack "+") `Set.member` keys)
+                        ((T.pack "Base", T.pack "+") `Set.member` keys)
   ]
 
 -- ---------------------------------------------------------------------------
@@ -7092,7 +7092,7 @@ foreignResolutionTests = testGroup "foreign resolution"
     -- directly with a clean diagnostic.
     testCase "partial application of foreign member gives ForeignMemberPartialApp" $
       case schemeOf
-             [ "import Std.Bytes"
+             [ "import Bytes"
              , "foreign module Libc \"c\" free \"free\" where"
              , "  owned strndup : Bytes -> U64 -> Bytes with IO"
              , "bad b = let f = Libc.strndup in f b 2"
@@ -7107,7 +7107,7 @@ foreignResolutionTests = testGroup "foreign resolution"
     -- cover this; this test targets the EApp special-case path specifically).
     testCase "direct application Libc.strndup b n still type-checks (no regression)" $
       case schemeOf
-             [ "import Std.Bytes"
+             [ "import Bytes"
              , "foreign module Libc \"c\" free \"free\" where"
              , "  owned strndup : Bytes -> U64 -> Bytes with IO"
              , "call b n = Libc.strndup b n"
@@ -7126,7 +7126,7 @@ foreignResolutionTests = testGroup "foreign resolution"
     -- at the intercept point; arity = 3; 1 < 3 => ForeignMemberPartialApp.
     testCase "#1: under-saturated memchr (1 of 3 args) gives ForeignMemberPartialApp" $
       case schemeOf
-             [ "import Std.Bytes"
+             [ "import Bytes"
              , "foreign module Libc \"c\" free \"free\" where"
              , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
              , "bad b = let f = Libc.memchr b in f 65 3"
@@ -7140,7 +7140,7 @@ foreignResolutionTests = testGroup "foreign resolution"
   , -- Finding #1b: same for strndup (arity 2, 1 arg supplied).
     testCase "#1b: under-saturated strndup (1 of 2 args) gives ForeignMemberPartialApp" $
       case schemeOf
-             [ "import Std.Bytes"
+             [ "import Bytes"
              , "foreign module Libc \"c\" free \"free\" where"
              , "  owned strndup : Bytes -> U64 -> Bytes with IO"
              , "bad b = let f = Libc.strndup b in f 2"
@@ -7156,7 +7156,7 @@ foreignResolutionTests = testGroup "foreign resolution"
     testCase "#2: paren-wrapped saturated memchr type-checks and runs" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
         , "main = (Libc.memchr) (fromList [65, 66, 67]) 65 3"
@@ -7171,7 +7171,7 @@ foreignResolutionTests = testGroup "foreign resolution"
     -- time with a clear diagnostic (not crash at runtime).
     testCase "#3: non-free destructor in adopt module gives compile error" $
       case schemeOf
-             [ "import Std.Bytes"
+             [ "import Bytes"
              , "foreign module Libc \"c\" free \"pfree\" where"
              , "  owned strndup : Bytes -> U64 -> Bytes with IO"
              , "call b n = Libc.strndup b n"
@@ -10236,7 +10236,7 @@ rcM3CarrierWallTests = testGroup "m3 cycle red-check (carrier-wall is load-beari
       -- runtime check ('cellAddr `notElem` continuationOwned prefix') must reject it
       -- loudly with the carrier-wall message --- BEFORE it can write the cyclic edge.
       let (s2, contAddr, _h, _prefix, cellAddr) = buildCycleStore
-      case Map.lookup (T.pack "Std.Control", T.pack "__cont_store") RCP.rcPrimTable of
+      case Map.lookup (T.pack "Control", T.pack "__cont_store") RCP.rcPrimTable of
         Nothing -> assertFailure "rcPrimTable is missing __cont_store"
         Just p  -> do
           res <- runExceptT (St.rpFn p [St.RVBox cellAddr, St.RVBox contAddr] s2)
@@ -10526,7 +10526,7 @@ rcM3TwoCellCycleSubsumedTests =
       -- legs and the cycle goes live; dropping cellA then double-frees. This is the
       -- gap the single-level runtime check has by itself.
       let (s2, cellA, cellB, contA, contB) = buildTwoCellCycle
-      case Map.lookup (T.pack "Std.Control", T.pack "__cont_store") RCP.rcPrimTable of
+      case Map.lookup (T.pack "Control", T.pack "__cont_store") RCP.rcPrimTable of
         Nothing -> assertFailure "rcPrimTable is missing __cont_store"
         Just storeP -> do
           -- leg 1: store contA into cellA. single-level: cellA `elem` owned(contA)?
@@ -11339,7 +11339,7 @@ reuseMapModule = Anf.CoreModule
       (Anf.Case (Anf.AVar (reuseNm "xs" 11))
         [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 12 reuseU64, reuseBnd "xx" 13 reuseListU64]
             (Anf.Let (reuseBnd "y" 14 reuseU64)
-               (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+               (Anf.RApp (Anf.APrim (T.pack "Base", T.pack "+"))
                   [Anf.AVar (reuseNm "x" 12), Anf.ALit (Anf.LInt 1)])
             (Anf.Let (reuseBnd "ys" 15 reuseListU64)
                (Anf.RApp (Anf.AVar (reuseNm "mapInc" 10)) [Anf.AVar (reuseNm "xx" 13)])
@@ -11381,7 +11381,7 @@ reuseKindModule = Anf.CoreModule
       (Anf.Case (Anf.AVar (reuseNm "xs" 31))
         [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 32 reuseU64, reuseBnd "xx" 33 reuseListU64]
             (Anf.Let (reuseBnd "c" 34 reuseChar)
-               (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "toChar")) [Anf.AVar (reuseNm "x" 32)])
+               (Anf.RApp (Anf.APrim (T.pack "Base", T.pack "toChar")) [Anf.AVar (reuseNm "x" 32)])
             (Anf.Let (reuseBnd "ys" 35 reuseListChar)
                (Anf.RApp (Anf.AVar (reuseNm "kindMap" 30)) [Anf.AVar (reuseNm "xx" 33)])
             (Anf.Let (reuseBnd "r" 36 reuseListChar)
@@ -11403,7 +11403,7 @@ reuseMapRunModule = Anf.CoreModule
       (Anf.Case (Anf.AVar (reuseNm "xs" 11))
         [ Anf.AltCon (T.pack "Cons") [reuseBnd "x" 12 reuseU64, reuseBnd "xx" 13 reuseListU64]
             (Anf.Let (reuseBnd "y" 14 reuseU64)
-               (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+               (Anf.RApp (Anf.APrim (T.pack "Base", T.pack "+"))
                   [Anf.AVar (reuseNm "x" 12), Anf.ALit (Anf.LInt 1)])
             (Anf.Let (reuseBnd "ys" 15 reuseListU64)
                (Anf.RApp (Anf.AVar (reuseNm "mapInc" 10)) [Anf.AVar (reuseNm "xx" 13)])
@@ -13967,12 +13967,12 @@ genFfiOwnedBytes = do
 ffiOwnedRenderBytes :: [Word8] -> String
 ffiOwnedRenderBytes = intercalate ", " . map show
 
--- | The @module Main@ / @import Std.Bytes@ / @foreign module Sink@ preamble
+-- | The @module Main@ / @import Bytes@ / @foreign module Sink@ preamble
 -- shared by every generated template, verbatim from the Task 4 corpus files.
 ffiOwnedPreamble :: [String]
 ffiOwnedPreamble =
   [ "module Main"
-  , "import Std.Bytes"
+  , "import Bytes"
   , ""
   , "foreign module Sink \"wok\" where"
   , "  consume \"consume\" : owned Bytes -> U64 with IO"
@@ -15958,9 +15958,9 @@ genMutualGroup capN mkFBase mkGBase = do
 -- prelude @extern@ to an 'APrim' carrying its @(module, name)@ identity; these
 -- hand-built RC/interpreter fixtures mirror that so the interpreters resolve them
 -- by the name part (Caveat B). The module label is cosmetic at runtime (lookup is
--- name-keyed) -- 'Std.Base' is where these arithmetic/comparison prims live.
+-- name-keyed) -- 'Base' is where these arithmetic/comparison prims live.
 primAtom :: Text -> Atom
-primAtom op = APrim (T.pack "Std.Base", op)
+primAtom op = APrim (T.pack "Base", op)
 
 -- | Seed a boxed Pair capture from two random int literals, returning its binder
 -- name and a wrapper that prefixes the seeding 'Let'.
@@ -19279,7 +19279,7 @@ data M3Route
   deriving (Eq, Show)
 
 -- | Continuation-cell extern atoms. As the elaborator emits for a genuine
--- @Std.Control@ continuation extern, these are 'APrim' heads carrying the
+-- @Control@ continuation extern, these are 'APrim' heads carrying the
 -- qualified @(module, name)@ identity --- the SAME identity the boundary guard
 -- ('Wok.IR.Escape.contStoreCell'), the Perceus pass ('contTakeKey'), and both
 -- machines' prim tables (by the name part) recognize. (A user binding hinted the
@@ -20084,9 +20084,9 @@ lookupPrimQ mn name =
     Nothing -> assertFailure
       ("rcPrimTable is missing prim: " <> T.unpack mn <> "." <> T.unpack name)
 
--- | Convenience wrapper that looks up an Array prim by bare name under 'Std.Array'.
+-- | Convenience wrapper that looks up an Array prim by bare name under 'Array'.
 lookupPrim :: Text -> IO St.RCPrim
-lookupPrim name = lookupPrimQ (T.pack "Std.Array") name
+lookupPrim name = lookupPrimQ (T.pack "Array") name
 
 -- | Helper: call 'rpFn' with args and an initial store, asserting it returns
 -- @Right (PRDone result, store')@.
@@ -21108,7 +21108,7 @@ regShape1 = regModule $ Anf.TopBind (regNm "f" 7000) [regBnd "x" 7001 regU64]
   (Anf.Case (Anf.AVar (regNm "p" 7002))
      [ Anf.AltCon (T.pack "Pair") [regBnd "a" 7003 regU64, regBnd "b" 7004 regU64]
          (Anf.Let (regBnd "r" 7005 regU64)
-            (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+            (Anf.RApp (Anf.APrim (T.pack "Base", T.pack "+"))
                [Anf.AVar (regNm "a" 7003), Anf.AVar (regNm "b" 7004)])
             (Anf.Ret (Anf.AVar (regNm "r" 7005)))) ]))
 
@@ -21123,18 +21123,18 @@ regShape2 = regModule $ Anf.TopBind (regNm "g" 7100) [regBnd "x" 7101 regU64]
   (Anf.Ret (Anf.AVar (regNm "p" 7102))))
 
 -- Shape 3: array (mutation fence §5.2).
---   h n v = let arr = Std.Array.new n v   -- arr :: Array U64
---           let len = Std.Array.length arr
+--   h n v = let arr = Array.new n v   -- arr :: Array U64
+--           let len = Array.length arr
 --           len
 -- Even though arr does not escape, the array binder -> Heap (arrays stay counted).
 regShape3 :: Anf.CoreModule
 regShape3 = regModule $ Anf.TopBind (regNm "h" 7200)
   [regBnd "n" 7201 regU64, regBnd "v" 7202 regU64]
   (Anf.Let (regBnd "arr" 7203 regArrayTy)
-     (Anf.RApp (Anf.APrim (PN.stdArrayModule, PN.arrayNewName))
+     (Anf.RApp (Anf.APrim (PN.arrayModule, PN.arrayNewName))
         [Anf.AVar (regNm "n" 7201), Anf.AVar (regNm "v" 7202)])
   (Anf.Let (regBnd "len" 7204 regU64)
-     (Anf.RApp (Anf.APrim (PN.stdArrayModule, PN.arrayLengthName))
+     (Anf.RApp (Anf.APrim (PN.arrayModule, PN.arrayLengthName))
         [Anf.AVar (regNm "arr" 7203)])
   (Anf.Ret (Anf.AVar (regNm "len" 7204)))))
 
@@ -21212,7 +21212,7 @@ regShape7 = regModule $ Anf.TopBind (regNm "run" 7600) [regBnd "k" 7601 regU64]
   (Anf.Let (regBnd "p" 7602 regBoxTy)
      (Anf.RLam [regBnd "y" 7603 regU64]
         (Anf.Let (regBnd "s" 7604 regU64)
-           (Anf.RApp (Anf.APrim (T.pack "Std.Base", T.pack "+"))
+           (Anf.RApp (Anf.APrim (T.pack "Base", T.pack "+"))
               [Anf.AVar (regNm "y" 7603), Anf.AVar (regNm "k" 7601)])
            (Anf.Ret (Anf.AVar (regNm "s" 7604)))))
   (Anf.LetRec
@@ -21287,12 +21287,12 @@ regionRoutingTests = testGroup "Region routing"
 -- A slice prim application RHS: slice/byteSlice over a parent atom + two index args.
 sliceRhs :: Anf.Atom -> Anf.Rhs
 sliceRhs parent =
-  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+  Anf.RApp (Anf.APrim (PN.stringModule, PN.stringSliceName))
     [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 5)]
 
 byteSliceRhs :: Anf.Atom -> Anf.Rhs
 byteSliceRhs parent =
-  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringByteSliceName))
+  Anf.RApp (Anf.APrim (PN.stringModule, PN.stringByteSliceName))
     [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 5)]
 
 regStrTy :: Ty.CType
@@ -21461,8 +21461,8 @@ oracleRep disabled placements bd parent cont
 -- 'sliceParent', written independently).
 oracleSliceParent :: Anf.Rhs -> Maybe Anf.Atom
 oracleSliceParent (Anf.RApp (Anf.APrim key) (parent : _))
-  | key == (PN.stdStringModule, PN.stringSliceName)     = Just parent
-  | key == (PN.stdStringModule, PN.stringByteSliceName) = Just parent
+  | key == (PN.stringModule, PN.stringSliceName)     = Just parent
+  | key == (PN.stringModule, PN.stringByteSliceName) = Just parent
 oracleSliceParent _ = Nothing
 
 -- | True iff a Handle appears anywhere in the expression (oracle re-derivation of
@@ -21631,13 +21631,13 @@ deathParentLit = Anf.ALit (Anf.LStr (T.pack "hello world long here"))
 -- | @slice s 0 10@ over an atom -- a 10-byte window (> 7) => an 'NStringView'.
 deathSliceRhs :: Anf.Atom -> Anf.Rhs
 deathSliceRhs parent =
-  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+  Anf.RApp (Anf.APrim (PN.stringModule, PN.stringSliceName))
     [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 10)]
 
 -- | @byteSlice s 0 10@ over an atom -- a 10-byte window (> 7) => an 'NStringView'.
 deathByteSliceRhs :: Anf.Atom -> Anf.Rhs
 deathByteSliceRhs parent =
-  Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringByteSliceName))
+  Anf.RApp (Anf.APrim (PN.stringModule, PN.stringByteSliceName))
     [parent, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 10)]
 
 -- | The Perceus-synthesized @__rc_drop@ name (matched by HINT, like the reuse tests).
@@ -21756,7 +21756,7 @@ rcSliceDeathTests = testGroup "rcSliceDeath"
                 pure $
                   Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
                   (Anf.Let (rcBnd nV1)
-                     (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+                     (Anf.RApp (Anf.APrim (PN.stringModule, PN.stringSliceName))
                         [Anf.AVar nS, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 15)])
                   (Anf.Let (rcBnd nV2) (deathSliceRhs (Anf.AVar nV1))
                   (Anf.Let (rcBnd nD2)
@@ -22047,7 +22047,7 @@ adv3SliceOfSliceFires = runFresh $ do
   pure $
     Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
     (Anf.Let (rcBnd nV1)
-       (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+       (Anf.RApp (Anf.APrim (PN.stringModule, PN.stringSliceName))
           [Anf.AVar nS, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 15)])
     (Anf.Let (rcBnd nV2) (deathSliceRhs (Anf.AVar nV1))
     (Anf.Ret (Anf.AVar nV2))))
@@ -22061,7 +22061,7 @@ adv3SliceOfSlicePasses = runFresh $ do
   pure $
     Anf.Let (rcBnd nS) (Anf.RAtom deathParentLit)
     (Anf.Let (rcBnd nV1)
-       (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringSliceName))
+       (Anf.RApp (Anf.APrim (PN.stringModule, PN.stringSliceName))
           [Anf.AVar nS, Anf.ALit (Anf.LInt 0), Anf.ALit (Anf.LInt 15)])
     (Anf.Let (rcBnd nV2) (deathSliceRhs (Anf.AVar nV1))
     (Anf.Let (rcBnd nD)
@@ -22111,7 +22111,7 @@ adv4AppendOutlivesPasses = runFresh $ do
     (Anf.Let (rcBnd nV) (deathSliceRhs (Anf.AVar nS))
     (Anf.Let (rcBnd nSfx) (Anf.RAtom adv4SuffixAtom)
     (Anf.Let (rcBnd nA)
-       (Anf.RApp (Anf.APrim (PN.stdStringModule, PN.stringAppendName))
+       (Anf.RApp (Anf.APrim (PN.stringModule, PN.stringAppendName))
           [Anf.AVar nV, Anf.AVar nSfx])
     (Anf.Let (rcBnd nD)
        (Anf.RApp (Anf.AVar deathDropName) [Anf.AVar nA])
@@ -22370,7 +22370,7 @@ rcSliceAdversarialTests = testGroup "rcSliceAdversarial"
   ]
 
 -- ---------------------------------------------------------------------------
--- Std.String prim tests (Slice E1, Task 4)
+-- String prim tests (Slice E1, Task 4)
 --
 -- These tests drive the String prims directly on the abstract heap (like
 -- 'rcArrayPrimTests'), verifying RC accounting (alloc/free balance, 0-alloc
@@ -22378,15 +22378,15 @@ rcSliceAdversarialTests = testGroup "rcSliceAdversarial"
 -- UTF-8 handling. The wok smoke programs in 'test/rc-string' provide the
 -- end-to-end tri-backend oracle.
 
--- | Look up a String prim from 'Std.String' module.  The prim table is keyed
--- by @(module, name)@, so 'lookupPrim' (which defaults to @Std.Array@) cannot
+-- | Look up a String prim from 'String' module.  The prim table is keyed
+-- by @(module, name)@, so 'lookupPrim' (which defaults to @Array@) cannot
 -- be reused here.
 lookupStrPrim :: Text -> IO St.RCPrim
-lookupStrPrim = lookupPrimQ (T.pack "Std.String")
+lookupStrPrim = lookupPrimQ (T.pack "String")
 
--- | Look up a prim from 'Std.Base' module (e.g. @eqString@).
+-- | Look up a prim from 'Base' module (e.g. @eqString@).
 lookupBasePrim :: Text -> IO St.RCPrim
-lookupBasePrim = lookupPrimQ (T.pack "Std.Base")
+lookupBasePrim = lookupPrimQ (T.pack "Base")
 
 rcStringPrimTests :: TestTree
 rcStringPrimTests = testGroup "rc string prims"
@@ -23831,7 +23831,7 @@ prop_inlineStrCodepointOps =
 -- PE6: search/distance ops on InlineStr inputs match independent references.
 -- Covers, on random short (<=7B) inline strings, the search prim
 -- 'indexOfFromRaw' (the sole RC search primitive; 'indexOf'/'contains'/'count'
--- are dogfooded over it in 'Std.String') and 'editDistance', against the same
+-- are dogfooded over it in 'String') and 'editDistance', against the same
 -- 'BS.breakSubstring' / pure-Levenshtein references the E2 properties (P8-P11)
 -- use.  Each op deref's the InlineStr to raw bytes; a bug in the inline byte
 -- view would surface as a wrong offset/count/distance.  Specifically checked:
@@ -25369,13 +25369,13 @@ rcRegionNegativeControl = testGroup "rc-region-negative-control"
 --   PB7  validators agree on arbitrary [Word8]: Utf8.validateUtf8 == wokValidateUtf8
 -- ---------------------------------------------------------------------------
 
--- | Look up a Bytes prim by name under Std.Bytes.
+-- | Look up a Bytes prim by name under Bytes.
 lookupBytesPrim :: Text -> IO St.RCPrim
-lookupBytesPrim = lookupPrimQ (T.pack "Std.Bytes")
+lookupBytesPrim = lookupPrimQ (T.pack "Bytes")
 
--- | Look up eqBytes under Std.Base.
+-- | Look up eqBytes under Base.
 lookupEqBytesPrim :: IO St.RCPrim
-lookupEqBytesPrim = lookupPrimQ (T.pack "Std.Base") (T.pack "eqBytes")
+lookupEqBytesPrim = lookupPrimQ (T.pack "Base") (T.pack "eqBytes")
 
 -- | Build a Cons/Nil spine of RVLit (LInt n) values from a list of integers,
 -- using the abstract heap only.
@@ -25769,7 +25769,7 @@ foreignReferenceTests = testGroup "foreign reference"
     testCase "memchr: byte present, returns index" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
         , "main = Libc.memchr (fromList [65, 66, 67]) 66 3"
@@ -25781,7 +25781,7 @@ foreignReferenceTests = testGroup "foreign reference"
     testCase "memchr: byte absent, returns n" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
         , "main = Libc.memchr (fromList [65, 66, 67]) 99 3"
@@ -25793,7 +25793,7 @@ foreignReferenceTests = testGroup "foreign reference"
     testCase "strndup: n < length, no NUL, returns prefix" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  owned strndup : Bytes -> U64 -> Bytes with IO"
         , "main = Libc.strndup (fromList [1, 2, 3, 4]) 2"
@@ -25805,7 +25805,7 @@ foreignReferenceTests = testGroup "foreign reference"
     testCase "strndup: n >= length, no NUL, returns full buffer" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  owned strndup : Bytes -> U64 -> Bytes with IO"
         , "main = Libc.strndup (fromList [1, 2, 3, 4]) 10"
@@ -25818,7 +25818,7 @@ foreignReferenceTests = testGroup "foreign reference"
     testCase "strndup: NUL before n, truncates at NUL" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  owned strndup : Bytes -> U64 -> Bytes with IO"
         , "main = Libc.strndup (fromList [1, 0, 3, 4]) 4"
@@ -25842,7 +25842,7 @@ foreignReferenceTests = testGroup "foreign reference"
     testCase "strndup: n = 2^63 (huge), returns full buffer via interpreter" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  owned strndup : Bytes -> U64 -> Bytes with IO"
         , "main = Libc.strndup (fromList [1, 2, 3]) 9223372036854775808"
@@ -26186,7 +26186,7 @@ foreignIoDischargeTests = testGroup "foreign IO discharge"
     testCase "memchr at entry: IO ground effect, typechecks and runs to value" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
         , "main = Libc.memchr (fromList [65, 66, 67]) 66 3"
@@ -26197,7 +26197,7 @@ foreignIoDischargeTests = testGroup "foreign IO discharge"
     testCase "strndup at entry: IO ground effect, adopted Bytes renders" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Bytes"
+        , "import Bytes"
         , "foreign module Libc \"c\" free \"free\" where"
         , "  owned strndup : Bytes -> U64 -> Bytes with IO"
         , "main = Libc.strndup (fromList [1, 2, 3]) 3"
@@ -26241,13 +26241,13 @@ foreignIoDischargeTests = testGroup "foreign IO discharge"
 
   , -- AC5 (FFI Slice 3 Task 4): end-to-end IO with the borrow disposition --
     -- a `Demo.lendBuffer`-calling `main` typechecks and runs, with `Borrow`
-    -- and the foreign module declared via `import Std.Borrow` (the prelude),
+    -- and the foreign module declared via `import Borrow` (the prelude),
     -- exactly the surface a real user program would use. buf[i] = i & 0xFF,
     -- so byteAt (Demo.lendBuffer 8) 5 = 5.
     testCase "Demo.lendBuffer at entry: IO ground effect, typechecks and runs to value" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Borrow"
+        , "import Borrow"
         , "main = byteAt (Demo.lendBuffer 8) 5"
         ]
       result @?= Right (T.pack "5")
@@ -26256,13 +26256,13 @@ foreignIoDischargeTests = testGroup "foreign IO discharge"
     -- mirroring AC3 for the borrow disposition. The Borrow result is consumed
     -- locally (never escapes pure_caller), so the only failure is the
     -- undischarged IO row, not a CarrierEscape. Uses 'runSourceWith' (the
-    -- real loader, resolving `import Std.Borrow`) rather than 'schemeOf'
+    -- real loader, resolving `import Borrow`) rather than 'schemeOf'
     -- (which seeds 'Builtins.initialEnv' directly with no import
     -- resolution): `Borrow` and `Demo` are prelude-declared, not builtins.
     testCase "caller without `with IO` sig calling Demo.lendBuffer: rejected (UndischargedEffect)" $ do
       result <- runSourceWith Pipeline.elaborateProgram $ T.unlines
         [ "module Main"
-        , "import Std.Borrow"
+        , "import Borrow"
         , "pure_caller : U64 -> U64"
         , "pure_caller n = length (Demo.lendBuffer n)"
         , "main = pure_caller 8"

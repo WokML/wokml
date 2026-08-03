@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Heap routing (negative control for arena routing): the Pair IS the return
 -- value of 'makePair', so it ESCAPES -- it must be born counted (Heap).

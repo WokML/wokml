@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b resume-binder-type leak (spec 2026-06-19): a resumable op whose arm BINDS
 -- but DISCARDS resume, with an UNBOXED answer type (U64). 'xs' is boxed and live

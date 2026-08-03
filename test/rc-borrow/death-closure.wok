@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- DEATH TEST (FFI Slice 3 Task 6, escaping-CLOSURE route). `leak` lends a malloc'd
 -- borrow and returns a CLOSURE that captures it. Normal build: compile-time

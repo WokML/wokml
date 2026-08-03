@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 POSITIVE guard (mirror of rc-examples/23): a LetRec body that DIRECTLY
 -- RETURNS a group member ('Ret (AVar f)'). Direct return-of-member is historically

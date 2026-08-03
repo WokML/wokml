@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Task-2 capability: a handler arm whose BODY spans multiple lines. The `set`
 -- arm's body is a `let ... in k ... ()` split across lines and indented deeper

@@ -1,15 +1,3 @@
-sumXY p =
-  let t.1 = p.x
-  let t.2 = p.y
-  let _drop = __rc_drop(p)
-  let t.3 = +(t.1, t.2)
-  t.3
-
-main =
-  let t.1 = Point { x = 3, y = 4 }
-  let t.2 = sumXY(t.1)
-  t.2
-
 id x =
   x
 
@@ -502,6 +490,18 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+sumXY p =
+  let t.1 = p.x
+  let t.2 = p.y
+  let _drop = __rc_drop(p)
+  let t.3 = +(t.1, t.2)
+  t.3
+
+main =
+  let t.1 = Point { x = 3, y = 4 }
+  let t.2 = sumXY(t.1)
+  t.2
 
 notFound =
   18446744073709551615

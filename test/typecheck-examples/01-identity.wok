@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 myId : a -> a
 myId x = x

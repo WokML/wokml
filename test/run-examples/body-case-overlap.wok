@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Bug #7: a body-position `case` with OVERLAPPING constructor heads and a
 -- refutable sub-pattern. The flat one-Alt-per-clause path commits to the first

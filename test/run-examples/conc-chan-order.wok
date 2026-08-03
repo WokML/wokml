@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Deterministic schedule (FIFO ready queue, round-robin), spawn order [worker 1, worker 2]:
 --   Root: newChan -> spawn w1 (parks at yield) -> spawn w2 (parks at yield) -> recv (parks, buffer empty)

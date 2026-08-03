@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 even : U64 -> Bool
 even n = case n of

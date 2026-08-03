@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Borrow is second-class: storing it inside a data constructor lets it outlive
 -- its scope. `Some`'s argument is a polymorphic slot (`a`), not a handle slot,

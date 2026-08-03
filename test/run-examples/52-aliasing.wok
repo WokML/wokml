@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Aliasing: instance identity is a RUNTIME property (the id the handle carries),
 -- not a type property -- exactly as two U64 parameters are distinguished by value,

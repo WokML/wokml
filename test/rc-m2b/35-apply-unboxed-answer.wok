@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Unboxed answer (U64), arm APPLIES resume (resume now in the owned set after the
 -- fix AND consumed as a move-out). Must be balanced before AND after the fix (the

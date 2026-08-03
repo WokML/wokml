@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 import RowParamDef
 
 -- Instantiating RowParamDef.mkbox's cross-module scheme must NOT panic.

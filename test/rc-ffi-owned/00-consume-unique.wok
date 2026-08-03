@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 Task 4: the UNIQUE (move) router branch. The freshly built Bytes
 -- is `Sink.consume`d as its ONLY use, so Perceus inserts no dup -> the runtime

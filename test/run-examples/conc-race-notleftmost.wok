@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- raceAny [slow, fast]: the fast (no-yield) child is SECOND, yet still wins ->
 -- proves a TRUE first-to-complete race, not a leftmost-pick. Winning schedule:

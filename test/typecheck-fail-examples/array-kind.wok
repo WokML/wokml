@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Array has kind (* -> *); using it unapplied is a kind/arity error.
 g : Array -> U64

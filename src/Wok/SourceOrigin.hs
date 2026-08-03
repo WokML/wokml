@@ -13,5 +13,5 @@ data Origin = Embedded | UserFile FilePath
   deriving (Eq, Show)
 
 originPath :: Origin -> String
-originPath Embedded        = "<Std.Base>"
+originPath Embedded        = "<Base>"
 originPath (UserFile path) = path

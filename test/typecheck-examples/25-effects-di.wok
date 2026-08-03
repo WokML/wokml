@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Dependency injection via handlers. `greet` depends on the Logger capability,
 -- not on any concrete backend. A handler translates Logger into IO; an outer

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP effect-safety (E+ lazy reclaim), abort case (the leak regression). An
 -- effectful map under an ABORTING handler: 'mapF' rebuilds a same-shape 'Cons'

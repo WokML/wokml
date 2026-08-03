@@ -1,4 +1,4 @@
--- | Multi-module loader: parse + build fixity tables for the Std.Base
+-- | Multi-module loader: parse + build fixity tables for the Base
 -- prelude + every -I file + the entry, build a module map, validate
 -- the import dep graph, and return modules in topo order. Expression
 -- reordering and typechecking happen downstream (in the caller, per
@@ -69,12 +69,12 @@ data LoaderError
   | LoadImportCycle               [ModuleName]
   deriving (Show)
 
--- | Load the Std.Base prelude + each user file in [extras] + the entry,
--- validate, dep-sort, return in topo order (Std.Base first, entry last by
+-- | Load the Base prelude + each user file in [extras] + the entry,
+-- validate, dep-sort, return in topo order (Base first, entry last by
 -- convention — but callers MUST consume the explicit entry ModuleName
 -- returned alongside the module list, not infer it from list position).
 -- The prelude source is read at runtime via the cabal-generated
--- Paths_wok.getDataFileName path; the synthetic display tag "<Std.Base>"
+-- Paths_wok.getDataFileName path; the synthetic display tag "<Base>"
 -- stands in for the actual on-disk data-file location so user-facing
 -- diagnostics don't leak the install-time path.
 loadProgram
@@ -82,22 +82,22 @@ loadProgram
   -> [FilePath]        -- additional -I files (order preserved)
   -> IO (Either LoaderError (ModuleName, [LoadedModule]))
 loadProgram entry extras = runExceptT $ do
-  preludeText    <- liftIO Prelude.preludeSource
-  preludeLM      <- liftEither (parseAndPrep "<Std.Base>" Embedded preludeText)
-  stdControlText <- liftIO Prelude.stdControlSource
-  stdControlLM   <- liftEither (parseAndPrep "<Std.Control>" Embedded stdControlText)
-  stdArrayText   <- liftIO Prelude.stdArraySource
-  stdArrayLM     <- liftEither (parseAndPrep "<Std.Array>" Embedded stdArrayText)
-  stdStringText  <- liftIO Prelude.stdStringSource
-  stdStringLM    <- liftEither (parseAndPrep "<Std.String>" Embedded stdStringText)
-  stdBytesText   <- liftIO Prelude.stdBytesSource
-  stdBytesLM     <- liftEither (parseAndPrep "<Std.Bytes>" Embedded stdBytesText)
-  stdBorrowText  <- liftIO Prelude.stdBorrowSource
-  stdBorrowLM    <- liftEither (parseAndPrep "<Std.Borrow>" Embedded stdBorrowText)
-  extraLMs       <- traverse (ExceptT . loadOne) extras
-  entryLM        <- ExceptT (loadOne entry)
-  mm             <- liftEither
-                      (buildMap (preludeLM : stdControlLM : stdArrayLM : stdStringLM : stdBytesLM : stdBorrowLM : extraLMs ++ [entryLM]))
+  preludeText   <- liftIO Prelude.preludeSource
+  preludeLM     <- liftEither (parseAndPrep "<Base>" Embedded preludeText)
+  controlText   <- liftIO Prelude.controlSource
+  controlLM     <- liftEither (parseAndPrep "<Control>" Embedded controlText)
+  arrayText     <- liftIO Prelude.arraySource
+  arrayLM       <- liftEither (parseAndPrep "<Array>" Embedded arrayText)
+  stringText    <- liftIO Prelude.stringSource
+  stringLM      <- liftEither (parseAndPrep "<String>" Embedded stringText)
+  bytesText     <- liftIO Prelude.bytesSource
+  bytesLM       <- liftEither (parseAndPrep "<Bytes>" Embedded bytesText)
+  borrowText    <- liftIO Prelude.borrowSource
+  borrowLM      <- liftEither (parseAndPrep "<Borrow>" Embedded borrowText)
+  extraLMs      <- traverse (ExceptT . loadOne) extras
+  entryLM       <- ExceptT (loadOne entry)
+  mm            <- liftEither
+                     (buildMap (preludeLM : controlLM : arrayLM : stringLM : bytesLM : borrowLM : extraLMs ++ [entryLM]))
   ms          <- liftEither (topoSort mm)
   pure (lmName entryLM, ms)
 
@@ -180,7 +180,7 @@ topoSort mm = do
         -- stronglyConnComp returns SCCs in reverse topological order:
         -- a node with NO outgoing edges (a "leaf" — a module nothing
         -- depends on) comes last; a node that everything depends on
-        -- (like Std.Base) comes first. That is exactly the
+        -- (like Base) comes first. That is exactly the
         -- dependencies-first order we want.
         -- No cyclic SCCs at this point, so flattenSCC just unwraps each
         -- AcyclicSCC to its singleton; equivalent to a pattern-binder

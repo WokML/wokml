@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- rung-2 DEATH TEST (was the rung-1 boundary): this handler-position residual
 -- laundering is now REJECTED with UndischargedEffect by the caller-root provenance
 -- rule. The runner-sugar form `with s = <runner> in body` launders the body's

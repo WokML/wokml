@@ -1,39 +1,3 @@
-build a b xs =
-  join j129(r.1) =
-    let h = r.1
-    let t.1 = Cell(h, a, b)
-    t.1
-  case xs of
-    Nil ->
-      let _drop.1 = __rc_drop(xs)
-      join j132(r.2) =
-        let g.1 = r.2
-        jump j129(g.1)
-      case b of
-        Nil -> jump j132(0)
-        Cons p _.1 -> jump j132(p)
-    Cons y _.2 ->
-      let _drop.2 = __rc_drop(xs)
-      join j139(r.3) =
-        let g.2 = r.3
-        jump j129(g.2)
-      case a of
-        Nil -> jump j139(y)
-        Cons q _.3 ->
-          let t.2 = +(y, q)
-          jump j139(t.2)
-
-main =
-  let t.1 = Nil
-  let t.2 = Cons(5, t.1)
-  let t.3 = Nil
-  let t.4 = Cons(6, t.3)
-  let t.6 = Nil
-  let t.5 = Cons(2, t.6)
-  let t.7 = Cons(1, t.5)
-  let t.8 = build(t.2, t.4, t.7)
-  t.8
-
 id x =
   x
 
@@ -526,6 +490,42 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+build a b xs =
+  join j414(r.1) =
+    let h = r.1
+    let t.1 = Cell(h, a, b)
+    t.1
+  case xs of
+    Nil ->
+      let _drop.1 = __rc_drop(xs)
+      join j417(r.2) =
+        let g.1 = r.2
+        jump j414(g.1)
+      case b of
+        Nil -> jump j417(0)
+        Cons p _.1 -> jump j417(p)
+    Cons y _.2 ->
+      let _drop.2 = __rc_drop(xs)
+      join j424(r.3) =
+        let g.2 = r.3
+        jump j414(g.2)
+      case a of
+        Nil -> jump j424(y)
+        Cons q _.3 ->
+          let t.2 = +(y, q)
+          jump j424(t.2)
+
+main =
+  let t.1 = Nil
+  let t.2 = Cons(5, t.1)
+  let t.3 = Nil
+  let t.4 = Cons(6, t.3)
+  let t.6 = Nil
+  let t.5 = Cons(2, t.6)
+  let t.7 = Cons(1, t.5)
+  let t.8 = build(t.2, t.4, t.7)
+  t.8
 
 notFound =
   18446744073709551615

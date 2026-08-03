@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- ATTACK: Outer.oop performed INSIDE withInner's handled expression, handled by the
 -- OUTER handler -- so the captured continuation prefix crosses withInner's KHandleRC

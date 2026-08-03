@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Bug #4: a nested signed helper's skolem must not escape into an UNSIGNED
 -- enclosing binding via a compiler PANIC. Here `helper : a -> a` forces its

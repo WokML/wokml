@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- Verified diagnostic-defect regression: `owned` is boundary metadata scoped
 -- to a `Bytes` parameter of a `foreign module` member ONLY. Before the fix,

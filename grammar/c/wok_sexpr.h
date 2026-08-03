@@ -24,9 +24,16 @@
 // unparseable, exactly like the violation it is reporting.
 //
 // The reader is the dumper run backwards, and just as strict: an unknown
-// head tag, a wrong field count, a field of the wrong shape, or an
-// unterminated list or string literal are all reported through the sink and
-// fail the whole parse (nullptr). Recursion depth (which tracks real C call
+// head tag, a wrong field count, a field of the wrong shape, a child of the
+// wrong FAMILY, or an unterminated list or string literal are all reported
+// through the sink and fail the whole parse (nullptr). The family check is
+// the one that needs saying, because a class check alone does not make it:
+// it asks whether a child is PRESENT, never what the child is, so a type in
+// an expression slot used to read back clean and print as a different
+// program. wok_ast.h carries the family each field demands; this compares it
+// against the family the child's tag belongs to. The two error nodes are
+// wildcards -- the parser plants damage wherever a production gives up, so a
+// damaged parse's dump must still read back. Recursion depth (which tracks real C call
 // stack depth in both directions) is capped; exceeding it is reported
 // rather than left to overflow the stack.
 //

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Back-compat mixing: a NAMED handler (`count = state 5`) also answers a BARE
 -- ambient perform (`State.get`, no capability binder). The named runner is the

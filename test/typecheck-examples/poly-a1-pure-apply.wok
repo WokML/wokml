@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- A generic local `apply` combinator with no trapped effect anywhere;
 -- purely polymorphic higher-order application. Must accept.
 outer : U64 -> U64

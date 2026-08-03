@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Carrier rule (named effect instances, §4.3): a named instance handle is
 -- second-class and may not escape its scope. Returning the bare handle from the

@@ -3,9 +3,9 @@
 -- write the search explicitly with `List` (the list monad IS reified multi-shot).
 -- This finds every (a, b) with a, b in 1..n and a + b == target.
 module Main
-import Std.Base
+import Base
 
--- Std.Base has no list combinators; define the two we need.
+-- Base has no list combinators; define the two we need.
 concatMapL : (a -> [b]) -> [a] -> [b]
 concatMapL f xs = case xs of
   []      -> []

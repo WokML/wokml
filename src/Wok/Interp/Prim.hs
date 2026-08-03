@@ -19,20 +19,20 @@ import Wok.Runtime.StringZilla (szHash)
 
 -- | Primitive lookup table, keyed by @(module, name)@.  Using the full
 -- qualified pair prevents silent shadowing when two modules export the same
--- bare name (e.g., @length@ in both @Std.Array@ and @Std.String@).
+-- bare name (e.g., @length@ in both @Array@ and @String@).
 primTable :: PrimTable
 primTable = Map.fromList [ ((mn, primName p), p) | (mn, p) <- taggedPrims ]
 
 -- | All primitives tagged with their defining module.
 taggedPrims :: [(Text, Prim)]
 taggedPrims =
-  map (PN.stdBaseModule,)    basePrims
-  ++ map (PN.stdControlModule,) controlPrims
-  ++ map (PN.stdArrayModule,)   arrayPrims
-  ++ map (PN.stdStringModule,)  stringPrims
-  ++ map (PN.stdBytesModule,)   bytesPrims
-  ++ map (PN.stdBaseModule,)    bytesBasePrims
-  ++ map (PN.stdBorrowModule,)  borrowPrims
+  map (PN.baseModule,)    basePrims
+  ++ map (PN.controlModule,) controlPrims
+  ++ map (PN.arrayModule,)   arrayPrims
+  ++ map (PN.stringModule,)  stringPrims
+  ++ map (PN.bytesModule,)   bytesPrims
+  ++ map (PN.baseModule,)    bytesBasePrims
+  ++ map (PN.borrowModule,)  borrowPrims
 
 basePrims :: [Prim]
 basePrims =
@@ -52,7 +52,7 @@ basePrims =
   , eqStringP
   ]
 
--- | Bytes prims that live under Std.Base (eqBytes mirrors eqString's keying).
+-- | Bytes prims that live under Base (eqBytes mirrors eqString's keying).
 bytesBasePrims :: [Prim]
 bytesBasePrims = [ eqBytesP ]
 
@@ -353,7 +353,7 @@ dollarP = mkPrim (Tx.pack "$") 2 $ \args -> case args of
   _      -> Left (ArityError (Tx.pack "$"))
 
 -- ---------------------------------------------------------------------------
--- Std.Array prims (reference interpreter side, Slice A).
+-- Array prims (reference interpreter side, Slice A).
 --
 -- Arrays are represented as @VCon "Array" [v1, v2, ...]@, a direct-field
 -- constructor holding one 'Value' slot per element. 'renderValue' has a
@@ -442,7 +442,7 @@ arrayResizeP = mkPrim PN.arrayResizeName 3 $ \args -> case args of
   _         -> Left (ArityError PN.arrayResizeName)
 
 -- ---------------------------------------------------------------------------
--- Std.String prims (reference interpreter side, Slice E1).
+-- String prims (reference interpreter side, Slice E1).
 --
 -- Strings are represented as @VLit (LStr Text)@ in the reference machine.
 -- The reference 'Text' value provides the semantics; codepoint and byte ops
@@ -662,10 +662,10 @@ singletonP = mkPrim PN.singletonName 1 $ \args -> case args of
   _                -> Left (ArityError PN.singletonName)
 
 -- ---------------------------------------------------------------------------
--- Std.Bytes prims (reference interpreter side, Slice E6).
+-- Bytes prims (reference interpreter side, Slice E6).
 --
 -- Bytes are represented as @VBytes ByteString@ in the reference machine.
--- The 7 prims mirror the Std.Array / Std.String pattern above.
+-- The 7 prims mirror the Array / String pattern above.
 -- 'renderValue (VBytes bs)' uses the format @Bytes[65,195,169]@ (decimal
 -- byte list) which Task 7 (RC interpreter) MUST reproduce exactly.
 
@@ -778,7 +778,7 @@ ffiDemoAdoptP = mkPrim PN.ffiDemoAdoptName 1 $ \args -> case args of
   _               -> Left (ArityError PN.ffiDemoAdoptName)
 
 -- ---------------------------------------------------------------------------
--- Std.Borrow prims (reference interpreter side, FFI Slice 3 Task 3).
+-- Borrow prims (reference interpreter side, FFI Slice 3 Task 3).
 --
 -- The reference machine has no ownership/RC model, so a 'Borrow' carries the
 -- SAME runtime representation as a 'Bytes' buffer: 'VBytes'. The TYPE checker

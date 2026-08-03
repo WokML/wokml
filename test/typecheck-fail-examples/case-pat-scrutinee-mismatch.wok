@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 main = case 5 of
   True  -> 1
   False -> 2

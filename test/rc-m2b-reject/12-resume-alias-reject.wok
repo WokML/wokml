@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 regression (code-review #4, verified leak before fix). The op arm ALIASES
 -- the resume binder (`let k2 = k`) then calls the alias. The old m2bResumeEscapes

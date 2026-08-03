@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 bad : a -> a
 bad x = x + 1

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #14 (DIRECT sibling-into-list-constructor escape, REJECTED):
 -- the LetRec group sibling 'f' is stored DIRECTLY into a 'Cons' cell whose spine

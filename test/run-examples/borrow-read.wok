@@ -1,14 +1,14 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- FFI Slice 3 Task 3: the Borrow read surface (length/byteAt/slice/memchr)
 -- plus the Bytes.copy escape hatch, exercised via the transitional
 -- __borrow_demo producer (a static deterministic buffer, buf[i] = i & 0xFF).
--- No Std.Bytes import: Std.Borrow and Std.Bytes both define `length`, which
+-- No Bytes import: Borrow and Bytes both define `length`, which
 -- would clash if both were imported into the same module (the known
 -- cross-module name-collision constraint -- see the String/Bytes corpus
--- comments in test/Spec.hs). `eqBytes` lives in Std.Base, so `copy`'s result
+-- comments in test/Spec.hs). `eqBytes` lives in Base, so `copy`'s result
 -- can still be checked without it.
 --
 -- b = __borrow_demo 8 -> [0,1,2,3,4,5,6,7]

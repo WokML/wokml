@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 regression (full-branch review, verified UAF). An op arm that SEALS an
 -- enclosing boxed local ('x : [U64]') into a constructor, on the ABORT path

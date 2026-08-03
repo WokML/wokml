@@ -4,8 +4,8 @@
 -- neither suspension is captured by a closure, so the second-class carrier rule
 -- is satisfied and the consumer can drive both at the same time.
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 gen : U64 -> U64 -> () with Coro U64 ()
 gen lo hi = case eqU64 lo hi of

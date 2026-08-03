@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E3 Task 4: Short string-literal CAF allocation test
 -- Tests that a top-level binding 'foo = "/" ' allocates 0 cells

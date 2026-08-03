@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 tail-resume handler (Task 2). 'Env.get' is a value op resumed in tail
 -- position: auto-resume elaborates the constant arm to 'get(resume) ->

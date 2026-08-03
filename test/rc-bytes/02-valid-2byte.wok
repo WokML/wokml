@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- valid UTF-8: 2-byte sequence U+00E9 'e with acute' (195, 169)
 -- fromBytes returns Some

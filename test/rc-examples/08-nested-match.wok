@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Tree = Leaf U64 | Node Tree Tree
 

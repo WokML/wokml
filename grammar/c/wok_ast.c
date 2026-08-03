@@ -7,21 +7,32 @@
 
 // A sentinel keeps the array non-empty for nodes with no fields; nfields comes
 // from the slot-index enum, so the sentinel is never visited.
-#define WOK_FIELD_DESC(T, cls, name) {#name, WFC_##cls},
-#define WOK_DECLARE_FIELDS(T)                             \
+#define WOK_FIELD_DESC(T, cls, name, fam) {#name, WFC_##cls, WFAM_##fam},
+#define WOK_DECLARE_FIELDS(T, fam)                        \
   static const WokFieldDesc T##_field_desc[] = {          \
-      T##_FIELDS(WOK_FIELD_DESC, T){nullptr, WFC_NODE}};
+      T##_FIELDS(WOK_FIELD_DESC, T){nullptr, WFC_NODE, WFAM_NONE}};
 WOK_NODES(WOK_DECLARE_FIELDS)
 #undef WOK_DECLARE_FIELDS
 
 const WokNodeDesc wok_node_desc[WOK_TAG_COUNT] = {
-#define WOK_NODE_DESC(T) [T] = {#T, T##_field_desc, T##__NSLOTS},
+#define WOK_NODE_DESC(T, fam) \
+    [T] = {#T, T##_field_desc, T##__NSLOTS, WFAM_##fam},
     WOK_NODES(WOK_NODE_DESC)
 #undef WOK_NODE_DESC
 };
 
+static const char *const family_name[WOK_FAMILY_COUNT] = {
+#define WOK_X(f) [WFAM_##f] = #f,
+    WOK_FAMILIES(WOK_X)
+#undef WOK_X
+};
+
+const char *wok_family_name(WokFamily f) {
+  return f < WOK_FAMILY_COUNT ? family_name[f] : "?";
+}
+
 static const u16 node_slots[WOK_TAG_COUNT] = {
-#define WOK_NODE_SLOTS(T) [T] = T##__NSLOTS,
+#define WOK_NODE_SLOTS(T, fam) [T] = T##__NSLOTS,
     WOK_NODES(WOK_NODE_SLOTS)
 #undef WOK_NODE_SLOTS
 };

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- M3 Task 4 (THE CYCLE EXPLOIT --- closest surface approximation). For an RC cycle
 -- 'cell -> NCont -> cell' to form, the stored continuation must counted-reach its

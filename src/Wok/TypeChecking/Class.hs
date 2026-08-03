@@ -286,7 +286,7 @@ collectVarsT = go
 collectVars :: Map Text Int -> [Abs.Constraint] -> Map Text Int
 collectVars = foldl' (\m (Abs.Constraint _ args) -> foldl' collectVarsT m args)
 
--- | The leaf name of a (possibly dotted) ModPath, e.g. @Std.Base.Option@
+-- | The leaf name of a (possibly dotted) ModPath, e.g. @Base.Option@
 -- -> @Option@. Built-in base names round-trip through 'resolveTyConName'.
 modPathLeaf :: Abs.ModPath -> Text
 modPathLeaf (Abs.MPName (Abs.ConId (_, n))) = n

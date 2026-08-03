@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #10 (bare ALIAS of a LetRec sibling, NON-escaping; the FIX):
 -- 'let x = f' aliases the LetRec group sibling 'f' (a borrowed/uncounted-region

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E3 inline-string corpus: single-byte string "/" (1 byte <= maxInlineStr = 7).
 -- Chosen as a non-alpha byte to stress-test the byte-content round-trip.

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Array
+import Base
+import Array
 
 -- Verify that 'length' reports the correct count after 'new', 'fromList', and
 -- 'resize'.

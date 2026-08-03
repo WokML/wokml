@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 -- A user-declared `effect IO` override is an ordinary HANDLEABLE effect, not
 -- the ground IO the entry ambient discharges. Performing it in a top-level
 -- 0-arg binding must reject at the emit site like any other effect -- seeding

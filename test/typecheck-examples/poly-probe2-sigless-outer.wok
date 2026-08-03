@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- Sig-less top-level `outer` generalizes the identity-apply pattern with no
 -- trapped effect; the inferred sig stays fully polymorphic. Must accept.
 outer n = let apply f x = f x in apply (\ y -> y) n

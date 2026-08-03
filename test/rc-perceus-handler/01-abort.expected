@@ -1,27 +1,3 @@
-risky b =
-  case b of
-    True ->
-      let _drop.1 = __rc_drop(b)
-      let t = Fail.fail("boom")
-      t
-    False ->
-      let _drop.2 = __rc_drop(b)
-      7
-
-main =
-  let t.1 = True
-  let t.2 = risky(t.1)
-  t.2
-  with {
-    return v ->
-      let t.4 = Got(v)
-      t.4
-    Fail.fail(msg, resume) ->
-      let t.3 = Failed(msg)
-      let _drop = __rc_drop(resume)
-      t.3
-  }
-
 id x =
   x
 
@@ -514,6 +490,30 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+risky b =
+  case b of
+    True ->
+      let _drop.1 = __rc_drop(b)
+      let t = Fail.fail("boom")
+      t
+    False ->
+      let _drop.2 = __rc_drop(b)
+      7
+
+main =
+  let t.1 = True
+  let t.2 = risky(t.1)
+  t.2
+  with {
+    return v ->
+      let t.4 = Got(v)
+      t.4
+    Fail.fail(msg, resume) ->
+      let t.3 = Failed(msg)
+      let _drop = __rc_drop(resume)
+      t.3
+  }
 
 notFound =
   18446744073709551615

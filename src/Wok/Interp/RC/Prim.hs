@@ -58,14 +58,14 @@ rcPrimTable = Map.fromList [ ((mn, rpName p), p) | (mn, p) <- taggedRcPrims ]
 -- | All RC primitives tagged with their defining module.
 taggedRcPrims :: [(Text, RCPrim)]
 taggedRcPrims =
-  map (PN.stdBaseModule,)    rcBasePrims
+  map (PN.baseModule,)    rcBasePrims
   ++ map (Tx.pack "",)          rcIntrinsics   -- hint-dispatched; empty module sentinel
-  ++ map (PN.stdControlModule,) rcControlPrims
-  ++ map (PN.stdArrayModule,)   rcArrayPrims
-  ++ map (PN.stdStringModule,)  rcStringPrims
-  ++ map (PN.stdBytesModule,)   rcBytesPrims
-  ++ map (PN.stdBaseModule,)    rcBytesBasePrims
-  ++ map (PN.stdBorrowModule,)  rcBorrowPrims
+  ++ map (PN.controlModule,) rcControlPrims
+  ++ map (PN.arrayModule,)   rcArrayPrims
+  ++ map (PN.stringModule,)  rcStringPrims
+  ++ map (PN.bytesModule,)   rcBytesPrims
+  ++ map (PN.baseModule,)    rcBytesBasePrims
+  ++ map (PN.borrowModule,)  rcBorrowPrims
 
 rcBasePrims :: [RCPrim]
 rcBasePrims =
@@ -84,7 +84,7 @@ rcBasePrims =
   , eqString
   ]
 
--- | Bytes prims under Std.Base (eqBytes mirrors eqString's keying in Std.Base).
+-- | Bytes prims under Base (eqBytes mirrors eqString's keying in Base).
 rcBytesBasePrims :: [RCPrim]
 rcBytesBasePrims = [ eqBytesRC ]
 
@@ -1328,7 +1328,7 @@ ffiDemoAdoptRC = RCPrim PN.ffiDemoAdoptName 1 [] $ \args s -> case args of
   _ -> throwE (ArityError PN.ffiDemoAdoptName)
 
 -- ---------------------------------------------------------------------------
--- Std.Borrow primitives (FFI Slice 3 Task 3).
+-- Borrow primitives (FFI Slice 3 Task 3).
 --
 -- A Borrow is represented as an 'NBorrowView' cell: on 'CHeap' a genuine
 -- 0xFFFA 'WokBorrowView' C cell wrapping a FOREIGN pointer (read via

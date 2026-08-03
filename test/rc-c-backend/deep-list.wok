@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Deep list through the C backend (Task 3): build a spine of 100000 'Cons' cells
 -- (each a C-heap 'NCon' with an encodable U64 head and an HBOX tail), sum it, and

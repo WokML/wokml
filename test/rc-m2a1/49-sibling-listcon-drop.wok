@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #19 (DIRECT sibling-into-list-constructor LOCAL DROP, ACCEPTED):
 -- the LetRec group sibling 'f' is stored into a 'Cons' cell that is DROPPED

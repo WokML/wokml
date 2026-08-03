@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Regression: the payload restriction (spec 3.3) must see through a user
 -- data constructor. Box wraps a function; Chan Box would smuggle the closure

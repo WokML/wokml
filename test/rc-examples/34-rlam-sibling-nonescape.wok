@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #4: a standalone closure ('RLam') that captures a LetRec
 -- GROUP SIBLING.  The closure 'h' is never called; the overall result is the

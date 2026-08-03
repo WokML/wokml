@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Soundness regression: a coro carrier (Step/Suspension, affine one-shot) must
 -- NOT cross the Conc transport. The promise cell would otherwise cache the

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Multi-constructor data decl: each constructor has its own record fields.
 -- Field names must be unique across constructors within the same decl.

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #13 (DIRECT sibling-into-call-argument escape, must be REJECTED):
 -- the LetRec group sibling 'f' is passed DIRECTLY as a NON-HEAD argument of a call

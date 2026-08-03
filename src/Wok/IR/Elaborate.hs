@@ -1180,7 +1180,7 @@ elaborateModule entryModule externKeys env tds =
 -- | Elaborate several modules into one CoreModule. Each top-level value-level
 -- global is identified by its DEFINING module, keyed @(definingModule, name)@,
 -- and given ONE canonical 'Name'. A module that defines a name shadowing one it
--- also imports (e.g. a user @state@ over @Std.Control.state@) therefore gets a
+-- also imports (e.g. a user @state@ over @Control.state@) therefore gets a
 -- DISTINCT runtime binding from the imported one: each module's own references
 -- resolve to its own definition, and cross-module references resolve to the
 -- importee's. Without this, two modules defining the same bare name would

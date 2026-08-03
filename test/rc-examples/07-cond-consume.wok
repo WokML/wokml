@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Choice = UseList [U64] | UseDefault
 

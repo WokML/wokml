@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 myLength : [a] -> U64
 myLength xs = case xs of

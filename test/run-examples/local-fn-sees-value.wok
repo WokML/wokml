@@ -1,4 +1,4 @@
 module Main
-import Std.Base
+import Base
 
 main = let a = 5; f y = y + a in f 1

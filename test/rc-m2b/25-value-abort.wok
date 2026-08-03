@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-2 Task 5: value-position handler whose op arm ABORTS (no resume call).
 -- The 'with' is in non-tail position within 'main': its result is used in a

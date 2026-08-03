@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- CHARACTERIZATION of the resume-site obligation (slice 4b-dprime).
 --

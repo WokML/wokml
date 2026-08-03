@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 leak : Step U64 () U64 (row e) -> Step U64 () U64 (row e)
 leak s = s
 main : U64

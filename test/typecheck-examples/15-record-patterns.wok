@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Point = Point { x : U64, y : U64 }
 

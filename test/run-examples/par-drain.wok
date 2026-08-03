@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 genC : () -> U64 with Async
 genC u = let p = Async.yield () in let q = Async.yield () in 100

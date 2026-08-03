@@ -96,7 +96,7 @@ dropHint = PN.rcDropName
 --
 -- TRUST ANCHOR (code-review #6; backlog #12 §2.7). @__cont_store@ is recognized
 -- HERE by its QUALIFIED @(module, name)@ extern identity, matching the 'APrim'
--- head the elaborator emits for a genuine @Std.Control.__cont_store@ reference.
+-- head the elaborator emits for a genuine @Control.__cont_store@ reference.
 -- This is the SAME identity layer the once-sink @__coro_susp@ uses (see
 -- 'Wok.IR.PrimNames.onceSinkNames'): a user binding merely HINTED @__cont_store@
 -- resolves to an 'AVar' (never 'APrim'), so it can never be matched here.
@@ -953,7 +953,7 @@ storeCalls resume = go Set.empty
     -- ADMIT-DIRECTION IDENTITY (code-review #6; backlog #12 §2.7). Case (1)
     -- recognizes @__cont_cell_new@ by its QUALIFIED @(module, name)@ extern identity
     -- ('PN.contCellNewKey'), matching the 'APrim' head the elaborator emits for a genuine
-    -- @Std.Control.__cont_cell_new@ reference --- the SAME identity layer as the
+    -- @Control.__cont_cell_new@ reference --- the SAME identity layer as the
     -- once-sink @__coro_susp@/@__cont_store@. A user binding hinted @__cont_cell_new@
     -- resolves to an 'AVar' and is never matched. (Case (3)'s @__rc_dup@ is still
     -- hint-on-'AVar': it is Perceus-SYNTHESIZED post-elaboration, never an extern, so

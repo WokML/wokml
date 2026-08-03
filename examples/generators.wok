@@ -3,7 +3,7 @@
 -- resumes the continuation exactly ONCE (one-shot), so it passes the law. The
 -- "many values" come from the PRODUCER's own recursion, not from resuming twice.
 module Main
-import Std.Base
+import Base
 
 effect Yield = { yield : U64 -> () }
 

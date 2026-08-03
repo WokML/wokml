@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Pure-cohort fast path: the Triple holds ONLY U64 scalars (all Inline / raw
 -- literals, no counted children). The arena_close scan-out is empty (no counted

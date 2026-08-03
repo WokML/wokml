@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Multi-byte string test: "hero" where the second char is the 2-byte UTF-8
 -- codepoint U+00E9 (LATIN SMALL LETTER E WITH ACUTE).  Written directly as

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 fact : U64 -> U64
 fact n = case n of

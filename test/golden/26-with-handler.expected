@@ -1,7 +1,7 @@
 ROUND-TRIP PARSE ERROR: syntax error at line 13, column 3 before `;'
 ---first print---
 module Main;
-import Std . Base;
+import Base;
 effect Ask =
 {
   ask : U64

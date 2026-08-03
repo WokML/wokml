@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 ignore : Suspension U64 U64 U64 (row e) -> ()
 ignore _ = ()
 main : U64

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP effect-safety (E+ lazy reclaim), resume case. An effectful map under a
 -- RESUMING handler: 'mapF' rebuilds a same-shape 'Cons' over the unique scrutinee

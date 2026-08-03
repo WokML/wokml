@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 wa : () -> U64 with Coro () ()
 wa u = let s = Coro.suspend () in 10

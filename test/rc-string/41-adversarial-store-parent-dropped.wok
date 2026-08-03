@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 7: adversarial shape 2 -- slice stored in a constructor cell,
 -- original parent binding consumed by the slice prim (the slice's counted

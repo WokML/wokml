@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- indexOf / indexOfFrom on multi-byte UTF-8 strings.
 -- "héllo": bytes h(1) é(2=0xC3 0xA9) l(1) l(1) o(1) = 6 bytes total.

@@ -330,10 +330,32 @@ static void resync_to_boundary(P *p) {
   }
 }
 
-static bool word_starts_decl(WokWord w) {
-  return w == WW_MODULE || w == WW_IMPORT || w == WW_TYPE || w == WW_ALIAS ||
-         w == WW_EFFECT || w == WW_CLASS || w == WW_INSTANCE ||
-         w == WW_FOREIGN || w == WW_EXTERN;
+// The words that BEGIN a declaration, and the production each one names.
+//
+// ONE roster, because two questions share this answer and must never drift
+// apart: parse_decl asks WHICH PRODUCTION parses a declaration, and
+// word_starts_decl asks whether a token is a safe place for recovery to
+// RESUME. They agree by construction rather than by convention -- forward-only
+// declarations (D23) are what makes a declaration keyword unambiguous enough
+// to be an anchor, so the two questions have one answer by design.
+//
+// They were two hand-written lists 1,500 lines apart, and dropping a word from
+// one of them compiled, passed every suite, and reported a fault on GOOD
+// source: recovery ran past the declaration it should have stopped at and into
+// its body. A wrong diagnostic on correct code is the worst kind, because a
+// reader believes it.
+#define WOK_DECL_WORDS(X)                                                    \
+  X(WW_MODULE, parse_module_decl)     X(WW_IMPORT, parse_import_decl)        \
+  X(WW_TYPE, parse_type_decl)         X(WW_ALIAS, parse_alias_decl)          \
+  X(WW_EFFECT, parse_effect_decl)     X(WW_CLASS, parse_class_decl)          \
+  X(WW_INSTANCE, parse_instance_decl) X(WW_FOREIGN, parse_foreign_decl)      \
+  X(WW_EXTERN, parse_extern_decl)
+
+WOK_PURE static bool word_starts_decl(WokWord w) {
+#define WOK_X(word, fn) if (w == word) return true;
+  WOK_DECL_WORDS(WOK_X)
+#undef WOK_X
+  return false;
 }
 
 // Forward-only declarations (D23) are what make a signature the strongest
@@ -1825,28 +1847,21 @@ static WokNode *parse_decl(P *p) {
   if (!enter(p)) return mk_error(p, D_Error, cur(p)->off);
   WokNode *r;
   if (at(p, WT_KEYWORD)) {
-    WokWord w = (WokWord)cur(p)->word;
-    if (w == WW_MODULE)
-      r = parse_module_decl(p);
-    else if (w == WW_IMPORT)
-      r = parse_import_decl(p);
-    else if (w == WW_TYPE)
-      r = parse_type_decl(p);
-    else if (w == WW_ALIAS)
-      r = parse_alias_decl(p);
-    else if (w == WW_EFFECT)
-      r = parse_effect_decl(p);
-    else if (w == WW_CLASS)
-      r = parse_class_decl(p);
-    else if (w == WW_INSTANCE)
-      r = parse_instance_decl(p);
-    else if (w == WW_FOREIGN)
-      r = parse_foreign_decl(p);
-    else if (w == WW_EXTERN)
-      r = parse_extern_decl(p);
-    else {
-      perr_expect(p, "a declaration");
-      r = mk_error(p, D_Error, cur(p)->off);
+    // The `default:` here is a real grammar case, not a silenced enumerator:
+    // `let`, `then` and `where` are keywords that legitimately reach this and
+    // legitimately do not begin a declaration. The -Wswitch ban on `default:`
+    // is about traversals, where it would hide a missing node kind.
+    switch ((WokWord)cur(p)->word) {
+#define WOK_X(word, fn) \
+  case word:            \
+    r = fn(p);          \
+    break;
+      WOK_DECL_WORDS(WOK_X)
+#undef WOK_X
+      default:
+        perr_expect(p, "a declaration");
+        r = mk_error(p, D_Error, cur(p)->off);
+        break;
     }
   } else {
     r = parse_sig_or_equation(p);

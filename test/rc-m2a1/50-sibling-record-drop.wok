@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #20 (DIRECT sibling-into-record-field LOCAL DROP, ACCEPTED):
 -- the LetRec group sibling 'f' is stored into a record field ('Cell { fn = f }')

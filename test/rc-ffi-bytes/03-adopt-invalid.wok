@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- __ffi_demo_adopt 200 yields bytes 0..199. Byte 128 (0x80) is a lone
 -- continuation byte, making the sequence invalid UTF-8. fromBytes = None.

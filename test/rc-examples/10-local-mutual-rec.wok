@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Local mutual recursion: the two helpers form one LetRec uncounted region.
 -- Intra-group references (ev <-> od) are uncounted edges that emit no dup/drop;

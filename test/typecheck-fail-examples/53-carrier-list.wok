@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Carrier rule: two handles collected into a list escape their scopes -- a
 -- list element is not a handle slot. Rejected.

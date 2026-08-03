@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data UserId = UserId { value : U64 }
 data OrderId = OrderId { value : U64 }

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 head0 : [a] -> a
 head0 xs = case xs of

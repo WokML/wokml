@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- A NAMED state instance (`count = state 0`) sitting under a MULTISHOT handler
 -- (`Choice.flip` resumes twice: `k True + k False`) must behave EXACTLY like

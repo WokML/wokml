@@ -47,7 +47,7 @@ decodeCharAt bs i = do
 
 -- | True iff the bytes are well-formed UTF-8 (rejects overlong, lone
 -- continuation, > U+10FFFF, lone surrogate). The reference/abstract-heap gate
--- for Std.Bytes.fromBytes, and the oracle anchor the C DFA must match.
+-- for Bytes.fromBytes, and the oracle anchor the C DFA must match.
 validateUtf8 :: ByteString -> Bool
 validateUtf8 bs = case TxEnc.decodeUtf8' bs of
   Right _ -> True

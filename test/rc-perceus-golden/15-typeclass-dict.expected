@@ -1,25 +1,3 @@
-main =
-  let t.1 = Circle(7)
-  case dict$Describe$Shape of
-    Describe$Dict f ->
-      let _dup = __rc_dup(f)
-      let t.2 = f(t.1)
-      let _drop = __rc_drop(f)
-      t.2
-
-dict$Describe$Shape$m0 s =
-  case s of
-    Circle r ->
-      let _drop.1 = __rc_drop(s)
-      r
-    Square w ->
-      let _drop.2 = __rc_drop(s)
-      w
-
-dict$Describe$Shape =
-  let t = Describe$Dict(dict$Describe$Shape$m0)
-  t
-
 id x =
   x
 
@@ -512,6 +490,28 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+main =
+  let t.1 = Circle(7)
+  case dict$Describe$Shape of
+    Describe$Dict f ->
+      let _dup = __rc_dup(f)
+      let t.2 = f(t.1)
+      let _drop = __rc_drop(f)
+      t.2
+
+dict$Describe$Shape$m0 s =
+  case s of
+    Circle r ->
+      let _drop.1 = __rc_drop(s)
+      r
+    Square w ->
+      let _drop.2 = __rc_drop(s)
+      w
+
+dict$Describe$Shape =
+  let t = Describe$Dict(dict$Describe$Shape$m0)
+  t
 
 notFound =
   18446744073709551615

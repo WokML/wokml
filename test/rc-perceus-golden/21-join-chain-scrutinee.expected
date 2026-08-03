@@ -1,34 +1,3 @@
-headCons xs =
-  join j127(r) =
-    let h = r
-    let t = Cell(h, xs)
-    t
-  join j129() =
-    jump j127(0)
-  join j130(y.1) =
-    jump j127(y.1)
-  join j132(y.2) =
-    jump j127(y.2)
-  case xs of
-    Nil -> jump j129()
-    Cons f.1 f.2 ->
-      let _dup = __rc_dup(f.2)
-      case f.2 of
-        Nil ->
-          let _drop.1 = __rc_drop(f.2)
-          jump j130(f.1)
-        Cons f.3 f.4 ->
-          let _drop.2 = __rc_drop(f.2)
-          jump j132(f.1)
-
-main =
-  let t.3 = Nil
-  let t.2 = Cons(3, t.3)
-  let t.1 = Cons(2, t.2)
-  let t.4 = Cons(1, t.1)
-  let t.5 = headCons(t.4)
-  t.5
-
 id x =
   x
 
@@ -521,6 +490,37 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+headCons xs =
+  join j412(r) =
+    let h = r
+    let t = Cell(h, xs)
+    t
+  join j414() =
+    jump j412(0)
+  join j415(y.1) =
+    jump j412(y.1)
+  join j417(y.2) =
+    jump j412(y.2)
+  case xs of
+    Nil -> jump j414()
+    Cons f.1 f.2 ->
+      let _dup = __rc_dup(f.2)
+      case f.2 of
+        Nil ->
+          let _drop.1 = __rc_drop(f.2)
+          jump j415(f.1)
+        Cons f.3 f.4 ->
+          let _drop.2 = __rc_drop(f.2)
+          jump j417(f.1)
+
+main =
+  let t.3 = Nil
+  let t.2 = Cons(3, t.3)
+  let t.1 = Cons(2, t.2)
+  let t.4 = Cons(1, t.1)
+  let t.5 = headCons(t.4)
+  t.5
 
 notFound =
   18446744073709551615

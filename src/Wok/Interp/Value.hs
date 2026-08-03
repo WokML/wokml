@@ -47,7 +47,7 @@ type JoinEnv = Map JoinId JoinPoint
 -- | Primitive lookup table, keyed by the qualified @(module, name)@ of the
 -- prelude @extern@. Using the full pair prevents name collisions between
 -- distinct modules that export identically-named operations (e.g. @length@
--- in both @Std.Array@ and @Std.String@).
+-- in both @Array@ and @String@).
 type PrimTable = Map (Text, Text) Prim
 
 -- | A lexical scope: term bindings plus join points.

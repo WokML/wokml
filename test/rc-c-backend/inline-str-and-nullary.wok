@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- E3 Task 2: co-exercise the 011 (Inline nullary) and 111 (InlineStr) slot
 -- sub-tags in the same constructor.  'Pair "hi" True' packs "hi" into a 111

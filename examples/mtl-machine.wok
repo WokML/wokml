@@ -1,10 +1,10 @@
 -- A small command machine that uses the whole mtl-style effect stack from
--- Std.Control at once: Reader (config), State (a running total), Writer (a log
+-- Control at once: Reader (config), State (a running total), Writer (a log
 -- of snapshots), and Except (abort on a bad command). The commands are walked
 -- RECURSIVELY, and the four handlers are stacked flatly with `with ... in`.
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 data Cmd = Inc U64 | Snapshot | Boom
 
@@ -23,7 +23,7 @@ tick cmd = case cmd of
   Boom     -> Except.throw "machine hit a Boom"
 
 -- Walk the program recursively, summing the per-command counts.
--- (Named `walk`, not `run`: `run` is now the Std.Control single-shot coroutine
+-- (Named `walk`, not `run`: `run` is now the Control single-shot coroutine
 -- driver, and a same-named top-level binding would shadow it ambiguously.)
 walk : [Cmd] -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
 walk cmds = case cmds of

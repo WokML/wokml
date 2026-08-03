@@ -1,4 +1,4 @@
 module Main
-import Std.Base
+import Base
 
 main = 2 + 3 * 4

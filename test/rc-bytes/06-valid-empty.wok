@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- valid UTF-8: empty byte buffer
 -- empty is trivially valid; fromBytes returns Some

@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 (finding #4): cross-tier composition -- an ADOPTED foreign-bytes
 -- cell (0xFFFB WokForeignBytes, produced by Libc.strndup's owned-return adopt

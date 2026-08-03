@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 abort handler (Task 2). 'Fail.fail' aborts: its op arm binds the
 -- continuation 'k' but NEVER applies it (the handler returns a boxed error

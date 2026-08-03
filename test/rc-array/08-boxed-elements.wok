@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Array
+import Base
+import Array
 
 -- Array (Option U64): pointer-scheme (KPointer) elements mixing counted CAddr
 -- slots (Some k) and uncounted Inline slots (None).  Exercises the C-cell

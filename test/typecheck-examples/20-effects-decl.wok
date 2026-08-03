@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Effect declarations: inline, block-form, and parameterized. No values use
 -- them yet; this fixture pins that declarations alone typecheck and that an

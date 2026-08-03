@@ -1,11 +1,3 @@
-main =
-  let t.1 = True
-  let t.2 = False
-  let t.3 = &&(t.1, t.2)
-  let t.4 = True
-  let t.5 = ||(t.3, t.4)
-  t.5
-
 id x =
   x
 
@@ -498,6 +490,14 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+main =
+  let t.1 = True
+  let t.2 = False
+  let t.3 = &&(t.1, t.2)
+  let t.4 = True
+  let t.5 = ||(t.3, t.4)
+  t.5
 
 notFound =
   18446744073709551615

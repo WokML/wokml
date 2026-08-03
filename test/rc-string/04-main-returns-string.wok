@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- main returns a String directly, exercising the top-level result drop path
 -- (valueChildren / dropAddr on NString) that no other corpus program covers.

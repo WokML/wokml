@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- The trapped-effect lambda is routed through a generic identity combinator
 -- before reaching the sig; the combinator must not launder e. Expect
 -- UndischargedEffect.

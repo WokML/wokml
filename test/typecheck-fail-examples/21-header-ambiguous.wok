@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 effect Reader = { ask : U64 }
 effect Config = { ask : U64 }

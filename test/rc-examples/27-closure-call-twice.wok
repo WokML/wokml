@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- The closure value is consumed by each call, so calling it twice forces the
 -- pass to insert one dup of the closure (rc must reach 2).

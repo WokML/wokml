@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 zipSum : [U64] -> [U64] -> U64
 zipSum (x :: xs) (y :: ys) = x + y + zipSum xs ys

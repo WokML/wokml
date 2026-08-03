@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 producer : () -> U64 with Coro U64 U64
 producer u = (Coro.suspend 42) + 1
 main : U64

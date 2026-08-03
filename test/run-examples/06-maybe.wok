@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 unwrapOr : Option a -> a -> a
 unwrapOr o d = case o of

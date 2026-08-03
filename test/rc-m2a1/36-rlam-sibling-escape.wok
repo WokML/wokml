@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #6 (ESCAPING variant of #4, must STAY rejected):
 -- a standalone closure ('RLam') 'h' captures a LetRec GROUP SIBLING 'f', and

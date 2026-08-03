@@ -1,8 +1,8 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
--- E4 Task 3: take and drop library functions (defined in Std.String over slice).
+-- E4 Task 3: take and drop library functions (defined in String over slice).
 -- s = "hello world" (11 bytes, 11 codepoints)
 -- take s 5 = "hello" (5 bytes)
 -- drop s 6 = "world" (5 bytes)

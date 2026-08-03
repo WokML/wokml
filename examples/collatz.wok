@@ -2,7 +2,7 @@
 -- Even -> n/2, odd -> 3n+1. Uses only `mod`, `==`, and arithmetic (the language
 -- has equality but no ordering, which is all this needs).
 module Main
-import Std.Base
+import Base
 
 collatz : U64 -> U64
 collatz n = case n == 1 of

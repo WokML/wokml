@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Borrow is second-class: returning it out of the scope it was received in
 -- is a CarrierEscape, exactly like Suspension/Step/ContCell, even though

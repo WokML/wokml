@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Out-of-bounds byteAt: both the reference interpreter and the RC interpreter
 -- must raise a PrimError. "hi" has byteLength 2; index 5 is out of bounds.

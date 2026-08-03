@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- DEATH TEST (inner-abstraction family, rung 3 — enclosing-parameter carrier).
 -- The laundering lambda is passed through the identity combinator before being
 -- applied. The residual is caught at its perform site inside the lambda, not at

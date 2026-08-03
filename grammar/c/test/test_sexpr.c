@@ -48,14 +48,24 @@ static WokNode *build_tree(WokArena *a) {
   D_Import_set_alias(imp, mk_name(a, src, "L", true));
 
   // D_Equation: an INT field (E_Int.value) and another empty SEQ (wheres).
+  // The left-hand side is an L_Prefix and not the bare P_Var this fixture
+  // used to carry: parse_lhs builds only L_Prefix and L_Infix, so a pattern
+  // there is a tree no parse produces -- which the schema now says, and the
+  // reader now enforces.
   WokNode *pvar = wok_node(a, P_Var, 0, 0);
   P_Var_set_name(pvar, span_in(src, "x"));
+
+  WokNode *lhs = wok_node(a, L_Prefix, 0, 0);
+  L_Prefix_set_name(lhs, span_in(src, "foo"));
+  L_Prefix_set_paren(lhs, false);
+  WokNode *lhsargs[1] = {pvar};
+  L_Prefix_set_args(lhs, wok_seq(a, lhsargs, 1));
 
   WokNode *eint = wok_node(a, E_Int, 0, 0);
   E_Int_set_value(eint, 42);
 
   WokNode *eqn = wok_node(a, D_Equation, 0, 0);
-  D_Equation_set_lhs(eqn, pvar);
+  D_Equation_set_lhs(eqn, lhs);
   D_Equation_set_body(eqn, eint);
   D_Equation_set_wheres(eqn, wok_seq_empty());
 
@@ -102,6 +112,52 @@ static WokNode *build_tree(WokArena *a) {
 // scoped block, rather than in helper functions.
 
 int main(void) {
+  // --- the reader is strict about FAMILIES, not just about shape ---------
+  //
+  // The schema records which KIND of child each field takes, so a dump that
+  // puts one family where another belongs is reported rather than read back
+  // as a different program. Without this the class check alone let it
+  // through -- it asks whether a child is present, never what the child IS --
+  // and `(D_Equation (L_Prefix "f" #f (seq)) (T_Var "a") (seq))` round-tripped
+  // into `f = a`, an expression the dump never held.
+  {
+    static const struct {
+      const char *text;
+      bool ok;
+    } cases[] = {
+        {"(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Var \"a\") "
+         "(seq))))", true},
+        // a TYPE in an expression slot
+        {"(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (T_Var \"a\") "
+         "(seq))))", false},
+        // an EXPRESSION where a left-hand side belongs
+        {"(W_File (seq (D_Equation (E_Var \"f\") (E_Var \"a\") (seq))))",
+         false},
+        // an EXPRESSION in a pattern sequence
+        {"(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq (E_Var \"x\"))) "
+         "(E_Var \"a\") (seq))))", false},
+        // a DECLARATION where the file expects one -- the subsumption cases
+        // must still pass: a block item may be a bare expression ...
+        {"(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Block (seq "
+         "(S_Use (seq (H_UseBind \"a\" \"b\"))) (E_Var \"a\"))) (seq))))",
+         true},
+        // ... and a binding's left side may be a pattern
+        {"(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_LetIn "
+         "(H_Bind (P_Wild) (E_Var \"a\")) (E_Var \"a\")) (seq))))", true},
+    };
+    for (usize i = 0; i < sizeof cases / sizeof *cases; i++) {
+      WokArena *a = wok_arena_new(1 << 14);
+      usize n = strlen(cases[i].text);
+      WokDiagSink *d = wok_diag_new(a, "<strict>", cases[i].text, n);
+      const char *pool = nullptr;
+      WokNode *t = wok_sexpr_read(cases[i].text, n, a, d, &pool);
+      CHECK((t != nullptr) == cases[i].ok,
+            "family case %zu: reader %s, wanted %s", i,
+            t ? "accepted" : "rejected", cases[i].ok ? "accept" : "reject");
+      wok_arena_free(a);
+    }
+  }
+
   // --- round trip: Dump(Read(Dump(t))) == Dump(t), byte for byte ---------
   {
     WokArena *a = wok_arena_new(1 << 16);

@@ -78,10 +78,10 @@ importListErrors envsByMod specs =
 -- only the UNQUALIFIED scope, per "the rest should be qualified").
 --
 -- Qualifier name:
--- * 'Abs.IMAs' (ConId alias) — the alias (e.g. @Base@ from @import Std.Base as Base@)
+-- * 'Abs.IMAs' (ConId alias) — the alias (e.g. @B@ from @import Foo as B@)
 -- * 'Abs.IMPlain' / 'Abs.IMList' — the module's own name, but ONLY if
 --   single-segment (no dots). Multi-seg plain imports register nothing
---   (D2: single-seg qualifier only; @Std.Base.x@ doesn't parse).
+--   (D2: single-seg qualifier only; @Foo.Bar.x@ doesn't parse).
 buildQualifierMap
   :: [ImportSpec]
   -> Map.Map ModuleName TC.Env

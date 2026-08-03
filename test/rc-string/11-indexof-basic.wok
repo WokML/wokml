@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- indexOf / indexOfFrom: present / absent / at-boundary / from-offset.
 -- All cases on ASCII strings.

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-2 code-review F3: value-position handler with a BOXED local in the
 -- answer-join consumer.  The handler sits in VALUE position (hAnswerJoin = Just

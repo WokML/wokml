@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- A merge join whose result is boxed and flows through the continuation. On the
 -- empty branch the owned `tag` is moved into the join (and the empty `xs` shell

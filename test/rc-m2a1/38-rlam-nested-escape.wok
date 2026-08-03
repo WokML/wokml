@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #8 (Route 5: NESTED capture, VERIFIED use-after-free):
 -- a standalone closure 'h' captures a LetRec GROUP SIBLING 'f' (borrowed from the

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- valid UTF-8: mixed ASCII + 2-byte sequence
 -- 65 = 'A', 195 169 = U+00E9 (e-acute)

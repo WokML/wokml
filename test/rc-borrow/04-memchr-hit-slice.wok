@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- __borrow_demo 10 yields buf = [0,...,9]. slice b 3 8 = [3,4,5,6,7]
 -- (parent offset 3, length 5). memchr for byte 6 hits at the SLICE-RELATIVE

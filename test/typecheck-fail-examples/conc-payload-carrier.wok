@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Soundness: a coro carrier (Step/Suspension, affine one-shot) named in a
 -- Promise/Chan payload would be cached by the transport and resumable more

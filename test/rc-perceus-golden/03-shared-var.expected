@@ -1,12 +1,3 @@
-double n =
-  let t = +(n, n)
-  t
-
-main =
-  let t.1 = +(10, 5)
-  let t.2 = double(t.1)
-  t.2
-
 id x =
   x
 
@@ -499,6 +490,15 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+double n =
+  let t = +(n, n)
+  t
+
+main =
+  let t.1 = +(10, 5)
+  let t.2 = double(t.1)
+  t.2
 
 notFound =
   18446744073709551615

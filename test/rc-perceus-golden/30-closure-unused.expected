@@ -1,17 +1,3 @@
-main =
-  let t.3 = Box(99)
-  let b = t.3
-  let t.2 = \n -> join j126(r) =
-    let t.1 = +(n, r)
-    t.1
-  case b of
-    Box v ->
-      let _drop.1 = __rc_drop(b)
-      jump j126(v)
-  let f = t.2
-  let _drop.2 = __rc_drop(f)
-  123
-
 id x =
   x
 
@@ -504,6 +490,20 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+main =
+  let t.3 = Box(99)
+  let b = t.3
+  let t.2 = \n -> join j411(r) =
+    let t.1 = +(n, r)
+    t.1
+  case b of
+    Box v ->
+      let _drop.1 = __rc_drop(b)
+      jump j411(v)
+  let f = t.2
+  let _drop.2 = __rc_drop(f)
+  123
 
 notFound =
   18446744073709551615

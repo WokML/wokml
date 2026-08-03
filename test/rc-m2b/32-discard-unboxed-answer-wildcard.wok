@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- The wildcard-discard arm (`choose n _ -> ...`) takes the same control path as a
 -- named-but-unused arm: body typed R, resume discarded. Leaks identically when R

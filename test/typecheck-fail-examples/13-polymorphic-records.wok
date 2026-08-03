@@ -10,7 +10,7 @@
 -- regression test once parameterized record support lands.
 
 module Records.Polymorphic
-import Std.Base
+import Base
 
 data Container a = Container { value : a }
 

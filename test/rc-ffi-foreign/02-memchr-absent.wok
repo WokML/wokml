@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 foreign module Libc "c" free "free" where
   memchr : Bytes -> U64 -> U64 -> U64 with IO
 -- memchr [65,66,67] 99 3 => 3 (absent, returns n)

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Golden hash corpus: pin sz_hash output for a fixed set of inputs.
 -- Regenerate ONLY on a deliberate StringZilla version bump.

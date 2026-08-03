@@ -15,8 +15,8 @@
 --   * Handles are SECOND-CLASS: scoped to their `with`, they cannot be returned,
 --     stored in data, or captured by an escaping closure.
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- A helper over ONE caller-supplied cell. Its parameter type is the effect; its
 -- own effect row is empty (the State is the caller's).

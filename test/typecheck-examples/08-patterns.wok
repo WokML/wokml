@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 first : (a, b) -> a
 first p = case p of

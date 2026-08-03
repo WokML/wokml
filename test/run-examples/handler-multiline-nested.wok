@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Task-2 capability under NESTED handlers: both the State and Writer handlers
 -- have multi-line arm bodies, and they are nested (writer inside state). Proves

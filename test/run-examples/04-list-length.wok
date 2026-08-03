@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 len : [a] -> U64
 len xs = case xs of

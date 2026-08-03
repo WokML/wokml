@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 counter : () -> U64 with Coro U64 U64
 counter u =

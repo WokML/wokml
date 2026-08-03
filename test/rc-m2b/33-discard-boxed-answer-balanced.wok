@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Boxed answer ([U64]) discard arm: already balanced before the fix (the boxed
 -- answer coincidentally typed resume boxed). Must STAY balanced after the fix

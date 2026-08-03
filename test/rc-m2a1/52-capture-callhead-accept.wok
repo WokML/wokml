@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-2 POSITIVE guard (regression for the call-head over-rejection): a recursive
 -- 'LetRec' group member whose body CALLS an enclosing boxed CAPTURE 'g' as a

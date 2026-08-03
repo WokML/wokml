@@ -1,6 +1,6 @@
 module Main
-import Std.Base
+import Base
 
 -- Exercises cross-module resolution: `id` and `const` are defined in
--- Std.Base (not prims), so this only runs under whole-program elaboration.
+-- Base (not prims), so this only runs under whole-program elaboration.
 main = const (id 42) 99

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 4: a NAMED-instance handler whose op arm ABORTS (binds the resume
 -- continuation but never applies it). 'main' performs 'throw 5' through the named

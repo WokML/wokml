@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 Task 1 coherence, REJECT: ForeignOwnedArgNotBlessed via a
 -- PARENTHESIZED arrow. `A -> (B -> C)` is type-identical to `A -> B -> C` but

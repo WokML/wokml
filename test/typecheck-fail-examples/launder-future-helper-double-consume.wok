@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- Closed-sig leaking form pinned after future-helper-double-consume was
 -- reclassified to trip the double-consume check via `with eff e` on both
 -- `useit` and `bad`: with the channels removed, the laundering check fires

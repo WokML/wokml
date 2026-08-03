@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 3: byteSlice that splits a multibyte codepoint raises PrimError.
 -- "héllo": h[0] + é[1=0xC3, 2=0xA9] + l[3] + l[4] + o[5] = 6 bytes

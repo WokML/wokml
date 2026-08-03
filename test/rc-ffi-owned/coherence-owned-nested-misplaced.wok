@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 Task 1 coherence, REJECT: OwnedModifierMisplaced via `owned`
 -- NESTED inside a compound parameter type (`[owned Bytes]`, a List of owned

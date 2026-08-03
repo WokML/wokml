@@ -1,21 +1,3 @@
-unbox b =
-  case b of
-    Box v ->
-      let _drop = __rc_drop(b)
-      v
-
-makeAdder k =
-  let t.4 = Box(k)
-  let b = t.4
-  let t.3 = \n -> let t.1 = unbox(b)
-  let t.2 = +(n, t.1)
-  t.2
-  t.3
-
-main =
-  let t = makeAdder(40, 2)
-  t
-
 id x =
   x
 
@@ -508,6 +490,24 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+unbox b =
+  case b of
+    Box v ->
+      let _drop = __rc_drop(b)
+      v
+
+makeAdder k =
+  let t.4 = Box(k)
+  let b = t.4
+  let t.3 = \n -> let t.1 = unbox(b)
+  let t.2 = +(n, t.1)
+  t.2
+  t.3
+
+main =
+  let t = makeAdder(40, 2)
+  t
 
 notFound =
   18446744073709551615

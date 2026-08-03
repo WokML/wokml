@@ -1,5 +1,5 @@
 module RowParamDef
-import Std.Base
+import Base
 
 -- Bug #5: an UNSIGNED row-polymorphic binding whose inferred scheme is EXPORTED.
 -- `mkbox` infers `forall (e : row). Box e`. Before the fix, freezeQuantify froze

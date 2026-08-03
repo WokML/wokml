@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 -- H1 scope pin (2026-07-05): a LOCAL zero-arg binding still inherits the
 -- enclosing ambient (the `both u = let a = useIO () ...` rule). Only
 -- TOP-LEVEL zero-arg bindings get the closed {IO} entry ambient; a let-bound

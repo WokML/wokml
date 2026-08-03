@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Op RESULT type is [U64] (boxed) but the handler ANSWER type is U64 (unboxed).
 -- Still leaks before the fix -> the leak is driven by the ANSWER type, not the op

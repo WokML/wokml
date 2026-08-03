@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Per-activation routing under RE-ENTRY. `f` recurses; each recursive call
 -- installs a NEW same-site cell (`inner = state 99`) while the OUTER cell `c`

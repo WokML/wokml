@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-2 Task 4C: carrier-wall verification.
 -- An op arm that passes the resume binder as a NON-HEAD argument (here as the

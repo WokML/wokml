@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 4, the spec §4.2 COUNTEREXAMPLE: a boxed value 'x' is MOVED into a
 -- container 'ys' (a list cell) BEFORE the throw, so 'x' is DEAD at the op site

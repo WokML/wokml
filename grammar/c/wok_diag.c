@@ -163,6 +163,10 @@ void wok_diag_render(const WokDiagSink *s, FILE *out) {
     u32 line;
     u32 col;
     wok_diag_position(s, d->off, &line, &col);
+    // No code here, deliberately. The human-facing line stays
+    // `file:line:col: message`, which is what an editor's error regex and a
+    // reader both want; the machine-readable code is in the JSON Lines
+    // renderer below, which is where a tool should be looking for it.
     (void)fprintf(out, "%s:%u:%u: %s\n", s->path, line, col, d->msg);
   }
 }

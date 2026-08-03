@@ -1,4 +1,3 @@
-Bail.bail : 0
 Reader.ask : 1
 State.get : 1
 State.set : 1
@@ -7,3 +6,4 @@ Except.throw : 0
 Coro.suspend : 1
 Async.yield : 1
 Conc.req : 1
+Bail.bail : 0

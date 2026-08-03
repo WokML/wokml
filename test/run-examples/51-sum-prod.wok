@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- The clincher: TWO instances of the SAME type (both State U64), folding one list
 -- into two accumulators at once. `sum` accumulates additively (seed 0) and `prod`

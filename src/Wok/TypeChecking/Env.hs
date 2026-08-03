@@ -164,7 +164,7 @@ data Env = Env
     -- transitive: 'overlayEnvs' does NOT merge this field -- qualifiers
     -- don't propagate through diamond merges). A bare 'import Foo'
     -- (single-segment) registers Foo; 'import M as A' registers A;
-    -- 'import Std.Base' (multi-seg plain) registers nothing (single-seg
+    -- 'import Foo.Bar' (multi-seg plain) registers nothing (single-seg
     -- qualifier only). The typechecker consults this map at the
     -- 'EProj (ECon q) label' arm before falling through to effect /
     -- foreign-module / record projection.
@@ -190,9 +190,9 @@ data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect | NsClass
 -- A name present in BOTH inputs is flagged as a collision only when the two
 -- stored entries DIFFER. When both sides carry the identical entry the
 -- overlap is benign and merges silently. This is what makes diamond
--- imports work: if @Main@ imports both @Std.Base@ and a module that
--- itself re-exports @Std.Base@ (e.g. @Std.Control@), every shared
--- @Std.Base@ name appears in both per-module envs with the same value, so
+-- imports work: if @Main@ imports both @Base@ and a module that
+-- itself re-exports @Base@ (e.g. @Control@), every shared
+-- @Base@ name appears in both per-module envs with the same value, so
 -- it must not be reported as a conflict.
 --
 -- BINDING PROVENANCE (var namespace). For the var namespace the stored
@@ -203,8 +203,8 @@ data EnvNs = NsVar | NsCon | NsTyCon | NsRecordCon | NsEffect | NsClass
 -- pipeline. A var present in both inputs is a clash iff its recorded
 -- origins are known on both sides and DIFFER (a genuine cross-module
 -- redefinition), or -- defensively, when an origin is missing -- its
--- 'Scheme's differ. Same-origin overlaps are the diamond case (@Std.Base@
--- re-exported through @Std.Control@ keeps origin @"Std.Base"@ on both
+-- 'Scheme's differ. Same-origin overlaps are the diamond case (@Base@
+-- re-exported through @Control@ keeps origin @"Base"@ on both
 -- sides) and merge silently. The two origin maps are unioned into the
 -- result.
 --

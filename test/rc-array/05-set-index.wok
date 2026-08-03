@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Array
+import Base
+import Array
 
 -- Verify copy-on-write set: the updated array carries the new value at index i,
 -- all other slots unchanged; the original is consumed (not shared).

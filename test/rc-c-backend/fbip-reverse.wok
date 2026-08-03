@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP reverse (Task 5): accumulator 'reverse' whose target 'Cons' is built
 -- BEFORE the recursive call, so the reuse token is born and consumed without

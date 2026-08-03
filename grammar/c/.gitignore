@@ -1,11 +1,23 @@
-*.o
+# Every generated file lands under build/, so this is nearly the whole list.
+build/
+
+# The two CLI binaries, which stay at the top level because test_pipe drives
+# ./wokfmt by name, and the debug bundles that appear beside them.
 wokparse
 wokfmt
+*.dSYM/
+
+# Belt and braces. Nothing the Makefile writes lands here any more, but a
+# hand-run `cc` while debugging does, and an object that shows up as UNTRACKED
+# is one somebody eventually commits. The test_* pair also keeps a checkout
+# from before the build moved from showing its stale binaries.
+*.o
+*.d
 test/test_*
 !test/test_*.c
-test/fuzz_*
-!test/fuzz_*.c
-*.dSYM/
+test/fuzz_layout
+test/fuzz_parse
+
+# Editor and tooling output, not the build's.
 compile_commands.json
 .cache/
-*.o.tmp

@@ -3,8 +3,8 @@
 -- Except when it hits a division by zero (caught with `== 0`, since the
 -- language only has equality, not ordering).
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 data Expr
   = Lit U64

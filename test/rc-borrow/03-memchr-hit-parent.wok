@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- __borrow_demo 10 yields buf = [0,1,...,9]. memchr for byte 4 hits at
 -- offset 4 in the parent buffer (buf[4] == 4).

@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 Task 1 coherence, REJECT: OwnedModifierMisplaced via a `owned`
 -- on a foreign member's RETURN type. `consume` is blessed DispScalar with

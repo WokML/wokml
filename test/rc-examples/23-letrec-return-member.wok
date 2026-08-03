@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- F5 regression: a LetRec body that RETURNS a group member.
 --

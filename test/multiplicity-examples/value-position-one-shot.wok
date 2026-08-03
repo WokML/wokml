@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- VALUE-POSITION (non-tail) handler: its result is consumed by the enclosing
 -- `case`, so `hAnswerJoin = Just j`. The `tick` arm resumes its continuation

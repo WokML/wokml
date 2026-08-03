@@ -11,8 +11,8 @@
 --   start : (() -> r with Coro a b) -> Step a b r
 --   step  : Suspension a b r -> b -> Step a b r
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Producer: yields lo, lo+1, ..., hi-1, suspending once per value.
 range : U64 -> U64 -> () with Coro U64 ()

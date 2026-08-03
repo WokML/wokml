@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- The inner local `go` opens its OWN unrelated channel `f`, not the outer
 -- trapped `e` from `g`; the outer sig still has no channel for e. Expect
 -- UndischargedEffect.

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- __borrow_demo 10 yields buf = [0,1,2,...,9]. slice b 3 8 is a NEW Borrow
 -- over buf[3..8) = [3,4,5,6,7] (length 5, NON-ZERO offset). Reading the

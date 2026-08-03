@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Continuation-byte check in charWidthAt: byte 4 of "café" (UTF-8:
 -- 63 61 66 C3 A9, byteLength=5) is 0xA9, the continuation byte of the

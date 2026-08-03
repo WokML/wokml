@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Smoke test: exercise the String ops that return U64/Bool and return a U64 result
 -- so that both the reference interpreter and the RC interpreter produce identical

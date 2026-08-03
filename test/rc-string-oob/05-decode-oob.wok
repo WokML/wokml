@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- Out-of-bounds decodeCharAt: exercises the offset >= byteLength guard in
 -- decodeCharAt. "abc" has byteLength 3; offset 5 is past the end, so both

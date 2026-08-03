@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Regression: row var `e` is shared across two effect-row positions (argument +
 -- result). Pins freezeSigSkolems' non-skolemization of row sig-vars, which the

@@ -9,24 +9,41 @@
 # No GNU extensions, no VLAs, no implementation-defined layout assumptions.
 # -Wswitch is load-bearing: no traversal may carry a `default:` label, because
 # a default silences the missing-enumerator error that replaces roster tests.
+#
+# EVERY generated file lands under $(BUILD). The source directories hold only
+# sources, so `ls test/` answers "what is tested" rather than "what was tested
+# and then built"; `clean` is one `rm -rf`; and an orphaned object from a
+# renamed source cannot survive to be linked, because nothing is ever written
+# beside the thing it was built from. The two CLI binaries are the exception:
+# test_pipe drives `./wokfmt` through popen, and a tool the tests invoke by
+# name belongs where a person would look for it.
 
 CC      ?= cc
+BUILD   := build
 STD     := -std=c23
 WARN    := -Wall -Wextra -Wpedantic -Wconversion -Wstrict-prototypes \
            -Wshadow -Wswitch -Wvla -Werror
 OPT     ?= -O2 -g
 INCLUDE := -I. -I../../include
-CFLAGS  := $(STD) $(WARN) $(OPT) $(INCLUDE)
+# -MMD -MP: the compiler writes each object's HEADER dependencies to a .d file,
+# which is included below. Without it, editing wok_ast.h -- the schema every
+# other file is derived from -- rebuilds NOTHING, and the tree that comes out
+# is half old schema and half new. That is the one edit this package is
+# designed to make routine, so it is the one that must not go stale.
+CFLAGS  := $(STD) $(WARN) $(OPT) $(INCLUDE) -MMD -MP
 SANFLAG := -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
 LIB_SRC := wok_arena.c wok_diag.c wok_token.c wok_layout.c wok_ast.c \
            wok_parse.c wok_sexpr.c wok_print.c wok_shape.c wok_trivia.c \
            wok_utf8.c \
            wok_write.c
-LIB_OBJ := $(LIB_SRC:.c=.o)
+LIB_OBJ := $(LIB_SRC:%.c=$(BUILD)/%.o)
 
 TEST_SRC := $(wildcard test/test_*.c)
-TEST_BIN := $(TEST_SRC:.c=)
+TEST_BIN := $(TEST_SRC:%.c=$(BUILD)/%)
+
+DEPS := $(LIB_OBJ:.o=.d) $(BUILD)/cmd/wokparse.d $(BUILD)/cmd/wokfmt.d \
+        $(TEST_BIN:=.d)
 
 CORPUS := $(wildcard ../../docs/redesign/examples/accept/*.wok) \
           $(wildcard ../../docs/redesign/examples/reject/*.wok) \
@@ -37,21 +54,28 @@ CORPUS := $(wildcard ../../docs/redesign/examples/accept/*.wok) \
 
 all: wokparse wokfmt
 
-%.o: %.c
+-include $(DEPS)
+
+# `mkdir -p $(@D)` rather than an order-only prerequisite on the directories:
+# a directory's mtime changes whenever anything is written into it, so naming
+# one as a prerequisite rebuilds every target that depends on it, every time.
+$(BUILD)/%.o: %.c
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-wokparse: $(LIB_OBJ) cmd/wokparse.o
+wokparse: $(LIB_OBJ) $(BUILD)/cmd/wokparse.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-wokfmt: $(LIB_OBJ) cmd/wokfmt.o
+wokfmt: $(LIB_OBJ) $(BUILD)/cmd/wokfmt.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-test/test_%: test/test_%.c $(LIB_OBJ)
+$(BUILD)/test/test_%: test/test_%.c $(LIB_OBJ)
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_OBJ)
 
 test: $(TEST_BIN) wokfmt
 	@fail=0; for t in $(TEST_BIN); do \
-	  printf '%-34s ' "$$t"; \
+	  printf '%-40s ' "$$t"; \
 	  if ./$$t > /tmp/wok_test_out 2>&1; then echo ok; \
 	  else echo FAIL; cat /tmp/wok_test_out; fail=1; fi; \
 	done; exit $$fail
@@ -68,12 +92,13 @@ sanitize:
 	@# reuse them: they carry __asan/__ubsan references the normal link lacks.
 	@$(MAKE) clean > /dev/null
 
-sweep: test/test_layout_sweep
-	./test/test_layout_sweep
+sweep: $(BUILD)/test/test_layout_sweep
+	./$(BUILD)/test/test_layout_sweep
 
-fuzz: test/fuzz_layout test/fuzz_parse
+fuzz: $(BUILD)/test/fuzz_layout $(BUILD)/test/fuzz_parse
 
-test/fuzz_%: test/fuzz_%.c $(LIB_SRC)
+$(BUILD)/test/fuzz_%: test/fuzz_%.c $(LIB_SRC)
+	@mkdir -p $(@D)
 	$(CC) $(STD) $(WARN) -O1 -g $(INCLUDE) -fsanitize=fuzzer,address,undefined \
 	  -o $@ $< $(LIB_SRC)
 
@@ -81,8 +106,20 @@ corpus:
 	@echo $(CORPUS) | tr ' ' '\n'
 
 clean:
-	rm -f $(LIB_OBJ) cmd/wokparse.o cmd/wokfmt.o wokparse wokfmt $(TEST_BIN) \
-	      test/fuzz_layout test/fuzz_parse
-	@# a debug build leaves a .dSYM bundle beside every binary; `clean` that
-	@# leaves 10 MB behind is not clean
-	rm -rf *.dSYM cmd/*.dSYM test/*.dSYM
+	@# One directory holds every generated file, so this is the whole of it --
+	@# no list to keep in step with LIB_SRC, and no orphan from a renamed
+	@# source left behind to be linked by a later build.
+	rm -rf $(BUILD)
+	@# The two exceptions, and the .dSYM bundles a debug build leaves beside
+	@# them: a `clean` that leaves 10 MB behind is not clean.
+	rm -f wokparse wokfmt
+	rm -rf wokparse.dSYM wokfmt.dSYM
+	@# TRANSITIONAL. Objects used to be written beside their sources, so a
+	@# checkout from before that moved carries a set this build never touches
+	@# again. Every pattern here is ANCHORED TO AN EXTENSION no source has --
+	@# a bare `test/test_*` would match test_batch.c, which is a `clean` that
+	@# deletes the suite. Delete these lines once nobody has such a tree; the
+	@# stale BINARIES are left alone and merely gitignored, because no glob
+	@# tells `test/test_batch` from `test/test_batch.c` safely.
+	rm -f *.o *.o.tmp *.d cmd/*.o cmd/*.d test/*.d
+	rm -rf cmd/*.dSYM test/*.dSYM

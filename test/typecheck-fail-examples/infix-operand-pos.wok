@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Bug #13: an operand mismatch at an infix operator must be reported AT the
 -- operator (`+` here), not as a positionless `Mismatch Nothing ...`. The infix

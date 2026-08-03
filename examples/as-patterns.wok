@@ -1,9 +1,9 @@
 -- As-patterns (`pat as name`, name LAST -- OCaml/F# style): match a structure
 -- AND bind the whole value to a name, so you can reuse it without rebuilding it.
 -- `::` is pattern-only in wok: it appears in the patterns below, but expressions
--- build lists with literals `[...]` and `++` (append, from Std.Base).
+-- build lists with literals `[...]` and `++` (append, from Base).
 module Main
-import Std.Base
+import Base
 
 -- case arm: name the whole list so the non-empty branch returns it as-is.
 keepNonEmpty : [U64] -> [U64]

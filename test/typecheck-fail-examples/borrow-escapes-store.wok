@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Borrow is second-class: storing it in a list (or any other structure) lets
 -- it outlive its scope, so this is a CarrierEscape too.

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 describe : Option U64 -> U64
 describe (Some 0) = 100

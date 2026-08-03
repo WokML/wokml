@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- rung-2 edge case (must REJECT): guards that `callerRootRefs` walks into
 -- NESTED arrow positions, not just top-level parameter types. `callF`'s
 -- parameter `f` is itself a FUNCTION whose own arrow carries the residual

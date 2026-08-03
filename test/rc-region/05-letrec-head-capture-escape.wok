@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- REGRESSION (capstone full-branch review): a reachable use-after-free in the
 -- arena LetRec-capture fence. 'p' is a boxed closure captured by the local

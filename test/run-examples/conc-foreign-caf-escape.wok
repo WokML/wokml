@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Door 3 (CAF escape): a top-level constant runs runConc in its own lazily
 -- forced interpreter entry; its escaped promise collides with main's

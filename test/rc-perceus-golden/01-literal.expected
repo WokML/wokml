@@ -1,6 +1,3 @@
-main =
-  99
-
 id x =
   x
 
@@ -493,6 +490,9 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+main =
+  99
 
 notFound =
   18446744073709551615

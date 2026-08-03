@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Counted-child scan-out: the arena-routed Wrap cell OWNS a counted Box child.
 -- At arena_close the scan-out must drop the Box reference exactly once (on BOTH

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- String literal allocation (Slice E1, Task 3): a string literal now allocates a
 -- counted NString cell (was inline). Here the literal "hi" is bound and then

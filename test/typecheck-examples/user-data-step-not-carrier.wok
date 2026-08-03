@@ -1,8 +1,8 @@
 module Main
-import Std.Base
+import Base
 
 -- Robustness (slice 4d): this declares its OWN `Step` reusing the prelude's
--- exact names, and deliberately does NOT `import Std.Control`. Because the
+-- exact names, and deliberately does NOT `import Control`. Because the
 -- carrier discipline rides the `extern` marker (tcCarrier) and not the name,
 -- this unmarked user `Step` is an ordinary type: it may be returned (`returnIt`)
 -- and stored in a list (`storeIt`) freely -- both forbidden for the marked

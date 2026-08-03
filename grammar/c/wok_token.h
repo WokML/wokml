@@ -170,8 +170,24 @@ WOK_PURE bool wok_kind_is_close_bracket(WokKind);
 // It lives here, not in wok_layout.c, because it is a lexical fact -- the
 // layout filter must not be able to name a keyword.
 //
-// Pinned by test/test_firstset.c against the grammar: for every kind and word,
-// this must agree with whether any item production can start with it.
+// Two things hold this down, and a third does not.
+//
+//   - -Wswitch. The switch below carries no `default:`, over the kinds OR the
+//     words, so a token added to either roster does not COMPILE until someone
+//     classifies it here. That is the load-bearing half, and it is the reason
+//     no roster test is needed to say every token has an answer.
+//   - test_fill pins the PRINTER's own copy of this question against this one
+//     for every lead a fill break can produce, so the two cannot drift into a
+//     second opinion about the lexis.
+//
+// What is NOT checked is that each answer is RIGHT -- that a token called a
+// lead cannot in fact begin an item. A wrong answer there compiles, and under
+// an offside rule it is silent: the line joins the previous one instead of
+// starting an item, and only the tree shows it. Checking it needs the FIRST
+// set of the grammar, and the only honest source for that is a generator that
+// builds items rather than a second list typed out beside this one -- so if it
+// is ever written, it belongs in test_generative, which already builds items
+// across 80 of the schema's 82 tags.
 WOK_READONLY bool wok_token_is_continuation_lead(const WokToken *);
 
 // Decodes an integer literal, reporting E-LEX-INT-RANGE on overflow past U64.
@@ -184,9 +200,10 @@ static inline const char *wok_token_text(const char *src, const WokToken *t) {
   return src + t->off;
 }
 
-// Test hooks. The symbol charset is a bitmap for speed; test_charclass.c
-// checks it against the readable definition for all 256 byte values, which is
-// what makes a hand-written bitmap safe.
+// Test hooks. The symbol charset is a bitmap for speed; test_roster.c checks
+// it against the readable definition for all 256 byte values, which is what
+// makes a hand-written bitmap safe. wok_print.c also reads two of them, so the
+// filler's lead test cannot grow a second opinion about the charset.
 bool wok_test_is_sym(unsigned char);
 bool wok_test_is_ident_start(unsigned char);
 bool wok_test_is_ident_cont(unsigned char);

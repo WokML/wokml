@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 bad : Option (row e)   -- a row argument in Option's `*` parameter slot
 

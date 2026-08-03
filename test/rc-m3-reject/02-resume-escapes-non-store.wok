@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- M3 Task 4 (guard-relaxation NARROWNESS proof). The store-route relaxation admits
 -- a 'resume' that escapes ONLY into the LITERAL '__cont_store cell resume'

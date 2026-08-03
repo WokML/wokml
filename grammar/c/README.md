@@ -99,9 +99,10 @@ been true.
 
 | Layer | What it is | Status |
 |---|---|---|
-| H1 compile time | X-macro rosters, `static_assert` on every keyed table, no `default:` label so a missing enumerator is `-Werror=switch` | live |
+| H1 compile time | X-macro rosters, `static_assert` on every keyed table, no `default:` label so a missing enumerator is `-Werror=switch`; every field declares the FAMILY it demands, and the s-expression reader enforces it | live |
 | H2 layout | 36,864-sequence exhaustive sweep vs a reference model; invariants on every emitted stream | live |
 | H3 metamorphic | re-indentation invariance, `Dump(Parse(Format(t))) == Dump(t)`, formatter fixed point, dump round-trip | partial |
+| H7 generation | the same properties over 5,000 **built** trees per run, reaching 80 of the schema's 82 tags with no corpus; failures are minimised before they are reported | live |
 | H4 production coverage | a bitmap indexed by node tag; the corpus must reach 100% | wired |
 | H5 sanitisers | ASan + UBSan over corpus and fuzz corpus; arena returns to baseline | live |
 | H6 fuzzing | properties under mutation: invariants, **conservation**, **purity** | live |
@@ -133,6 +134,30 @@ abandons a bracket that a later closer still balances. Inferring the exception
 from the diagnostic sink was tried and is unsound — the cap can swallow the
 bracket fault — so the invariant is now an explicit opt-in for input known to be
 well formed.
+
+### Generating trees, not source
+
+The fuzzers generate SOURCE, which is the right shape for the error path and a
+measurably poor one for the happy path: more than half of a mutated corpus
+parses cleanly and so re-tests recovery, which is already covered.
+`test/test_generative.c` inverts it. Every tree is BUILT from the schema, so it
+is valid by construction and every case exercises the printer and the parser
+against each other — the difference between "every node was built once", which
+H4 already asserts, and "every COMBINATION was tried", which nothing else does.
+
+It found a printer bug on its first run — `(-a) b` was printed as `-a b`, which
+reads back as `-(a b)` — now closed by the `EP_NEG` rung in `wok_print.c`. It
+found a second of the same class once patterns arrived: `f (-1) = 2` printed as
+`f -1 = 2` and read back as the infix equation `f - 1 = 2`, now closed by
+guarding an equation's first argument. And it is the only suite that catches that class of thing: with a negated
+negation deliberately left unbracketed, so that `- -x` is emitted and scans as
+a comment, seventeen suites stay green and this one fails.
+
+A counterexample is MINIMISED before it is reported, on the tree and never on
+the text — dropping a bracket does not make a program smaller, it makes it a
+different program. A hundred-node tree reduces to under ten in a few dozen
+candidates, and what is printed is the reduced tree's dump, which
+`wok_sexpr_read` reads straight back.
 
 ## C23, and what it actually bought
 

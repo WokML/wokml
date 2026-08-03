@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Same leak with a Never-typed op and an UNBOXED answer (U64): the Never typing
 -- does NOT save it (refutes the M3 spec's Never-vs-resumable framing). Heap must

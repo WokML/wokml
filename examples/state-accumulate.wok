@@ -2,8 +2,8 @@
 -- State effect. The `state` runner hands back a (value, finalState) pair; we use
 -- a tuple destructuring `let` to keep just the part we want -- no `fst` needed.
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Add every element of the list into the State total, one recursive step each.
 sumList : [U64] -> () with State U64

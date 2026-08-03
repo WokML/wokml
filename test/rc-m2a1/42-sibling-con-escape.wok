@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #12 (DIRECT sibling-into-constructor escape, must be REJECTED):
 -- the LetRec group sibling 'f' flows DIRECTLY into a constructor field ('Box f')

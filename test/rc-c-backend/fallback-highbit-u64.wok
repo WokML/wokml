@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Fallback (high-bit U64): a constructor with a U64 field whose value exceeds
 -- Int64.maxBound (2^63 - 1). 'encodeSlotC' calls 'toIntegralSized n :: Maybe

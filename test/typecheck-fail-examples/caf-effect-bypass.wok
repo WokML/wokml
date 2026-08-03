@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 -- H1 death test (2026-07-05): a top-level zero-arg binding (CAF) performs a
 -- concrete effect. Pre-fix this TYPECHECKED (the 0-arg branch seeded an open
 -- ambient that was closed but never reconciled -- the entire effect

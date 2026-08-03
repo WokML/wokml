@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 data Bad (row e) = Bad e   -- the field's OWN type is a row (KEffect) -- must be REJECTED
 

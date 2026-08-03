@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 5: TAIL RESUME with a constant. 'reader' installs a Reader handler
 -- whose 'ask' arm auto-resumes with the seeded constant 'n' (the elaborator

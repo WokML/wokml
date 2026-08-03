@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- DEATH TEST (Option B, resume launders effects): a resume driver that performs
 -- the parked tail's effects via `run` but declares no `with eff e` is rejected
 -- with UndischargedEffect. Single consumption -> no carrier/affine error masks it.

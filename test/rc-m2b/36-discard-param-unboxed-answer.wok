@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Parameterized-handler (M2b-2, two-arg resume; resume : sigma -> T -> R) variant
 -- of the resume-binder-type leak. The 'set' arm DISCARDS its resume k with an

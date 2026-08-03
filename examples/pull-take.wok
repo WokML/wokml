@@ -4,8 +4,8 @@
 --
 --   cancel : Suspension a b r -> ()   -- discard a suspension without resuming it
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- A long counter (bounded by hi only to stay total): yields 0,1,2,...
 count : U64 -> U64 -> () with Coro U64 ()

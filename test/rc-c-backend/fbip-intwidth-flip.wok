@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP integer-width flip (Task 5, §4.3 / §11-finding): a 'map' whose result
 -- crosses >= 2^63. The INPUT cells carry small encodable U64 heads (C-eligible),

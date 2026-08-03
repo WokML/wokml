@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Regression: the payload restriction (spec 3.3) walks constructor fields
 -- TRANSITIVELY. Box2 wraps Box wraps a function; Promise Box2 would smuggle

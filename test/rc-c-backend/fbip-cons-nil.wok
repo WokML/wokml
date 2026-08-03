@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP Cons-with-immediate-tail (Task 5, §7): a single-element 'Cons x Nil'
 -- whose tail is the inline 'Nil' immediate (zero cells since the layout-

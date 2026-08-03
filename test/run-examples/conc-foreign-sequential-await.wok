@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Door 2 (sequential escape, NO nesting): a promise returned out of one
 -- runConc and awaited inside a later sibling that has minted its own

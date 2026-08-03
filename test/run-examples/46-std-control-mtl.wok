@@ -1,12 +1,12 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Exercises the full mtl quartet (Reader/Writer/State/Except) composed in a
 -- single handler stack. Reader supplies a budget that is folded into each
 -- step's contribution, State threads a running total, Writer logs each step's
 -- contribution, and Except is in the row (composing cleanly) even though this
--- happy path never throws. Wok's Std.Base has no comparison operator, so the
+-- happy path never throws. Wok's Base has no comparison operator, so the
 -- demo proves "runs without losing state/log", not a guarded throw.
 tick : U64 -> U64 with Reader U64 + Writer [U64] + State U64 + Except String
 tick n =

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Array
+import Base
+import Array
 
 -- Shared-input set: arr0 is used by BOTH `set` and a later `index`, so Perceus dups
 -- it and `set` sees rc > 1 -> copy-on-write fallback (NOT in-place). The original

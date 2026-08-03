@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Regression for the whole-branch review finding on top of the Task-4 clamp
 -- fix (08-foreign-lendbuffer-clamp.wok): the REFERENCE interpreter's

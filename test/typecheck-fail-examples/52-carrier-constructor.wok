@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Carrier rule: storing a handle inside a data constructor lets it escape. The
 -- argument of `Some` is a polymorphic slot (`a`), not a handle slot, so the

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- C2: a USER binding named `__coro_susp` must NOT inherit the trusted-once
 -- relaxation. The relaxation keys on the genuine prelude prim's IDENTITY, not

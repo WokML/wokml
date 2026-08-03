@@ -4,7 +4,7 @@
 -- made explicit as data -- no multi-shot handler needed. We compute the law of
 -- the sum of two fair dice and read off P(sum == 7) = favourable / total.
 module Main
-import Std.Base
+import Base
 
 concatMapL : (a -> [b]) -> [a] -> [b]
 concatMapL f xs = case xs of

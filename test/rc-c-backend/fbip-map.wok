@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP headline (Task 5): 'map (\x -> x + 1)' over a unique literal int list.
 -- 'mapInc xs = case xs of Cons x xx -> Cons (x + 1) (mapInc xx) ; Nil -> Nil'

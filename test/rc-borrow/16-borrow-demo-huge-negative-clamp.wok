@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Regression for the SAME wraparound-below-Int-range hazard fixed for
 -- `Demo.lendBuffer` in 14-foreign-lendbuffer-huge-negative-clamp.wok, but for

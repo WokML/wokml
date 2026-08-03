@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 regression (full-branch review, verified UAF). An auto-resuming op arm
 -- ('get -> x' elaborates to 'get(resume) -> resume(x)') that hands an enclosing

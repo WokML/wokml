@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 grab : Step U64 () () (row e) -> [Suspension U64 () () (row e)]
 grab s = case s of
   Completed _   -> []

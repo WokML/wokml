@@ -8,12 +8,12 @@ maintainer:         zhengyan@posteo.net
 category:           Language
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
-data-files:         prelude/Std/Base.wok
-                    prelude/Std/Control.wok
-                    prelude/Std/Array.wok
-                    prelude/Std/String.wok
-                    prelude/Std/Bytes.wok
-                    prelude/Std/Borrow.wok
+data-files:         prelude/Base.wok
+                    prelude/Control.wok
+                    prelude/Array.wok
+                    prelude/String.wok
+                    prelude/Bytes.wok
+                    prelude/Borrow.wok
 
 -- Enable AddressSanitizer for the C runtime and the wok executable.
 -- WOK_RC_MALLOC forces the slab pool to fall back to plain malloc, giving

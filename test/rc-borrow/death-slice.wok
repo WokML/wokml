@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- DEATH TEST (FFI Slice 3 Task 6, SLICE-escape route). `slice` returns a derived
 -- Borrow viewing the SAME malloc'd buffer, so it is just as second-class as the

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- Carrier rule: a Suspension passed as a handle-typed argument is allowed.
 -- This must NOT produce a CarrierEscape.
 useIt : Suspension U64 U64 U64 (row e) -> ()

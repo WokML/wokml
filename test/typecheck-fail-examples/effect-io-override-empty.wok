@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 -- An `effect IO` override must declare at least one operation. An EMPTY
 -- override would still satisfy isGroundIO (no ops), so a SECOND override
 -- could slip past the override-once duplicate check -- and the zero-op

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 hyp : U64 -> U64 -> U64
 hyp x y = root (sq x + sq y)

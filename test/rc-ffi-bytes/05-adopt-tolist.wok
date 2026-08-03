@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- Sum a list of U64 by structural recursion.
 sumU64 : [U64] -> U64

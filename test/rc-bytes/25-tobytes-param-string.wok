@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- toBytes on a let-bound String variable (not just a literal) to exercise
 -- the RVBox path in the RC/C backend.  The result is valid UTF-8 so

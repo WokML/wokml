@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- PB6 content round-trip (multibyte): fromBytes (toBytes s) recovers a string
 -- content-equal to the original across a WokString->WokBytes->WokString trip.

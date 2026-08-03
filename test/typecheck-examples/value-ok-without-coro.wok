@@ -1,8 +1,8 @@
 module Main
-import Std.Base
--- A module that does NOT import Std.Control may freely name a top-level
+import Base
+-- A module that does NOT import Control may freely name a top-level
 -- function `value`: the reservation is gated on `value` being in scope via
--- import (i.e. on importing Std.Control). This must type-check.
+-- import (i.e. on importing Control). This must type-check.
 value : U64 -> U64
 value x = x
 main : U64

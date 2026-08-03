@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- C1: a Suspension consumed through a HELPER call escapes the intra-procedural
 -- affine check. `useit` runs its Suspension parameter; calling it twice on the
 -- same suspension double-consumes. A Suspension passed to ANY function counts as

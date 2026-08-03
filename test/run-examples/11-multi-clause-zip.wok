@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 sumPairs : [U64] -> [U64] -> U64
 sumPairs (x :: xs) (y :: ys) = x + y + sumPairs xs ys

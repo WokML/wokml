@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- RED-CHECK: a GENUINE multi-shot VALUE-POSITION handler (resumes its
 -- continuation twice) must STILL be rejected after the answer-join exit-seed

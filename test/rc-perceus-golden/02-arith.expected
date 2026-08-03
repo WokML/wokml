@@ -1,8 +1,3 @@
-main =
-  let t.1 = *(3, 4)
-  let t.2 = +(2, t.1)
-  t.2
-
 id x =
   x
 
@@ -495,6 +490,11 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+main =
+  let t.1 = *(3, 4)
+  let t.2 = +(2, t.1)
+  t.2
 
 notFound =
   18446744073709551615

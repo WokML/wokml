@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- A producer thunk that CAPTURES an existing carrier and returns a derived carrier
 -- must still escape-fail. If this ever starts typechecking, the soundness guard

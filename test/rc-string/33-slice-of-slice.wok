@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 3: slice-of-slice flatten correctness (AC4).
 -- The intermediate view must be > maxInlineStr (7) to be an NStringView

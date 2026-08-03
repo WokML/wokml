@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- slice returns a Borrow too (a derived view into the same buffer), so it is
 -- just as second-class as the original: returning it out of the scope it was

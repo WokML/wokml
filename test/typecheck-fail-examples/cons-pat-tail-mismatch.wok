@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 bad : [U64] -> U64
 bad xs = case xs of
   (x :: 0) -> x

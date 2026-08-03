@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- case arm with a refutable as-pattern that binds the matched payload
 unwrapOr : U64 -> Option U64 -> U64

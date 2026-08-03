@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Two TRULY mutually recursive members BOTH capture the same enclosing boxed
 -- local `b` (shared capture): the group build must provide two owning units

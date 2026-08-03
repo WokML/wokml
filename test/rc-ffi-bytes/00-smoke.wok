@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- both producers yield 5 deterministic ASCII bytes (0..4); fromBytes accepts
 -- them (valid UTF-8 control chars); length returns 5

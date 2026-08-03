@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- own-children / drop-parent: the Some branch KEEPS the boxed child `xs`
 -- (it is dup'd and returned); the parent option shell is dropped at the match.

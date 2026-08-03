@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Multi-clause function: elaborates to a decision tree whose leaves Jump to a
 -- per-clause join point. The first clause's join keeps the boxed tail children

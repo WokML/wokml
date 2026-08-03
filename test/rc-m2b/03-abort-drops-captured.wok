@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 4: a boxed value ('xs', a list cell) is LIVE in the frame ABOVE the
 -- throw. The op arm aborts (returns 'None', never resumes), so the captured

@@ -16,6 +16,11 @@
 // or ends one early, so the output still parses and only the tree shows the
 // damage. Comparing text would pass while the program silently changed.
 //
+// The contract holds for trees a PARSE produced. It does not extend to every
+// tree the schema can express -- a damaged node, a multi-item block inside
+// brackets, a tree past the depth cap -- and wok_print_unprintable_count()
+// below is how a caller asks whether it met one.
+//
 // THE CANONICAL DECISIONS
 //
 //   1. Two spaces per indentation level. Never tabs.
@@ -104,6 +109,18 @@ unsigned wok_print_fault_count(void);
 // of them says so on stderr, so a long line reads as a stated limitation
 // rather than as a filler that gave up silently.
 unsigned wok_print_overflow_count(void);
+
+// A node with NO canonical form: a damaged declaration or expression, a tree
+// past the depth cap, or a corrupted one -- a multi-item block where layout is
+// suspended, an out-of-range transfer mode or row kind. The text written in its
+// place is the raw source or a marker, and is expected NOT to re-parse.
+//
+// This is the third of the three, and the reason it exists: the other two say
+// the printer did something questionable to a tree it could write. This says
+// the tree could not be written at all, which is the answer a caller about to
+// SAVE a file actually needs, and it used to be available only as prose on
+// stderr.
+unsigned wok_print_unprintable_count(void);
 
 void wok_print_reports_reset(void);
 

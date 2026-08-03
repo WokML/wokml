@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Large-scale variant of test/rc-examples/16-deep-list.wok, kept OUT of the
 -- auto-discovered corpus dir so it is NOT golden-pinned at 50000 cells. The

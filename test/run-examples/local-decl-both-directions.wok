@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Bug #6 (both directions). Local bindings are emitted in dependency order, so a
 -- function referencing a sibling VALUE and a value referencing a sibling

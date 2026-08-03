@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Borrow
+import Base
+import Borrow
 
 -- Borrow is second-class: a closure that CAPTURES a Borrow and then ESCAPES
 -- (here it is returned) is rejected -- the Borrow would outlive its scope

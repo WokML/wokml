@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Door 1 (nested runConc): an OUTER promise awaited under an INNER runConc.
 -- Today the inner scheduler silently serves its own same-numbered cell and

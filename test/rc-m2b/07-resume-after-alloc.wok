@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 5: a BOXED value LIVE ACROSS THE RESUME. 'xs' (a list cell) is built
 -- BEFORE the op and used AFTER the resume returns, so it sits in the captured

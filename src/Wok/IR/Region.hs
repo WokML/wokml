@@ -293,7 +293,7 @@ collectPlacements place = go
 --   1. 'boxedBinder' bd        --- only boxed/RC values are routable; an unboxed
 --                                  scalar lives inline (no cell to route, §4.1);
 --   2. @not (isArrayBinder bd)@ --- the MUTATION FENCE (§5.2): a mutable array cell
---                                  ('NArray'/the @Std.Array@ allocators) could later
+--                                  ('NArray'/the @Array@ allocators) could later
 --                                  have a slot overwritten with a counted ref,
 --                                  invalidating the alloc-time escape verdict;
 --   3. @not (arenaEscapes {bd} cont)@ --- the §5.1 NON-ESCAPE check, delegated
@@ -431,7 +431,7 @@ sliceRep placements bd r cont
 -- | The PARENT atom of a @slice@/@byteSlice@ application, or 'Nothing' if this RHS
 -- is not a slice prim call. A view binder is @let v = slice s i j@ /
 -- @let v = byteSlice s i j@, an 'RApp' whose head is the 'APrim' carrying the
--- qualified @(Std.String, "slice"|"byteSlice")@ identity (the SAME identity layer
+-- qualified @(String, "slice"|"byteSlice")@ identity (the SAME identity layer
 -- 'isArrayAlloc' and the prim recognizers use). The parent @s@ is the FIRST argument
 -- atom (spec §4.3 / §6).
 sliceParent :: Rhs -> Maybe Atom
@@ -444,12 +444,12 @@ sliceParent _                  = Nothing
 sliceKeys :: Set (Text, Text)
 sliceKeys =
   Set.fromList
-    [ (PN.stdStringModule, PN.stringSliceName)
-    , (PN.stdStringModule, PN.stringByteSliceName)
+    [ (PN.stringModule, PN.stringSliceName)
+    , (PN.stringModule, PN.stringByteSliceName)
     ]
 
 -- | True iff this RHS is an ALLOCATION the pass routes: a constructor cell, a
--- record cell, a closure cell, or an array-allocating @Std.Array@ prim. Other
+-- record cell, a closure cell, or an array-allocating @Array@ prim. Other
 -- RHS forms (a bare atom, a saturated call, a projection, an effect op) allocate
 -- nothing the pass places (so they carry no placement entry). 'RReuseCon' is a
 -- post-Perceus FBIP form that never reaches this pre-instrumentation pass.
@@ -459,7 +459,7 @@ isAlloc RRecord{}  = True
 isAlloc RLam{}     = True
 isAlloc r          = isArrayAlloc r
 
--- | True iff this RHS is an array-allocating @Std.Array@ prim call (@new@,
+-- | True iff this RHS is an array-allocating @Array@ prim call (@new@,
 -- @fromList@, @set@, @resize@ --- the cell-producing prims; @set@/@resize@ are
 -- copy-on-write, so they allocate a fresh 'NArray' too). Recognized by the
 -- 'APrim' head's QUALIFIED @(module, name)@ identity, the same identity layer the
@@ -471,15 +471,15 @@ isArrayAlloc :: Rhs -> Bool
 isArrayAlloc (RApp (APrim key) _) = key `Set.member` arrayAllocKeys
 isArrayAlloc _                    = False
 
--- | The @(module, name)@ keys of the @Std.Array@ prims that allocate a fresh
+-- | The @(module, name)@ keys of the @Array@ prims that allocate a fresh
 -- array cell.
 arrayAllocKeys :: Set (Text, Text)
 arrayAllocKeys =
   Set.fromList
-    [ (PN.stdArrayModule, PN.arrayNewName)
-    , (PN.stdArrayModule, PN.arrayFromListName)
-    , (PN.stdArrayModule, PN.arraySetName)
-    , (PN.stdArrayModule, PN.arrayResizeName)
+    [ (PN.arrayModule, PN.arrayNewName)
+    , (PN.arrayModule, PN.arrayFromListName)
+    , (PN.arrayModule, PN.arraySetName)
+    , (PN.arrayModule, PN.arrayResizeName)
     ]
 
 -- | True iff the binder names a mutable array value (@Array a@). This is the

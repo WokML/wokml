@@ -626,24 +626,44 @@ static bool parse_seq(WokReader *r, u32 depth, WokSeq *out) {
   return true;
 }
 
+// THE FAMILY CHECK. The schema says which kind of child a field demands, so a
+// dump holding a type where an expression belongs is REPORTED here rather than
+// read back as a different program. The class check alone let it through: it
+// asks whether a child is present, never what the child IS.
+static bool family_ok(WokReader *r, const WokNode *child, WokFamily want,
+                      const char *field) {
+  WokFamily got = wok_node_desc[child->tag].family;
+  if (wok_family_accepts(want, got)) return true;
+  wok_diag_add(r->diag, WOK_E_PARSE, (u32)r->pos, 0,
+               "field `%s` takes %s, found %s, which is %s", field,
+               wok_family_name(want), wok_node_desc[child->tag].tag,
+               wok_family_name(got));
+  return false;
+}
+
 static bool parse_field(WokReader *r, WokNode *node, u16 i,
-                        WokFieldClass cls, u32 depth) {
+                        const WokFieldDesc *desc, u32 depth) {
+  WokFieldClass cls = desc->cls;
   switch (cls) {
     case WFC_NODE: {
       WokNode *child = parse_node(r, depth + 1);
       if (!child) return false;
+      if (!family_ok(r, child, desc->family, desc->name)) return false;
       node->slot[i] = WOK_MK_NODE(child);
       return true;
     }
     case WFC_OPT: {
       WokNode *child = nullptr;
       if (!parse_opt(r, depth, &child)) return false;
+      if (child && !family_ok(r, child, desc->family, desc->name)) return false;
       node->slot[i] = WOK_MK_OPT(child);
       return true;
     }
     case WFC_SEQ: {
       WokSeq seq;
       if (!parse_seq(r, depth, &seq)) return false;
+      for (u32 k = 0; k < seq.n; k++)
+        if (!family_ok(r, seq.items[k], desc->family, desc->name)) return false;
       node->slot[i] = WOK_MK_SEQ(seq);
       return true;
     }
@@ -722,7 +742,7 @@ static WokNode *parse_node(WokReader *r, u32 depth) {
                   "unterminated node `%s`", desc->tag);
       return nullptr;
     }
-    if (!parse_field(r, node, i, desc->fields[i].cls, depth)) return nullptr;
+    if (!parse_field(r, node, i, &desc->fields[i], depth)) return nullptr;
   }
 
   if (!peek_is(r, ')')) {

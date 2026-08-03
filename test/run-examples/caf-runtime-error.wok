@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Bug #11: a runtime error raised while forcing a 0-arity binding (a CAF) must
 -- surface as a clean `runtime error: ...`, NOT an internal panic / uncaught

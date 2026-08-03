@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 7: adversarial shape 3 -- slice-of-slice with intermediate view
 -- consumed by the flatten; the outer view must still read correct bytes.

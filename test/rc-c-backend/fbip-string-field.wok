@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP String-field reuse (String Slice E1 follow-up): exercises the newly-enabled
 -- reuse pairing for constructors carrying a String field.

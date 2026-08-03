@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 5: RESUME CALLED TWICE. 'prog' performs 'tick' twice; each op
 -- captures a continuation, and the handler's 'tick k -> k 1' tail-resumes with 1.

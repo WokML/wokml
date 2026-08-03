@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 3: basic ASCII slice.
 -- "hello world" codepoints: h e l l o   w o r l d  (11 codepoints, 11 bytes)

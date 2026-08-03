@@ -197,7 +197,7 @@ prettyLoaderError = \case
 prettyWarning :: TC.Warning -> String
 prettyWarning (TC.BodylessBinding name pos) =
   "warning: bodyless binding `" <> Tx.unpack name <> "`" <> showPos pos
-    <> "\n  add an equation, or move the declaration into Std.Base if intentional."
+    <> "\n  add an equation, or move the declaration into Base if intentional."
 prettyWarning (TC.RowShadow pos label outerTy innerTy) =
   "warning: row-shadow" <> showPos pos
     <> ": label `" <> Tx.unpack label <> "` already exists in the row."

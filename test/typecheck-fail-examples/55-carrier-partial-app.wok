@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Carrier rule (§4.3): a PARTIAL APPLICATION that captures a handle is a closure
 -- of arrow type that has closed over the handle, exactly like a lambda. Here

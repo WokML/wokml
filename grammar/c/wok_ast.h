@@ -6,9 +6,20 @@
 // adding one line; forgetting to teach the dump about it is impossible,
 // because the dump does not know about nodes individually.
 //
+// Each line says TWO things: the family the node belongs to, and -- per field --
+// the family that field demands. The second used to live only in wok_parse.c,
+// which meant the reader could not tell an expression from a type and a
+// corrupted dump read back as a different program. Now it can. A node added
+// here without a family does not compile; a family that disagrees with what the
+// parser builds fails in test_generative at startup, by name.
+//
 // Nodes are UNIFORM: a header plus a flexible array of slots. That trades a
-// little static typing for a schema a machine can walk, so the setters carry
-// a debug-build check that a slot receives the family it was declared with.
+// little static typing for a schema a machine can walk, and two things buy
+// some of it back: an accessor's C type comes from the field's CLASS, so a
+// NODE slot cannot be read as a span; and every accessor asserts the node's
+// TAG in a debug build, so E_App_fn(someTypeNode) fires rather than returning
+// a misread word. Neither checks the FAMILY -- that is the reader's job, in
+// wok_sexpr.c, on the way in.
 
 #pragma once
 
@@ -59,7 +70,17 @@ static inline WokSeq wok_seq_unpack(WokNode **items) {
 
 struct WokNode {
   u32 off, len;  // source span, for diagnostics only
+  // WHICH node this is: a WokTag, and the index every generic walk takes into
+  // wok_node_desc[] to find the field list it then walks -- the dump, the
+  // reader, the coverage bitmap, the printer's overflow report. It is the one
+  // field that turns a uniform header-plus-slots block back into a typed node.
+  //
+  // Spelled u16 rather than WokTag only because the enum is DERIVED from
+  // WOK_NODES further down this file, so the name does not exist yet here. The
+  // enum is already `: u16`, so nothing is narrowed by saying so.
   u16 tag;
+  // The arity its tag declares, copied here by wok_node so a walk never has to
+  // reach for the schema just to bound a loop.
   u16 nslots;
   // The four bytes of padding the slot array's 8-byte alignment already
   // forced. 0 means no comments; otherwise this indexes a WokTrivia table
@@ -88,6 +109,47 @@ typedef enum : unsigned char {
       WOK_FIELD_CLASS_COUNT
 } WokFieldClass;
 
+// Field FAMILIES. The class says a field holds a child; the family says WHICH
+// KIND of child, and that is the half the schema used to leave to wok_parse.c.
+// Every node declares the family it BELONGS to, every NODE/OPT/SEQ field the
+// family it DEMANDS, and the s-expression reader compares the two -- so a dump
+// with a type where an expression belongs is rejected rather than silently
+// read back as a different program.
+//
+// NONE is for NAME, TEXT, INT and FLAG fields, which hold no child at all.
+// ERROR is the damage marker, and it is a WILDCARD: mk_err plants an error
+// node wherever a production gave up -- in a type, a pattern, an alternative,
+// a clause -- so a family that refused it would make a damaged parse's dump
+// unreadable, which is exactly when reading one back is worth something.
+#define WOK_FAMILIES(X)                                                     \
+  X(NONE) X(ERROR)                                                          \
+  /* the big four, plus the file and the block item */                      \
+  X(FILE) X(DECL) X(TYPE) X(PAT) X(EXPR) X(STMT)                            \
+  /* names, and a dotted path of them */                                    \
+  X(NAME) X(PATH)                                                           \
+  /* every helper is its own family: each is demanded by ONE kind of slot */ \
+  X(LHS) X(BINDLHS) X(SIGNAME) X(TYPARAM) X(CONDEF) X(FIELDTYPE) X(OPSIG)   \
+  X(FOREIGNMEM) X(ROWENTRY) X(FIELDPAT) X(CHAINOP) X(BIND) X(USEBIND)       \
+  X(ALT) X(CLAUSE) X(FIELD)
+
+typedef enum : unsigned char {
+#define WOK_X(f) WFAM_##f,
+  WOK_FAMILIES(WOK_X)
+#undef WOK_X
+      WOK_FAMILY_COUNT
+} WokFamily;
+
+// The three places a family is WIDER than one node kind. Each is a fact about
+// the grammar, not a loosening: parse_stmt's last arm is a bare expression, and
+// parse_bind takes either a prefix head or a pattern. Nothing else subsumes.
+WOK_PURE static inline bool wok_family_accepts(WokFamily want, WokFamily got) {
+  if (want == got) return true;
+  if (got == WFAM_ERROR) return true;  // damage stands anywhere; see above
+  if (want == WFAM_STMT && got == WFAM_EXPR) return true;
+  if (want == WFAM_BINDLHS && (got == WFAM_LHS || got == WFAM_PAT)) return true;
+  return false;
+}
+
 // --------------------------------------------------------------- constants
 
 // H_Clause kinds (spec 1.1: clause kinds are keyword-distinguished).
@@ -114,169 +176,194 @@ enum {
 
 // ------------------------------------------------------------- the schema
 //
-// One line per node. The FIELDS macro takes the field-emitting macro F and
-// the tag T, so the generated names can be prefixed per node.
+// One line per node: X(tag, FAMILY). The FIELDS macro takes the field-emitting
+// macro F and the tag T, so the generated names can be prefixed per node, and
+// each field reads F(T, CLASS, name, FAMILY) -- the class it stores, and the
+// family it demands of whatever fills it.
 
-#define WOK_NODES(X)                                                        \
-  /* names and paths */                                                     \
-  X(N_Name) X(N_ModPath)                                                    \
-  /* declarations */                                                        \
-  X(D_Module) X(D_Import) X(D_Type) X(D_Alias) X(D_Effect) X(D_Class)       \
-  X(D_Instance) X(D_Foreign) X(D_ExternType) X(D_Sig) X(D_Equation)         \
-  X(D_Error)                                                                \
-  /* declaration helpers */                                                 \
-  X(H_TyParam) X(H_ConDef) X(H_FieldType) X(H_OpSig) X(H_ForeignMember)     \
-  X(H_SigName) X(L_Prefix) X(L_Infix)                                       \
-  /* types */                                                               \
-  X(T_Var) X(T_Con) X(T_App) X(T_Fun) X(T_Qual) X(T_With) X(T_List)         \
-  X(T_Tuple) X(T_Unit) X(T_RowArg) X(T_Transfer) X(H_RowEntry)              \
-  /* patterns */                                                            \
-  X(P_Var) X(P_Wild) X(P_Int) X(P_Str) X(P_Char) X(P_Con) X(P_Cons)         \
-  X(P_Tuple) X(P_List) X(P_Unit) X(P_As) X(P_Record) X(H_FieldPat)          \
-  /* expressions */                                                         \
-  X(E_Var) X(E_Con) X(E_Int) X(E_Str) X(E_Char) X(E_Unit) X(E_OpRef)        \
-  X(E_App) X(E_Chain) X(E_Dot) X(E_Neg) X(E_List) X(E_Tuple) X(E_Lambda)    \
-  X(E_LetIn) X(E_HandleIn) X(E_UseIn) X(E_If) X(E_Case) X(E_Handler)        \
-  X(E_Assign) X(E_Record) X(E_Block) X(E_Error)                             \
-  /* statements (D11: an indented block is a SEQUENCE) */                   \
-  X(S_Let) X(S_Handle) X(S_Use) X(S_Discard)                                \
-  /* expression helpers */                                                  \
-  X(H_ChainOp) X(H_Bind) X(H_UseBind) X(H_Alt) X(H_Clause) X(H_Field)       \
-  /* the file */                                                            \
-  X(W_File)
+#define WOK_NODES(X)                                                       \
+  /* names and paths */                                                    \
+  X(N_Name, NAME) X(N_ModPath, PATH)                                       \
+  /* declarations */                                                       \
+  X(D_Module, DECL) X(D_Import, DECL) X(D_Type, DECL) X(D_Alias, DECL)     \
+  X(D_Effect, DECL) X(D_Class, DECL) X(D_Instance, DECL)                   \
+  X(D_Foreign, DECL) X(D_ExternType, DECL) X(D_Sig, DECL)                  \
+  X(D_Equation, DECL) X(D_Error, ERROR)                                     \
+  /* declaration helpers */                                                \
+  X(H_TyParam, TYPARAM) X(H_ConDef, CONDEF) X(H_FieldType, FIELDTYPE)      \
+  X(H_OpSig, OPSIG) X(H_ForeignMember, FOREIGNMEM) X(H_SigName, SIGNAME)   \
+  X(L_Prefix, LHS) X(L_Infix, LHS)                                         \
+  /* types */                                                              \
+  X(T_Var, TYPE) X(T_Con, TYPE) X(T_App, TYPE) X(T_Fun, TYPE)              \
+  X(T_Qual, TYPE) X(T_With, TYPE) X(T_List, TYPE) X(T_Tuple, TYPE)         \
+  X(T_Unit, TYPE) X(T_RowArg, TYPE) X(T_Transfer, TYPE)                    \
+  X(H_RowEntry, ROWENTRY)                                                  \
+  /* patterns */                                                           \
+  X(P_Var, PAT) X(P_Wild, PAT) X(P_Int, PAT) X(P_Str, PAT) X(P_Char, PAT)  \
+  X(P_Con, PAT) X(P_Cons, PAT) X(P_Tuple, PAT) X(P_List, PAT)              \
+  X(P_Unit, PAT) X(P_As, PAT) X(P_Record, PAT) X(H_FieldPat, FIELDPAT)     \
+  /* expressions */                                                        \
+  X(E_Var, EXPR) X(E_Con, EXPR) X(E_Int, EXPR) X(E_Str, EXPR)              \
+  X(E_Char, EXPR) X(E_Unit, EXPR) X(E_OpRef, EXPR) X(E_App, EXPR)          \
+  X(E_Chain, EXPR) X(E_Dot, EXPR) X(E_Neg, EXPR) X(E_List, EXPR)           \
+  X(E_Tuple, EXPR) X(E_Lambda, EXPR) X(E_LetIn, EXPR) X(E_HandleIn, EXPR)  \
+  X(E_UseIn, EXPR) X(E_If, EXPR) X(E_Case, EXPR) X(E_Handler, EXPR)        \
+  X(E_Assign, EXPR) X(E_Record, EXPR) X(E_Block, EXPR)          \
+  X(E_Error, ERROR)    \
+  /* statements (D11: an indented block is a SEQUENCE) */                  \
+  X(S_Let, STMT) X(S_Handle, STMT) X(S_Use, STMT) X(S_Discard, STMT)       \
+  /* expression helpers */                                                 \
+  X(H_ChainOp, CHAINOP) X(H_Bind, BIND) X(H_UseBind, USEBIND)              \
+  X(H_Alt, ALT) X(H_Clause, CLAUSE) X(H_Field, FIELD)                      \
+  /* the file */                                                           \
+  X(W_File, FILE)
 
 // names ---------------------------------------------------------------------
-#define N_Name_FIELDS(F, T)    F(T, NAME, text) F(T, FLAG, upper)
-#define N_ModPath_FIELDS(F, T) F(T, SEQ, parts)
+#define N_Name_FIELDS(F, T) F(T, NAME, text, NONE) F(T, FLAG, upper, NONE)
+#define N_ModPath_FIELDS(F, T) F(T, SEQ, parts, NAME)
 
 // declarations --------------------------------------------------------------
-#define D_Module_FIELDS(F, T) F(T, NODE, path)
+#define D_Module_FIELDS(F, T) F(T, NODE, path, PATH)
 // names is empty for a plain import; alias is null unless `as A` was written.
-#define D_Import_FIELDS(F, T) F(T, NODE, path) F(T, SEQ, names) F(T, OPT, alias)
-#define D_Type_FIELDS(F, T)   F(T, NAME, name) F(T, SEQ, params) F(T, SEQ, cons)
-#define D_Alias_FIELDS(F, T)  F(T, NAME, name) F(T, SEQ, params) F(T, NODE, body)
-#define D_Effect_FIELDS(F, T) F(T, NAME, name) F(T, SEQ, params) F(T, SEQ, ops)
-#define D_Class_FIELDS(F, T)  F(T, NAME, name) F(T, SEQ, params) F(T, SEQ, body)
+#define D_Import_FIELDS(F, T) \
+  F(T, NODE, path, PATH) F(T, SEQ, names, NAME) F(T, OPT, alias, NAME)
+#define D_Type_FIELDS(F, T) \
+  F(T, NAME, name, NONE) F(T, SEQ, params, TYPARAM) F(T, SEQ, cons, CONDEF)
+#define D_Alias_FIELDS(F, T) \
+  F(T, NAME, name, NONE) F(T, SEQ, params, TYPARAM) F(T, NODE, body, TYPE)
+#define D_Effect_FIELDS(F, T) \
+  F(T, NAME, name, NONE) F(T, SEQ, params, TYPARAM) F(T, SEQ, ops, OPSIG)
+#define D_Class_FIELDS(F, T) \
+  F(T, NAME, name, NONE) F(T, SEQ, params, TYPARAM) F(T, SEQ, body, DECL)
 #define D_Instance_FIELDS(F, T) \
-  F(T, OPT, ctx) F(T, NAME, name) F(T, SEQ, args) F(T, SEQ, body)
+  F(T, OPT, ctx, TYPE) F(T, NAME, name, NONE) F(T, SEQ, args, TYPE) \
+  F(T, SEQ, body, DECL)
 #define D_Foreign_FIELDS(F, T) \
-  F(T, NAME, name) F(T, TEXT, lib) F(T, SEQ, members)
-#define D_ExternType_FIELDS(F, T) F(T, NAME, name) F(T, SEQ, params)
+  F(T, NAME, name, NONE) F(T, TEXT, lib, NONE) F(T, SEQ, members, FOREIGNMEM)
+#define D_ExternType_FIELDS(F, T) \
+  F(T, NAME, name, NONE) F(T, SEQ, params, TYPARAM)
 // `extern` marks a compiler hole: analyses trust the MARKER, never a name.
 #define D_Sig_FIELDS(F, T) \
-  F(T, SEQ, names) F(T, NODE, type) F(T, FLAG, is_extern)
+  F(T, SEQ, names, SIGNAME) F(T, NODE, type, TYPE) F(T, FLAG, is_extern, NONE)
 #define D_Equation_FIELDS(F, T) \
-  F(T, NODE, lhs) F(T, NODE, body) F(T, SEQ, wheres)
-#define D_Error_FIELDS(F, T) F(T, TEXT, text)
+  F(T, NODE, lhs, LHS) F(T, NODE, body, EXPR) F(T, SEQ, wheres, DECL)
+#define D_Error_FIELDS(F, T) F(T, TEXT, text, NONE)
 
-#define H_TyParam_FIELDS(F, T) F(T, NAME, name) F(T, FLAG, is_row)
+#define H_TyParam_FIELDS(F, T) F(T, NAME, name, NONE) F(T, FLAG, is_row, NONE)
 // name is empty for the elided record form `{ x : U64 }`.
 #define H_ConDef_FIELDS(F, T) \
-  F(T, NAME, name) F(T, SEQ, args) F(T, SEQ, fields) F(T, FLAG, is_record)
-#define H_FieldType_FIELDS(F, T) F(T, NAME, name) F(T, NODE, type)
-#define H_OpSig_FIELDS(F, T)     F(T, NAME, name) F(T, NODE, type)
+  F(T, NAME, name, NONE) F(T, SEQ, args, TYPE) F(T, SEQ, fields, FIELDTYPE) \
+  F(T, FLAG, is_record, NONE)
+#define H_FieldType_FIELDS(F, T) F(T, NAME, name, NONE) F(T, NODE, type, TYPE)
+#define H_OpSig_FIELDS(F, T) F(T, NAME, name, NONE) F(T, NODE, type, TYPE)
 #define H_ForeignMember_FIELDS(F, T) \
-  F(T, NAME, name) F(T, TEXT, symbol) F(T, NODE, type)
+  F(T, NAME, name, NONE) F(T, TEXT, symbol, NONE) F(T, NODE, type, TYPE)
 // paren records `(+)` so the printer re-derives the brackets from the fact.
-#define H_SigName_FIELDS(F, T) F(T, NAME, name) F(T, FLAG, paren)
+#define H_SigName_FIELDS(F, T) F(T, NAME, name, NONE) F(T, FLAG, paren, NONE)
 
 #define L_Prefix_FIELDS(F, T) \
-  F(T, NAME, name) F(T, FLAG, paren) F(T, SEQ, args)
+  F(T, NAME, name, NONE) F(T, FLAG, paren, NONE) F(T, SEQ, args, PAT)
 #define L_Infix_FIELDS(F, T) \
-  F(T, NODE, left) F(T, NAME, op) F(T, FLAG, backtick) F(T, NODE, right)
+  F(T, NODE, left, PAT) F(T, NAME, op, NONE) F(T, FLAG, backtick, NONE) \
+  F(T, NODE, right, PAT)
 
 // types ---------------------------------------------------------------------
-#define T_Var_FIELDS(F, T)   F(T, NAME, name)
-#define T_Con_FIELDS(F, T)   F(T, NODE, path)
-#define T_App_FIELDS(F, T)   F(T, NODE, fn) F(T, NODE, arg)
-#define T_Fun_FIELDS(F, T)   F(T, NODE, from) F(T, NODE, to)
-#define T_Qual_FIELDS(F, T)  F(T, NODE, ctx) F(T, NODE, body)
-#define T_With_FIELDS(F, T)  F(T, NODE, body) F(T, SEQ, row)
-#define T_List_FIELDS(F, T)  F(T, NODE, elem)
-#define T_Tuple_FIELDS(F, T) F(T, SEQ, items)
+#define T_Var_FIELDS(F, T) F(T, NAME, name, NONE)
+#define T_Con_FIELDS(F, T) F(T, NODE, path, PATH)
+#define T_App_FIELDS(F, T) F(T, NODE, fn, TYPE) F(T, NODE, arg, TYPE)
+#define T_Fun_FIELDS(F, T) F(T, NODE, from, TYPE) F(T, NODE, to, TYPE)
+#define T_Qual_FIELDS(F, T) F(T, NODE, ctx, TYPE) F(T, NODE, body, TYPE)
+#define T_With_FIELDS(F, T) F(T, NODE, body, TYPE) F(T, SEQ, row, ROWENTRY)
+#define T_List_FIELDS(F, T) F(T, NODE, elem, TYPE)
+#define T_Tuple_FIELDS(F, T) F(T, SEQ, items, TYPE)
 #define T_Unit_FIELDS(F, T)
-#define T_RowArg_FIELDS(F, T)  F(T, NAME, name)
-#define T_Transfer_FIELDS(F, T) F(T, INT, mode) F(T, NODE, body)
+#define T_RowArg_FIELDS(F, T) F(T, NAME, name, NONE)
+#define T_Transfer_FIELDS(F, T) F(T, INT, mode, NONE) F(T, NODE, body, TYPE)
 // label is empty for a slot obligation; kind is one of WOK_ROW_*.
 #define H_RowEntry_FIELDS(F, T) \
-  F(T, INT, kind) F(T, NAME, label) F(T, OPT, type)
+  F(T, INT, kind, NONE) F(T, NAME, label, NONE) F(T, OPT, type, TYPE)
 
 // patterns ------------------------------------------------------------------
-#define P_Var_FIELDS(F, T)  F(T, NAME, name)
+#define P_Var_FIELDS(F, T) F(T, NAME, name, NONE)
 #define P_Wild_FIELDS(F, T)
-#define P_Int_FIELDS(F, T)  F(T, INT, value) F(T, FLAG, negative)
-#define P_Str_FIELDS(F, T)  F(T, TEXT, text)
-#define P_Char_FIELDS(F, T) F(T, TEXT, text)
-#define P_Con_FIELDS(F, T)  F(T, NODE, path) F(T, SEQ, args)
-#define P_Cons_FIELDS(F, T) F(T, NODE, head) F(T, NODE, tail)
-#define P_Tuple_FIELDS(F, T) F(T, SEQ, items)
-#define P_List_FIELDS(F, T)  F(T, SEQ, items)
+#define P_Int_FIELDS(F, T) F(T, INT, value, NONE) F(T, FLAG, negative, NONE)
+#define P_Str_FIELDS(F, T) F(T, TEXT, text, NONE)
+#define P_Char_FIELDS(F, T) F(T, TEXT, text, NONE)
+#define P_Con_FIELDS(F, T) F(T, NODE, path, PATH) F(T, SEQ, args, PAT)
+#define P_Cons_FIELDS(F, T) F(T, NODE, head, PAT) F(T, NODE, tail, PAT)
+#define P_Tuple_FIELDS(F, T) F(T, SEQ, items, PAT)
+#define P_List_FIELDS(F, T) F(T, SEQ, items, PAT)
 #define P_Unit_FIELDS(F, T)
-#define P_As_FIELDS(F, T)    F(T, NODE, pat) F(T, NAME, name)
+#define P_As_FIELDS(F, T) F(T, NODE, pat, PAT) F(T, NAME, name, NONE)
 // rest is empty unless `..name` was written; open records also set is_open.
 #define P_Record_FIELDS(F, T) \
-  F(T, NODE, path) F(T, SEQ, fields) F(T, FLAG, is_open) F(T, NAME, rest)
-#define H_FieldPat_FIELDS(F, T) F(T, NAME, name) F(T, NODE, pat)
+  F(T, NODE, path, PATH) F(T, SEQ, fields, FIELDPAT) F(T, FLAG, is_open, NONE) \
+  F(T, NAME, rest, NONE)
+#define H_FieldPat_FIELDS(F, T) F(T, NAME, name, NONE) F(T, NODE, pat, PAT)
 
 // expressions ---------------------------------------------------------------
-#define E_Var_FIELDS(F, T)   F(T, NAME, name)
-#define E_Con_FIELDS(F, T)   F(T, NAME, name)
-#define E_Int_FIELDS(F, T)   F(T, INT, value)
-#define E_Str_FIELDS(F, T)   F(T, TEXT, text)
-#define E_Char_FIELDS(F, T)  F(T, TEXT, text)
+#define E_Var_FIELDS(F, T) F(T, NAME, name, NONE)
+#define E_Con_FIELDS(F, T) F(T, NAME, name, NONE)
+#define E_Int_FIELDS(F, T) F(T, INT, value, NONE)
+#define E_Str_FIELDS(F, T) F(T, TEXT, text, NONE)
+#define E_Char_FIELDS(F, T) F(T, TEXT, text, NONE)
 #define E_Unit_FIELDS(F, T)
-#define E_OpRef_FIELDS(F, T) F(T, NAME, name)
-#define E_App_FIELDS(F, T)   F(T, NODE, fn) F(T, NODE, arg)
+#define E_OpRef_FIELDS(F, T) F(T, NAME, name, NONE)
+#define E_App_FIELDS(F, T) F(T, NODE, fn, EXPR) F(T, NODE, arg, EXPR)
 // FLAT: precedence and associativity are a later pass's job, exactly as
 // src/Wok/Reordering.hs already expects. No fixity table lives in the parser.
-#define E_Chain_FIELDS(F, T) F(T, NODE, head) F(T, SEQ, ops)
+#define E_Chain_FIELDS(F, T) F(T, NODE, head, EXPR) F(T, SEQ, ops, CHAINOP)
 #define H_ChainOp_FIELDS(F, T) \
-  F(T, NAME, op) F(T, FLAG, backtick) F(T, NODE, rhs)
+  F(T, NAME, op, NONE) F(T, FLAG, backtick, NONE) F(T, NODE, rhs, EXPR)
 // ONE Dot node for `M.f`, `st.get` and `p.x`: spec 1.5 resolves qualifier /
 // label / projection later, and its collision rule needs them undistinguished
 // at parse time.
-#define E_Dot_FIELDS(F, T) F(T, NODE, recv) F(T, NAME, name) F(T, FLAG, upper)
-#define E_Neg_FIELDS(F, T)   F(T, NODE, body)
-#define E_List_FIELDS(F, T)  F(T, SEQ, items)
-#define E_Tuple_FIELDS(F, T) F(T, SEQ, items)
-#define E_Lambda_FIELDS(F, T) F(T, SEQ, params) F(T, NODE, body)
-#define E_LetIn_FIELDS(F, T)  F(T, NODE, bind) F(T, NODE, body)
+#define E_Dot_FIELDS(F, T) \
+  F(T, NODE, recv, EXPR) F(T, NAME, name, NONE) F(T, FLAG, upper, NONE)
+#define E_Neg_FIELDS(F, T) F(T, NODE, body, EXPR)
+#define E_List_FIELDS(F, T) F(T, SEQ, items, EXPR)
+#define E_Tuple_FIELDS(F, T) F(T, SEQ, items, EXPR)
+#define E_Lambda_FIELDS(F, T) F(T, SEQ, params, PAT) F(T, NODE, body, EXPR)
+#define E_LetIn_FIELDS(F, T) F(T, NODE, bind, BIND) F(T, NODE, body, EXPR)
 // label is empty when elided -- legal only in this delimited inline form
 // (D13 two-tier); the statement form S_Handle always writes one.
 #define E_HandleIn_FIELDS(F, T) \
-  F(T, NAME, label) F(T, NODE, handler) F(T, NODE, body)
-#define E_UseIn_FIELDS(F, T) F(T, SEQ, binds) F(T, NODE, body)
-#define E_If_FIELDS(F, T) F(T, NODE, cond) F(T, NODE, then_) F(T, NODE, else_)
-#define E_Case_FIELDS(F, T) F(T, NODE, scrut) F(T, SEQ, alts)
+  F(T, NAME, label, NONE) F(T, NODE, handler, EXPR) F(T, NODE, body, EXPR)
+#define E_UseIn_FIELDS(F, T) F(T, SEQ, binds, USEBIND) F(T, NODE, body, EXPR)
+#define E_If_FIELDS(F, T) \
+  F(T, NODE, cond, EXPR) F(T, NODE, then_, EXPR) F(T, NODE, else_, EXPR)
+#define E_Case_FIELDS(F, T) F(T, NODE, scrut, EXPR) F(T, SEQ, alts, ALT)
 // `handler E` names its effect MANDATORILY (C3).
-#define E_Handler_FIELDS(F, T) F(T, NAME, effect) F(T, SEQ, clauses)
-#define E_Assign_FIELDS(F, T)  F(T, NODE, target) F(T, NODE, value)
+#define E_Handler_FIELDS(F, T) \
+  F(T, NAME, effect, NONE) F(T, SEQ, clauses, CLAUSE)
+#define E_Assign_FIELDS(F, T) F(T, NODE, target, EXPR) F(T, NODE, value, EXPR)
 #define E_Record_FIELDS(F, T) \
-  F(T, NODE, path) F(T, OPT, spread) F(T, SEQ, fields)
-#define E_Block_FIELDS(F, T) F(T, SEQ, stmts)
-#define E_Error_FIELDS(F, T) F(T, TEXT, text)
+  F(T, NODE, path, EXPR) F(T, OPT, spread, EXPR) F(T, SEQ, fields, FIELD)
+#define E_Block_FIELDS(F, T) F(T, SEQ, stmts, STMT)
+#define E_Error_FIELDS(F, T) F(T, TEXT, text, NONE)
 
-#define S_Let_FIELDS(F, T)     F(T, NODE, bind)
-#define S_Handle_FIELDS(F, T)  F(T, NAME, label) F(T, NODE, handler)
-#define S_Use_FIELDS(F, T)     F(T, SEQ, binds)
-#define S_Discard_FIELDS(F, T) F(T, NODE, body)
+#define S_Let_FIELDS(F, T) F(T, NODE, bind, BIND)
+#define S_Handle_FIELDS(F, T) F(T, NAME, label, NONE) F(T, NODE, handler, EXPR)
+#define S_Use_FIELDS(F, T) F(T, SEQ, binds, USEBIND)
+#define S_Discard_FIELDS(F, T) F(T, NODE, body, EXPR)
 
-#define H_Bind_FIELDS(F, T)    F(T, NODE, lhs) F(T, NODE, body)
-#define H_UseBind_FIELDS(F, T) F(T, NAME, from) F(T, NAME, to)
-#define H_Alt_FIELDS(F, T) F(T, NODE, pat) F(T, NODE, body) F(T, SEQ, wheres)
+#define H_Bind_FIELDS(F, T) F(T, NODE, lhs, BINDLHS) F(T, NODE, body, EXPR)
+#define H_UseBind_FIELDS(F, T) F(T, NAME, from, NONE) F(T, NAME, to, NONE)
+#define H_Alt_FIELDS(F, T) \
+  F(T, NODE, pat, PAT) F(T, NODE, body, EXPR) F(T, SEQ, wheres, DECL)
 // `once` splits its binders: the LAST is the continuation, stored separately,
 // so E-ARITY can compare pattern count against op arity directly (D14).
-#define H_Clause_FIELDS(F, T)                                        \
-  F(T, INT, kind) F(T, NAME, name) F(T, SEQ, pats) F(T, NAME, k)     \
-  F(T, NODE, body)
-#define H_Field_FIELDS(F, T) F(T, NAME, name) F(T, NODE, value)
+#define H_Clause_FIELDS(F, T) \
+  F(T, INT, kind, NONE) F(T, NAME, name, NONE) F(T, SEQ, pats, PAT) \
+  F(T, NAME, k, NONE) F(T, NODE, body, EXPR)
+#define H_Field_FIELDS(F, T) F(T, NAME, name, NONE) F(T, NODE, value, EXPR)
 
-#define W_File_FIELDS(F, T) F(T, SEQ, decls)
+#define W_File_FIELDS(F, T) F(T, SEQ, decls, DECL)
 
 // ------------------------------------------------------------ derived: tags
 
 typedef enum : u16 {
-#define WOK_X(tag) tag,
+#define WOK_X(tag, fam) tag,
   WOK_NODES(WOK_X)
 #undef WOK_X
       WOK_TAG_COUNT
@@ -284,8 +371,8 @@ typedef enum : u16 {
 
 // ------------------------------------------------- derived: slot indices
 
-#define WOK_SLOT_INDEX(T, cls, name) T##__##name,
-#define WOK_DECLARE_SLOTS(T) \
+#define WOK_SLOT_INDEX(T, cls, name, fam) T##__##name,
+#define WOK_DECLARE_SLOTS(T, fam) \
   enum { T##_FIELDS(WOK_SLOT_INDEX, T) T##__NSLOTS };
 WOK_NODES(WOK_DECLARE_SLOTS)
 #undef WOK_DECLARE_SLOTS
@@ -316,7 +403,7 @@ WOK_NODES(WOK_DECLARE_SLOTS)
 #define WOK_MK_INT(v) ((WokSlot){.num = (v)})
 #define WOK_MK_FLAG(v) ((WokSlot){.flag = (v)})
 
-#define WOK_SLOT_ACCESS(T, cls, name)                                 \
+#define WOK_SLOT_ACCESS(T, cls, name, fam)                                 \
   static inline WOK_CT_##cls T##_##name(const WokNode *n) {           \
     assert(n->tag == T);                                              \
     return WOK_GET_##cls(n->slot[T##__##name]);                       \
@@ -325,7 +412,7 @@ WOK_NODES(WOK_DECLARE_SLOTS)
     assert(n->tag == T);                                              \
     n->slot[T##__##name] = WOK_MK_##cls(v);                           \
   }
-#define WOK_DECLARE_ACCESS(T) T##_FIELDS(WOK_SLOT_ACCESS, T)
+#define WOK_DECLARE_ACCESS(T, fam) T##_FIELDS(WOK_SLOT_ACCESS, T)
 WOK_NODES(WOK_DECLARE_ACCESS)
 #undef WOK_DECLARE_ACCESS
 
@@ -334,15 +421,19 @@ WOK_NODES(WOK_DECLARE_ACCESS)
 typedef struct {
   const char *name;
   WokFieldClass cls;
+  WokFamily family;  // WFAM_NONE unless the field holds a child
 } WokFieldDesc;
 
 typedef struct {
   const char *tag;
   const WokFieldDesc *fields;
   u16 nfields;
+  WokFamily family;  // the family this node BELONGS to
 } WokNodeDesc;
 
 extern const WokNodeDesc wok_node_desc[WOK_TAG_COUNT];
+
+WOK_READONLY const char *wok_family_name(WokFamily);
 
 // ------------------------------------------------------------ construction
 

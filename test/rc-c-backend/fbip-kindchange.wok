@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- FBIP slot-kind-change refusal (Task 5, §6.3): a map that changes a field's
 -- STORAGE CLASS. The matched cell is 'ConsI U64 ListI' (head slot 'KLitInt'); the

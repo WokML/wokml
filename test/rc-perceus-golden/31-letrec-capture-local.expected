@@ -1,21 +1,3 @@
-main =
-  let t.5 = Box(6)
-  let b = t.5
-  letrec
-    go k =
-      case k of
-        0 ->
-          case b of
-            Box v -> v
-        _ ->
-          let t.2 = -(k, 1)
-          let t.3 = go(t.2)
-          let t.4 = +(1, t.3)
-          t.4
-  let t.1 = go(3)
-  let _drop = __rc_drop(go)
-  t.1
-
 id x =
   x
 
@@ -508,6 +490,24 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+main =
+  let t.5 = Box(6)
+  let b = t.5
+  letrec
+    go k =
+      case k of
+        0 ->
+          case b of
+            Box v -> v
+        _ ->
+          let t.2 = -(k, 1)
+          let t.3 = go(t.2)
+          let t.4 = +(1, t.3)
+          t.4
+  let t.1 = go(3)
+  let _drop = __rc_drop(go)
+  t.1
 
 notFound =
   18446744073709551615

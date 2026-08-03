@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- Shares ONE adopted Bytes across two consuming uses, forcing a Perceus dup
 -- (rc 1->2) then two drops (2->1->0, foreign free at rc=0).

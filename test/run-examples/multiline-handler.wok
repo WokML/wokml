@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 effect Counter = { tick : () -> () , read : U64 }
 demo : U64
 demo = with Counter {

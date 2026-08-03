@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E3 inline-string corpus: case-match on an inline-backed string VARIABLE
 -- (not a literal scrutinee).  The string "hi" (2B) is InlineStr; this test

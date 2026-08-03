@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 effect Eff = { eop : U64 -> Never }
 

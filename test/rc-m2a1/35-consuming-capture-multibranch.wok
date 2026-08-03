@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 case #1 (DEFERRED): a LetRec member that CONSUMES (moves) an enclosing
 -- boxed capture 'b'.  Consuming-capture support was deferred -- the runtime

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- CHAINED-JOINS scrutinee regression (F1): the value-position case has THREE
 -- arms, so the elaborator emits a CHAIN of merge joins (alt -> jump jk -> jump j)

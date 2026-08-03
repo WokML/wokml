@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Bug #14: a USER file may not write a producer THUNK that manufactures a fresh
 -- carrier. `\ () -> Completed n` is a `() -> Step ...` factory; the direct form

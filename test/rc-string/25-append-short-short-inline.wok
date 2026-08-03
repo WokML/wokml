@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E3 inline-string corpus: append of two short strings producing an inline result.
 -- "abc" (3B) ++ "cd" (2B) = "abccd" (5B <= 7B) -> result is InlineStr.

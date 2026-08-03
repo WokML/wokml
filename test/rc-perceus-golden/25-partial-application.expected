@@ -1,47 +1,3 @@
-sumList xs =
-  case xs of
-    Nil ->
-      let _drop.1 = __rc_drop(xs)
-      0
-    Cons h t.1 ->
-      let _dup = __rc_dup(t.1)
-      let _drop.2 = __rc_drop(xs)
-      let t.2 = sumList(t.1)
-      let t.3 = +(h, t.2)
-      t.3
-
-add3 a b c =
-  let t.1 = +(a, b)
-  let t.2 = +(t.1, c)
-  t.2
-
-addLen xs n =
-  let t.1 = sumList(xs)
-  let t.2 = +(n, t.1)
-  t.2
-
-main =
-  let t.10 = add3(1)
-  let f = t.10
-  let t.9 = f(2)
-  let _drop.3 = __rc_drop(f)
-  let g = t.9
-  let t.8 = g(3)
-  let _drop.2 = __rc_drop(g)
-  let r1 = t.8
-  let t.4 = Nil
-  let t.5 = Cons(3, t.4)
-  let t.6 = Cons(2, t.5)
-  let t.7 = Cons(1, t.6)
-  let ys = t.7
-  let t.3 = addLen(ys)
-  let h = t.3
-  let t.2 = h(10)
-  let _drop.1 = __rc_drop(h)
-  let r2 = t.2
-  let t.1 = +(r1, r2)
-  t.1
-
 id x =
   x
 
@@ -534,6 +490,50 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+sumList xs =
+  case xs of
+    Nil ->
+      let _drop.1 = __rc_drop(xs)
+      0
+    Cons h t.1 ->
+      let _dup = __rc_dup(t.1)
+      let _drop.2 = __rc_drop(xs)
+      let t.2 = sumList(t.1)
+      let t.3 = +(h, t.2)
+      t.3
+
+add3 a b c =
+  let t.1 = +(a, b)
+  let t.2 = +(t.1, c)
+  t.2
+
+addLen xs n =
+  let t.1 = sumList(xs)
+  let t.2 = +(n, t.1)
+  t.2
+
+main =
+  let t.10 = add3(1)
+  let f = t.10
+  let t.9 = f(2)
+  let _drop.3 = __rc_drop(f)
+  let g = t.9
+  let t.8 = g(3)
+  let _drop.2 = __rc_drop(g)
+  let r1 = t.8
+  let t.4 = Nil
+  let t.5 = Cons(3, t.4)
+  let t.6 = Cons(2, t.5)
+  let t.7 = Cons(1, t.6)
+  let ys = t.7
+  let t.3 = addLen(ys)
+  let h = t.3
+  let t.2 = h(10)
+  let _drop.1 = __rc_drop(h)
+  let r2 = t.2
+  let t.1 = +(r1, r2)
+  t.1
 
 notFound =
   18446744073709551615

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- round-trip: length (fromList (toList b)) == length b
 -- fromList [5, 6, 7] -> toList -> fromList -> length 3

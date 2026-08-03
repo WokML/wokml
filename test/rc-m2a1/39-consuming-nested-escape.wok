@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #9 (Route 5, CONSUMING-capture twin of #8):
 -- a LetRec group 'go' BOTH CONSUMES (moves) an enclosing boxed capture 'b' AND has

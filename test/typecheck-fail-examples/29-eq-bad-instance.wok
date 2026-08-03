@@ -1,5 +1,5 @@
 module Fail.BadInstance
-import Std.Base
+import Base
 
 class C a where
   f : a -> Bool

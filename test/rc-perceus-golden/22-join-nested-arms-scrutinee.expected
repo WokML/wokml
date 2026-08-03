@@ -1,27 +1,3 @@
-classify xs =
-  join j127(r) =
-    let n = r
-    let t = Pair(n, xs)
-    t
-  case xs of
-    Wrap ys ->
-      let _dup = __rc_dup(ys)
-      case ys of
-        Nil ->
-          let _drop.1 = __rc_drop(ys)
-          jump j127(0)
-        Cons z _ ->
-          let _drop.2 = __rc_drop(ys)
-          jump j127(z)
-
-main =
-  let t.2 = Nil
-  let t.1 = Cons(8, t.2)
-  let t.3 = Cons(7, t.1)
-  let t.4 = Wrap(t.3)
-  let t.5 = classify(t.4)
-  t.5
-
 id x =
   x
 
@@ -514,6 +490,30 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+classify xs =
+  join j412(r) =
+    let n = r
+    let t = Pair(n, xs)
+    t
+  case xs of
+    Wrap ys ->
+      let _dup = __rc_dup(ys)
+      case ys of
+        Nil ->
+          let _drop.1 = __rc_drop(ys)
+          jump j412(0)
+        Cons z _ ->
+          let _drop.2 = __rc_drop(ys)
+          jump j412(z)
+
+main =
+  let t.2 = Nil
+  let t.1 = Cons(8, t.2)
+  let t.3 = Cons(7, t.1)
+  let t.4 = Wrap(t.3)
+  let t.5 = classify(t.4)
+  t.5
 
 notFound =
   18446744073709551615

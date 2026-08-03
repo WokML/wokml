@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- M3-b Task 3: a BOXED value LIVE ACROSS THE STORE. 'xs' (a list cell) is built
 -- BEFORE the op and consumed AFTER the resume returns, so it sits in the captured

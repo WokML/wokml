@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Bug #7 (catch-all variant). A refutable sub-pattern under a constructor
 -- (`Some 0`) followed by a wildcard catch-all must backtrack: `Some 5` fails the

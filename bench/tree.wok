@@ -2,7 +2,7 @@
 -- it to a number by summing all node labels. Exercises many Leaf
 -- (nullary) constructors and many Node (3-field) constructors.
 module Main
-import Std.Base
+import Base
 
 data Tree = Leaf | Node U64 Tree Tree
 

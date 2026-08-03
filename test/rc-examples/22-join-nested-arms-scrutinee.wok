@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- ALL-ARMS-NESTED scrutinee regression (F1): every arm of the outer case on the
 -- scrutinee `xs` is ITSELF a nested case before reaching the value-position merge

@@ -1,26 +1,3 @@
-sumTree t.1 =
-  case t.1 of
-    Leaf n ->
-      let _drop.1 = __rc_drop(t.1)
-      n
-    Node l r ->
-      let _dup.1 = __rc_dup(l)
-      let _dup.2 = __rc_dup(r)
-      let _drop.2 = __rc_drop(t.1)
-      let t.2 = sumTree(l)
-      let t.3 = sumTree(r)
-      let t.4 = +(t.2, t.3)
-      t.4
-
-main =
-  let t.1 = Leaf(1)
-  let t.2 = Leaf(2)
-  let t.3 = Leaf(3)
-  let t.4 = Node(t.2, t.3)
-  let t.5 = Node(t.1, t.4)
-  let t.6 = sumTree(t.5)
-  t.6
-
 id x =
   x
 
@@ -513,6 +490,29 @@ raceSpawn ch fs =
       let t.8 = raceSpawn(ch, gs)
       let t.9 = ++(t.7, t.8)
       t.9
+
+sumTree t.1 =
+  case t.1 of
+    Leaf n ->
+      let _drop.1 = __rc_drop(t.1)
+      n
+    Node l r ->
+      let _dup.1 = __rc_dup(l)
+      let _dup.2 = __rc_dup(r)
+      let _drop.2 = __rc_drop(t.1)
+      let t.2 = sumTree(l)
+      let t.3 = sumTree(r)
+      let t.4 = +(t.2, t.3)
+      t.4
+
+main =
+  let t.1 = Leaf(1)
+  let t.2 = Leaf(2)
+  let t.3 = Leaf(3)
+  let t.4 = Node(t.2, t.3)
+  let t.5 = Node(t.1, t.4)
+  let t.6 = sumTree(t.5)
+  t.6
 
 notFound =
   18446744073709551615

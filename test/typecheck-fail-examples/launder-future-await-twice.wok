@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 -- Closed-sig leaking form pinned after future-await-twice was reclassified
 -- to trip the double-consume check via `with eff e`: with the channel
 -- removed, `bad`'s own sig has no channel for e, so the laundering check

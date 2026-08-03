@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E3 inline-string corpus: 8-byte string "abcdefgh" (exactly maxInlineStr + 1 = 8).
 -- This is the first string that lands on the heap (one cell allocation).

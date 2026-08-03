@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 bad : U64 -> U64 with State (row e)   -- a row argument in State's `*` parameter slot
 bad x = x

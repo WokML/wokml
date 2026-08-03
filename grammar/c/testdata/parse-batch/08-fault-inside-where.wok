@@ -1,0 +1,22 @@
+-- EXPECT-LINES: 17 20
+-- EXPECT-SOUND: 3
+-- Damage TWO block levels down: inside a `where`, inside an equation.
+--
+-- Recovery skips to the next NEWLINE at the damaged item's own level, or to
+-- its DEDENT. DEDENT is what makes the depth irrelevant: it is arithmetic from
+-- columns rather than a guess about what a closing token meant, so the
+-- innermost block cannot swallow the one containing it, and that one cannot
+-- swallow the file.
+--
+-- What this pins: the cost stays at the damaged BINDING. The `where` keeps its
+-- other binding, the equation survives, and the batch continues past it.
+module M
+
+f = 1
+  where
+    a ) = 2
+    b = 3
+
+g y := 4
+
+h = 5

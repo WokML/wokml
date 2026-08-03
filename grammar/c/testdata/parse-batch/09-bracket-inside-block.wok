@@ -1,0 +1,19 @@
+-- EXPECT-LINES: 14 14 17
+-- EXPECT-SOUND: 3
+-- L7 again, but with the bracket opened INSIDE a block rather than at the top
+-- level, so the column that abandons it is the BLOCK's and not column 1.
+--
+-- What this pins: containment holds just as well one level down. The stray `(`
+-- costs exactly the alternative that opened it -- `1 -> 2` survives in the same
+-- block, as an H_Alt beside the error node, and the enclosing equation is still
+-- a D_Equation. Compare 10, where one more level of nesting is enough to lose
+-- the neighbour as well.
+module M
+
+pick cmd = case cmd of
+  0 -> (a
+  1 -> 2
+
+after y := 9
+
+last = 10

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 zero, one, two : U64
 zero = 0

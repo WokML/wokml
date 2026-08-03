@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- Same-effect AND cross-effect named routing AT ONCE: two State instances
 -- (`count`, `total`) that must stay distinct from each other, plus a Reader

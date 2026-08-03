@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- A nested-tuple destructuring component type-checks but the case-compiler
 -- elaboration does not bind the inner binders, so it would silently

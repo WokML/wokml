@@ -97,12 +97,15 @@ typedef struct {
 // The two latches; see wok_print.h for why they are process-wide.
 static unsigned print_faults = 0;
 static unsigned print_overflows = 0;
+static unsigned print_unprintables = 0;
 
 unsigned wok_print_fault_count(void) { return print_faults; }
 unsigned wok_print_overflow_count(void) { return print_overflows; }
+unsigned wok_print_unprintable_count(void) { return print_unprintables; }
 void wok_print_reports_reset(void) {
   print_faults = 0;
   print_overflows = 0;
+  print_unprintables = 0;
 }
 
 // A break that would change the tree rather than the text. Counted in every
@@ -307,6 +310,12 @@ static bool is_trailing_blank(char c) {
 // silently mangled, and the text that follows is expected to fail to
 // re-parse -- exactly like the violation it is reporting.
 static void unprintable(Pr *p, const char *what) {
+  // Counted BEFORE the quiet check and skipped on a measuring pass, exactly as
+  // `fault` is: every node is rendered at least twice, once into a width
+  // counter and once for real, so counting on the measuring pass would double
+  // every answer.
+  if (p->count_only) return;
+  print_unprintables++;
   if (p->quiet) return;
   (void)fprintf(stderr, "wok_print: %s cannot be written in canonical form\n",
                 what);
@@ -378,10 +387,27 @@ static void p_block_close(Pr *p, const WokNode *owner, u32 ind) {
 
 enum { TP_TYPE = 0, TP_ARROW = 1, TP_APP = 2, TP_ATOM = 3 };
 enum { PP_PAT = 0, PP_APP = 1, PP_ATOM = 2 };
-enum { EP_EXPR = 0, EP_CHAIN = 1, EP_APP = 2, EP_ATOM = 3 };
+// EP_NEG sits BETWEEN the chain and the application, and it is not cosmetic.
+// parse_app has two arms -- `- <the whole application to the right>`, and a
+// juxtaposition of atoms -- and they share a rung without being
+// interchangeable: a leading `-` SWALLOWS the rest of the rung, so negation is
+// legal only at the HEAD of an application spine, never as the function of
+// one. On one rung the printer wrote `E_App(E_Neg a, b)` as `-a b`, which
+// reads back as `-(a b)`; the split is what asks for the bracket, and it also
+// subsumes the hand-written case that used to keep `- -x` from lexing as a
+// comment opener.
+enum { EP_EXPR = 0, EP_CHAIN = 1, EP_NEG = 2, EP_APP = 3, EP_ATOM = 4 };
 
-// Nodes that occupy no position where re-association is possible.
-enum { PREC_FIXED = 3 };
+// Nodes that occupy no position where re-association is possible. It must be
+// at least the top rung of EVERY ladder above, so that a node which cannot
+// re-associate is never bracketed wherever it is placed. Inserting a rung and
+// forgetting to raise this would put brackets around an N_Name in a module
+// path or an H_ChainOp -- where a bracket is SYNTAX, not grouping -- so the
+// invariant is asserted rather than described.
+enum { PREC_FIXED = 4 };
+static_assert(PREC_FIXED >= TP_ATOM && PREC_FIXED >= PP_ATOM &&
+                  PREC_FIXED >= EP_ATOM,
+              "PREC_FIXED must top every ladder; see the note above");
 
 typedef struct {
   u32 prec;    // the level this position demands
@@ -490,8 +516,9 @@ static u32 node_prec(const WokNode *n) {
     case E_Error:
       return EP_ATOM;
     case E_App:
-    case E_Neg:
       return EP_APP;
+    case E_Neg:
+      return EP_NEG;
     case E_Chain:
       return EP_CHAIN;
     case E_Lambda:
@@ -511,11 +538,20 @@ static u32 node_prec(const WokNode *n) {
   WOK_UNREACHABLE();
 }
 
-// A block ITEM may not begin with a token the layout filter reads as a
-// continuation lead: the line would join the previous one instead of
-// starting an item. Only `-` can arise -- prefix negation and a negative
-// integer pattern -- and bracketing it is the repair the corpus already
-// writes by hand (`(-1) -> 2`).
+// Does this node begin with `-`? There are TWO positions where that is misread,
+// and only `-` can arise in either: prefix negation, and a negative integer
+// pattern.
+//
+//   1. the first token of a block ITEM. The layout filter reads an operator
+//      lead as a CONTINUATION, so the line would join the previous one instead
+//      of starting an item. Bracketing it is the repair the corpus already
+//      writes by hand (`(-1) -> 2`).
+//   2. the first ARGUMENT of a prefix left-hand side. parse_lhs decides
+//      prefix-vs-infix on the single token after the name, so `f -1 = 2` is
+//      read as the infix equation `f - 1 = 2` -- a different program that
+//      still parses. A binding does not need the bracket (parse_bind has no
+//      such lookahead), but the printer cannot tell an equation's left-hand
+//      side from a binding's, so it writes the safe one for both.
 static bool needs_lead_paren(const WokNode *n) {
   if (n->tag == E_Neg) return true;
   return n->tag == P_Int && P_Int_negative(n);
@@ -748,13 +784,19 @@ static usize flat_after(const Pr *p, const WokNode *n, Ctx c);
 // Space-separated arguments, each at `prec`. Juxtaposition owns no separator,
 // so every one of these arguments is UNCONDITIONALLY on this line: an
 // argument's reserve is the flat width of the ones that follow it.
-static void p_args(Pr *p, WokSeq s, Ctx c, u32 prec) {
+// `guard_first` marks the one caller whose FIRST argument sits in a position
+// where a leading `-` is misread; see needs_lead_paren. Every other caller
+// passes false, and says so at the call site rather than leaving it to be
+// inferred from a default.
+static void p_args(Pr *p, WokSeq s, Ctx c, u32 prec, bool guard_first) {
   for (u32 i = 0; i < s.n; i++) {
     usize after = 0;
     for (u32 j = i + 1; j < s.n; j++)
       after += 1 + flat_after(p, s.items[j], sub(c, prec));
     put_c(p, ' ');
-    p_node(p, s.items[i], sub_rest(c, prec, after));
+    Ctx ac = sub_rest(c, prec, after);
+    ac.lead = guard_first && i == 0;
+    p_node(p, s.items[i], ac);
   }
 }
 
@@ -995,17 +1037,17 @@ static void p_arrow_head(Pr *p, const WokNode *n, Ctx c) {
       put_span(p, H_Clause_name(n));
       // The continuation binder still follows every pattern on this line.
       c.rest += 1 + H_Clause_k(n).len;
-      p_args(p, H_Clause_pats(n), c, PP_ATOM);
+      p_args(p, H_Clause_pats(n), c, PP_ATOM, false);
       put_c(p, ' ');
       put_span(p, H_Clause_k(n));
       return;
     case WOK_CLAUSE_RETURN:
       put_z(p, "return");
-      p_args(p, H_Clause_pats(n), c, PP_ATOM);
+      p_args(p, H_Clause_pats(n), c, PP_ATOM, false);
       return;
     case WOK_CLAUSE_PLAIN:
       put_span(p, H_Clause_name(n));
-      p_args(p, H_Clause_pats(n), c, PP_ATOM);
+      p_args(p, H_Clause_pats(n), c, PP_ATOM, false);
       return;
     case WOK_CLAUSE_VAR:
       break;
@@ -1184,7 +1226,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
     case D_Type: {
       put_z(p, "type ");
       put_span(p, D_Type_name(n));
-      p_args(p, D_Type_params(n), c, PREC_FIXED);
+      p_args(p, D_Type_params(n), c, PREC_FIXED, false);
       put_z(p, " = ");
       // The FIRST alternative stays on the `=` line: a break before it would
       // put an item lead at the head of the next line. Every later one is led
@@ -1206,20 +1248,20 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
     case D_Alias:
       put_z(p, "alias ");
       put_span(p, D_Alias_name(n));
-      p_args(p, D_Alias_params(n), c, PREC_FIXED);
+      p_args(p, D_Alias_params(n), c, PREC_FIXED, false);
       put_z(p, " = ");
       p_node(p, D_Alias_body(n), sub(c, TP_TYPE));
       return;
     case D_Effect:
       put_z(p, "effect ");
       put_span(p, D_Effect_name(n));
-      p_args(p, D_Effect_params(n), c, PREC_FIXED);
+      p_args(p, D_Effect_params(n), c, PREC_FIXED, false);
       p_seq_block(p, n, D_Effect_ops(n), c.ind + 1, c.flat, false);
       return;
     case D_Class:
       put_z(p, "class ");
       put_span(p, D_Class_name(n));
-      p_args(p, D_Class_params(n), c, PREC_FIXED);
+      p_args(p, D_Class_params(n), c, PREC_FIXED, false);
       p_seq_block(p, n, D_Class_body(n), c.ind + 1, c.flat, false);
       return;
     case D_Instance:
@@ -1232,7 +1274,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
         put_z(p, ") => ");
       }
       put_span(p, D_Instance_name(n));
-      p_args(p, D_Instance_args(n), c, TP_ATOM);
+      p_args(p, D_Instance_args(n), c, TP_ATOM, false);
       p_seq_block(p, n, D_Instance_body(n), c.ind + 1, c.flat, false);
       return;
     case D_Foreign:
@@ -1245,7 +1287,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
     case D_ExternType:
       put_z(p, "extern type ");
       put_span(p, D_ExternType_name(n));
-      p_args(p, D_ExternType_params(n), c, PREC_FIXED);
+      p_args(p, D_ExternType_params(n), c, PREC_FIXED, false);
       return;
     case D_Sig:
       if (D_Sig_is_extern(n)) put_z(p, "extern ");
@@ -1296,7 +1338,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
           group_close(p, g, " }");
         }
       } else {
-        p_args(p, H_ConDef_args(n), c, TP_ATOM);
+        p_args(p, H_ConDef_args(n), c, TP_ATOM, false);
       }
       return;
     }
@@ -1338,7 +1380,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
       } else {
         put_span(p, L_Prefix_name(n));
       }
-      p_args(p, L_Prefix_args(n), c, PP_ATOM);
+      p_args(p, L_Prefix_args(n), c, PP_ATOM, !L_Prefix_paren(n));
       return;
     case L_Infix: {
       const WokNode *right = L_Infix_right(n);
@@ -1524,7 +1566,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
       return;
     case P_Con:
       p_node(p, P_Con_path(n), lead_sub(c, PREC_FIXED));
-      p_args(p, P_Con_args(n), c, PP_ATOM);
+      p_args(p, P_Con_args(n), c, PP_ATOM, false);
       return;
     case P_Cons: {
       const WokNode *tail = P_Cons_tail(n);
@@ -1639,7 +1681,9 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
       return;
     }
     case E_Chain: {
-      p_node(p, E_Chain_head(n), lead_sub(c, EP_APP));
+      // EP_NEG, not EP_APP: `-a + b` is one chain whose head is a negation,
+      // and a spine head is exactly where negation is legal bare.
+      p_node(p, E_Chain_head(n), lead_sub(c, EP_NEG));
       WokSeq ops = E_Chain_ops(n);
       for (u32 i = 0; i < ops.n; i++) {
         // Every operand is separated by an OPERATOR, which is the one token
@@ -1655,7 +1699,7 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
     case H_ChainOp:
       p_op(p, H_ChainOp_op(n));
       put_c(p, ' ');
-      p_node(p, H_ChainOp_rhs(n), sub(c, EP_APP));
+      p_node(p, H_ChainOp_rhs(n), sub(c, EP_NEG));  // `a + -b`
       return;
     case E_Dot:
       p_node(p, E_Dot_recv(n), lead_rest(c, EP_ATOM, 1 + E_Dot_name(n).len));
@@ -1664,10 +1708,11 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
       return;
     case E_Neg:
       put_c(p, '-');
-      // `- -x` would lex as the comment opener `--`, so a negated negation
-      // is bracketed rather than spaced.
-      p_node(p, E_Neg_body(n),
-             sub_rest(c, E_Neg_body(n)->tag == E_Neg ? EP_ATOM : EP_APP, 0));
+      // Negation takes the whole application to its right, so its body is an
+      // application spine. A nested negation is looser than that and brackets
+      // itself, which is also what keeps `- -x` from lexing as the comment
+      // opener `--`; the ladder states it, so no case here has to.
+      p_node(p, E_Neg_body(n), sub_rest(c, EP_APP, 0));
       return;
     case E_List: {
       WokSeq items = E_List_items(n);

@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #1: a LetRec member that CONSUMES (moves) an enclosing
 -- boxed capture.  The group is non-escaping (result is a U64 scalar).

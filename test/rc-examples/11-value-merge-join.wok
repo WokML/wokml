@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- A case in value (let-bound) position elaborates to a merge join whose body is
 -- the continuation. Here the join body uses only its (unboxed) parameter, so the

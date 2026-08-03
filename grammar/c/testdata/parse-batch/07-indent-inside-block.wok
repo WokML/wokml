@@ -1,0 +1,29 @@
+-- EXPECT-LINES: 23 27
+-- EXPECT-SOUND: 3
+-- A block item at a column matching no open level, and a fault after it.
+--
+-- The layout filter, not the parser, catches this: an item line that is
+-- neither deeper than the current level nor equal to any open one is L6, and
+-- it is repaired by adopting the column so the block skeleton survives.
+--
+-- The first line NUMBER here is deliberate and worth reading twice: the fault
+-- is blamed on line 15, the line being CONTINUED, not line 16, the one that is
+-- over-indented. A layout token has length zero, so wok_parse.c's `blame`
+-- charges it to the end of the last thing the author actually wrote -- which is
+-- where a missing `=` or `->` belongs. Do not "fix" this to point at line 16
+-- without reading that rule; E1 chose it on purpose.
+--
+-- What this pins: the repair is LOCAL, and exactly local. The case comes back
+-- with all THREE alternatives -- H_Alt, E_Error, H_Alt -- so the damaged one
+-- became an error node IN PLACE and both neighbours survived. The enclosing
+-- equation still parses, and the independent fault later is still reported.
+module M
+
+pick cmd = case cmd of
+  0 -> 1
+   1 -> 2
+  2 -> 3
+
+after y := 9
+
+last = 10

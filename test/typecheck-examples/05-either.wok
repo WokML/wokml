@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 mapResult : (a -> c) -> (b -> c) -> Result a b -> c
 mapResult f g e = case e of

@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- valid UTF-8: 4-byte sequence U+1F600 emoji (240, 159, 152, 128)
 -- fromBytes returns Some

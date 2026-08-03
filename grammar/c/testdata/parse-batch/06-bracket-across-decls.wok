@@ -1,0 +1,24 @@
+-- EXPECT-LINES: 17 17 22
+-- EXPECT-SOUND: 4
+-- An unclosed bracket, and the file after it.
+--
+-- Layout is SUSPENDED inside brackets (L2), so without a second witness a
+-- stray `(` swallows the rest of the file into one logical line and the batch
+-- collapses to a single fault. Indentation is that witness: a line STARTING AN
+-- ITEM at or left of the block column current when the bracket opened cannot
+-- be inside it (L7). The filter reports at the OPENING `(`, force-closes, and
+-- resumes.
+--
+-- What this pins beyond the existing L7 coverage: the batch keeps going. The
+-- damaged `h` two declarations later is still found, so an abandoned bracket
+-- costs its own declaration and does not end the run.
+module M
+
+f = (a + b
+
+g : U64
+g = 1
+
+h y := 2
+
+k = 3

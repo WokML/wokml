@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Control
+import Base
+import Control
 
 -- M2: the end-to-end --dump-multiplicity proof artifact for the escaping
 -- one-shot coroutine. The prelude `Coro.suspend` arm desugars to the genuine

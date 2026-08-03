@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-2 POSITIVE guard (PARTIAL-application variant of #52): a recursive 'LetRec'
 -- group member whose body uses an enclosing boxed CAPTURE 'g' as a PARTIAL call

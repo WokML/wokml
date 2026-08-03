@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Deep-list / recursive-drop at scale (Suite E, Task 11). We use an explicit
 -- 'List' type (rather than the built-in '[a]', whose '::' is pattern-only) so a

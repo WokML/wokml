@@ -1,5 +1,5 @@
 module Main
-import Std.Bytes
+import Bytes
 
 -- FFI Slice 4 Task 1 coherence, POSITIVE case. `consume` is blessed
 -- (("wok","consume"), DispScalar, [MoveOut]); the surface signature declares

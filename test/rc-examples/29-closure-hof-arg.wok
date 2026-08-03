@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- A higher-order function takes a closure argument and applies it.
 apply1 : (U64 -> U64) -> U64 -> U64

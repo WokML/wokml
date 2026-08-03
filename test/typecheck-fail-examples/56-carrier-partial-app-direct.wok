@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- Carrier rule (§4.3): a partial application capturing a handle is rejected even
 -- when returned DIRECTLY (not via a let-binder). `peek c : () -> U64` is the

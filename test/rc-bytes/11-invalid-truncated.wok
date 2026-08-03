@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.Bytes
+import Base
+import Bytes
 
 -- invalid UTF-8: truncated 3-byte sequence (226, 130 missing third byte)
 -- fromBytes returns None

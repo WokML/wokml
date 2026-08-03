@@ -1,6 +1,6 @@
 module Main
-import Std.Base
-import Std.String
+import Base
+import String
 
 -- E4 Task 3: codepoint-indexed slice with multibyte UTF-8.
 -- s = "héllo": [h, é(2B), l, l, o] = 5 codepoints, 6 bytes

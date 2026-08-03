@@ -50,7 +50,7 @@ data Lit = LInt Integer | LStr Text | LChar Char | LUnit
 -- constructor fields, scrutinees, jump args.
 --
 -- 'APrim' carries the QUALIFIED identity @(Module, Name)@ of a prelude
--- @extern@ (e.g. @("Std.Base", "+")@). The module disambiguates same-named
+-- @extern@ (e.g. @("Base", "+")@). The module disambiguates same-named
 -- externs across modules; runtime implementation lookup keys on the name part
 -- (Caveat B), and the trusted-sink recognizers key on the whole pair.
 data Atom = AVar Name | ALit Lit | APrim (Text, Text)

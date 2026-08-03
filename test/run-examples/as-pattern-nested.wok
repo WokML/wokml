@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- plain nested constructor matching (the pre-existing bug)
 flatten : Option (Option U64) -> U64

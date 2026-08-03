@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2b-1 Task 3: a NAMED-instance handler whose handled body performs NO
 -- operation. The body '7' is pure, so the 'tick' arm is never reached; the

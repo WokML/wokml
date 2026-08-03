@@ -1,5 +1,5 @@
 module Main
-import Std.Base
+import Base
 
 -- M2a-1 reproducer #15 (DIRECT sibling-into-record-field escape, REJECTED):
 -- the LetRec group sibling 'f' is stored DIRECTLY into a record field
