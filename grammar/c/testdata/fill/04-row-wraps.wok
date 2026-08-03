@@ -1,0 +1,16 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- a capability row: it wraps under its own `with`, with the `+` entries
+-- aligned under each other (decision 1).
+--
+-- 81 columns, one past the width, so every break in the group is taken.
+module M
+
+tick : Cmd -> U64
+       with Reader U64
+          + Writer [U64]
+          + State U64
+          + Except Sxxxxxxxxxx
+tick cmd = 0

@@ -1,0 +1,21 @@
+-- Rule 3: a comment with no item after it closes the block it was written
+-- in, and at the top level it closes the file.
+module M
+
+f =
+  let a = 1
+  a
+  -- closes a statement block
+
+g = handler St
+  get -> 1
+  -- closes a clause block
+
+k x = case x of
+  A -> 1
+  -- closes an alternative block
+
+effect E
+  op : ()
+  -- closes an effect block
+-- closes the file, with no declaration after it

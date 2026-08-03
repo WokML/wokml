@@ -1,0 +1,12 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- Decision 3: nested groups break INDEPENDENTLY. The outer chain does not
+-- fit and breaks; the list inside it does fit and stays flat.
+module M
+
+f = [11, 22, 33]
+  + bbbbbbbbbbbbbbbbbbbb
+  + cccccccccccccccccccc
+  + dddddddddddddddddddd

@@ -1,0 +1,15 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- type alternatives: the FIRST one stays on the `=` line, because a break
+-- before it would put an item lead at the head of the next line.
+--
+-- 81 columns, one past the width, so every break in the group is taken.
+module M
+
+type Shape = Circle U64
+  | Square U64
+  | Rect U64 U64
+  | Triangle U64 U64
+  | Dxxxxxxx

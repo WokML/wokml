@@ -1,0 +1,4 @@
+-- EXPECT: E-LAY-BRACKET
+module Main
+f =
+  foo [1, 2

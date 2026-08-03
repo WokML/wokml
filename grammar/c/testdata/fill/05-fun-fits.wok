@@ -1,0 +1,12 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- a function type: the whole arrow SPINE is one group, so all of its
+-- `->` break together or none of them do.
+--
+-- 80 columns, so it stays on one line: 80 is the last width that fits.
+module M
+
+step : Command -> Registry -> Session -> Outcome -> Journal -> Report -> Uxxxxxx
+step a b c d e f = 0

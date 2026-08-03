@@ -1,0 +1,70 @@
+-- A tour of the PATTERN forms. A capitalized name is never a fresh binder
+-- (spec 1.6), which is a lexical fact here rather than a later check.
+module Main.Tour.Pats
+import Base
+
+type Msg = Ping U64 | Pong String | Quiet
+type Point = Point { x : U64, y : U64 }
+
+wild : Msg -> U64
+wild m = case m of
+  _ -> 0
+
+vars : (U64, U64) -> U64
+vars pr = case pr of
+  (a, b) -> a + b
+
+-- A negative literal must be bracketed in item-lead position: a line
+-- beginning with `-` continues the previous one (D-LEX-1).
+ints : U64 -> U64
+ints n = case n of
+  0    -> 1
+  (-1) -> 2
+  _    -> 3
+
+strs : Msg -> U64
+strs m = case m of
+  Pong "hi" -> 1
+  Pong s    -> 2
+  Ping k    -> k
+  Quiet     -> 0
+
+chars : Char -> U64
+chars c = case c of
+  'x' -> 1
+  _   -> 0
+
+lists : [U64] -> U64
+lists xs = case xs of
+  []             -> 0
+  [a]            -> a
+  a :: b :: rest -> a + b
+
+-- `as` binds to an atompat, so an applied constructor needs brackets. `@`
+-- stays reserved for visible type application.
+asPat : Msg -> Msg
+asPat m = case m of
+  (Ping n) as whole -> whole
+  other             -> other
+
+recPat : Point -> U64
+recPat p = case p of
+  Point { x = a, y = b } -> a + b
+
+recPun : Point -> U64
+recPun p = case p of
+  Point { x, y } -> x + y
+
+recOpen : Point -> U64
+recOpen p = case p of
+  Point { .., x = a } -> a
+
+recRest : Point -> U64
+recRest p = case p of
+  Point { .. more, x = a } -> a
+
+unitHead : () -> U64
+unitHead () = 0
+
+conHead : Msg -> U64
+conHead Quiet = 0

@@ -1,0 +1,3 @@
+-- EXPECT: E-LEX-UNTERMINATED
+module Main
+f = "no closing quote

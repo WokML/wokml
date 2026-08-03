@@ -1,0 +1,4 @@
+-- EXPECT: E-LEX-SEMI
+-- Legal v1 wok that a port will hit, so it earns a real message (D22).
+module Main
+f = 1 ; g = 2

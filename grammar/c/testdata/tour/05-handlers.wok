@@ -1,0 +1,59 @@
+-- A tour of HANDLER and CAPABILITY forms: every clause kind, both `handle`
+-- tiers, both `use` tiers, and every row-entry kind.
+module Main.Tour.Handlers
+import Base
+
+type Msg = Ping U64 | Close
+
+effect State s
+  get : s
+  set : s -> ()
+
+effect Proto
+  req : Msg -> U64
+
+effect Emit a
+  emit : a -> ()
+
+-- All four clause kinds: the frame baton, two plain tail-resumptive arms and
+-- the value clause.
+state : s -> Handler (State s) a (a, s)
+state init = handler State
+  var cur = init
+  get      -> cur
+  set x    -> cur := x
+  return v -> (v, cur)
+
+-- `once` splits its binders: the LAST one is the continuation (D14), and the
+-- ones before it are ordinary patterns that must cover the argument type.
+server : Handler Proto a a
+server = handler Proto
+  once req (Ping n) k -> k n
+  once req Close    k -> k 0
+
+drain : Handler (Emit a) r [a]
+drain = handler Emit
+  once emit x k -> x :: k ()
+  return u      -> []
+
+-- Row entries: a role obligation, a designation slot, and a row variable.
+mixed : () -> U64 with (from : State U64) + Emit U64 + eff e
+mixed () =
+  let n = from.get
+  Emit.emit n
+  n
+
+-- The statement tiers: a labelled `handle`, a bare `use` and a bridged call.
+runMixed : U64
+runMixed =
+  handle from = state 1
+  handle Emit = drain
+  use from as State
+  use from as State in mixed ()
+
+-- The inline tiers, with and without a label.
+inlineLabelled : U64
+inlineLabelled = handle st = state 0 in st.get
+
+inlineElided : U64
+inlineElided = handle server in 0

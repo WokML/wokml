@@ -1,0 +1,5 @@
+-- The very first line of a file, with nothing above it.
+module M
+
+f = 1
+-- The very last line of a file, with no item after it at all.

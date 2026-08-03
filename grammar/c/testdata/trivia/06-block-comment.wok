@@ -1,0 +1,10 @@
+module M
+
+{- A block comment spanning lines.
+   Its interior is emitted VERBATIM: a formatter may move a comment,
+   it may not rewrite one. -}
+f = 1  {- and one that trails an item -}
+
+g =
+  {- leading a statement -}
+  1

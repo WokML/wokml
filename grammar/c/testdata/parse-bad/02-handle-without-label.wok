@@ -1,0 +1,12 @@
+-- EXPECT: E-HANDLE-LABEL
+-- P1/D13: the STATEMENT form must write its label. Only the delimited inline
+-- form `handle h in e` may elide it.
+module Main
+
+main : U64
+main =
+  handle st
+  0
+
+g : U64
+g = 1

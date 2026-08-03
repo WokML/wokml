@@ -1,0 +1,14 @@
+-- EXPECT: E-PARSE
+-- Recovery inside a NON-declaration block. Alternative columns are already
+-- unambiguous, so no anchor is needed: the damaged alternative is discarded
+-- and the one after it still parses.
+module Main
+
+f : U64 -> U64
+f n = case n of
+  0 -> 1
+  1 =: 2
+  _ -> 3
+
+g : U64
+g = 4

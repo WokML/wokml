@@ -1,0 +1,13 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- a record literal: the separators and the closer align under the `{`.
+--
+-- 81 columns, one past the width, so every break in the group is taken.
+module M
+
+p = Point { xxxxxx = aaaaaaaaaa
+          , yyyyyy = bbbbbbbbbb
+          , zzzzzz = cxxxxxxxxxxxxxxx
+          }

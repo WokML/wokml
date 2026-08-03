@@ -1,0 +1,37 @@
+-- EXPECT-LINES: 15 29 31 33 35 37
+-- EXPECT-SOUND: 2
+-- FIVE damaged equations in a row: every one is reported.
+--
+-- This was the case that proved the old anchor rule too narrow. Recovery
+-- resynchronised only at a declaration keyword or `name :`, so a damaged
+-- EQUATION was not an anchor and the skip walked over every remaining one --
+-- five faults collapsed into one report, and the batch stopped early exactly
+-- when a file was uniformly broken, which is when a work list helps most.
+--
+-- E4: resync_to_boundary already stops at a NEWLINE at the block's own level,
+-- and the layout filter emits one exactly where an item begins, so the
+-- boundary was always exact. The anchor's only remaining job is rejecting
+-- wreckage, which is precisely the continuation-lead set.
+module M`: all five damaged equations collapse into one error node
+-- FIVE damaged equations in a row, and only the FIRST is reported.
+--
+-- This pins a real limitation rather than desired behaviour. Recovery in a
+-- declaration block resynchronises only at an ANCHOR -- a declaration keyword,
+-- or `name :` at the block column (D23 makes a signature the strongest anchor
+-- available). A damaged EQUATION is not an anchor, so once the first fault
+-- skips forward it walks over every remaining one to end of file.
+--
+-- Contrast 01, where sound declarations sit between the faults and act as
+-- anchors: there all three are reported. So the batch stops early exactly
+-- when a file is uniformly broken, which is when a work list would help most.
+module M
+
+a1 x := 1
+
+a2 y := 2
+
+a3 z := 3
+
+a4 w := 4
+
+a5 v := 5

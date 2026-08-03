@@ -1,0 +1,11 @@
+-- EXPECT: E-LAY-INDENT
+-- D-LAY-3: an INDENT where no block is due is an error, not a continuation.
+-- The layout filter emits a well formed stream regardless, so this reaches the
+-- parser as a grammar fault with a usable hint.
+module Main
+
+f : U64
+   f2 : U64
+
+g : U64
+g = 1

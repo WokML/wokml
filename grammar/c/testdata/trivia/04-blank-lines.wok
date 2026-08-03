@@ -1,0 +1,23 @@
+-- Rule 4: a paragraph break between two items of a block survives, and
+-- anything above one blank line collapses to one.
+module M
+
+f =
+  let a = 1
+
+  let b = 2
+
+  a + b
+
+g = handler St
+  get   -> 1
+
+  set x -> 2
+
+-- A blank line ABOVE a leading comment is what counts: the comment block is
+-- part of the item it leads.
+k =
+  let a = 1
+
+  -- leads the item after a paragraph break
+  a

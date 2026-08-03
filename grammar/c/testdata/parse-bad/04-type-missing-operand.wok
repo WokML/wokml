@@ -1,0 +1,11 @@
+-- EXPECT: E-PARSE
+-- A damaged signature. Declaration blocks resynchronise only at an ANCHOR, so
+-- the following equation is discarded with it and `g :` is where parsing
+-- resumes -- one message, not two.
+module Main
+
+f : U64 -> ->
+f x = x
+
+g : U64
+g = 2

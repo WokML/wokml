@@ -1,0 +1,12 @@
+-- EXPECT-LINES: 9 12
+-- EXPECT-SOUND: 2
+-- module and the sound signature
+-- Faults whose offending token is a LAYOUT token. Before E1 these were
+-- blamed on the FOLLOWING line, because a layout token carries the position
+-- of the token it precedes.
+module M
+
+missingEquals x
+
+alsoMissing : U64
+alsoMissing y

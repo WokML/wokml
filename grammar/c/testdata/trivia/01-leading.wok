@@ -1,0 +1,28 @@
+-- Rule 1: an own-line comment leads the next block ITEM, at every
+-- granularity the rule names -- declaration, statement, clause, alternative.
+module M
+-- leads an import, inside a run that stays one unit
+import Base
+
+-- leads a signature
+f : U64
+-- leads the equation the signature describes
+f =
+  -- leads a statement
+  let a = 1
+  -- leads the statement after it
+  a
+
+-- leads a handler-valued declaration
+h = handler St
+  -- leads a clause
+  get   -> 1
+  -- leads the clause after it
+  set x -> 2
+
+-- leads a case
+k x = case x of
+  -- leads an alternative
+  A -> 1
+  -- leads the alternative after it
+  B -> 2

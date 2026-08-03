@@ -1,0 +1,94 @@
+-- A tour of the EXPRESSION forms. Chains stay flat here: `a + b * c` is one
+-- E_Chain with two ops, and src/Wok/Reordering.hs reassociates it later.
+module Main.Tour.Exprs
+import Base
+
+type Point = Point { x : U64, y : U64 }
+
+lam : U64 -> U64
+lam = \x -> x + 1
+
+lam2 : U64 -> U64 -> U64
+lam2 = \x y -> x * y
+
+-- An operator section is a plain atom; `+` stays freely redefinable.
+opref : U64 -> U64 -> U64
+opref = (+)
+
+backtick : U64
+backtick = 3 `lam2` 4
+
+-- D-LEX-1: `-` is never glued to a literal, so this is prefix negation of a
+-- name rather than a negative-literal token.
+negate : U64 -> U64
+negate n = -n
+
+flat : U64
+flat = 1 + 2 * 3 - 4
+
+lits : (String, Char)
+lits = ("a line\n", 'q')
+
+lst : [U64]
+lst = [1, 2, 3]
+
+emptyList : [U64]
+emptyList = []
+
+nothing : ()
+nothing = ()
+
+triple : (U64, U64, U64)
+triple = (1, 2, 3)
+
+rec : Point
+rec = Point { x = 1, y = 2 }
+
+recPun : U64 -> U64 -> Point
+recPun x y = Point { x, y }
+
+recSpread : Point -> Point
+recSpread p = Point { .. p, y = 9 }
+
+proj : Point -> U64
+proj p = p.x
+
+qualified : U64
+qualified = Base.identity 1
+
+cond : Bool -> U64
+cond b =
+  if b
+    then 1
+    else 2
+
+pick : [U64] -> U64
+pick xs = case xs of
+  []      -> 0
+  y :: ys -> y + pick ys
+
+seqBody : U64
+seqBody =
+  let a = 1
+  let b = 2
+  _ = lam a
+  a + b
+
+inlineLet : U64
+inlineLet = let a = 1 in a + 1
+
+whereClause : U64 -> U64
+whereClause n = n + bump
+  where
+    bump : U64
+    bump = 10
+
+-- Both infix left-hand-side spellings.
+(|>) : U64 -> U64 -> U64
+(|>) a b = a + b
+
+joinOn : U64 -> U64 -> U64
+a `joinOn` b = a + b
+
+(<+>) : U64 -> U64 -> U64
+a <+> b = a + b

@@ -1,0 +1,21 @@
+-- EXPECT-LINES: 8 13 18
+-- EXPECT-SOUND: 7
+-- module, and the beta/delta/zeta pairs: every sound declaration survives
+-- Three faults in three unrelated declarations. Each must be reported, at its
+-- own line, and the sound declarations between them must survive.
+module M
+
+alpha x := 1
+
+beta : U64
+beta = 2
+
+gamma y ?? 3
+
+delta : U64
+delta = 4
+
+epsilon =! 5
+
+zeta : U64
+zeta = 6

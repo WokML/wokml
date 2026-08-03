@@ -1,0 +1,16 @@
+-- EXPECT-LINES: 12
+-- EXPECT-SOUND: 5
+-- ZERO error nodes at top level -- the damaged alternative cost the
+-- alternative, not the equation containing it, nor anything after
+-- A fault in ONE case alternative. It must cost that alternative and nothing
+-- else: the enclosing equation, and every declaration after it, still parse.
+module M
+
+pick : U64 -> U64
+pick cmd = case cmd of
+  0 -> 1
+  1 ~~ 2
+  2 -> 3
+
+after : U64
+after = 9

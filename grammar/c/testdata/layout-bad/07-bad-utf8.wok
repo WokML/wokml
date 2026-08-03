@@ -1,0 +1,3 @@
+-- EXPECT: E-LEX-UTF8
+module Main
+f = "Ã("

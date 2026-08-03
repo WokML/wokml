@@ -1,0 +1,24 @@
+-- Every rule at once, nested, so their ORDER is what the round trip checks.
+module M
+
+-- leads the outer declaration
+outer x =
+  -- an item that OPENS a block takes no trailing comment: it would
+  -- print after the whole block, and so after every comment written
+  -- inside it. This leads the first thing in the block instead.
+  -- leads the case
+  case x of
+    -- leads the first alternative
+    A ->
+      -- leads a nested statement
+      let a = 1
+
+      -- leads the next statement, after a paragraph break
+      a
+      -- closes the nested statement block
+    B -> 2  -- trails the last alternative
+    -- closes the alternative block
+
+-- leads the last declaration
+last = 1  -- trails it
+-- closes the file

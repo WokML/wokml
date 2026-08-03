@@ -1,0 +1,21 @@
+-- EXPECT-LINES: 17
+-- EXPECT-SOUND: 4
+-- A damaged SIGNATURE, and the equation beneath it SURVIVES.
+--
+-- Under the old anchor rule it did not: recovery resynchronised only at a
+-- declaration keyword or `name :`, and a bare equation is neither, so
+-- `broken = 1` was swallowed along with the signature above it. That was
+-- recorded as the designed cost of D23 making a signature the strongest
+-- anchor available.
+--
+-- E4 dissolved it rather than trading it away. The boundary was never the
+-- problem: resync stops at a NEWLINE at the block's own level, which the
+-- layout filter emits exactly where an item begins. Only the wreckage filter
+-- was too narrow.
+module M
+
+broken : : U64
+broken = 1
+
+sound : U64
+sound = 2

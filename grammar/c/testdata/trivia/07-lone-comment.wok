@@ -1,0 +1,16 @@
+-- The grammar has no EMPTY block -- every block list parses at least one
+-- item -- so the nearest thing to a comment alone in a block is a block
+-- whose only other content is one item.
+module M
+
+effect E
+  -- the only own-line comment in this block
+  op : ()
+
+f x = case x of
+  -- the same, for an alternative block
+  _ -> ()
+
+g =
+  -- the same, for a statement block
+  ()

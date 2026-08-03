@@ -1,0 +1,17 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- a list literal: layout is suspended inside brackets, so the break is
+-- free -- but the `,` still LEADS its line, so L7 cannot fire on it.
+--
+-- 81 columns, one past the width, so every break in the group is taken.
+module M
+
+xs = [ aaaaaaaaaa
+     , bbbbbbbbbb
+     , cccccccccc
+     , dddddddddd
+     , eeeeeeeeee
+     , fxxxxxxxxxxxxx
+     ]

@@ -1,0 +1,9 @@
+-- testdata/fill: the width boundary, which is the only place an off-by-one
+-- in the measurement shows up. This file is CANONICAL: `wokfmt` must
+-- reproduce it byte for byte.
+--
+-- Application juxtaposition owns no separator, so this line CANNOT be
+-- broken and stays long. The printer reports it rather than pretending.
+module M
+
+f = collect aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggg

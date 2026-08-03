@@ -1,0 +1,10 @@
+-- EXPECT: E-LAY-BRACKET
+-- The catastrophic case: layout is suppressed inside brackets, so a stray `(`
+-- would otherwise collapse the rest of the file into one logical line. L7
+-- uses indentation as the independent witness and recovers the three
+-- declarations below.
+module Main
+f = (a + b
+g : U64
+g = 1
+h = 2

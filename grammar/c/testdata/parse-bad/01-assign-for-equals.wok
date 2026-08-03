@@ -1,0 +1,10 @@
+-- EXPECT: E-PARSE
+-- `:=` is handler frame state, not a definition. The message must name what
+-- was expected and what was found, and the next signature is an anchor.
+module Main
+
+f : U64
+f x := 3
+
+g : U64
+g = 1

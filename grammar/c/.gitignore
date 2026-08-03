@@ -1,0 +1,11 @@
+*.o
+wokparse
+wokfmt
+test/test_*
+!test/test_*.c
+test/fuzz_*
+!test/fuzz_*.c
+*.dSYM/
+compile_commands.json
+.cache/
+*.o.tmp

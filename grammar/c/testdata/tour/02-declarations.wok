@@ -1,0 +1,63 @@
+-- A tour of the DECLARATION forms of section 7's `decl`. Every shape here is
+-- reached by exactly one production, and H4's coverage bitmap is what forces
+-- this file to grow when the grammar does.
+module Main.Tour.Decls
+import Base
+import Base.Text (words, unwords)
+import Control as C
+
+-- `type`: applied constructors, a named record constructor, and the elided
+-- record form whose constructor name is the type's own (D-NAMING).
+type Pair a b = Pair a b
+
+type Wrapped = { value : U64, tag : U64 }
+
+type Shape
+  = Circle U64
+  | Rect { width : U64, height : U64 }
+  | Blank
+
+-- `alias`, including a row-kinded parameter and `(row e)` in argument
+-- position -- the only place a row may be spelled as a type.
+alias Grid a = [[a]]
+alias Ambient (row e) = Task (row e) U64
+
+-- `effect`: a block of operation signatures, one `VarId : type` each.
+effect Log
+  info : String -> ()
+  level : U64
+
+-- `class`: signatures and default equations share one block.
+class Show a
+  show : a -> String
+  showList : [a] -> String
+  showList xs = "..."
+
+instance Show U64
+  show n = "u64"
+
+-- An instance context is the only place `(type) =>` appears in a head.
+instance (Show a) => Show [a]
+  show xs = "list"
+
+-- `foreign module`: the transfer law. `own`, `lend` and `copy` are read as
+-- modes ONLY here; everywhere else they are ordinary names.
+foreign module Libc "c"
+  strlen "strlen" : lend Bytes -> U64
+  puts : own Bytes -> U64
+  clone : copy Bytes -> Bytes
+
+extern type Handle a
+
+extern alloc : U64 -> Handle U64
+
+extern (<+>) : U64 -> U64 -> U64
+
+-- A qualified type in an ordinary signature reaches T_Qual by the other route.
+render : (Show a) => a -> String
+render x = show x
+
+-- Several names may share one signature.
+lo, hi : U64
+lo = 0
+hi = 9

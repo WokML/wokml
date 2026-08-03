@@ -1,0 +1,3 @@
+-- EXPECT: E-LEX-TAB
+main =
+	foo
