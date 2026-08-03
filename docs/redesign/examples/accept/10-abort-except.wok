@@ -1,0 +1,25 @@
+-- v2 FINAL surface. The Except runner as an ABORTING handler (C13/D24). The
+-- `abort` clause binds op arity ONLY: no continuation name exists in the
+-- clause, so "never resumes" holds by construction instead of being promised
+-- through a dead binder (the migrated v1 arm was `once throw e k -> Err e`).
+-- The clause body IS the handle-expression's answer; the return clause does
+-- not run on the abort path (Err "overflow", never Ok (Err "overflow")).
+module Main
+import Base
+
+effect Except e
+  throw : e -> Never
+
+except : Handler (Except e) a (Result a e)
+except = handler Except
+  abort throw e -> Err e
+  return v      -> Ok v
+
+checked : U64 -> U64 with Except String
+checked n = case n > 100 of
+  True  -> Except.throw "overflow"
+  False -> n + 1
+
+main : Result U64 String
+main = handle except in checked 200
+-- EXPECT OUTPUT: Err "overflow"

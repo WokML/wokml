@@ -1,0 +1,29 @@
+-- v2 FINAL surface. C15/D28: the k CONVENTION COMPOSES. Handler literals
+-- and lambdas are function-forming boundaries, so a same-named binder
+-- beyond one is a FRESH declaration, not a shadow: the outer continuation
+-- is unusable there anyway (capture is conservatively rejected, C10), so
+-- nothing legal can be masked. Both continuations below are named k per
+-- convention, and the lambda's k is an innocent U64. Under the strict
+-- pre-D28 rule both were probed REJECTED on the retrofit build.
+module Main
+import Base
+
+effect Tick
+  tick : U64 -> U64
+
+effect Tock
+  tock : U64 -> U64
+
+useTock : () -> U64 with Tock
+useTock () = Tock.tock 5
+
+outer : Handler Tick U64 U64
+outer = handler Tick
+  tick x, k ->
+    let bump = \k -> k + 1
+    let m = handle (handler Tock tock y, k -> k (y + 1)) in useTock ()
+    k (bump m + x)
+
+main : U64
+main = handle outer in Tick.tick 10
+-- EXPECT OUTPUT: 17

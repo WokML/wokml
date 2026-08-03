@@ -1,0 +1,24 @@
+-- v2 FINAL surface. D26: value bindings are non-recursive, so the rebind
+-- idiom works -- each `let off = off + 4` reads the OUTER off and binds a
+-- new immutable value shadowing it. This is the hand-written-SSA disease
+-- (off0/off1/off2) handed back to the compiler, whose job it is. Nothing
+-- mutates: no var, no :=, no frame -- every off is an ordinary value.
+-- (Pinned against the current compiler's fresh-name spelling, which
+-- printed (7, (47, 87)); today the same-name spelling dies with a RUNTIME
+-- UnboundVar -- the recursive-let hole D26 closes, v1 backlog #15.)
+module Main
+import Base
+
+fieldAt : U64 -> U64
+fieldAt off = off * 10 + 7
+
+main : (U64, (U64, U64))
+main =
+  let off     = 0
+  let magic   = fieldAt off
+  let off     = off + 4
+  let version = fieldAt off
+  let off     = off + 4
+  let flags   = fieldAt off
+  (magic, (version, flags))
+-- EXPECT OUTPUT: (7, (47, 87))

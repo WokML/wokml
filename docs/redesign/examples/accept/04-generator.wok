@@ -1,4 +1,4 @@
--- v2 FINAL surface. Redesign of examples/generators.wok. Shows: once clause,
+-- v2 FINAL surface. Redesign of examples/generators.wok. Shows: control clause,
 -- return clause, cons as an EXPRESSION (`x :: k ()`, previously `[x] ++ k ()`),
 -- default-label row. The arm resumes exactly once; the one-shot law holds.
 module Main
@@ -9,8 +9,8 @@ effect Yield a
 
 collect : Handler (Yield a) r [a]
 collect = handler Yield
-  once yield x k -> x :: k ()
-  return u       -> []
+  yield x, k -> x :: k ()
+  return u   -> []
 
 count : U64 -> U64 -> () with Yield U64
 count lo hi = case lo == hi of

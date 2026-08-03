@@ -164,6 +164,113 @@ row label is a binder — spec 1.3), and uniqueness powers DIAGNOSTICS,
 never meaning: with exactly one type-compatible label in scope,
 E-AMBIENT's hint is definitive and mechanically applicable.
 
+### A12. Abortness inferred from the op's return type (rejected in C13)
+
+```
+effect Except e
+  throw : e -> Never       -- Never return: handler "obviously" cannot resume
+
+except = handler Except
+  throw e  -> Err e        -- INFERRED abort: no keyword, kind read off the type
+  return v -> Ok v
+
+-- the counterfactual that kills it: aborting a RESUMABLE op
+effect Tick
+  tick : U64 -> U64        -- resumable type; THIS handler chooses to abort
+
+timeout = handler Tick
+  tick n -> Err "deadline" -- is this a plain clause (auto-resume with the
+                           -- body's value) or an inferred abort? The type
+                           -- says resumable; the handler means abort. No
+                           -- inference can see a CHOICE.
+```
+
+The clause kind is a per-handler choice, not a per-op property; inference
+from the op type covers only the `Never` corner and silently mis-reads every
+abortive handler of a resumable op as a plain clause — the S1 collapse
+rebuilt one floor up. It also splits the register: kind-by-inference for
+some clauses, kind-by-keyword for others, re-opening the
+reconstructed-by-analysis reading this design exists to close. The type
+fact survives as a lint: a `once` clause for a `Never`-returning op binds a
+continuation typing already killed — suggest `abort`, never an error (D2).
+
+### A13. Function-local `var` (Koka-style; rejected in C14)
+
+```
+-- (a) straight-line: var's only winning case -- D26 covers it with no mutation
+readHeader b =
+  var off = 0
+  let magic = u32At b off
+  off := off + 4
+  ...
+-- vs D26:  let off = off + 4      (a new VALUE; nothing mutates)
+
+-- (b) loops: wok iterates via HOFs; the first real loop crosses a lambda
+sumTo n =
+  var acc = 0
+  var i   = 1
+  while (\_ -> i <= n) (\_ ->
+    acc := acc + i        -- E-VARSCOPE: the write crosses a lambda boundary
+    i   := i + 1)
+  acc
+-- allowing it means tracking the captured slot in the closure's type,
+-- which IS the State effect: Koka's own var is sugar over a local state
+-- row entry, so "function-local var done soundly" duplicates State with
+-- the row hidden
+
+-- (c) escape: untracked capture is unsound
+counter : () -> (() -> U64)     -- the type claims PURE
+counter u =
+  var n = 0
+  \_ -> n := n + 1              -- hidden state behind a pure type; the slot
+                                -- secretly migrates to the heap
+```
+
+The design space has no fourth point: forbid capture and (a) is all that
+remains (already covered by D26); track capture and the feature is State
+with the row hidden — the D20-refused second spelling. One mutation home
+(the handler frame, D27) keeps the pyramid teachable: values shadow,
+effects mutate visibly, frames mutate privately.
+
+### A14. `return` as the abort spelling (rejected in the C13 naming probes)
+
+```
+-- the unification that almost works: both clauses produce the final answer
+except = handler Except
+  return throw e -> Err e     -- on this op: the answer, now (C-style early exit)
+  return v       -> Ok v      -- on completion: the answer (Koka-style transformer)
+
+-- the killer: a NULLARY op makes classification name-dependent
+effect Cfg
+  get : U64
+
+h = handler Cfg
+  return get -> 41     -- abortive handling of get? or a value clause whose
+                       -- binder happens to be named `get`? one token either way
+
+-- and the typo that exploits it, verified on the current compiler
+-- (2026-08-03, old surface): `gett` for declared `get` silently became the
+-- VALUE arm; the error surfaced positionless, far from the typo
+  return gett -> 41    -- typo: silently a value clause binding `gett`
+```
+
+The strongest of the naming probes, because the imported prior is CORRECT
+— C's `return` does mean "stop here, hand back a value," which is what an
+abort does. It dies anyway, on the rule every clause-head candidate must
+pass: THE HEAD MUST CLASSIFY THE CLAUSE WITH NO HELP — not from types
+(`yield`'s collision with its own flagship op name), not from ecosystem
+priors (`continue`'s loop reading), not from name resolution (this
+entry). For any nullary op, `return name ->` is one token in both
+readings, so classification falls back to asking whether `name` is a
+declared op — resolution-dependent clause kinds, the exact S-collapse
+family the clause-kind redesign exists to close, rebuilt at the one
+arity where the collision is guaranteed. Secondary wounds: one word
+carries two different priors (Koka's completion-transformer vs C's
+early-exit — half the clauses obey each), and abort deliberately
+BYPASSES the value clause (`Err e`, never `Ok (Err e)`), so spelling
+both `return` invites exactly the wrong uniformity guess. `abort` and
+`return` remain distinct words because they are distinct promises.
+
 ## Bucket B — rejected removals (uniformity by deletion)
 
 ### B1. Forbid `handle State = state 0` (roles + `use` only)

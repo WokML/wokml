@@ -1,0 +1,19 @@
+-- v2 FINAL surface REJECT. The mechanical mis-migration of the v1 arm
+-- `once throw e k -> Err e`: the keyword swapped to `abort` but the dead
+-- continuation binder kept. An abort clause binds op arity ONLY -- there is
+-- no continuation position to fill -- so the surplus name is an arity fault.
+-- Smallest-edit twin of accept/10-abort-except.wok.
+module Main
+import Base
+
+effect Except e
+  throw : e -> Never
+
+bad : Handler (Except e) a (Result a e)
+bad = handler Except
+  abort throw e k -> Err e
+  return v        -> Ok v
+-- EXPECT: E-ARITY `abort throw` binds 2 names but needs 1 (1 argument; abort binds no continuation)
+
+main : Result U64 String
+main = handle bad in Except.throw "boom"

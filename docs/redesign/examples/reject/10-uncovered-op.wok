@@ -11,7 +11,7 @@ effect Proto
 
 partial : Handler Proto a a
 partial = handler Proto
-  once req (Ping n) k -> k n
+  req (Ping n), k -> k n
 -- EXPECT: E-COVER clauses for op `req` do not cover `Msg`: missing `Close`
 --         note: performs route to exactly one activation; there is no
 --         fallthrough handler under labels

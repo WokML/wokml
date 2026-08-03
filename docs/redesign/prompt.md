@@ -89,8 +89,8 @@ You are continuing the wok v2 surface redesign on branch
 `docs/redesign-v2-surface`. Before anything else, read
 `docs/redesign/plan.md` (status, cautions, task menu), then
 `docs/redesign/spec.md` sections 1.0-1.6 and decisions D13-D20. The bundle
-is a buildable spec-format contract with 20 conformance examples
-(`docs/redesign/examples/`) and a 16-entry rejection ledger
+is a buildable spec-format contract with 26 conformance examples
+(`docs/redesign/examples/`) and a 19-entry rejection ledger
 (`docs/redesign/rejected.md`).
 
 METHOD — non-negotiable:

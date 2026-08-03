@@ -1,7 +1,11 @@
--- v2 FINAL surface REJECT. The S1 collapse made loud in BOTH directions. The
--- op's argument is itself a function; under the old binder-count convention the
--- one-binder arm silently meant the ARGUMENT reading (Section E probe e-s1 ran
--- and printed 42).
+-- v2 FINAL surface REJECT. The S1 shape under comma classification (D25).
+-- The op's argument is itself a function. A head with NO comma is a PLAIN
+-- arm, full stop, so the v1 control spelling below is not ambiguous -- it is
+-- a plain arm binding one name too many, and E-ARITY blames the count
+-- against the op type. (Note the one-binder spelling `call k -> k 41` is a
+-- LEGAL plain arm -- the argument reading -- under any design with unmarked
+-- plain arms; declared kinds make the two readings distinct SPELLINGS,
+-- never a guess: the control spelling is `call f, k`.)
 module Main
 import Base
 
@@ -13,10 +17,10 @@ useCall () = Call.call (\n -> n + 1)
 
 bad : Handler Call a a
 bad = handler Call
-  once call k -> k 41
--- EXPECT: E-ARITY `once call` binds 1 name but needs 2 (1 argument + the continuation)
---         hint: argument reading:      call k -> k 41
---         hint: continuation reading:  once call f k -> k (f 41)
+  call f k -> k (f 41)
+-- EXPECT: E-ARITY plain clause `call` binds 2 names but the op takes 1 argument
+--         hint: control reading:  call f, k -> k (f 41)
+--         hint: plain reading:    call f -> ...
 
 main : U64
 main = handle bad in useCall ()

@@ -29,11 +29,19 @@ ordinary name resolution and typing).
 | Register | Keywords |
 |----------|----------|
 | ML skeleton | `module` `import` `as` `type` `alias` `class` `instance` `let` `in` `case` `of` `if` `then` `else` `where` `\` (lambda) |
-| Law words | `effect` `handler` `handle` `use` `once` `return` `var` `:=` `with` `foreign` `extern` `own` `lend` `copy` |
+| Law words | `effect` `handler` `handle` `use` `abort` `return` `var` `:=` `with` `foreign` `extern` `own` `lend` `copy` |
 
 Law-word promises:
-- `once op args k -> e` — this clause receives the continuation; it resumes
-  AT MOST ONCE (checked by inference, declared by the word).
+- `op args, k -> e` — the control clause, classified by the comma ALONE
+  (spec D25; there is no clause keyword). It receives the continuation and
+  resumes AT MOST ONCE (checked by inference). The `,` marks where the op's
+  application ends: `args` count = op arity, the continuation stands apart
+  (spec C8, amended). An arm that consumes its continuation on no path is
+  E-ABORT — write `abort`.
+- `abort op args -> e` — this clause NEVER resumes; it binds no continuation
+  (nothing to call — the promise holds by construction), and its body is the
+  handle-expression's answer directly: the `return` clause does not run on
+  that path (spec C13/D24).
 - `handle l = h` — install an activation of handler `h`, binding label `l`;
   binding the effect head name (`handle State = state 0`) serves
   ambient/default-label code. Statement form REQUIRES the label; the
@@ -48,7 +56,9 @@ Law-word promises:
   consumed by C / read-only view / duplicated across the boundary.
 - `with` — appears ONLY in types: the labeled capability row.
 
-Reserved from op-name position: `once`, `return`, `var` (E-RESERVED).
+Reserved from op-name position: `once`, `abort`, `return`, `var`
+(E-RESERVED; `once` is reserved solely to power the v1-migration
+diagnostic — "v1 clause keyword; drop it" — spec D25).
 
 ## 3. Declarations (layout-uniform)
 
@@ -147,9 +157,16 @@ main =
   named by their effect); labeled entries are parenthesized and LOWERCASE
   (spec D20); labels are not terms.
 - Handlers are first-class values; the capability exists only as a label.
-- `once` clauses bind the continuation as the LAST binder, arity-checked
-  (E-ARITY); shadowing a live continuation is E-SHADOW; affinity is inferred,
-  never annotated (spec C10).
+- Control clauses are comma-classified (`ask q, k ->`, spec D25 — no
+  keyword): argument patterns left of the comma equal the op's arity, for
+  every clause kind, arity-checked (E-ARITY); an arm that never consumes
+  its continuation is E-ABORT (write `abort`); rebinding a continuation's
+  name within its arm is E-SHADOW, live or dead — while a fresh k beyond a
+  lambda / local-function / handler-literal boundary is legal, so the k
+  convention composes across nesting (spec D28); affinity is inferred,
+  never annotated (spec C10). `abort` clauses bind op arity only — no
+  continuation exists in the clause, so never-resumes holds by construction
+  (spec C13/D24).
 - Op-argument positions take PATTERNS (spec D14): multiple clauses per op
   dispatch on constructors and desugar to case (decision trees); together
   they must cover the argument type (E-COVER); the continuation binder is

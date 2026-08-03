@@ -13,8 +13,8 @@ effect Proto
 
 server : Handler Proto a a
 server = handler Proto
-  once req (Ping n) k -> k (Pong n)
-  once req Close    k -> k Bye
+  req (Ping n), k -> k (Pong n)
+  req Close,    k -> k Bye
 
 client : () -> U64 with Proto
 client () = case Proto.req (Ping 41) of

@@ -1,0 +1,29 @@
+-- v2 FINAL surface REJECT. D26 + D27 composed: `let t = t + x` in a clause
+-- body reads the SLOT's current value (batons are the innermost binding in
+-- clause bodies) and shadows it with an arm-local VALUE; the later `t := 9`
+-- then targets that value, not the slot. E-VARSCOPE's second voice names
+-- the shadow site -- mixing the rename idiom and the frame write is loud,
+-- never a silent write to the wrong thing.
+module Main
+import Base
+
+effect Acc
+  add : U64 -> ()
+
+bump : () -> U64 with Acc
+bump () =
+  Acc.add 5
+  42
+
+bad : Handler Acc a (a, U64)
+bad = handler Acc
+  var t = 0
+  add x, k -> let t = t + x
+              t := 9
+              k ()
+-- EXPECT: E-VARSCOPE `t` is a value here (22:15), not a slot: the var `t`
+--         is shadowed by the binding at 21:19
+--         hint: rename the local, or drop the let and write `t := t + x`
+
+main : (U64, U64)
+main = handle bad in bump ()

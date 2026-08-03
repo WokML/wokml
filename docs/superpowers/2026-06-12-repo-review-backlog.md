@@ -204,3 +204,20 @@ position for the infix case.
 - `__coerce`/`erase`/`recall` user-reachable pending module privacy.
 - Scheduler maps never shrink (cells/chans retained for the run's lifetime);
   spawn fiber ids are write-only until a fiber table exists.
+
+## 2026-08-04 addition (probed during the v2 local-mutability design round)
+
+- **#15 — self-referential local VALUE let dies at RUNTIME as `UnboundVar`
+  instead of a compile-time error.** `let x = 1 in let x = x + 1 in x` →
+  `runtime error: UnboundVar "x"`. Local let groups are recursive, so the
+  RHS `x` resolves to the binder being defined; for a non-function value
+  the self-reference survives typechecking AND elaboration and only dies
+  in the machine (elaboration-scope family, cf. #1). Identical hole
+  through a handler baton: `with Acc { var t = 0 ; add x k ->
+  let t = t + x in k t () ; v -> (v, t) }` → `UnboundVar "t"`. Fresh-name
+  lets and plain shadowing (`let x = 1 in let x = 2 in x` → 2) are fine;
+  only the self-referencing rebind is a hole. Fix direction: reject value
+  self-reference at resolution time with an eta hint ("recursive binding?
+  write `let f x = ...`") — the v2 spec pins the full rule as D26
+  (non-recursive value bindings); v1 wants the positioned diagnostic
+  regardless of the fork.

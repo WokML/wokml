@@ -11,11 +11,12 @@ effect Tick
 -- result matches the answer type: E-SHADOW must be this file's ONLY fault (D6).
 bad : Handler Tick U64 U64
 bad = handler Tick
-  once tick x k ->
+  tick x, k ->
     let k = \y -> y + x
     k (k 1)
--- EXPECT: E-SHADOW continuation `k` (bound 14:15) shadowed at 15:9 while unconsumed
---         hint: rename the local binding; the continuation is affine and still live
+-- EXPECT: E-SHADOW continuation `k` (bound 14:11) rebound at 15:9 within its arm
+--         hint: rename the local binding; a continuation's name is frozen in its
+--         own arm (a fresh k inside a lambda or nested handler is fine -- D28)
 
 useTick : () -> U64 with Tick
 useTick () = Tick.tick 41

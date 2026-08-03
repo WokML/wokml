@@ -1,0 +1,26 @@
+-- v2 FINAL surface REJECT. D28's dead-name half: a continuation's name
+-- stays frozen for the WHOLE arm, even after consumption. The shadow
+-- below would silently absorb the double-resume attempt on the last line
+-- -- without it, `k 1` is E-AFFINE (consumed twice); with it, a legal
+-- ordinary call, S2's trick replayed after consumption. The shadow is
+-- blamed, not the second call: it is the enabling edit, and renaming --
+-- not `abort` -- is the true repair (precedence, D28).
+module Main
+import Base
+
+effect Tick
+  tick : U64 -> U64
+
+bad : Handler Tick U64 U64
+bad = handler Tick
+  tick x, k ->
+    let a = k (x + 1)
+    let k = \y -> y + a
+    k 1
+-- EXPECT: E-SHADOW continuation `k` (bound 16:11) rebound at 18:9 within its arm
+--         note: the name stays frozen after consumption -- this shadow would
+--         absorb a double resume (E-AFFINE) as a silent ordinary call
+--         hint: rename the local binding
+
+main : U64
+main = handle bad in Tick.tick 41
