@@ -83,8 +83,8 @@ static void wok_diag_append(WokDiagSink *s, WokDiagCode code, u32 off,
   s->last_off = off;
 }
 
-void wok_diag_add(WokDiagSink *s, WokDiagCode code, u32 off, u32 len,
-                  const char *fmt, ...) {
+void wok_diag_add_text(WokDiagSink *s, WokDiagCode code, u32 off, u32 len,
+                       const char *msg) {
   if (s->too_many_emitted) return;
 
   if (s->count >= WOK_DIAG_CAP) {
@@ -95,13 +95,18 @@ void wok_diag_add(WokDiagSink *s, WokDiagCode code, u32 off, u32 len,
 
   if (s->has_last_off && off == s->last_off) return;
 
+  wok_diag_append(s, code, off, len, msg);
+}
+
+void wok_diag_add(WokDiagSink *s, WokDiagCode code, u32 off, u32 len,
+                  const char *fmt, ...) {
   char buf[512];
   va_list ap;
   va_start(ap, fmt);
   (void)vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
 
-  wok_diag_append(s, code, off, len, buf);
+  wok_diag_add_text(s, code, off, len, buf);
 }
 
 usize wok_diag_count(const WokDiagSink *s) { return s->count; }

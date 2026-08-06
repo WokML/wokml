@@ -92,16 +92,28 @@ WOK_READONLY const char *wok_kind_name(WokKind);
   X(WW_HANDLER, "handler", WT_KEYWORD)                                    \
   X(WW_HANDLE, "handle", WT_KEYWORD)                                      \
   X(WW_USE, "use", WT_KEYWORD)                                            \
-  X(WW_ONCE, "once", WT_KEYWORD)                                          \
+  X(WW_ABORT, "abort", WT_KEYWORD)                                        \
   X(WW_RETURN, "return", WT_KEYWORD)                                      \
   X(WW_VAR, "var", WT_KEYWORD)                                            \
   X(WW_WITH, "with", WT_KEYWORD)                                          \
   X(WW_FOREIGN, "foreign", WT_KEYWORD)                                    \
   X(WW_EXTERN, "extern", WT_KEYWORD)                                      \
+  X(WW_FIXITY, "fixity", WT_KEYWORD)                                      \
   /* --- contextual: tagged, but still ordinary identifiers --- */        \
+  /* `once` is CUT (D25): reserved at CLAUSE-HEAD position only, where */  \
+  /* parse_clause reads the tag to emit the v1-migration diagnostic. */    \
+  X(WW_ONCE, "once", WT_VARID)                                            \
   X(WW_OWN, "own", WT_VARID)                                              \
   X(WW_LEND, "lend", WT_VARID)                                            \
   X(WW_COPY, "copy", WT_VARID)                                            \
+  /* the five words of a `fixity` line. Contextual for the same reason */ \
+  /* `own` is: `left`, `right` and `than` are ordinary names anywhere */  \
+  /* else, and reserving them would cost every program that has one. */   \
+  X(WW_LEFT, "left", WT_VARID)                                            \
+  X(WW_RIGHT, "right", WT_VARID)                                          \
+  X(WW_TIGHTER, "tighter", WT_VARID)                                      \
+  X(WW_LOOSER, "looser", WT_VARID)                                        \
+  X(WW_THAN, "than", WT_VARID)                                            \
   X(WW_ROW, "row", WT_VARID)                                              \
   X(WW_EFF, "eff", WT_VARID)                                              \
   /* --- an operator run one production reads by name --- */              \
@@ -162,8 +174,14 @@ WokScanResult wok_scan(const char *src, usize src_len, WokArena *,
 
 // ------------------------------------------------- lexical classification
 
-WOK_PURE bool wok_kind_is_open_bracket(WokKind);
-WOK_PURE bool wok_kind_is_close_bracket(WokKind);
+// Static inline, not out-of-line: these are asked once per token, and
+// profiling showed the calls themselves on the clock (~5% of a parse).
+WOK_PURE static inline bool wok_kind_is_open_bracket(WokKind k) {
+  return k == WT_LPAREN || k == WT_LBRACKET || k == WT_LBRACE;
+}
+WOK_PURE static inline bool wok_kind_is_close_bracket(WokKind k) {
+  return k == WT_RPAREN || k == WT_RBRACKET || k == WT_RBRACE;
+}
 
 // THE predicate stage 2 is built on: a token that can never BEGIN a block
 // item, and therefore marks its line as a CONTINUATION of the previous one.
@@ -188,7 +206,96 @@ WOK_PURE bool wok_kind_is_close_bracket(WokKind);
 // builds items rather than a second list typed out beside this one -- so if it
 // is ever written, it belongs in test_generative, which already builds items
 // across 80 of the schema's 82 tags.
-WOK_READONLY bool wok_token_is_continuation_lead(const WokToken *);
+WOK_READONLY static inline bool wok_token_is_continuation_lead(
+    const WokToken *t) {
+  switch ((WokKind)t->kind) {
+    // Every operator lead. No prefix operator exists except `-`, and a line
+    // beginning with `-` is subtraction continuing the previous line -- the
+    // same call v2 already made when it decided `1-2` is subtraction.
+    case WT_VARSYM:
+    case WT_ARROW:
+    case WT_FATARROW:
+    case WT_EQUALS:
+    case WT_COLON:
+    case WT_COLONCOLON:
+    case WT_ASSIGN:
+    case WT_BAR:
+    case WT_COMMA:
+    case WT_DOT:
+    case WT_DOTDOT:
+    case WT_BACKTICK:
+    case WT_RPAREN:
+    case WT_RBRACKET:
+    case WT_RBRACE:
+      return true;
+    // Words that can never begin a block item.
+    case WT_KEYWORD:
+      switch ((WokWord)t->word) {
+        case WW_WHERE:
+        case WW_IN:
+        case WW_THEN:
+        case WW_ELSE:
+        case WW_OF:
+        case WW_AS:
+        case WW_WITH:
+          return true;
+        case WW_NONE:
+        case WW_MODULE:
+        case WW_IMPORT:
+        case WW_TYPE:
+        case WW_ALIAS:
+        case WW_CLASS:
+        case WW_INSTANCE:
+        case WW_LET:
+        case WW_CASE:
+        case WW_IF:
+        case WW_EFFECT:
+        case WW_HANDLER:
+        case WW_HANDLE:
+        case WW_USE:
+        case WW_ABORT:
+        case WW_ONCE:
+        case WW_RETURN:
+        case WW_VAR:
+        case WW_FOREIGN:
+        case WW_EXTERN:
+        case WW_FIXITY:
+        case WW_OWN:
+        case WW_LEND:
+        case WW_COPY:
+        case WW_ROW:
+        case WW_EFF:
+        case WW_LEFT:
+        case WW_RIGHT:
+        case WW_TIGHTER:
+        case WW_LOOSER:
+        case WW_THAN:
+        case WW_PLUS:
+        case WOK_WORD_COUNT:
+          return false;
+      }
+      WOK_UNREACHABLE();
+    case WT_EOF:
+    case WT_NEWLINE:
+    case WT_INDENT:
+    case WT_DEDENT:
+    case WT_VARID:
+    case WT_CONID:
+    case WT_INT:
+    case WT_STRING:
+    case WT_CHAR:
+    case WT_LPAREN:
+    case WT_LBRACKET:
+    case WT_LBRACE:
+    case WT_UNDERSCORE:
+    case WT_LAMBDA:
+    case WT_SEMI:
+    case WT_BAD:
+    case WOK_KIND_COUNT:
+      return false;
+  }
+  WOK_UNREACHABLE();
+}
 
 // Decodes an integer literal, reporting E-LEX-INT-RANGE on overflow past U64.
 // Uses ckd_mul/ckd_add where available: literal conversion is where parsers

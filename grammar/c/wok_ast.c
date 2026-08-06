@@ -41,7 +41,10 @@ WokNode *wok_node(WokArena *a, WokTag tag, u32 off, u32 len) {
   u16 n = node_slots[tag];
   usize bytes = sizeof(WokNode) + (usize)n * sizeof(WokSlot);
   WokNode *node = wok_arena_alloc(a, bytes, alignof(WokNode));
-  memset(node, 0, bytes);
+  // Only the SLOTS are zeroed: the 16 header bytes are all assigned right
+  // below (the static_asserts in wok_ast.h pin that the header is exactly
+  // those five fields), so zeroing them first was pure double-writing.
+  memset(node->slot, 0, (usize)n * sizeof(WokSlot));
   node->tag = (u16)tag;
   node->nslots = n;
   node->trivia = 0;  // no comments until wok_trivia_attach says otherwise
@@ -89,17 +92,16 @@ WokSeq wok_buf_seq(WokNodeBuf *b) {
 // does not enable it. Making it atomic would buy nothing and cost the hot
 // path.
 
-static bool cover[WOK_TAG_COUNT];
+bool wok_cover_bits[WOK_TAG_COUNT];
 static WokTag cover_missing_buf[WOK_TAG_COUNT];
 
-void wok_cover_mark(WokTag t) { cover[t] = true; }
-void wok_cover_reset(void) { memset(cover, 0, sizeof cover); }
-bool wok_cover_seen(WokTag t) { return cover[t]; }
+void wok_cover_reset(void) { memset(wok_cover_bits, 0, sizeof wok_cover_bits); }
+bool wok_cover_seen(WokTag t) { return wok_cover_bits[t]; }
 
 usize wok_cover_missing(const WokTag **out) {
   usize n = 0;
   for (int t = 0; t < WOK_TAG_COUNT; t++)
-    if (!cover[t]) cover_missing_buf[n++] = (WokTag)t;
+    if (!wok_cover_bits[t]) cover_missing_buf[n++] = (WokTag)t;
   *out = cover_missing_buf;
   return n;
 }

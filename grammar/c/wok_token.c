@@ -73,11 +73,15 @@ static WokWord word_of_ident(const char *s, u32 len) {
       EQ("once", WW_ONCE);
       EQ("copy", WW_COPY);
       EQ("lend", WW_LEND);
+      EQ("left", WW_LEFT);
+      EQ("than", WW_THAN);
       return WW_NONE;
     case 5:
+      EQ("abort", WW_ABORT);
       EQ("alias", WW_ALIAS);
       EQ("class", WW_CLASS);
       EQ("where", WW_WHERE);
+      EQ("right", WW_RIGHT);
       return WW_NONE;
     case 6:
       EQ("module", WW_MODULE);
@@ -86,10 +90,13 @@ static WokWord word_of_ident(const char *s, u32 len) {
       EQ("handle", WW_HANDLE);
       EQ("return", WW_RETURN);
       EQ("extern", WW_EXTERN);
+      EQ("fixity", WW_FIXITY);
+      EQ("looser", WW_LOOSER);
       return WW_NONE;
     case 7:
       EQ("foreign", WW_FOREIGN);
       EQ("handler", WW_HANDLER);
+      EQ("tighter", WW_TIGHTER);
       return WW_NONE;
     case 8:
       EQ("instance", WW_INSTANCE);
@@ -142,95 +149,11 @@ bool wok_test_is_sym(unsigned char c) { return is_sym(c); }
 bool wok_test_is_ident_start(unsigned char c) { return is_ident_start(c); }
 bool wok_test_is_ident_cont(unsigned char c) { return is_ident_cont(c); }
 
-WOK_PURE bool wok_kind_is_open_bracket(WokKind k) {
-  return k == WT_LPAREN || k == WT_LBRACKET || k == WT_LBRACE;
-}
-WOK_PURE bool wok_kind_is_close_bracket(WokKind k) {
-  return k == WT_RPAREN || k == WT_RBRACKET || k == WT_RBRACE;
-}
+// wok_kind_is_open_bracket / wok_kind_is_close_bracket /
+// wok_token_is_continuation_lead live in wok_token.h as static inline: they
+// are asked once per token, and profiling showed the calls themselves on the
+// clock (~5% of a parse), which one compare per question does not deserve.
 
-WOK_READONLY bool wok_token_is_continuation_lead(const WokToken *t) {
-  switch ((WokKind)t->kind) {
-    // Every operator lead. No prefix operator exists except `-`, and a line
-    // beginning with `-` is subtraction continuing the previous line -- the
-    // same call v2 already made when it decided `1-2` is subtraction.
-    case WT_VARSYM:
-    case WT_ARROW:
-    case WT_FATARROW:
-    case WT_EQUALS:
-    case WT_COLON:
-    case WT_COLONCOLON:
-    case WT_ASSIGN:
-    case WT_BAR:
-    case WT_COMMA:
-    case WT_DOT:
-    case WT_DOTDOT:
-    case WT_BACKTICK:
-    case WT_RPAREN:
-    case WT_RBRACKET:
-    case WT_RBRACE:
-      return true;
-    // Words that can never begin a block item.
-    case WT_KEYWORD:
-      switch ((WokWord)t->word) {
-        case WW_WHERE:
-        case WW_IN:
-        case WW_THEN:
-        case WW_ELSE:
-        case WW_OF:
-        case WW_AS:
-        case WW_WITH:
-          return true;
-        case WW_NONE:
-        case WW_MODULE:
-        case WW_IMPORT:
-        case WW_TYPE:
-        case WW_ALIAS:
-        case WW_CLASS:
-        case WW_INSTANCE:
-        case WW_LET:
-        case WW_CASE:
-        case WW_IF:
-        case WW_EFFECT:
-        case WW_HANDLER:
-        case WW_HANDLE:
-        case WW_USE:
-        case WW_ONCE:
-        case WW_RETURN:
-        case WW_VAR:
-        case WW_FOREIGN:
-        case WW_EXTERN:
-        case WW_OWN:
-        case WW_LEND:
-        case WW_COPY:
-        case WW_ROW:
-        case WW_EFF:
-        case WW_PLUS:
-        case WOK_WORD_COUNT:
-          return false;
-      }
-      WOK_UNREACHABLE();
-    case WT_EOF:
-    case WT_NEWLINE:
-    case WT_INDENT:
-    case WT_DEDENT:
-    case WT_VARID:
-    case WT_CONID:
-    case WT_INT:
-    case WT_STRING:
-    case WT_CHAR:
-    case WT_LPAREN:
-    case WT_LBRACKET:
-    case WT_LBRACE:
-    case WT_UNDERSCORE:
-    case WT_LAMBDA:
-    case WT_SEMI:
-    case WT_BAD:
-    case WOK_KIND_COUNT:
-      return false;
-  }
-  WOK_UNREACHABLE();
-}
 
 // ------------------------------------------------------------- scanning
 

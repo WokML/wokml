@@ -1,16 +1,20 @@
 // wok_parse -- stage 3. Recursive descent, one function per production.
 //
-// It enforces only what is a matter of FORM. Everything the spec calls a
-// diagnostic code (E-ARITY, E-COVER, E-ESCAPE ...) is a later pass's job, and
-// the AST is shaped to make those passes easy: row entries record slot / role
-// / row-variable, `once` keeps its continuation separate, and the statement
-// and inline forms of handle/let/use are distinct nodes.
+// It enforces only what is a matter of FORM. Everything that needs a TABLE --
+// op arities, coverage, escape (E-COVER, E-ESCAPE ...) -- is a later pass's
+// job, and the AST is shaped to make those passes easy: row entries record
+// slot / role / row-variable, a control clause keeps its continuation
+// separate, and the statement and inline forms of handle/let/use are distinct
+// nodes.
 //
-// Two rules of form ARE enforced here, because they are grammar facts:
+// Three rules of form ARE enforced here, because they are grammar facts:
 //   - a `handle` STATEMENT must write its label (P1/D13; the delimited
 //     inline form may elide it);
-//   - a `once` clause's continuation binder must be a plain lowercase name
-//     (D14 makes anything else unwritable).
+//   - a control clause binds exactly one bare lowercase name after its comma
+//     (C8/D14; a pattern there is unwritable, and E-ARITY says so);
+//   - `once` at clause-head position is the v1 spelling and gets the
+//     migration diagnostic (D25). That is the ONLY position where the word
+//     means anything; everywhere else it is an ordinary name.
 
 #pragma once
 

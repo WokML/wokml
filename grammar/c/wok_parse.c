@@ -4,10 +4,12 @@
 // after the production. Nothing here reads a token's bytes to make a decision:
 // every choice is a kind or a word compare, so a misspelling fails to compile.
 //
-// Two rules of FORM are enforced (they are grammar facts, not analyses):
+// Three rules of FORM are enforced (they are grammar facts, not analyses):
 //   - a `handle` STATEMENT must write its label (P1/D13);
-//   - a `once` clause's continuation binder must be a plain lowercase name
-//     (D14), which is what lets a later pass compare pattern count to arity.
+//   - a control clause binds exactly one bare lowercase name after its comma
+//     (C8/D14), which is what lets a later pass compare pattern count to
+//     arity for every clause kind alike;
+//   - `once` at clause-head position gets the v1 migration diagnostic (D25).
 //
 // Operator chains stay FLAT. src/Wok/Reordering.hs owns fixity, so no
 // precedence table lives here.
@@ -59,6 +61,16 @@ static WokWord word_at(const P *p, usize k) {
   usize j = p->i + k;
   if (j >= p->n) j = p->n - 1;
   return (WokWord)p->tok[j].word;
+}
+
+// The one place the parser reads a COLUMN: which inline body an indented
+// continuation belongs to (see parse_block_body). It is a token field like
+// any other -- the stage split forbids the LAYOUT filter from naming a
+// keyword, not the parser from reading a position.
+static u32 col_at(const P *p, usize k) {
+  usize j = p->i + k;
+  if (j >= p->n) j = p->n - 1;
+  return p->tok[j].col;
 }
 
 static bool at(const P *p, WokKind k) { return (WokKind)cur(p)->kind == k; }
@@ -349,7 +361,7 @@ static void resync_to_boundary(P *p) {
   X(WW_TYPE, parse_type_decl)         X(WW_ALIAS, parse_alias_decl)          \
   X(WW_EFFECT, parse_effect_decl)     X(WW_CLASS, parse_class_decl)          \
   X(WW_INSTANCE, parse_instance_decl) X(WW_FOREIGN, parse_foreign_decl)      \
-  X(WW_EXTERN, parse_extern_decl)
+  X(WW_EXTERN, parse_extern_decl)     X(WW_FIXITY, parse_fixity_decl)
 
 WOK_PURE static bool word_starts_decl(WokWord w) {
 #define WOK_X(word, fn) if (w == word) return true;
@@ -480,15 +492,107 @@ static WokSeq parse_block_list(P *p, const Block *b, ItemFn item,
   return wok_buf_seq(&buf);
 }
 
-// A body is `expr | E_Block`. E_Block is used whenever the indented form was
+// A statement that is not also an expression. It carries no value, so it is
+// meaningful only as an ITEM of a block; standing alone as a body it is a
+// `let` (or `handle`, or `use`) whose continuation was never written. Read
+// from the schema rather than hand-listed: the STMT family IS this set, and
+// a new statement form joins the check by joining the family.
+static bool is_statement_only(const WokNode *n) {
+  return wok_node_desc[n->tag].family == WFAM_STMT;
+}
+
+// Named per form, because the repair differs: three of them are missing an
+// `in`, and the fourth cannot be repaired that way at all -- `_ = e` throws
+// its value away, so it can only be one line of a block, never the thing a
+// body evaluates to. An if-chain rather than a switch: this is four tags out
+// of eighty-two, so -Wswitch has nothing to hold down here.
+static void perr_unfinished_stmt(P *p, const WokNode *n) {
+  if (n->tag == S_Let)
+    perr_expect(p, "`in` after this binding");
+  else if (n->tag == S_Handle)
+    perr_expect(p, "`in` after the handler of this `handle`");
+  else if (n->tag == S_Use)
+    perr_expect(p, "`in` after these bridges");
+  else
+    perr_expect(p, "a value here; `_ =` discards a result");
+}
+
+// A body is `expr | E_Block`. E_Block is used whenever the block form was
 // taken -- even for one statement -- so a printer can re-derive line breaks.
+//
+// The block form has TWO spellings. The first is the ordinary one: the body
+// opens its own block under the head. The second is the HANGING body --
+// the first statement shares the head's line and the rest are indented under
+// it:
+//
+//     add x, k -> let t = t + x        False -> budget := budget - 1
+//                 t := 9                        k (lookup q)
+//
+// Both are normative (spec.md 1.1's column-aware arm bodies; spec-min section
+// 6's `race`; reject/13). The layout filter already emits NEWLINE INDENT for
+// the continuation, so the whole difference is that the block's FIRST item was
+// read before the block opened -- which is why this cannot be decided by
+// lookahead: an inline `case` opens a block of its own on the same line, and
+// only parsing tells the two INDENTs apart.
 static WokNode *parse_block_body(P *p, const Block *b) {
-  if (!b->indented) return parse_expr(p);
   u32 start = cur(p)->off;
-  WokSeq stmts = parse_block_list(p, b, parse_stmt, false);
-  WokNode *n = mk(p, E_Block, start, span_end(p));
-  E_Block_set_stmts(n, stmts);
-  return n;
+  if (b->indented) {
+    WokSeq stmts = parse_block_list(p, b, parse_stmt, false);
+    WokNode *n = mk(p, E_Block, start, span_end(p));
+    E_Block_set_stmts(n, stmts);
+    return n;
+  }
+
+  // THE ANCHOR. Inline bodies nest on one line -- `let t = t + x` is a clause
+  // body holding a binding whose own body is `t + x` -- and every one of them
+  // is looking at the same INDENT. The block belongs to the body whose first
+  // token stands in the block's column, which is the offside rule read
+  // literally and the only reading that lets reject/13 mean what it says:
+  //
+  //     add x, k -> let t = t + x     the continuation is in `let`'s column,
+  //                 t := 9            so it continues the CLAUSE body, and
+  //                 k ()              `let t = t + x` is one statement of it.
+  //
+  // A column matching no inline body is not silently attached to the nearest
+  // one: it falls through to D-LAY-3, which is what a misaligned line is.
+  //
+  // Limit, stated: the first statement must be SUB-BLOCK-FREE. If it opens
+  // its own indented block (`set x -> case x of` with the alts deeper), that
+  // block's DEDENT closes every level at or right of the anchor, so a
+  // continuation standing in the anchor column arrives with no open level to
+  // match and is D-LAY-3, not a clause-body line. Only a sub-block-free
+  // first statement can share the arrow's line and still be continued
+  // (README, Limits).
+  u32 anchor = cur(p)->col;
+  WokNode *first = parse_stmt(p);
+  // The panic path takes the same statement guard as the fall-through below:
+  // an enclosing block list may absorb and CLEAR the panic, and then a STMT
+  // node returned here would stand in an EXPR slot of the final tree.
+  if (p->panic) return is_statement_only(first) ? mk_err(p) : first;
+
+  if (at(p, WT_NEWLINE) && kind_at(p, 1) == WT_INDENT && col_at(p, 2) == anchor) {
+    Block hb = {.indented = true};
+    bump(p);
+    bump(p);
+    WokNodeBuf buf;
+    wok_buf_init(&buf, p->a);
+    wok_buf_push(&buf, first);
+    WokSeq rest = parse_block_list(p, &hb, parse_stmt, false);
+    for (u32 i = 0; i < rest.n; i++) wok_buf_push(&buf, rest.items[i]);
+    block_end(p, &hb);
+    WokNode *n = mk(p, E_Block, start, span_end(p));
+    E_Block_set_stmts(n, wok_buf_seq(&buf));
+    return n;
+  }
+
+  if (is_statement_only(first)) {
+    perr_unfinished_stmt(p, first);
+    // The node's FAMILY is STMT and an expression is due, so returning it
+    // would put a statement where the schema demands an expression. Damage
+    // is a wildcard family precisely so a damaged parse still dumps.
+    return mk_err(p);
+  }
+  return first;
 }
 
 static WokNode *parse_body(P *p) {
@@ -1376,6 +1480,36 @@ static WokNode *parse_alt(P *p) {
 }
 
 // ------------------------------------------------------------ handler clause
+//
+// spec-min section 3, in order, and it reads NOTHING but token kinds and
+// words -- never a name, a type or a count:
+//
+//   1. `var` / `return` / `abort` at the head          -> that kind
+//   2. `once` at the head                              -> migration diagnostic
+//   3. a `,` at clause-head depth before the `->`      -> CONTROL, else PLAIN
+//   4. exactly one bare lowercase varid after the `,`  -> the continuation
+//
+// Step 3 needs no lookahead and no depth counter. Clause-head binders are
+// ATOM patterns, and every atom pattern that can contain a comma is
+// bracketed, so parse_atompat has already consumed it: a WT_COMMA still
+// visible here is at head depth by construction.
+
+// The clause-head word set, stated ONCE, directly above the ladder that
+// dispatches on it. parse_clause's branches and this predicate must agree
+// forever: a word added to the ladder below without joining this set lets an
+// effect declare an op spelled like it, and every clause for that op then
+// silently parses as the new clause KIND instead of a call -- the
+// parses-silently-and-wrong class. This set churned twice in one week
+// (`once` demoted, `abort` added); adjacency is the guard.
+//
+// Used by parse_opsig for E-RESERVED: a clause naming one of these would be
+// read as that kind of clause and never as a call. Three are keywords;
+// `once` is an ordinary name everywhere else (D25) and would otherwise be
+// accepted as an op name and then be unwritable as a clause.
+static bool at_reserved_opname(const P *p) {
+  return at_word(p, WW_ABORT) || at_word(p, WW_RETURN) || at_word(p, WW_VAR) ||
+         at_word(p, WW_ONCE);
+}
 
 static WokNode *parse_clause(P *p) {
   u32 start = cur(p)->off;
@@ -1398,31 +1532,60 @@ static WokNode *parse_clause(P *p) {
     wok_buf_push(&pats, parse_pat(p));
     expect(p, WT_ARROW, "`->` after the return clause's pattern");
     body = parse_body(p);
-  } else if (at_word(p, WW_ONCE)) {
-    bump(p);
-    kind = WOK_CLAUSE_ONCE;
-    name = take_kind(p, WT_VARID, "the operation's name after `once`");
-    WokNodeBuf all;
-    wok_buf_init(&all, p->a);
-    while (starts_atompat(p) && !p->panic) wok_buf_push(&all, parse_atompat(p));
-    // D14: the LAST binder IS the continuation, and it must be a plain
-    // lowercase name -- anything else is unwritable rather than reinterpreted.
-    if (wok_buf_count(&all) == 0 || wok_buf_at(&all, wok_buf_count(&all) - 1)->tag != P_Var) {
-      perr_form(p, WOK_E_ONCE_BINDER, cur(p),
-                "the last binder of a `once` clause is its continuation and "
-                "must be a plain lowercase name");
-      for (u32 j = 0; j < wok_buf_count(&all); j++) wok_buf_push(&pats, wok_buf_at(&all, j));
-    } else {
-      k = P_Var_name(wok_buf_at(&all, wok_buf_count(&all) - 1));
-      for (u32 j = 0; j + 1 < wok_buf_count(&all); j++)
-        wok_buf_push(&pats, wok_buf_at(&all, j));
-    }
-    expect(p, WT_ARROW, "`->` after the clause's binders");
-    body = parse_body(p);
   } else {
+    // `abort` is the third head keyword (D24). `once` is not a keyword at
+    // all any more (D25) -- it is a contextual name that means something
+    // only HERE, and only to say it should not be here.
+    if (at_word(p, WW_ABORT)) {
+      bump(p);
+      kind = WOK_CLAUSE_ABORT;
+    } else if (at_word(p, WW_ONCE)) {
+      perr_form(p, WOK_E_MIGRATE, cur(p),
+                "v1 clause keyword; drop it -- a control clause is spelled "
+                "`op args, k -> body` (D25)");
+      bump(p);
+    }
     name = take_kind(p, WT_VARID, "an operation name");
     while (starts_atompat(p) && !p->panic)
       wok_buf_push(&pats, parse_atompat(p));
+    if (at(p, WT_COMMA)) {
+      // The comma ALONE classifies (D25), so an `abort` head that carries one
+      // is a contradiction the reader must be told about rather than a fourth
+      // reading to invent.
+      if (kind == WOK_CLAUSE_ABORT)
+        perr_form(p, WOK_E_ARITY, cur(p),
+                  "an `abort` clause never resumes, so it binds no "
+                  "continuation: drop the `,` and the name after it");
+      else
+        kind = WOK_CLAUSE_CONTROL;
+      bump(p);
+      if (at(p, WT_VARID)) {
+        // The ABORT contradiction was reported at the comma; the binder is
+        // consumed for recovery but NOT stored, so the recovered node keeps
+        // wok_ast.h's invariant that `k` is empty for every non-control kind.
+        if (kind != WOK_CLAUSE_ABORT) k = tok_span(cur(p));
+        bump(p);
+        // C8: EXACTLY one name. A second binder is an argument written on
+        // the wrong side of the comma, which is an arity fault about the op,
+        // not about the continuation.
+        if (starts_atompat(p) && !p->panic)
+          perr_form(p, WOK_E_ARITY, cur(p),
+                    "a control clause binds exactly one continuation after "
+                    "the `,`; the op's arguments go before it");
+      } else if (!p->panic) {
+        perr_form(p, WOK_E_ARITY, cur(p),
+                  "the name after `,` is the continuation binder and must be "
+                  "a plain lowercase name, never a pattern");
+        // The recovered node keeps wok_ast.h's invariant that a CONTROL
+        // clause has a continuation binder: no binder was stored, so the
+        // clause is demoted to the plain reading rather than left as a
+        // CONTROL with an empty `k` that would not re-print.
+        if (kind == WOK_CLAUSE_CONTROL) kind = WOK_CLAUSE_PLAIN;
+      }
+      // Whatever followed the comma, the arrow is still where the head ends,
+      // so a surplus binder is skipped rather than left to derail the body.
+      while (starts_atompat(p) && !p->panic) (void)parse_atompat(p);
+    }
     expect(p, WT_ARROW, "`->` after the clause's patterns");
     body = parse_body(p);
   }
@@ -1726,6 +1889,24 @@ static WokNode *parse_alias_decl(P *p) {
 
 static WokNode *parse_opsig(P *p) {
   u32 start = cur(p)->off;
+  if (at_reserved_opname(p)) {
+    const WokToken *t = cur(p);
+    // perr_form's body, with the word quoted in: naming it is the whole
+    // message, and quoting text into a diagnostic is the one thing the parser
+    // may do with a token's bytes.
+    if (!p->panic)
+      wok_diag_add(p->d, WOK_E_RESERVED, t->off, t->len,
+                   "`%.*s` heads a clause, so an operation cannot be called "
+                   "that",
+                   (int)t->len, p->src + t->off);
+    bump(p);
+    expect(p, WT_COLON, "`:` after the operation name");
+    WokNode *ty = parse_type(p);
+    WokNode *bad = mk(p, H_OpSig, start, span_end(p));
+    H_OpSig_set_name(bad, tok_span(t));
+    H_OpSig_set_type(bad, ty);
+    return bad;
+  }
   WokSpan name = take_kind(p, WT_VARID, "an operation name");
   expect(p, WT_COLON, "`:` after the operation name");
   WokNode *type = parse_type(p);
@@ -1824,6 +2005,74 @@ static WokNode *parse_foreign_decl(P *p) {
   D_Foreign_set_name(n, name);
   D_Foreign_set_lib(n, lib);
   D_Foreign_set_members(n, members);
+  return n;
+}
+
+// `fixity + left tighter than *`
+//
+// An operator is named by a SYMBOL RUN (`+`) or by a bare identifier meant to
+// be used infix in backticks (`div`); `alpha` records which, because they are
+// different names that their text alone does not always tell apart.
+//
+// The associativity word is REQUIRED -- there is no `none` tier. An operator
+// that has been declared at all has an answer for ties against itself, which
+// is what lets the reassociator resolve a run of one operator without ever
+// consulting the order.
+static bool take_fix_name(P *p, WokSpan *out, bool *alpha) {
+  if (at(p, WT_VARSYM) || at(p, WT_VARID)) {
+    *alpha = at(p, WT_VARID);
+    *out = tok_span(cur(p));
+    bump(p);
+    return true;
+  }
+  perr_expect(p, "an operator: a symbol run like `+`, or a name used infix");
+  *out = wok_span(cur(p)->off, 0);
+  *alpha = false;
+  return false;
+}
+
+static WokNode *parse_fixrel(P *p) {
+  u32 start = cur(p)->off;
+  u64 sense = WOK_FIXREL_TIGHTER;
+  if (at_word(p, WW_LOOSER)) {
+    sense = WOK_FIXREL_LOOSER;
+    bump(p);
+  } else {
+    expect_word(p, WW_TIGHTER, "`tighter` or `looser`");
+  }
+  expect_word(p, WW_THAN, "`than` after `tighter` or `looser`");
+  WokSpan name = wok_span(cur(p)->off, 0);
+  bool alpha = false;
+  (void)take_fix_name(p, &name, &alpha);
+  WokNode *n = mk(p, H_FixRel, start, span_end(p));
+  H_FixRel_set_sense(n, sense);
+  H_FixRel_set_name(n, name);
+  H_FixRel_set_alpha(n, alpha);
+  return n;
+}
+
+static WokNode *parse_fixity_decl(P *p) {
+  u32 start = cur(p)->off;
+  bump(p);  // `fixity`
+  WokSpan name = wok_span(cur(p)->off, 0);
+  bool alpha = false;
+  (void)take_fix_name(p, &name, &alpha);
+  u64 assoc = WOK_ASSOC_LEFT;
+  if (at_word(p, WW_RIGHT)) {
+    assoc = WOK_ASSOC_RIGHT;
+    bump(p);
+  } else {
+    expect_word(p, WW_LEFT, "`left` or `right`, the operator's associativity");
+  }
+  WokNodeBuf rels;
+  wok_buf_init(&rels, p->a);
+  while ((at_word(p, WW_TIGHTER) || at_word(p, WW_LOOSER)) && !p->panic)
+    wok_buf_push(&rels, parse_fixrel(p));
+  WokNode *n = mk(p, D_Fixity, start, span_end(p));
+  D_Fixity_set_name(n, name);
+  D_Fixity_set_alpha(n, alpha);
+  D_Fixity_set_assoc(n, assoc);
+  D_Fixity_set_rels(n, wok_buf_seq(&rels));
   return n;
 }
 

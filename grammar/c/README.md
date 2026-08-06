@@ -60,10 +60,27 @@ Each is **one logical line** with no layout tokens inside it. The hanging `in`
 lands on a column matching no open level and is legal precisely because a
 continuation is not claiming to start anything at a level.
 
-Measured over the 21-file v2 corpus: **zero layout faults, and zero "hanging
-indents"** — every INDENT opens a block the grammar already owed. So the parser
-needs no transparent-continuation machinery at all, and an INDENT where no block
-is due is simply an error.
+Measured over the v2 corpus: **zero layout faults**, and every INDENT opens a
+block the grammar already owed. So the parser needs no transparent-continuation
+machinery at all, and an INDENT where no block is due is simply an error.
+
+The one block the grammar owes but does not open at the head is the **hanging
+body** — the first statement shares the arrow's line and the rest stand in its
+column:
+
+```
+add x, k -> let t = t + x        False -> budget := budget - 1
+            t := 9                        k (lookup q)
+```
+
+The filter emits the same `NEWLINE INDENT` it emits for anything deeper; only
+the parser knows the block's first item was already read. Inline bodies NEST
+(`let t = t + x` is a clause body holding a binding whose own body is `t + x`),
+and each of them sees the same INDENT, so the block goes to the body whose
+first token stands in the block's column — the offside rule, read literally.
+That is the only column the parser reads, and it is why doubling every line's
+indentation is no longer a meaning-preserving transform for a file that hangs
+(see `test_metamorphic.c`).
 
 ### Bracket abandonment (L7)
 
@@ -201,8 +218,13 @@ one.
   `-fmt` must not be run over a file a human wrote and kept. Closing this needs
   trivia in the schema; the side list is there so that does not mean re-opening
   the scanner.
-- `fixity` declarations are not parsed — surface.md's palette drops them. Flat
-  operator chains will need a fixity source eventually.
+- A hanging body's FIRST statement must be sub-block-free. If it opens its own
+  indented block — `set x -> case x of` with the alts indented deeper — the
+  continuation standing in the anchor column arrives after the inner block's
+  DEDENT, when no open layout level matches it, and is reported as misaligned
+  (D-LAY-3) rather than continuing the clause body. Open the clause's block
+  under the arrow instead; only a sub-block-free first statement can share the
+  arrow's line and still be continued.
 - Columns are counted in bytes. Identifiers are ASCII, and indentation is
   spaces, so this only affects a diagnostic column after non-ASCII text on the
   same line.

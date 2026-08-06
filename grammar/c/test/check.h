@@ -38,6 +38,51 @@ static int wok_test_checks = 0;
     return 1;                                                             \
   } while (0)
 
+#include <dirent.h>
+
+// ONE corpus walker for every suite. Six verbatim copies of this loop lived
+// across the test files, and a corpus-layout change missed in one copy made
+// that suite silently stop covering new fixtures instead of failing to
+// build. Visits each `*.wok` in readdir order; `fn` returns its failure
+// count; `seen` (optional) counts files visited.
+static inline int wok_test_walk(const char *dir,
+                                int (*fn)(const char *path, void *ctx),
+                                void *ctx, int *seen) {
+  DIR *dp = opendir(dir);
+  if (!dp) {
+    fprintf(stderr, "  FAIL cannot open %s\n", dir);
+    return 1;
+  }
+  int bad = 0;
+  struct dirent *e;
+  while ((e = readdir(dp)) != nullptr) {
+    usize len = strlen(e->d_name);
+    if (len < 5 || strcmp(e->d_name + len - 4, ".wok") != 0) continue;
+    char path[1024];
+    (void)snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+    bad += fn(path, ctx);
+    if (seen) (*seen)++;
+  }
+  closedir(dp);
+  return bad;
+}
+
+// The fixture's own statement of its fault: the code token of its
+// `-- EXPECT:` header, or empty when it has none. The marker protocol lives
+// here and nowhere else.
+static inline void wok_test_expect_code(const char *src, char *want,
+                                        usize cap) {
+  want[0] = '\0';
+  const char *marker = strstr(src, "-- EXPECT: ");
+  if (!marker) return;
+  marker += strlen("-- EXPECT: ");
+  usize k = 0;
+  while (k + 1 < cap && marker[k] && marker[k] != '\n' && marker[k] != ' ')
+    k++;
+  memcpy(want, marker, k);
+  want[k] = '\0';
+}
+
 static inline char *wok_test_slurp(const char *path, usize *n) {
   FILE *fp = fopen(path, "rb");
   if (!fp) return nullptr;

@@ -1,5 +1,5 @@
--- A tour of HANDLER and CAPABILITY forms: every clause kind, both `handle`
--- tiers, both `use` tiers, and every row-entry kind.
+-- A tour of HANDLER and CAPABILITY forms: all five clause kinds, both
+-- `handle` tiers, both `use` tiers, and every row-entry kind.
 module Main.Tour.Handlers
 import Base
 
@@ -15,8 +15,10 @@ effect Proto
 effect Emit a
   emit : a -> ()
 
--- All four clause kinds: the frame baton, two plain tail-resumptive arms and
--- the value clause.
+effect Fail
+  quit : String -> Never
+
+-- The baton, two plain tail-resumptive arms and the value clause.
 state : s -> Handler (State s) a (a, s)
 state init = handler State
   var cur = init
@@ -24,17 +26,35 @@ state init = handler State
   set x    -> cur := x
   return v -> (v, cur)
 
--- `once` splits its binders: the LAST one is the continuation (D14), and the
--- ones before it are ordinary patterns that must cover the argument type.
+-- CONTROL arms, classified by the comma alone (D25). Left of it the binders
+-- are ordinary patterns and must cover the argument type; right of it stands
+-- one bare name, the continuation.
 server : Handler Proto a a
 server = handler Proto
-  once req (Ping n) k -> k n
-  once req Close    k -> k 0
+  req (Ping n), k -> k n
+  req Close, k    -> k 0
 
 drain : Handler (Emit a) r [a]
 drain = handler Emit
-  once emit x k -> x :: k ()
-  return u      -> []
+  emit x, k -> x :: k ()
+  return u  -> []
+
+-- An ABORT arm (D24): op arity only, no continuation to name, and the body IS
+-- the answer -- the return clause does not run on this path.
+bail : Handler Fail a (Result a String)
+bail = handler Fail
+  abort quit msg -> Err msg
+  return v       -> Ok v
+
+-- A hanging arm body: the first statement shares the arrow's line and the
+-- rest stand in its column.
+counted : Handler (State U64) a a
+counted = handler State
+  var cur = 0
+  get   -> cur
+  set x -> let next = x + 1
+           cur := next
+           ()
 
 -- Row entries: a role obligation, a designation slot, and a row variable.
 mixed : () -> U64 with (from : State U64) + Emit U64 + eff e

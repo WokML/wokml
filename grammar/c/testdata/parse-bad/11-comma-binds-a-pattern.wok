@@ -1,0 +1,16 @@
+-- EXPECT: E-ARITY
+-- C8/D14: exactly ONE bare lowercase name follows the comma, and it is the
+-- continuation. A pattern there is unwritable, not reinterpreted -- the
+-- continuation is a function the arm may call, and there is nothing in it to
+-- destructure.
+module Main
+
+effect Proto
+  req : U64 -> U64
+
+bad : Handler Proto a a
+bad = handler Proto
+  req n, (Ping k) -> k n
+
+g : U64
+g = 1

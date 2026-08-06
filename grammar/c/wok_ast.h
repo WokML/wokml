@@ -130,7 +130,7 @@ typedef enum : unsigned char {
   /* every helper is its own family: each is demanded by ONE kind of slot */ \
   X(LHS) X(BINDLHS) X(SIGNAME) X(TYPARAM) X(CONDEF) X(FIELDTYPE) X(OPSIG)   \
   X(FOREIGNMEM) X(ROWENTRY) X(FIELDPAT) X(CHAINOP) X(BIND) X(USEBIND)       \
-  X(ALT) X(CLAUSE) X(FIELD)
+  X(ALT) X(CLAUSE) X(FIELD) X(FIXREL)
 
 typedef enum : unsigned char {
 #define WOK_X(f) WFAM_##f,
@@ -152,12 +152,15 @@ WOK_PURE static inline bool wok_family_accepts(WokFamily want, WokFamily got) {
 
 // --------------------------------------------------------------- constants
 
-// H_Clause kinds (spec 1.1: clause kinds are keyword-distinguished).
+// H_Clause kinds. Four are keyword-headed; the fifth is spelled by a COMMA
+// and nothing else (D25 cut `once`), which is why classification can consult
+// no name, type or count -- see parse_clause.
 enum {
-  WOK_CLAUSE_PLAIN = 0,   // op p1 p2 -> e      auto-resume, tail-resumptive
-  WOK_CLAUSE_ONCE = 1,    // once op p1 k -> e  control clause; last binder is k
-  WOK_CLAUSE_RETURN = 2,  // return p -> e      the value clause
-  WOK_CLAUSE_VAR = 3,     // var cur = e        a frame baton
+  WOK_CLAUSE_PLAIN = 0,    // op p1 p2 -> e      auto-resume, tail-resumptive
+  WOK_CLAUSE_CONTROL = 1,  // op p1, k -> e      control clause; k after the `,`
+  WOK_CLAUSE_RETURN = 2,   // return p -> e      the value clause
+  WOK_CLAUSE_VAR = 3,      // var cur = e        a frame baton
+  WOK_CLAUSE_ABORT = 4,    // abort op p1 -> e   never resumes; binds no k
 };
 
 // H_RowEntry kinds (spec 1.3 / D20).
@@ -165,6 +168,22 @@ enum {
   WOK_ROW_SLOT = 0,    // `State U64`          designation-slot obligation (P2)
   WOK_ROW_ROLE = 1,    // `(from : State U64)` role obligation, parenthesized
   WOK_ROW_VAR = 2,     // `eff e`              row variable
+};
+
+// D_Fixity associativity. There is no `none`: `fixity` requires one of the
+// two words, so an operator that was declared at all has an answer for its
+// own ties.
+enum {
+  WOK_ASSOC_LEFT = 0,
+  WOK_ASSOC_RIGHT = 1,
+};
+
+// H_FixRel senses. `a tighter than b` and `b looser than a` state the SAME
+// edge from opposite ends, and both spellings are kept because which one
+// reads better depends on which operator you are declaring.
+enum {
+  WOK_FIXREL_TIGHTER = 0,
+  WOK_FIXREL_LOOSER = 1,
 };
 
 // T_Transfer modes (surface.md section 3: the FFI transfer law).
@@ -188,10 +207,11 @@ enum {
   X(D_Module, DECL) X(D_Import, DECL) X(D_Type, DECL) X(D_Alias, DECL)     \
   X(D_Effect, DECL) X(D_Class, DECL) X(D_Instance, DECL)                   \
   X(D_Foreign, DECL) X(D_ExternType, DECL) X(D_Sig, DECL)                  \
-  X(D_Equation, DECL) X(D_Error, ERROR)                                     \
+  X(D_Fixity, DECL) X(D_Equation, DECL) X(D_Error, ERROR)                  \
   /* declaration helpers */                                                \
   X(H_TyParam, TYPARAM) X(H_ConDef, CONDEF) X(H_FieldType, FIELDTYPE)      \
   X(H_OpSig, OPSIG) X(H_ForeignMember, FOREIGNMEM) X(H_SigName, SIGNAME)   \
+  X(H_FixRel, FIXREL)                                                      \
   X(L_Prefix, LHS) X(L_Infix, LHS)                                         \
   /* types */                                                              \
   X(T_Var, TYPE) X(T_Con, TYPE) X(T_App, TYPE) X(T_Fun, TYPE)              \
@@ -256,6 +276,15 @@ enum {
   F(T, FLAG, is_record, NONE)
 #define H_FieldType_FIELDS(F, T) F(T, NAME, name, NONE) F(T, NODE, type, TYPE)
 #define H_OpSig_FIELDS(F, T) F(T, NAME, name, NONE) F(T, NODE, type, TYPE)
+// `fixity + left tighter than *`. `alpha` records which SPELLING the operator
+// was named by -- a symbol run (`+`) or a bare identifier used infix in
+// backticks (`div`) -- because the two are different names that may not be
+// told apart by their text alone downstream.
+#define D_Fixity_FIELDS(F, T)                                        \
+  F(T, NAME, name, NONE) F(T, FLAG, alpha, NONE) F(T, INT, assoc, NONE) \
+  F(T, SEQ, rels, FIXREL)
+#define H_FixRel_FIELDS(F, T) \
+  F(T, INT, sense, NONE) F(T, NAME, name, NONE) F(T, FLAG, alpha, NONE)
 #define H_ForeignMember_FIELDS(F, T) \
   F(T, NAME, name, NONE) F(T, TEXT, symbol, NONE) F(T, NODE, type, TYPE)
 // paren records `(+)` so the printer re-derives the brackets from the fact.
@@ -351,8 +380,11 @@ enum {
 #define H_UseBind_FIELDS(F, T) F(T, NAME, from, NONE) F(T, NAME, to, NONE)
 #define H_Alt_FIELDS(F, T) \
   F(T, NODE, pat, PAT) F(T, NODE, body, EXPR) F(T, SEQ, wheres, DECL)
-// `once` splits its binders: the LAST is the continuation, stored separately,
-// so E-ARITY can compare pattern count against op arity directly (D14).
+// A control clause's continuation is held apart from `pats`, so E-ARITY can
+// compare pattern count against op arity directly for every kind (D14). The
+// comma is what delimits it: left of a comma, binder count = op arity (C8,
+// amended). `k` is empty for every other kind, `abort` included -- an abort
+// clause has no continuation to name (D24).
 #define H_Clause_FIELDS(F, T) \
   F(T, INT, kind, NONE) F(T, NAME, name, NONE) F(T, SEQ, pats, PAT) \
   F(T, NAME, k, NONE) F(T, NODE, body, EXPR)
@@ -476,7 +508,11 @@ WokSeq wok_buf_seq(WokNodeBuf *);
 // on entry; the corpus must reach 100%, and a form no file reaches names
 // itself rather than sitting silently uncovered.
 
-void wok_cover_mark(WokTag);
+// The bitmap is extern and the mark inline: it runs once per node built, and
+// a store does not deserve a call. Single-threaded by design (a test
+// instrument); the readers stay out of line.
+extern bool wok_cover_bits[];
+static inline void wok_cover_mark(WokTag t) { wok_cover_bits[t] = true; }
 void wok_cover_reset(void);
 bool wok_cover_seen(WokTag);
 usize wok_cover_missing(const WokTag **out);

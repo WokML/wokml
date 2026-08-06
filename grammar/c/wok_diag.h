@@ -18,6 +18,13 @@
 // are faults the PARSER never sees: stage 2 repairs its own input (see
 // wok_layout.h invariants), so an inconsistent dedent is never reported as a
 // grammar error.
+//
+// Codes the front end does NOT emit and must not re-mint under another
+// spelling: E-ABORT, E-SHADOW, E-AFFINE, E-ESCAPE, E-COVER, E-KIND,
+// E-AMBIENT, E-DISCARD. Each belongs to an analysis downstream of the
+// grammar (spec.md section 3), and each already has this spelling there.
+// E-ARITY and E-VARSCOPE are SHARED: the front end raises the part decidable
+// from the grammar and the effect declarations, the analyses raise the rest.
 #define WOK_DIAG_CODES(X)                                                    \
   X(WOK_E_LEX_STRAY, "E-LEX-STRAY")                                          \
   X(WOK_E_LEX_TAB, "E-LEX-TAB")                                              \
@@ -33,7 +40,12 @@
   X(WOK_E_PARSE, "E-PARSE")                                                  \
   X(WOK_E_DEPTH, "E-DEPTH")                                                  \
   X(WOK_E_HANDLE_LABEL, "E-HANDLE-LABEL")                                    \
-  X(WOK_E_ONCE_BINDER, "E-ONCE-BINDER")                                      \
+  X(WOK_E_ARITY, "E-ARITY")                                                  \
+  X(WOK_E_MIGRATE, "E-MIGRATE")                                              \
+  X(WOK_E_RESERVED, "E-RESERVED")                                            \
+  X(WOK_E_DUPLICATE, "E-DUPLICATE")                                          \
+  X(WOK_E_FIXITY, "E-FIXITY")                                                \
+  X(WOK_E_VARSCOPE, "E-VARSCOPE")                                            \
   X(WOK_E_TOO_MANY, "E-TOO-MANY")
 
 typedef enum wok_diag_code : u16 {
@@ -66,6 +78,11 @@ WokDiagSink *wok_diag_new(WokArena *, const char *path, const char *src,
 // recorded exactly once.
 void wok_diag_add(WokDiagSink *, WokDiagCode, u32 off, u32 len,
                   const char *fmt, ...) WOK_PRINTF(5, 6);
+
+// The same, for a message already built in full -- no format buffer, so no
+// silent truncation. For messages that carry a table in continuation lines.
+void wok_diag_add_text(WokDiagSink *, WokDiagCode, u32 off, u32 len,
+                       const char *msg);
 
 usize wok_diag_count(const WokDiagSink *);
 const WokDiag *wok_diag_at(const WokDiagSink *, usize i);

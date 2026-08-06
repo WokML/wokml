@@ -1,0 +1,16 @@
+-- EXPECT: E-MIGRATE
+-- D25 cut `once`. It stays reserved at CLAUSE-HEAD position and nowhere else,
+-- purely so a v1 arm gets told what to do rather than a puzzle about an
+-- operation named `once` applied to two arguments. The repair is one edit:
+-- drop the word, put a comma before the continuation.
+module Main
+
+effect Proto
+  req : U64 -> U64
+
+bad : Handler Proto a a
+bad = handler Proto
+  once req n k -> k n
+
+g : U64
+g = 1

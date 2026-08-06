@@ -1,0 +1,16 @@
+-- EXPECT: E-ARITY
+-- C8's second amendment: LEFT of the comma the binder count is the op's
+-- arity, right of it there is exactly one name. A second name after the comma
+-- is an argument written on the wrong side of it, so the fault is about the
+-- op's arity and says so.
+module Main
+
+effect Proto
+  req : U64 -> U64 -> U64
+
+bad : Handler Proto a a
+bad = handler Proto
+  req n, m k -> k n
+
+g : U64
+g = 1

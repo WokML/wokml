@@ -216,6 +216,7 @@ typedef enum : u8 {
   FAM_CONDEF,     // H_ConDef
   FAM_FIELDTYPE,  // H_FieldType
   FAM_OPSIG,      // H_OpSig
+  FAM_FIXREL,     // H_FixRel
   FAM_FOREIGNMEM, // H_ForeignMember
   FAM_SIGEQ,      // what a `where`, a class body and an instance body hold
   FAM_DECL,       // any top-level declaration
@@ -438,20 +439,28 @@ static const Slot SL_Bind[] = {{.rule = FAM_BINDLHS}, {.rule = FAM_BODY}};
 static const Slot SL_Alt[] = {{.rule = FAM_PAT},
                               {.rule = FAM_BODY},
                               {.rule = FAM_SIGEQ, .lo = 0, .hi = 2, .blk = 1}};
-// One shape per clause KIND. `once` splits its binders so that the LAST one --
-// the continuation -- lives in `k`, and a `once` without one is unprintable;
-// `return` takes exactly one pattern and no name; `var` is headed by `=` and
-// takes neither patterns nor a continuation.
+// One shape per clause KIND. A CONTROL clause is the one that holds a
+// continuation, so `k` is non-empty there and empty everywhere else -- a
+// control clause without one is unprintable, and a `k` on any other kind
+// would print a comma the parser would then read as a control clause.
+// `abort` takes patterns and no continuation; `return` takes exactly one
+// pattern and no name; `var` is headed by `=` and takes neither.
 static const Slot SL_ClausePlain[] = {{.rule = IR_CONST, .lo = WOK_CLAUSE_PLAIN},
                                       {.rule = NR_LOWER},
                                       {.rule = FAM_PAT, .lo = 0, .hi = 2},
                                       {.rule = NR_EMPTY},
                                       {.rule = FAM_BODY}};
-static const Slot SL_ClauseOnce[] = {{.rule = IR_CONST, .lo = WOK_CLAUSE_ONCE},
-                                     {.rule = NR_LOWER},
-                                     {.rule = FAM_PAT, .lo = 0, .hi = 2},
-                                     {.rule = NR_LOWER},
-                                     {.rule = FAM_BODY}};
+static const Slot SL_ClauseControl[] = {
+    {.rule = IR_CONST, .lo = WOK_CLAUSE_CONTROL},
+    {.rule = NR_LOWER},
+    {.rule = FAM_PAT, .lo = 0, .hi = 2},
+    {.rule = NR_LOWER},
+    {.rule = FAM_BODY}};
+static const Slot SL_ClauseAbort[] = {{.rule = IR_CONST, .lo = WOK_CLAUSE_ABORT},
+                                      {.rule = NR_LOWER},
+                                      {.rule = FAM_PAT, .lo = 0, .hi = 2},
+                                      {.rule = NR_EMPTY},
+                                      {.rule = FAM_BODY}};
 static const Slot SL_ClauseReturn[] = {
     {.rule = IR_CONST, .lo = WOK_CLAUSE_RETURN},
     {.rule = NR_EMPTY},
@@ -528,6 +537,27 @@ static const Slot SL_DForeign[] = {{.rule = NR_UPPER},
                                     .blk = 1}};
 static const Slot SL_DExternType[] = {{.rule = NR_UPPER},
                                       {.rule = FAM_TYPARAM, .lo = 0, .hi = 2}};
+// `alpha` is derived from the operator's spelling exactly as H_ChainOp's
+// backtick flag is: a name can only have been written as an alphabetic
+// operator, a symbol run only as a symbolic one, so a tree carrying the other
+// combination prints something that does not read back.
+// One shape per associativity and per relation SENSE, in the style the row
+// entries and the clause kinds already use: an INT field that selects a
+// spelling is a different form, not a random number.
+static const Slot SL_DFixityL[] = {{.rule = NR_OPERATOR},
+                                   {.rule = FR_BACKTICK_OF, .dep = 0},
+                                   {.rule = IR_CONST, .lo = WOK_ASSOC_LEFT},
+                                   {.rule = FAM_FIXREL, .lo = 0, .hi = 2}};
+static const Slot SL_DFixityR[] = {{.rule = NR_OPERATOR},
+                                   {.rule = FR_BACKTICK_OF, .dep = 0},
+                                   {.rule = IR_CONST, .lo = WOK_ASSOC_RIGHT},
+                                   {.rule = FAM_FIXREL, .lo = 0, .hi = 2}};
+static const Slot SL_FixRelT[] = {{.rule = IR_CONST, .lo = WOK_FIXREL_TIGHTER},
+                                  {.rule = NR_OPERATOR},
+                                  {.rule = FR_BACKTICK_OF, .dep = 1}};
+static const Slot SL_FixRelL[] = {{.rule = IR_CONST, .lo = WOK_FIXREL_LOOSER},
+                                  {.rule = NR_OPERATOR},
+                                  {.rule = FR_BACKTICK_OF, .dep = 1}};
 static const Slot SL_DSig[] = {{.rule = FAM_SIGNAME, .lo = 1, .hi = 2},
                                {.rule = FAM_TYPE},
                                {.rule = FR_RANDOM}};
@@ -608,8 +638,9 @@ static const Shape SH_STMT[] = {
     SHAPE(S_Use, SL_SUse), SHAPE(S_Discard, SL_SDiscard),
 };
 static const Shape SH_CLAUSE[] = {
-    SHAPE(H_Clause, SL_ClausePlain), SHAPE(H_Clause, SL_ClauseOnce),
+    SHAPE(H_Clause, SL_ClausePlain), SHAPE(H_Clause, SL_ClauseControl),
     SHAPE(H_Clause, SL_ClauseReturn), SHAPE(H_Clause, SL_ClauseVar),
+    SHAPE(H_Clause, SL_ClauseAbort),
 };
 static const Shape SH_CONDEF[] = {SHAPE(H_ConDef, SL_ConDef),
                                   SHAPE(H_ConDef, SL_ConDefRec),
@@ -629,8 +660,12 @@ static const Shape SH_DECL[] = {
     SHAPE(D_Type, SL_DType),         SHAPE(D_Alias, SL_DAlias),
     SHAPE(D_Effect, SL_DEffect),     SHAPE(D_Class, SL_DClass),
     SHAPE(D_Instance, SL_DInstance), SHAPE(D_Foreign, SL_DForeign),
+    SHAPE(D_Fixity, SL_DFixityL), SHAPE(D_Fixity, SL_DFixityR),
 };
 enum { SH_DECL_LEAF = 5 };
+
+static const Shape SH_FIXREL[] = {SHAPE(H_FixRel, SL_FixRelT),
+                                  SHAPE(H_FixRel, SL_FixRelL)};
 
 static const Shape SH_CONPATH[] = {SHAPE(E_Con, SL_ECon),
                                    SHAPE(E_Dot, SL_EDotCon)};
@@ -684,6 +719,7 @@ static const Family family[FAM_COUNT] = {
     [FAM_ANYNAME] = {SH_ANYNAME, 1, 1, NOFB},
     [FAM_CHAINOP] = {SH_CHAINOP, 1, 1, NOFB},
     [FAM_ROWENTRY] = {SH_ROWENTRY, COUNT(SH_ROWENTRY), 1, NOFB},
+    [FAM_FIXREL] = {SH_FIXREL, COUNT(SH_FIXREL), COUNT(SH_FIXREL), NOFB},
     [FAM_FIELD] = {SH_FIELD, 1, 1, NOFB},
     [FAM_FIELDPAT] = {SH_FIELDPAT, 1, 1, NOFB},
     [FAM_USEBIND] = {SH_USEBIND, 1, 1, NOFB},
@@ -896,6 +932,24 @@ static WokNode *build(Gen *g, const Shape *s, u32 depth, bool flat) {
 static Fam fam_last(Fam fam) {
   while (family[fam].fallback != FAM_COUNT) fam = (Fam)family[fam].fallback;
   return fam;
+}
+
+// Is anything drawn for `child` also legal where `slot` is demanded? Two ways
+// to be, and the second is why this is not just a fallback walk: FAM_BODY
+// contains FAM_EXPR by sharing its ROSTER and taking more of it (the extra is
+// E_Block), not by naming it as a fallback. Read from the table, so a family
+// that later gains that relation gets it here for free.
+//
+// The shrinker's HOIST needs this. Without it an `if` buried in the scrutinee
+// of a `case` that sits in a BODY slot cannot come out -- the case's scrutinee
+// slot says EXPR, the body slot says BODY, and an equality test calls them
+// unrelated. That leaves a counterexample bigger than the one the reader gets
+// shown, which is the one thing the shrinker exists to prevent.
+static bool fam_accepts(Fam slot, Fam child) {
+  for (Fam f = slot; f != FAM_COUNT; f = (Fam)family[f].fallback)
+    if (f == child) return true;
+  return family[slot].shape == family[child].shape &&
+         family[slot].nshape >= family[child].nshape;
 }
 
 static const Shape *pick_shape(Gen *g, Fam fam, u32 depth) {
@@ -1527,7 +1581,7 @@ static bool shrink_site(Shr *s, WokNode *file, const Site *st) {
       if (sh != nullptr) {
         const WokNodeDesc *d = &wok_node_desc[cur->tag];
         for (u16 k = 0; k < d->nfields; k++) {
-          if (sh->slot[k].rule != st->rule) continue;
+          if (!fam_accepts((Fam)st->rule, (Fam)sh->slot[k].rule)) continue;
           switch (d->fields[k].cls) {
             case WFC_NODE:
             case WFC_OPT:
@@ -2110,10 +2164,13 @@ int main(int argc, char **argv) {
 //     whenever a name is followed by anything but an operator, so a BARE
 //     variable is the only name-leading pattern that survives on the left of
 //     one.
-// 16. H_Clause is a four-way node. `once` splits its binders so the LAST is
-//     the continuation, held apart in `k`; `return` takes exactly one pattern
-//     and no name; `var` is headed by `=` and takes neither patterns nor a
-//     continuation. Nothing in the schema ties `kind` to the four.
+// 16. H_Clause is a FIVE-way node, and `k` is what the comma buys: a CONTROL
+//     clause holds its continuation there and every other kind leaves it
+//     empty, `abort` included -- printing a `k` on any other kind would emit
+//     a comma the parser reads straight back as a control clause. `return`
+//     takes exactly one pattern and no name; `var` is headed by `=` and takes
+//     neither patterns nor a continuation. Nothing in the schema ties `kind`
+//     to the five, which is why this list has to.
 // 17. P_Record.rest is empty unless the record is OPEN, and H_ConDef.name is
 //     empty only for the elided record form `type T = { x : U64 }`.
 // 18. T_Transfer stands only at the top of a foreign member's type or of an

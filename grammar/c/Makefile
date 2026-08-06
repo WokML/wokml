@@ -34,6 +34,7 @@ CFLAGS  := $(STD) $(WARN) $(OPT) $(INCLUDE) -MMD -MP
 SANFLAG := -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
 LIB_SRC := wok_arena.c wok_diag.c wok_token.c wok_layout.c wok_ast.c \
+           wok_resolve.c \
            wok_parse.c wok_sexpr.c wok_print.c wok_shape.c wok_trivia.c \
            wok_utf8.c \
            wok_write.c
@@ -73,12 +74,23 @@ $(BUILD)/test/test_%: test/test_%.c $(LIB_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_OBJ)
 
-test: $(TEST_BIN) wokfmt
+test: $(TEST_BIN) wokfmt wokparse
 	@fail=0; for t in $(TEST_BIN); do \
 	  printf '%-40s ' "$$t"; \
 	  if ./$$t > /tmp/wok_test_out 2>&1; then echo ok; \
 	  else echo FAIL; cat /tmp/wok_test_out; fail=1; fi; \
 	done; exit $$fail
+	@# The CLI's mode split is DELIBERATE and pinned here, because no test
+	@# binary exercises cmd/wokparse.c: bare mode dumps any parse-clean file
+	@# (a stage-4 fault must not cost the reader the tree it is about), while
+	@# the check modes gate on stage 4 too. reject/07 is parse-clean with a
+	@# resolver fault, so it distinguishes the two.
+	@f=../../docs/redesign/examples/reject/07-assign-outside.wok; \
+	  ./wokparse $$f > /dev/null 2>&1 || \
+	    { echo "cli: bare mode must dump a parse-clean file"; exit 1; }; \
+	  if ./wokparse -check-only $$f > /dev/null 2>&1; then \
+	    echo "cli: -check-only must fault reject/07"; exit 1; fi; \
+	  echo "cli: mode split holds"
 
 # Every test, plus the corpus, under ASan + UBSan. Wired beside the existing
 # runtime sanitiser script.
@@ -86,7 +98,17 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) test CFLAGS="$(STD) $(WARN) -O1 -g $(SANFLAG) $(INCLUDE)"
 	$(MAKE) wokparse wokfmt CFLAGS="$(STD) $(WARN) -O1 -g $(SANFLAG) $(INCLUDE)"
-	@for f in $(CORPUS); do ./wokparse -check-only $$f > /dev/null || exit 1; done
+	@# Two things are checked at once: the SANITISERS stay quiet everywhere
+	@# (an abort exits well above 1), and the corpus means what its directory
+	@# says. Only reject/ files may exit 1 -- they are rejects, and some carry
+	@# a stage-4 fault the tool is supposed to report. accept/, tour/ and
+	@# fill/ must exit 0: for fill/ this loop is the ONLY gate that runs the
+	@# resolver at all, so tolerating rc 1 here would let a faulting fixture
+	@# ship while the real -check-only pipeline rejects it.
+	@for f in $(CORPUS); do ./wokparse -check-only $$f > /dev/null 2>&1; \
+	  rc=$$?; case $$f in */reject/*) max=1;; *) max=0;; esac; \
+	  if [ $$rc -gt $$max ]; then \
+	    echo "sanitize: $$f exited $$rc"; exit 1; fi; done
 	@echo "sanitize: clean over $(words $(CORPUS)) corpus files"
 	@# Instrumented objects must not be left where an ordinary `make` would
 	@# reuse them: they carry __asan/__ubsan references the normal link lacks.

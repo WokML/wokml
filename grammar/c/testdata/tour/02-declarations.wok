@@ -6,6 +6,16 @@ import Base
 import Base.Text (words, unwords)
 import Control as C
 
+-- `fixity`: both associativities, both relation senses, a symbolic operator
+-- and an alphabetic one, and a line carrying more than one relation. The
+-- order is PARTIAL -- there are no numeric levels -- so an operator with no
+-- relation to another is incomparable with it, not equal.
+fixity + left
+fixity * left tighter than +
+fixity == left looser than +
+fixity ++ right
+fixity div left tighter than + looser than *
+
 -- `type`: applied constructors, a named record constructor, and the elided
 -- record form whose constructor name is the type's own (D-NAMING).
 type Pair a b = Pair a b

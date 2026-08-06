@@ -220,7 +220,7 @@ main =
 |-------------|----|-----|
 | `let u = State.set x in e` | `State.set x` as a statement | block sequencing; the dummy-binder noise appears in every effectful file |
 | `[x] ++ k ()` | `x :: k ()` | cons is an expression now |
-| `data Cmd = ...` | `type Cmd = ...` | one common word; `alias` for synonyms |
+| `data Cmd = ...` | `type Cmd = ...` | one common word; `alias` for synonyms. Re-examined 2026-08: `enum` rejected (only names the sum shape; records and single-constructor products are not enumerations, and the honest version is Rust's enum/struct split — fragments the one uniform ADT form); `data`/`type` swap rejected (Haskell's `type`-is-transparent inversion is a known teaching hazard); Elm-style `type alias` (contextual word, one fewer keyword) viable but declined — `alias` stays |
 | `effect E = { op : T }` | layout block | declarations are layout-uniform |
 | `with` (4 meanings) | `with` = rows only | D1; `handler`/`handle`/`use` carry the rest |
 | equality-only branching | `Ord` + comparison operators | classes already exist; same dictionary road |

@@ -9,10 +9,30 @@
 // TREES.
 //
 // Doubling every line's indentation preserves both the ordering and the
-// equality of columns, which is all the filter's rules ever consult, so the
-// dump must come out byte-identical.
+// equality of LINE-LEADING columns, and nothing else. That was enough while
+// columns were read by the layout filter alone. It is not enough for a
+// HANGING body, which anchors an indented block to the column of a token that
+// is not at the start of its line (see parse_block_body): doubling moves the
+// block and leaves the anchor behind.
+//
+//     add x, k -> let t = t + x        add x, k -> let t = t + x
+//                 t := 9                                   t := 9
+//
+// The conclusion is that doubling is not a re-indentation of THIS language,
+// not that the anchor is wrong -- the anchor is the offside rule, and the alt
+// body in spec-min section 6's `race` needs it to claim its continuation
+// rather than the clause body two levels out.
+//
+// A constant SHIFT of every line, which would preserve differences as well and
+// so be valid for any file, was tried and is not available: the top level is
+// pinned at column 1, so shifting it produces an INDENT where no block is due.
+//
+// So a file that hangs is doubled in its CANONICAL form instead, which has no
+// hanging body -- the formatter writes a multi-statement body as a block under
+// its head. The tree is the same one (test_print pins Dump(Parse(Format(t)))
+// == Dump(t)), so the property compares against the same dump either way, and
+// which files take that route is COMPUTED (has_hanging_block), not listed.
 
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +40,7 @@
 #include "../wok_arena.h"
 #include "../wok_ast.h"
 #include "../wok_parse.h"
+#include "../wok_print.h"
 #include "../wok_sexpr.h"
 #include "check.h"
 
@@ -49,6 +70,44 @@ static char *reindent(const char *src, usize n, usize *out_n) {
   return out;
 }
 
+// A block whose FIRST statement shares a line with the head that owns it --
+// `-> let t = t + x` and the rest indented under the `let`. Exact rather than
+// heuristic: a body of one statement is not an E_Block at all, so every
+// E_Block came either from a block opened on its own line (only spaces before
+// it) or from a hanging one (its head before it).
+static bool has_hanging_block(const WokNode *n, const char *src) {
+  if (!n) return false;
+  if (n->tag == E_Block) {
+    u32 i = n->off;
+    while (i > 0 && src[i - 1] != '\n') {
+      if (src[i - 1] != ' ') return true;
+      i--;
+    }
+  }
+  const WokNodeDesc *desc = &wok_node_desc[n->tag];
+  for (u16 i = 0; i < desc->nfields; i++) {
+    switch (desc->fields[i].cls) {
+      case WFC_NODE:
+      case WFC_OPT:
+        if (has_hanging_block(n->slot[i].node, src)) return true;
+        break;
+      case WFC_SEQ: {
+        WokSeq s = wok_seq_unpack(n->slot[i].seq);
+        for (u32 j = 0; j < s.n; j++)
+          if (has_hanging_block(s.items[j], src)) return true;
+        break;
+      }
+      case WFC_NAME:
+      case WFC_TEXT:
+      case WFC_INT:
+      case WFC_FLAG:
+      case WOK_FIELD_CLASS_COUNT:
+        break;
+    }
+  }
+  return false;
+}
+
 static char *parse_and_dump(const char *path, const char *src, usize n,
                             WokArena *a, usize *ndiag) {
   WokDiagSink *d = wok_diag_new(a, path, src, n);
@@ -72,26 +131,44 @@ static int check_file(const char *path) {
   WokArena *a = wok_arena_new(0);
 
   usize nd = 0;
-  char *dump1 = parse_and_dump(path, src, n, a, &nd);
-  if (!dump1) {
-    fprintf(stderr, "  FAIL %s: %zu diagnostic(s) on the original\n", path, nd);
+  WokDiagSink *d0 = wok_diag_new(a, path, src, n);
+  WokNode *tree1 = wok_parse_source(src, n, a, d0);
+  char *dump1 = nullptr;
+  if (wok_diag_count(d0) != 0) {
+    fprintf(stderr, "  FAIL %s: %zu diagnostic(s) on the original\n", path,
+            wok_diag_count(d0));
+    wok_diag_render(d0, stderr);
     bad++;
+  } else {
+    dump1 = wok_sexpr_dump_string(tree1, src, a);
   }
 
   // Property 1 -- re-indentation invariance.
-  usize n2 = 0;
-  char *wide = reindent(src, n, &n2);
-  if (dump1 && wide) {
-    char *dump2 = parse_and_dump(path, wide, n2, a, &nd);
-    if (!dump2) {
-      fprintf(stderr, "  FAIL %s: re-indented copy failed to parse\n", path);
-      bad++;
-    } else if (strcmp(dump1, dump2) != 0) {
-      fprintf(stderr, "  FAIL %s: doubling indentation CHANGED THE TREE\n", path);
-      bad++;
+  if (dump1) {
+    const char *base = src;
+    usize base_n = n;
+    if (has_hanging_block(tree1, src)) {
+      char *canon = wok_print_string(tree1, src, a);
+      if (canon) {
+        base = canon;
+        base_n = strlen(canon);
+      }
+    }
+    usize n2 = 0;
+    char *wide = reindent(base, base_n, &n2);
+    if (wide) {
+      char *dump2 = parse_and_dump(path, wide, n2, a, &nd);
+      if (!dump2) {
+        fprintf(stderr, "  FAIL %s: re-indented copy failed to parse\n", path);
+        bad++;
+      } else if (strcmp(dump1, dump2) != 0) {
+        fprintf(stderr, "  FAIL %s: doubling indentation CHANGED THE TREE\n",
+                path);
+        bad++;
+      }
+      free(wide);
     }
   }
-  free(wide);
 
   // Property 2 -- the dump forgot no field.
   if (dump1) {
@@ -116,30 +193,15 @@ static int check_file(const char *path) {
   return bad;
 }
 
-static int check_dir(const char *dir, int *seen) {
-  DIR *dp = opendir(dir);
-  if (!dp) {
-    fprintf(stderr, "  FAIL cannot open %s\n", dir);
-    return 1;
-  }
-  int bad = 0;
-  struct dirent *e;
-  while ((e = readdir(dp)) != nullptr) {
-    usize len = strlen(e->d_name);
-    if (len < 5 || strcmp(e->d_name + len - 4, ".wok") != 0) continue;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-    bad += check_file(path);
-    (*seen)++;
-  }
-  closedir(dp);
-  return bad;
+static int check_file_cb(const char *path, void *ctx) {
+  (void)ctx;
+  return check_file(path);
 }
 
 int main(void) {
   int bad = 0, seen = 0;
   for (usize i = 0; i < sizeof dirs / sizeof *dirs; i++)
-    bad += check_dir(dirs[i], &seen);
+    bad += wok_test_walk(dirs[i], check_file_cb, nullptr, &seen);
   if (seen == 0) {
     fprintf(stderr, "metamorphic: no files found\n");
     return 1;

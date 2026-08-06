@@ -12,7 +12,6 @@
 // DEDENT synchronisation point means a damaged item can never swallow its
 // block, and the last declaration in each fixture is a good one.
 
-#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -53,47 +52,39 @@ static int count_error_nodes(const WokNode *n) {
   return total;
 }
 
-static int check_good_dir(const char *dir) {
-  DIR *dp = opendir(dir);
-  if (!dp) {
-    fprintf(stderr, "  FAIL cannot open %s\n", dir);
+static int good_one(const char *path, void *ctx) {
+  (void)ctx;
+  int bad = 0;
+  usize n = 0;
+  char *src = wok_test_slurp(path, &n);
+  if (!src) {
+    fprintf(stderr, "  FAIL cannot read %s\n", path);
     return 1;
   }
-  int bad = 0, seen = 0;
-  struct dirent *e;
-  while ((e = readdir(dp)) != nullptr) {
-    usize len = strlen(e->d_name);
-    if (len < 5 || strcmp(e->d_name + len - 4, ".wok") != 0) continue;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-    usize n = 0;
-    char *src = wok_test_slurp(path, &n);
-    if (!src) {
-      fprintf(stderr, "  FAIL cannot read %s\n", path);
-      bad++;
-      continue;
-    }
-    WokArena *a = wok_arena_new(0);
-    WokDiagSink *d = wok_diag_new(a, path, src, n);
-    WokNode *file = wok_parse_source(src, n, a, d);
-    usize nd = wok_diag_count(d);
-    if (nd != 0) {
-      fprintf(stderr, "  FAIL %s: %zu diagnostic(s)\n", path, nd);
-      wok_diag_render(d, stderr);
-      bad++;
-    }
-    if (!file || file->tag != W_File) {
-      fprintf(stderr, "  FAIL %s: parse did not return a W_File\n", path);
-      bad++;
-    } else if (W_File_decls(file).n == 0) {
-      fprintf(stderr, "  FAIL %s: W_File has no declarations\n", path);
-      bad++;
-    }
-    wok_arena_free(a);
-    free(src);
-    seen++;
+  WokArena *a = wok_arena_new(0);
+  WokDiagSink *d = wok_diag_new(a, path, src, n);
+  WokNode *file = wok_parse_source(src, n, a, d);
+  usize nd = wok_diag_count(d);
+  if (nd != 0) {
+    fprintf(stderr, "  FAIL %s: %zu diagnostic(s)\n", path, nd);
+    wok_diag_render(d, stderr);
+    bad++;
   }
-  closedir(dp);
+  if (!file || file->tag != W_File) {
+    fprintf(stderr, "  FAIL %s: parse did not return a W_File\n", path);
+    bad++;
+  } else if (W_File_decls(file).n == 0) {
+    fprintf(stderr, "  FAIL %s: W_File has no declarations\n", path);
+    bad++;
+  }
+  wok_arena_free(a);
+  free(src);
+  return bad;
+}
+
+static int check_good_dir(const char *dir) {
+  int seen = 0;
+  int bad = wok_test_walk(dir, good_one, nullptr, &seen);
   if (seen == 0) {
     fprintf(stderr, "  FAIL %s contained no .wok files\n", dir);
     bad++;
@@ -103,97 +94,80 @@ static int check_good_dir(const char *dir) {
   return bad;
 }
 
-static int check_bad_dir(void) {
-  const char *dir = "testdata/parse-bad";
-  DIR *dp = opendir(dir);
-  if (!dp) {
-    fprintf(stderr, "  FAIL cannot open %s\n", dir);
+static int bad_one(const char *path, void *ctx) {
+  (void)ctx;
+  int bad = 0;
+  usize n = 0;
+  char *src = wok_test_slurp(path, &n);
+  if (!src) {
+    fprintf(stderr, "  FAIL cannot read %s\n", path);
     return 1;
   }
-  int bad = 0, seen = 0;
-  struct dirent *e;
-  while ((e = readdir(dp)) != nullptr) {
-    usize len = strlen(e->d_name);
-    if (len < 5 || strcmp(e->d_name + len - 4, ".wok") != 0) continue;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-    usize n = 0;
-    char *src = wok_test_slurp(path, &n);
-    if (!src) {
-      fprintf(stderr, "  FAIL cannot read %s\n", path);
-      bad++;
-      continue;
-    }
 
-    char want[64] = {0};
-    const char *marker = strstr(src, "-- EXPECT: ");
-    if (marker) {
-      marker += strlen("-- EXPECT: ");
-      usize k = 0;
-      while (k + 1 < sizeof want && marker[k] && marker[k] != '\n' &&
-             marker[k] != ' ')
-        k++;
-      memcpy(want, marker, k);
-      want[k] = '\0';
-    }
+  char want[64];
+  wok_test_expect_code(src, want, sizeof want);
 
-    WokArena *a = wok_arena_new(0);
-    WokDiagSink *d = wok_diag_new(a, path, src, n);
-    WokNode *file = wok_parse_source(src, n, a, d);
-    usize nd = wok_diag_count(d);
+  WokArena *a = wok_arena_new(0);
+  WokDiagSink *d = wok_diag_new(a, path, src, n);
+  WokNode *file = wok_parse_source(src, n, a, d);
+  usize nd = wok_diag_count(d);
 
-    // Item granularity: one damaged item, one message. A cascade here means
-    // the parser is inventing faults that were never in the source.
-    if (nd != 1) {
-      fprintf(stderr, "  FAIL %s: expected exactly 1 diagnostic, got %zu\n",
-              path, nd);
-      wok_diag_render(d, stderr);
-      bad++;
-    }
-    bool found = false;
+  // Item granularity: one damaged item, one message. A cascade here means
+  // the parser is inventing faults that were never in the source.
+  if (nd != 1) {
+    fprintf(stderr, "  FAIL %s: expected exactly 1 diagnostic, got %zu\n",
+            path, nd);
+    wok_diag_render(d, stderr);
+    bad++;
+  }
+  bool found = false;
+  for (usize i = 0; i < nd; i++)
+    if (strcmp(wok_diag_code_text(wok_diag_at(d, i)->code), want) == 0)
+      found = true;
+  if (!found) {
+    fprintf(stderr, "  FAIL %s: expected %s, got", path, want);
     for (usize i = 0; i < nd; i++)
-      if (strcmp(wok_diag_code_text(wok_diag_at(d, i)->code), want) == 0)
-        found = true;
-    if (!found) {
-      fprintf(stderr, "  FAIL %s: expected %s, got", path, want);
-      for (usize i = 0; i < nd; i++)
-        fprintf(stderr, " %s", wok_diag_code_text(wok_diag_at(d, i)->code));
-      fputc('\n', stderr);
-      bad++;
-    }
+      fprintf(stderr, " %s", wok_diag_code_text(wok_diag_at(d, i)->code));
+    fputc('\n', stderr);
+    bad++;
+  }
 
-    if (!file || file->tag != W_File) {
-      fprintf(stderr, "  FAIL %s: parse did not return a W_File\n", path);
+  if (!file || file->tag != W_File) {
+    fprintf(stderr, "  FAIL %s: parse did not return a W_File\n", path);
+    bad++;
+  } else {
+    WokSeq decls = W_File_decls(file);
+    if (decls.n < 3) {
+      fprintf(stderr, "  FAIL %s: only %u declaration(s) survived\n", path,
+              decls.n);
       bad++;
     } else {
-      WokSeq decls = W_File_decls(file);
-      if (decls.n < 3) {
-        fprintf(stderr, "  FAIL %s: only %u declaration(s) survived\n", path,
-                decls.n);
+      // Recovery: the declaration AFTER the damaged one still parses, and
+      // does so as a real equation rather than another error region.
+      const WokNode *last = decls.items[decls.n - 1];
+      if (last->tag != D_Equation) {
+        fprintf(stderr,
+                "  FAIL %s: the declaration after the damaged item is %s, "
+                "not D_Equation\n",
+                path, wok_node_desc[last->tag].tag);
         bad++;
-      } else {
-        // Recovery: the declaration AFTER the damaged one still parses, and
-        // does so as a real equation rather than another error region.
-        const WokNode *last = decls.items[decls.n - 1];
-        if (last->tag != D_Equation) {
-          fprintf(stderr,
-                  "  FAIL %s: the declaration after the damaged item is %s, "
-                  "not D_Equation\n",
-                  path, wok_node_desc[last->tag].tag);
-          bad++;
-        }
-        if (count_error_nodes(last) != 0) {
-          fprintf(stderr, "  FAIL %s: the recovered declaration is damaged\n",
-                  path);
-          bad++;
-        }
+      }
+      if (count_error_nodes(last) != 0) {
+        fprintf(stderr, "  FAIL %s: the recovered declaration is damaged\n",
+                path);
+        bad++;
       }
     }
-    wok_arena_free(a);
-    free(src);
-    seen++;
   }
-  closedir(dp);
+  wok_arena_free(a);
+  free(src);
+  return bad;
+}
+
+static int check_bad_dir(void) {
+  const char *dir = "testdata/parse-bad";
+  int seen = 0;
+  int bad = wok_test_walk(dir, bad_one, nullptr, &seen);
   if (seen < 5) {
     fprintf(stderr, "  FAIL %s needs at least 5 fixtures, found %d\n", dir,
             seen);

@@ -1,9 +1,11 @@
 // wokparse -- the CLI.
 //
-//   wokparse FILE.wok              print the AST as an s-expression
+//   wokparse FILE.wok              print the AST as an s-expression (any
+//                                  parse-clean file dumps; stage-4 checks
+//                                  belong to -check-only and -json)
 //   wokparse -tokens FILE.wok      the token stream, with positions
 //   wokparse -layout FILE.wok      the stream after the layout filter
-//   wokparse -check-only FILE.wok  parse and report faults; print nothing else
+//   wokparse -check-only FILE.wok  parse, resolve, report faults; print nothing else
 //   wokparse -json FILE.wok        the same faults, one JSON object per line
 //
 // Human diagnostics are `file:line:col: message`, which every editor and CI
@@ -18,6 +20,7 @@
 #include "../wok_diag.h"
 #include "../wok_layout.h"
 #include "../wok_parse.h"
+#include "../wok_resolve.h"
 #include "../wok_sexpr.h"
 #include "../wok_token.h"
 
@@ -104,8 +107,15 @@ int main(int argc, char **argv) {
       print_tokens(lay, src, d);
     } else {
       WokNode *file = wok_parse(lay, src, a, d);
-      if (mode == M_SEXP && wok_diag_count(d) == 0)
-        wok_sexpr_dump(file, src, stdout);
+      bool parsed = wok_diag_count(d) == 0;
+      // Resolution runs only over a clean parse: a damaged tree has holes
+      // where the names and counts belong, and the parse fault already said
+      // the true thing about them. And it runs only in the CHECK modes:
+      // -sexp is the dump tool, and a stage-4 fault must not cost the
+      // reader the very tree the fault is about.
+      if (parsed && (mode == M_CHECK || mode == M_JSON))
+        wok_resolve(file, src, a, d);
+      if (mode == M_SEXP && parsed) wok_sexpr_dump(file, src, stdout);
     }
 
     if (wok_diag_count(d) > 0) {

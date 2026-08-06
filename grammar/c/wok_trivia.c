@@ -127,6 +127,8 @@ static TagLayout tag_layout(WokTag t) {
     case D_Alias:
     case D_ExternType:
     case D_Sig:
+    case D_Fixity:
+    case H_FixRel:
     case D_Error:
     case H_TyParam:
     case H_ConDef:

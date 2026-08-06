@@ -66,7 +66,7 @@ static void load_dir(const char *dir) {
 // Weighted towards what a PARSER cares about: keywords, delimiters, arrows.
 static usize mutate(const unsigned char *in, usize n, unsigned char *out) {
   static const char *const frags[] = {
-      "handle ", "handler ", "once ", "return ", "var ", "where ", "in ",
+      "handle ", "handler ", "abort ", "return ", "var ", "where ", "in ",
       "case ", " of", "->", "=>", ":=", "::", "..", "|", "(", ")", "[", "]",
       "{", "}", "\n", "  ", "\t", "\"", "`", "\\", ",", "="};
   usize len = n > MAX_INPUT ? MAX_INPUT : n;

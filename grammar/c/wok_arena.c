@@ -1,10 +1,11 @@
 // wok_arena -- bump allocator implementation. See wok_arena.h for the
 // contract: one growable list of malloc'd blocks, no frees of individual
-// allocations, teardown frees the whole list at once.
+// allocations, teardown frees the whole list at once. The allocation fast
+// path is inline in the header; this file owns creation, growth and
+// teardown.
 
 #include "wok_arena.h"
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,20 +13,6 @@
 
 #define WOK_ARENA_DEFAULT_BLOCK ((usize)(64u * 1024u))
 #define WOK_ARENA_MAX_GROWTH ((usize)(8u * 1024u * 1024u))
-
-typedef struct WokArenaBlock {
-  struct WokArenaBlock *next;
-  usize capacity;
-  usize used;
-  alignas(max_align_t) unsigned char payload[];
-} WokArenaBlock;
-
-struct WokArena {
-  WokArenaBlock *head;
-  usize block_count;
-  usize bytes_out;        // bytes handed to callers, excluding alignment pad
-  usize growth_capacity;  // capacity of the last *normal* growth block
-};
 
 [[noreturn]] static void wok_arena_oom(void) {
   (void)fprintf(stderr, "wok: out of memory allocating arena block\n");
@@ -71,30 +58,12 @@ void wok_arena_free(WokArena *a) {
   free(a);
 }
 
-void *wok_arena_alloc(WokArena *a, usize size, usize align) {
-  assert(align != 0 && (align & (align - 1)) == 0);
-
-  // Zero-size requests still consume (and bump past) one byte so that two
-  // successive zero-size allocations do not alias the same address.
+void *wok_arena_grow(WokArena *a, usize size, usize align) {
   usize footprint = size == 0 ? (usize)1 : size;
 
-  WokArenaBlock *blk = a->head;
-  uptr base = (uptr)blk->payload;
-  uptr cur = base + (uptr)blk->used;
-  uptr aligned = wok_align_up(cur, align);
-  usize pad = (usize)(aligned - cur);
-  usize remaining = blk->capacity - blk->used;
-
-  if (pad <= remaining && footprint <= remaining - pad) {
-    blk->used += pad + footprint;
-    a->bytes_out += size;
-    return (void *)aligned;
-  }
-
-  // Current block cannot hold this allocation: grow the arena. `needed` is a
-  // safe upper bound on what a fresh block must hold, since a brand new
-  // block's payload is already max-aligned and align worst-case slop is
-  // bounded by `align` itself.
+  // `needed` is a safe upper bound on what a fresh block must hold, since a
+  // brand new block's payload is already max-aligned and align worst-case
+  // slop is bounded by `align` itself.
   usize needed = footprint + align;
   bool dedicated = needed > WOK_ARENA_MAX_GROWTH;
   usize new_cap;

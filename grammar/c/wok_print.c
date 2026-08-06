@@ -442,6 +442,8 @@ static u32 node_prec(const WokNode *n) {
     case D_Class:
     case D_Instance:
     case D_Foreign:
+    case D_Fixity:
+    case H_FixRel:
     case D_ExternType:
     case D_Sig:
     case D_Equation:
@@ -598,6 +600,8 @@ static bool opens_block(const WokNode *n) {
       case D_Class:
       case D_Instance:
       case D_Foreign:
+      case D_Fixity:
+      case H_FixRel:
       case D_ExternType:
       case D_Sig:
       case D_Equation:
@@ -737,6 +741,10 @@ static bool decls_are_one_unit(const Pr *p, const WokNode *prev,
   if ((prev->tag == D_Module || prev->tag == D_Import) &&
       (cur->tag == D_Module || cur->tag == D_Import))
     return true;
+  // A run of `fixity` lines is one unit for the same reason a run of imports
+  // is: each line is a fact about one operator, and the table they build is
+  // read as a block. prelude/Base.wok writes twelve of them together.
+  if (prev->tag == D_Fixity && cur->tag == D_Fixity) return true;
   if (prev->tag != D_Sig || cur->tag != D_Equation) return false;
   const WokNode *lhs = D_Equation_lhs(cur);
   if (lhs->tag != L_Prefix) return false;  // an infix LHS names no signature
@@ -845,6 +853,8 @@ static bool is_group(const WokNode *n) {
     case D_Foreign:
     case D_ExternType:
     case D_Sig:
+    case D_Fixity:
+    case H_FixRel:
     case D_Equation:
     case D_Error:
     case H_TyParam:
@@ -1032,14 +1042,19 @@ static void p_arrow_head(Pr *p, const WokNode *n, Ctx c) {
     return;
   }
   switch (H_Clause_kind(n)) {
-    case WOK_CLAUSE_ONCE:
-      put_z(p, "once ");
+    case WOK_CLAUSE_CONTROL:
       put_span(p, H_Clause_name(n));
-      // The continuation binder still follows every pattern on this line.
-      c.rest += 1 + H_Clause_k(n).len;
+      // `, k` still follows every pattern on this line, and it is two columns
+      // wider than the name, so a binder run wraps at the right place.
+      c.rest += 2 + H_Clause_k(n).len;
       p_args(p, H_Clause_pats(n), c, PP_ATOM, false);
-      put_c(p, ' ');
+      put_z(p, ", ");
       put_span(p, H_Clause_k(n));
+      return;
+    case WOK_CLAUSE_ABORT:
+      put_z(p, "abort ");
+      put_span(p, H_Clause_name(n));
+      p_args(p, H_Clause_pats(n), c, PP_ATOM, false);
       return;
     case WOK_CLAUSE_RETURN:
       put_z(p, "return");
@@ -1294,6 +1309,25 @@ static void p_node_inner(Pr *p, const WokNode *n, Ctx c) {
       p_list(p, D_Sig_names(n), sub(c, PREC_FIXED), ", ");
       put_z(p, " : ");
       p_node(p, D_Sig_type(n), sub(c, TP_TYPE));
+      return;
+    // `fixity + left tighter than *`. One line, never filled: the relations
+    // are a sentence, and breaking `tighter than` across lines would put a
+    // continuation lead where the reader expects the rest of a phrase.
+    case D_Fixity: {
+      put_z(p, "fixity ");
+      put_span(p, D_Fixity_name(n));
+      put_z(p, D_Fixity_assoc(n) == WOK_ASSOC_RIGHT ? " right" : " left");
+      WokSeq rels = D_Fixity_rels(n);
+      for (u32 i = 0; i < rels.n; i++) {
+        put_c(p, ' ');
+        p_node(p, rels.items[i], sub(c, PREC_FIXED));
+      }
+      return;
+    }
+    case H_FixRel:
+      put_z(p, H_FixRel_sense(n) == WOK_FIXREL_LOOSER ? "looser than "
+                                                      : "tighter than ");
+      put_span(p, H_FixRel_name(n));
       return;
     case D_Equation: {
       WokSeq wheres = D_Equation_wheres(n);
