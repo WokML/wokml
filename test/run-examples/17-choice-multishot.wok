@@ -8,6 +8,6 @@ pick u = if Choice.flip then 10 else 20
 
 main : U64
 main =
-  with { Choice.flip k -> k True + k False
-         ; v -> v }
+  with { once Choice.flip k -> k True + k False
+         ; return v -> v }
   pick ()

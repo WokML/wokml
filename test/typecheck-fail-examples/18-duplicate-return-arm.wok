@@ -8,6 +8,6 @@ effect IO = { read : String -> String, write : String -> () }
 bad comp =
   with { IO.read p -> p
        ; IO.write m -> ()
-       ; v -> v
-       ; w -> w }
+       ; return v -> v
+       ; return w -> w }
   comp ()

@@ -24,7 +24,7 @@ mapF e xs = case xs of
   Cons x xx -> Cons (bump e x) (mapF e xx)
 
 run : (Exn -> a with Exn + eff r) -> Option a with eff r
-run c = with self = Exn { throw n k -> None ; v -> Some v } in c self
+run c = with self = Exn { once throw n k -> None ; return v -> Some v } in c self
 
 prog : Exn -> List with Exn
 prog e = mapF e (Cons 1 (Cons 2 (Cons 3 Nil)))

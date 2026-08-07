@@ -17,7 +17,7 @@ effect Choice = { flip : Bool }
 main : (U64, U64)
 main =
   with count = state 0 in
-    (with { Choice.flip k -> k True + k False ; v -> v }
+    (with { once Choice.flip k -> k True + k False ; return v -> v }
       (let b = Choice.flip in
        let u = count.set (count.get + 1) in
        count.get))

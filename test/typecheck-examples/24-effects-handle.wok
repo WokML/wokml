@@ -11,7 +11,7 @@ runIO : (() -> a with IO + eff e) -> a with eff e
 runIO comp =
   with { IO.read p -> p
        ; IO.write m -> ()
-       ; v -> v }
+       ; return v -> v }
   comp ()
 
 -- Handler with no return arm: result type is the handled expression's type.

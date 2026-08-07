@@ -24,7 +24,7 @@ prog r = let m = r.ask in m + 1
 
 main : Option U64
 main =
-  let r = (with self = Reader { ask -> 10 ; v -> v } in prog self) in
+  let r = (with self = Reader { ask -> 10 ; return v -> v } in prog self) in
   let bonus = Some 3 in
   case bonus of
     None   -> None

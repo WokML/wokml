@@ -68,6 +68,11 @@ data Rhs
     -- operation is performed; 'Nothing' = ambient (route to nearest handler).
   | RRecord Text [(Text, Atom)]  -- T { l = a }
   | RProj Text Atom              -- a.l
+  | RMakeHandler Handler         -- build a first-class handler VALUE (VHandler)
+    -- ^ (proto/handler-values) Evaluates to a runtime handler value carrying
+    -- these arms and the scope where it was built. The construct half of the
+    -- construct/install split; installed later by 'InstallHandler'. Unlike a
+    -- 'Handle', this has no body -- the handler exists on its own.
   | RReuseCon Atom Text [Atom]   -- alloc_at(tok) Con field...  (FBIP reuse)
     -- ^ An 'RCon' that consumes a reuse token (the leading 'Atom', an 'AVar'
     -- naming a token binder produced by @__rc_drop_reuse@). Produced ONLY by the
@@ -101,6 +106,17 @@ data Expr
   | LetJoin JoinId [Binder] Expr Expr        -- join j(ps)=jbody ; body
   | Jump JoinId [Atom]
   | Handle Expr Handler
+  -- | Install a first-class handler VALUE (proto/handler-values). The 'Atom'
+  -- names a runtime handler value (a @VHandler@ carrying the arms + the scope
+  -- they were constructed in); the 'Expr' is the body it wraps. At runtime this
+  -- pushes the SAME @KHandle@ frame that 'Handle' does, but from a value rather
+  -- than an inline 'Handler', so the arms run in their construction scope. This
+  -- is the install half of the construct/install split; 'RMakeHandler' is the
+  -- construct half. The optional 'Binder' is a NAMED install's self-instance
+  -- binder (`handle name = h in body`): the machine binds it to a fresh VInst
+  -- for this activation in the BODY's scope and stamps it into the frame's
+  -- handler record as 'hSelf', so named performs id-route to this activation.
+  | InstallHandler Atom (Maybe Binder) Expr
   deriving (Eq, Show)
 
 data Alt
@@ -169,6 +185,7 @@ collectRhs (RLam ps e)     t = collectExpr e (insertBinders ps t)
 collectRhs (ROp minst _ _ xs) t = foldr collectAtom t (maybe xs (: xs) minst)
 collectRhs (RRecord _ flds) t = foldr (\(_, a) acc -> collectAtom a acc) t flds
 collectRhs (RProj _ a)     t = collectAtom a t
+collectRhs (RMakeHandler h) t = collectHandler h t
 collectRhs (RReuseCon tok _ xs) t = foldr collectAtom t (tok : xs)
 collectRhs (RForeignCall _ _ _ _ _ xs) t = foldr collectAtom t xs
 
@@ -183,6 +200,7 @@ collectExpr (Case a alts)        t = foldr collectAlt (collectAtom a t) alts
 collectExpr (LetJoin _ ps jb e)  t = collectExpr e (collectExpr jb (insertBinders ps t))
 collectExpr (Jump _ xs)          t = foldr collectAtom t xs
 collectExpr (Handle e h)         t = collectHandler h (collectExpr e t)
+collectExpr (InstallHandler _ _ e) t = collectExpr e t
 
 collectAlt :: Alt -> HintTable -> HintTable
 collectAlt (AltCon _ bs e) t = collectExpr e (insertBinders bs t)
@@ -273,6 +291,8 @@ renderRhs _   tbl (RCon c xs) =
     <> Tx.pack "("
     <> Tx.intercalate (Tx.pack ", ") (map (renderAtom tbl) xs)
     <> Tx.pack ")"
+renderRhs fmt tbl (RMakeHandler h) =
+  Tx.pack "handler {\n" <> renderHandler fmt tbl h <> Tx.pack "\n}"
 renderRhs fmt tbl (RLam ps e) =
   Tx.pack "\\"
     <> (if null ps then Tx.pack "" else renderBinders fmt tbl ps <> Tx.pack " ")
@@ -347,6 +367,9 @@ renderExpr fmt tbl (Handle e h) =
   renderExpr fmt tbl e
     <> Tx.pack "\n"
     <> renderHandler fmt tbl h
+renderExpr fmt tbl (InstallHandler a _ e) =
+  Tx.pack "install " <> renderAtom tbl a <> Tx.pack " in\n"
+    <> renderExpr fmt tbl e
 
 -- ---------------------------------------------------------------------------
 -- Rendering Alt
@@ -503,6 +526,11 @@ freeVarsExpr (LetJoin _ ps jb e) =
   let psU = Set.fromList (map binderUnique ps)
   in (freeVarsExpr jb `Set.difference` psU) `Set.union` freeVarsExpr e
 freeVarsExpr (Jump _ as)        = Set.unions (map atomVars as)
+-- The named-install self binder is bound only in the BODY's scope (see the
+-- machine's InstallHandler arm), so it is subtracted like any other binder.
+freeVarsExpr (InstallHandler a mSelf e) =
+  atomVars a `Set.union`
+    maybe id (Set.delete . binderUnique) mSelf (freeVarsExpr e)
 freeVarsExpr (Handle e h)       =
   freeVarsExpr e `Set.union` freeVarsHandler h
     -- The handler CONSUMES its parameter from the enclosing scope (baton model,
@@ -547,6 +575,7 @@ freeVarsRhs (RLam ps e)      = freeVarsExpr e `Set.difference` Set.fromList (map
 freeVarsRhs (ROp m _ _ as)   = Set.unions (map atomVars (maybe as (: as) m))
 freeVarsRhs (RRecord _ flds) = Set.unions (map (atomVars . snd) flds)
 freeVarsRhs (RProj _ a)      = atomVars a
+freeVarsRhs (RMakeHandler h) = freeVarsHandler h
 freeVarsRhs (RReuseCon tok _ as) = Set.unions (atomVars tok : map atomVars as)
 freeVarsRhs (RForeignCall _ _ _ _ _ as) = Set.unions (map atomVars as)
 

@@ -13,7 +13,7 @@ prog : Exn -> U64 with Exn
 prog e = e.throw 5
 
 run : (Exn -> a with Exn + eff e) -> Option a with eff e
-run c = with self = Exn { throw n k -> None ; v -> Some v } in c self
+run c = with self = Exn { once throw n k -> None ; return v -> Some v } in c self
 
 main : Option U64
 main = run prog

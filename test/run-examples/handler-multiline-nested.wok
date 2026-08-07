@@ -12,19 +12,19 @@ state : s -> (() -> a with State s + eff e) -> (a, s) with eff e
 state i c = with State {
     var s = i
     get -> s
-    set x k ->
+    once set x k ->
       let next = x in
       k next ()
-    v -> (v, s)
+    return v -> (v, s)
   } c ()
 
 writer : (() -> a with Writer [w] + eff e) -> (a, [w]) with eff e
 writer c = with Writer {
     var log = []
-    tell w k ->
+    once tell w k ->
       let extended = log ++ w in
       k extended ()
-    v -> (v, log)
+    return v -> (v, log)
   } c ()
 
 both : () -> U64 with State U64 + Writer [U64]

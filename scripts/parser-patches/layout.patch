@@ -1,0 +1,21 @@
+--- /private/tmp/claude-501/-Users-zy-wokml/795ce70c-6c11-4acb-b629-bd402d8b57a2/scratchpad/regen-check/GeneratedParser/Wok/Layout.hs	2026-07-22 16:48:39
++++ src-generated/GeneratedParser/Wok/Layout.hs	2026-07-22 16:47:33
+@@ -94,13 +94,16 @@
+   res _ [] ts = layoutError ts "layout stack empty"
+ 
+   -- Handling explicit blocks:
+-  res _ st (t0 : ts)
++  res pt st (t0 : ts)
+     -- We found an open brace in the input,
+     -- put an explicit layout block on the stack.
+     -- This is done even if there was no layout word,
+     -- to keep opening and closing braces.
+-    | isLayoutOpen t0 || isParenOpen t0
++    | isLayoutOpen t0
+       = t0 : res (Just t0) (Explicit : st) ts
++    | isParenOpen t0
++      = maybeInsertSeparator pt t0 st $
++        t0 : res (Just t0) (Explicit : st) ts
+ 
+     -- If we encounter a closing brace, exit the first explicit layout block.
+     | isLayoutClose t0 || isParenClose t0

@@ -1,0 +1,28 @@
+-- S2, the shadowed-continuation collapse, made loud. The arm binds the
+-- continuation as `k`, then immediately rebinds `k` to an ordinary function
+-- and calls THAT twice.
+--
+-- Pre-retrofit this compiled and printed 83, and --dump-multiplicity reported
+-- ZERO uses of the real continuation: the program elaborated as a perfectly
+-- legal zero-shot arm. The affine analysis was not wrong, it was answering a
+-- question about a different `k`. Naming the continuation in the clause head
+-- is what makes the shadowing reportable (E-SHADOW).
+--
+-- The rule is strict: a live continuation binder may not be shadowed anywhere
+-- in the arm body, delimited or not -- its consumption obligation does not end
+-- at a scope boundary.
+--
+-- The signature is monomorphic so the shadowed body's U64 result matches the
+-- answer type: E-SHADOW must be this file's ONLY fault.
+module Main
+import Std.Base
+
+effect Tick = { tick : U64 -> U64 }
+
+useTick : () -> U64 with Tick
+useTick u = Tick.tick 41
+
+main : U64
+main =
+  with { once Tick.tick x k -> let k = \y -> y + x in k (k 1) }
+  useTick ()

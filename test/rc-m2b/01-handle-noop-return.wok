@@ -12,7 +12,7 @@ import Base
 effect Tick = { tick : () }
 
 runTick : U64
-runTick = with self = Tick { tick k -> k () } in 7
+runTick = with self = Tick { once tick k -> k () } in 7
 
 main : U64
 main = runTick

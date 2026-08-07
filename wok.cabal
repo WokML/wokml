@@ -229,6 +229,24 @@ executable wok
     if flag(asan)
       ghc-options:    -optl-fsanitize=address
 
+-- Development-only codemod. Reuses the library's parser and the effect
+-- declarations' arities to rewrite handler arms to their declared clause
+-- kinds (once/return). Not part of the shipped compiler.
+executable wok-codemod
+    import:           strict, executable-flags
+    main-is:          Codemod.hs
+    build-depends:
+        base ^>=4.20,
+        wok,
+        wok:wok-generated,
+        bytestring,
+        containers,
+        directory,
+        filepath,
+        mtl,
+        text
+    hs-source-dirs:   tools
+
 test-suite wok-tests
     import:           strict
     type:             exitcode-stdio-1.0

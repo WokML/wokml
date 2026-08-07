@@ -17,5 +17,5 @@ prog u =
 
 main : U64
 main =
-  let r = with State { var s = 5 ; get -> s ; set x k -> k x () ; v -> (v, s) } prog () in
+  let r = with State { var s = 5 ; get -> s ; once set x k -> k x () ; return v -> (v, s) } prog () in
   case r of (v, s) -> v + s

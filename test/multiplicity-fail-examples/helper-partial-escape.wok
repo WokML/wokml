@@ -3,18 +3,18 @@ import Base
 
 effect Tick = { tick : U64 -> U64 }
 
--- once has arity 2 but is applied to ONLY the continuation `k` below. That
+-- helper has arity 2 but is applied to ONLY the continuation `k` below. That
 -- partial application does NOT invoke `k`; it CAPTURES it into the closure `f`.
 -- The two later `f n` calls each re-invoke the captured continuation, so the
--- arm genuinely resumes TWICE and must be rejected. Charging once's per-param
+-- arm genuinely resumes TWICE and must be rejected. Charging helper's per-param
 -- card on the partial application would be unsound.
-once : (U64 -> U64) -> U64 -> U64
-once k n = k n
+helper : (U64 -> U64) -> U64 -> U64
+helper k n = k n
 
 useTick : () -> U64 with Tick
 useTick u = Tick.tick 41
 
 main : U64
 main =
-  with { Tick.tick n k -> let f = once k in let a = f n in f n }
+  with { once Tick.tick n k -> let f = helper k in let a = f n in f n }
   useTick ()

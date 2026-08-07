@@ -13,6 +13,6 @@ producer u =
 -- Must collect [1,2,3] and prepend 100.
 main : [U64]
 main =
-  [100] ++ (with { Yield.yield x k -> [x] ++ k ()
-                   ; v             -> [] }
+  [100] ++ (with { once Yield.yield x k -> [x] ++ k ()
+                   ; return v             -> [] }
              producer ())

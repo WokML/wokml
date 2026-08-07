@@ -80,7 +80,6 @@ data ReservedKw
     | ReservedKw_record
     | ReservedKw_row
     | ReservedKw_fun
-    | ReservedKw_ctl
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data SigName = SNBare VarId | SNParen VarSym
@@ -203,6 +202,9 @@ data Exp
     | EWithRun VarId [WithArg] Exp
     | EWithNamed VarId VarId [WithArg] Exp
     | EWithNamedH VarId ConId [HandlerArm] Exp
+    | EHandlerV ConId [HandlerArm]
+    | EHandleV Exp [WithArg] Exp
+    | EHandleN VarId Exp [WithArg] Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)
 
 data InfixTail = ITail InfixOp Exp
@@ -223,6 +225,9 @@ data WithArg = WRArg Exp
 data HandlerArm
     = HArm ConId VarId [AtomPat] Exp
     | HUArm VarId [AtomPat] Exp
+    | HOnceArm ConId VarId [AtomPat] Exp
+    | HOnceUArm VarId [AtomPat] Exp
+    | HRetArm AtomPat Exp
     | HParam VarId Exp
     | HParamV VarId Exp
   deriving (C.Eq, C.Ord, C.Show, C.Read)

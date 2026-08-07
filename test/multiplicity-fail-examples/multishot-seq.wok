@@ -10,5 +10,5 @@ useChoice u = case Choice.flip of
 
 main : U64
 main =
-  with { Choice.flip k -> let a = k True in k False }
+  with { once Choice.flip k -> let a = k True in k False }
   useChoice ()

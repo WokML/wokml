@@ -151,9 +151,17 @@ exprHasHandle = go
     go (LetJoin _ _ jb e) = go jb || go e
     go (Jump _ _)         = False
     go (Handle _ _)       = True
+    go (InstallHandler _ _ _) = True
     goAlt (AltCon _ _ e)  = go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e
+    -- A handler VALUE carries arms that will run under some install; for the
+    -- module-wide disable signal it counts as a handler, same as its install.
+    -- (Currently unreachable behind the RC gate -- Reachable flags
+    -- RMakeHandler unconditionally -- but this fold walks ALL binds while the
+    -- gate walks only main-reachable ones, so the conservative case is stated
+    -- explicitly rather than left to the wildcard.)
+    goRhs (RMakeHandler _) = True
     goRhs (RLam _ e)      = go e
     goRhs _               = False
 
@@ -236,12 +244,17 @@ capturesContinuation = go
     go (LetJoin _ _ jb e)    = go jb || go e
     go (Jump _ _)            = False
     go (Handle e h)          = go e || goHandler h
+    go (InstallHandler _ _ e)  = go e
     goAlt (AltCon _ _ e)     = go e
     goAlt (AltLit _ e)       = go e
     goAlt (AltDefault e)     = go e
     -- A FREE effect operation reifies this body's continuation outward (case (b)).
     goRhs ROp{}              = True
     goRhs (RLam _ e)         = go e
+    -- A handler VALUE's arms hold resume continuations once installed;
+    -- conservatively a capture (unreachable behind the RC gate today -- see
+    -- 'exprHasHandle's RMakeHandler note -- but stated, not wildcarded).
+    goRhs (RMakeHandler _)   = True
     goRhs _                  = False
     goHandler h =
       -- Any op-arm whose resume escapes its body is a captured continuation
@@ -279,6 +292,7 @@ collectPlacements place = go
     go (Handle e h)       =
       go e `Map.union` go (snd (hReturn h))
         `Map.union` Map.unions (map (go . oaBody) (hOps h))
+    go (InstallHandler _ _ e) = go e
     goAlt (AltCon _ _ e)  = go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e
@@ -376,6 +390,7 @@ collectSliceReps rep = go
     go (Handle e h)       =
       go e `Map.union` go (snd (hReturn h))
         `Map.union` Map.unions (map (go . oaBody) (hOps h))
+    go (InstallHandler _ _ e) = go e
     goAlt (AltCon _ _ e)  = go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e

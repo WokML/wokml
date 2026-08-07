@@ -9,6 +9,6 @@ pick u = if Choice.flip then 10 else 20
 -- Bounded multishot handler in NON-tail position (operand of +). Both branches
 -- must run: k True (10) + k False (20) = 30, then + 0.
 main : U64
-main = (with { Choice.flip k -> k True + k False
-               ; v -> v }
+main = (with { once Choice.flip k -> k True + k False
+               ; return v -> v }
          pick ()) + 0

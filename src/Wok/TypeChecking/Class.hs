@@ -183,8 +183,9 @@ tyConKey TcUnit       = Tx.pack "Unit"
 tyConKey TcList       = Tx.pack "List"
 tyConKey TcArray      = Tx.pack "Array"
 tyConKey (TcTuple n)  = Tx.pack "Tuple" <> Tx.pack (show n)
-tyConKey (TcUser t)   = t
-tyConKey (TcEffect t) = Tx.pack "Effect$" <> t
+tyConKey (TcUser t)    = t
+tyConKey (TcEffect t)  = Tx.pack "Effect$" <> t
+tyConKey (TcHandler t) = Tx.pack "Handler$" <> t
 
 -- ---------------------------------------------------------------------------
 -- Pure Abs.Type -> CType translation
@@ -559,10 +560,13 @@ rewriteMethodRefs classMethods dictNm idx = go
     goWhere Abs.NoWhere     = Abs.NoWhere
     goWhere (Abs.WithWh ds) = Abs.WithWh (map goLocal ds)
     goAlt (Abs.AltC p a mw) = Abs.AltC p (go a) (goWhere mw)
-    goArm (Abs.HArm c v ps a) = Abs.HArm c v ps (go a)
-    goArm (Abs.HUArm v ps a)  = Abs.HUArm v ps (go a)
-    goArm (Abs.HParam v a)    = Abs.HParam v (go a)
-    goArm (Abs.HParamV v a)   = Abs.HParamV v (go a)
+    goArm (Abs.HArm c v ps a)     = Abs.HArm c v ps (go a)
+    goArm (Abs.HUArm v ps a)      = Abs.HUArm v ps (go a)
+    goArm (Abs.HOnceArm c v ps a) = Abs.HOnceArm c v ps (go a)
+    goArm (Abs.HOnceUArm v ps a)  = Abs.HOnceUArm v ps (go a)
+    goArm (Abs.HRetArm p a)       = Abs.HRetArm p (go a)
+    goArm (Abs.HParam v a)        = Abs.HParam v (go a)
+    goArm (Abs.HParamV v a)       = Abs.HParamV v (go a)
 
 -- | The parameter 'Abs.AtomPat's of a function LHS, in order. (Duplicated
 -- here rather than imported from 'Infer' to avoid an import cycle.)

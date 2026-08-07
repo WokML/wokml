@@ -1,0 +1,32 @@
+-- The accept twin of typecheck-fail-examples/56 and /57: the S1 collapse is a
+-- collapse precisely because BOTH readings are meaningful programs. Declaring
+-- the clause kind makes each one sayable, and says which is meant.
+--
+-- `call`'s argument is itself a function, so:
+--   plain arm, 1 binder  -- `k` is the ARGUMENT; the arm auto-resumes with the
+--                           result of applying it
+--   once arm,  2 binders -- `f` is the argument, `k` is the CONTINUATION
+--
+-- The two are given deliberately different answers so this fixture would fail
+-- if the readings were ever confused again: the once arm drops its
+-- continuation (legal -- affine means AT MOST once) and answers from `f`.
+module Main
+import Std.Base
+
+effect Call = { call : (U64 -> U64) -> U64 }
+
+useCall : () -> U64 with Call
+useCall u = Call.call (\n -> n + 1)
+
+argReading : U64
+argReading =
+  with { Call.call k -> k 41 }
+  useCall ()
+
+contReading : U64
+contReading =
+  with { once Call.call f k -> f 100 }
+  useCall ()
+
+main : (U64, U64)
+main = (argReading, contReading)

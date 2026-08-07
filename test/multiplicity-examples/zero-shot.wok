@@ -8,5 +8,5 @@ useBail u = Bail.bail 7
 
 main : U64
 main =
-  with { Bail.bail e k -> 0 }
+  with { once Bail.bail e k -> 0 }
   useBail ()

@@ -42,6 +42,21 @@ data TexpF a
   -- elaborator (Task 4) lowers it to @Handle body (Handler ... { hSelf = Just
   -- self })@. Args: self-binder name, arms, body.
   | TWithNamedH Text [THandlerArm a] (Texp a)
+  -- | First-class handler VALUE `handler E { arms }` (proto/handler-values).
+  -- Effect name + arms, NO body -- this is the whole point: a handler detached
+  -- from any installation. Elaborates to @RMakeHandler@ (a value-producing
+  -- Rhs). Args: effect name, arms.
+  | THandlerV Text [THandlerArm a]
+  -- | Install a handler VALUE `handle h in body`. First expr is the handler
+  -- value; second is the body it wraps. Elaborates to @InstallHandler@, which
+  -- pushes a KHandle frame built from the runtime handler value. Args: handler
+  -- value expr, body.
+  | THandleV (Texp a) (Texp a)
+  -- | NAMED install `handle name = h in body` (item-4 D5). Like 'THandleV'
+  -- but binds the role label @name@ to this activation's instance handle in
+  -- the body's scope, so @name.op@ performs on it ('TPerformOn'). Args:
+  -- self-binder name, handler value expr, body.
+  | THandleNV Text (Texp a) (Texp a)
   deriving (Show, Functor, Foldable, Traversable)
 
 data TAlt a = TAlt (Tpat a) [TLocalDecl a] (Texp a)   -- pattern, where, body

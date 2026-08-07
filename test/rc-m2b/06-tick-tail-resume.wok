@@ -11,7 +11,7 @@ import Base
 effect Tick = { tick : U64 }
 
 runTick : (Tick -> a with Tick + eff e) -> a with eff e
-runTick c = with self = Tick { tick k -> k 1 } in c self
+runTick c = with self = Tick { once tick k -> k 1 } in c self
 
 prog : Tick -> U64 with Tick
 prog t = let a = t.tick in let b = t.tick in a + b

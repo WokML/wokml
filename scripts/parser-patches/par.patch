@@ -1,0 +1,26 @@
+--- /private/tmp/claude-501/-Users-zy-wokml/795ce70c-6c11-4acb-b629-bd402d8b57a2/scratchpad/regen-check/GeneratedParser/Wok/Par.y	2026-07-22 16:48:39
++++ src-generated/GeneratedParser/Wok/Par.y	2026-07-22 16:47:33
+@@ -285,13 +285,21 @@
+   | '(' Pat ')' { GeneratedParser.Wok.Abs.APParen $2 }
+   | '(' ')' { GeneratedParser.Wok.Abs.PUnit }
+   | AtomPat 'as' VarId { GeneratedParser.Wok.Abs.APAs $1 $3 }
+-  | ConId '{' ListRecordFieldPat '}' { GeneratedParser.Wok.Abs.PRecord $1 $3 }
+-  | ConId '{' ListRecordFieldPat ',' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordOpen $1 $3 $5 }
++  | ConId '{' '}' { GeneratedParser.Wok.Abs.PRecord $1 [] }
++  | ConId '{' NEListRecordFieldPat '}' { GeneratedParser.Wok.Abs.PRecord $1 (reverse $3) }
++  | ConId '{' NEListRecordFieldPat ',' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordOpen $1 (reverse $3) $5 }
+   | ConId '{' PatRowTail '}' { GeneratedParser.Wok.Abs.PRecordWild $1 $3 }
+ 
+ RecordFieldPat :: { GeneratedParser.Wok.Abs.RecordFieldPat }
+ RecordFieldPat
+   : VarId '=' Pat { GeneratedParser.Wok.Abs.RFPat $1 $3 }
++
++-- PATCH: left-recursive NEListRecordFieldPat to avoid shift/reduce conflict
++--        with the trailing comma before `..` in PRecordOpen. Built reversed.
++NEListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
++NEListRecordFieldPat
++  : RecordFieldPat { [$1] }
++  | NEListRecordFieldPat ',' RecordFieldPat { $3 : $1 }
+ 
+ ListRecordFieldPat :: { [GeneratedParser.Wok.Abs.RecordFieldPat] }
+ ListRecordFieldPat

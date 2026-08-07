@@ -75,6 +75,14 @@ data Value
                            -- runner site that coexist (nested), so two same-typed
                            -- instances minted by one prelude runner route apart.
   | VBytes BS.ByteString   -- a Bytes buffer: flat UTF-8-or-arbitrary bytes
+  | VHandler Handler ~Env  -- a FIRST-CLASS handler value (proto/handler-values).
+                           -- Carries the handler arms and the ENV they were
+                           -- constructed in (their captured free vars), exactly
+                           -- as VClosure captures its defining env. Installing it
+                           -- (`InstallHandler`) pushes a KHandle frame whose
+                           -- scope is this env, so the arms run where they were
+                           -- built, not where installed. Lazy env for the same
+                           -- recursive-knot reason as VClosure.
 
 instance Show Value where
   show = Tx.unpack . renderValue
@@ -287,6 +295,7 @@ renderValue VPrim{}    = Tx.pack "<builtin>"
 renderValue VCont{}    = Tx.pack "<continuation>"
 renderValue VContP{}   = Tx.pack "<continuation>"
 renderValue (VInst _ _) = Tx.pack "<instance>"
+renderValue (VHandler _ _) = Tx.pack "<handler>"
 renderValue (VBytes bs) = Tx.pack ("Bytes" <> show (BS.unpack bs))
 
 renderLit :: Lit -> Text

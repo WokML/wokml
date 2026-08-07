@@ -14,7 +14,7 @@ prog : Eff -> U64 with Eff
 prog e = e.eop 1
 
 run : (Eff -> U64 with Eff + eff r) -> U64 with eff r
-run c = with self = Eff { eop n k -> let k2 = k in k2 0 } in c self
+run c = with self = Eff { once eop n k -> let k2 = k in k2 0 } in c self
 
 main : U64
 main = run prog

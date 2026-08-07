@@ -19,7 +19,7 @@ withInner : Outer -> (Outer -> Inner -> [U64] with Outer + Inner + eff e) -> [U6
 withInner o f = with self = Inner { iop -> 7 } in f o self
 
 run : (Outer -> [U64] with Outer + eff e) -> Result [U64] U64 with eff e
-run c = with self = Outer { oop n k -> Err n ; v -> Ok v } in c self
+run c = with self = Outer { once oop n k -> Err n ; return v -> Ok v } in c self
 
 prog : Outer -> [U64] with Outer
 prog o = withInner o body

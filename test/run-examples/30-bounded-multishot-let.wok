@@ -9,7 +9,7 @@ pick u = if Choice.flip then 10 else 20
 -- Handler result bound mid-block, then used. Must be 30.
 main : U64
 main =
-  let r = (with { Choice.flip k -> k True + k False
-                  ; v -> v }
+  let r = (with { once Choice.flip k -> k True + k False
+                  ; return v -> v }
             pick ()) in
   r

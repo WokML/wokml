@@ -269,6 +269,7 @@ main = do
     , effectGrammarTests
     , effectOpTests
     , effectHandlerTests
+    , handlerValueTests
     , effectPressureTests
     , closedByDefaultTests
     , lambdaEffectScopingTests
@@ -1094,12 +1095,43 @@ typedExprForTest env = goE
 
     goArm (Abs.HArm (Abs.ConId (_, en)) (Abs.VarId (_, op)) ps body) =
       Typed.TOpArm en op (map goAP ps) (T.pack "") (Ty.CTArr testTy Ty.CREmpty testTy) (goE body)
-    goArm (Abs.HUArm (Abs.VarId (_, v)) _ body) =
-      Typed.TReturnArm (tpa (Typed.TPVar v)) (goE body)
+    -- once/return retrofit: the clause kind is DECLARED, not counted. A `once`
+    -- arm's LAST binder is the continuation, so it fills TOpArm's resume-name
+    -- slot instead of appearing among the argument patterns.
+    goArm (Abs.HOnceArm (Abs.ConId (_, en)) (Abs.VarId (_, op)) ps body) =
+      let (args, k) = splitContBinder ps
+      in Typed.TOpArm en op (map goAP args) k
+           (Ty.CTArr testTy Ty.CREmpty testTy) (goE body)
+    goArm (Abs.HRetArm bp body) =
+      Typed.TReturnArm (goAP bp) (goE body)
+    -- Only headerless `with { ... }` reaches this helper, so an unqualified
+    -- arm has no header to resolve against. Since the retrofit these two are
+    -- not value arms: a value arm is spelled `return v -> e` (HRetArm), and a
+    -- bare `v -> e` names an operation the helper cannot look up. Failing
+    -- loudly is the point -- the old HUArm-as-value-arm reading is exactly the
+    -- silent classification this retrofit closes.
+    goArm (Abs.HUArm (Abs.VarId (_, v)) _ _) =
+      error ("typedExprForTest: bare arm `" <> T.unpack v
+             <> " -> ...` in a headerless block: write `return " <> T.unpack v
+             <> " -> ...` for a value arm, or qualify it as `E." <> T.unpack v
+             <> " -> ...` for an operation arm")
+    goArm (Abs.HOnceUArm (Abs.VarId (_, v)) _ _) =
+      error ("typedExprForTest: unqualified `once " <> T.unpack v
+             <> "` needs header effects to resolve; write `once E."
+             <> T.unpack v <> "` in this helper")
     goArm (Abs.HParam _ _) =
       error "typedExprForTest: handler-local parameter (slice 4a) not supported in tests"
     goArm (Abs.HParamV _ _) =
       error "typedExprForTest: handler-local parameter (slice 4a) not supported in tests"
+
+    -- Split a `once` arm's binders into (arguments, continuation name). The
+    -- continuation is always the last binder and is always a bare variable or
+    -- a wildcard discard; patterns there are rejected by the typechecker.
+    splitContBinder ps = case reverse ps of
+      (Abs.APVar (Abs.VarId (_, k)) : rest) -> (reverse rest, k)
+      (Abs.APWild : rest)                   -> (reverse rest, T.pack "")
+      _ -> error "typedExprForTest: `once` arm's continuation binder must be a \
+                 \variable or `_`"
 
     goDecls :: [Abs.LocalDecl] -> [Typed.TLocalDecl Ty.CType]
     goDecls decls =
@@ -3922,7 +3954,7 @@ renderHandlerSrc ambient tRes rAns shape
       , "prog : () -> " ++ rtyText rAns ++ " with E"
       , "prog u = let x = E.fire 0 in " ++ rtyLit rAns
       , "run : (() -> " ++ rtyText rAns ++ " with E + eff e) -> " ++ rtyText rAns ++ " with eff e"
-      , "run c = with { E." ++ arm ++ " ; v -> v } c ()"
+      , "run c = with { " ++ arm "E." ++ " ; return v -> v } c ()"
       , "main : " ++ rtyText rAns
       , "main = run prog"
       ]
@@ -3932,16 +3964,20 @@ renderHandlerSrc ambient tRes rAns shape
       , "prog : E -> " ++ rtyText rAns ++ " with E"
       , "prog e = let u = e.fire 0 in " ++ rtyLit rAns
       , "run : (E -> " ++ rtyText rAns ++ " with E + eff e) -> " ++ rtyText rAns ++ " with eff e"
-      , "run c = with self = E { " ++ arm ++ " ; v -> v } in c self"
+      , "run c = with self = E { " ++ arm "" ++ " ; return v -> v } in c self"
       , "main : " ++ rtyText rAns
       , "main = run prog"
       ]
   where
-    arm = case shape of
-      DiscardNamed -> "fire n k -> " ++ rtyLit rAns
-      DiscardWild  -> "fire n _ -> " ++ rtyLit rAns
-      ApplyNamed   -> "fire n k -> k (" ++ rtyLit tRes ++ ")"
-      AutoResume   -> "fire n -> " ++ rtyLit tRes
+    -- The clause kind is DECLARED, so the keyword precedes the head and any
+    -- qualifier: `once E.fire n k -> ...`. The three continuation-binding
+    -- shapes bind arity + 1 patterns and so must say `once`; AutoResume binds
+    -- exactly the arity and stays plain.
+    arm qual = case shape of
+      DiscardNamed -> "once " ++ qual ++ "fire n k -> " ++ rtyLit rAns
+      DiscardWild  -> "once " ++ qual ++ "fire n _ -> " ++ rtyLit rAns
+      ApplyNamed   -> "once " ++ qual ++ "fire n k -> k (" ++ rtyLit tRes ++ ")"
+      AutoResume   -> qual ++ "fire n -> " ++ rtyLit tRes
 
 genHandlerSrc :: Gen (String, Bool, RTy, RTy, ArmShape)
 genHandlerSrc = do
@@ -4509,7 +4545,7 @@ namedInstanceTests = testGroup "Wok.TypeChecking.NamedInstance"
           schemeOf
             [ T.pack "effect State s = { get : s, set : s -> () }"
             , T.pack "runLocal : U64 -> U64"
-            , T.pack "runLocal i = with s = State { get -> i ; set x k -> k () ; v -> v } in s.get"
+            , T.pack "runLocal i = with s = State { get -> i ; once set x k -> k () ; return v -> v } in s.get"
             ]
             (T.pack "runLocal")
             @?= Right (T.pack "U64 -> U64")
@@ -4767,7 +4803,7 @@ effectHandlerTests = testGroup "Wok.TypeChecking.EffectHandler"
         , T.pack "runIO comp ="
         , T.pack "  with { IO.read p -> p"
         , T.pack "       ; IO.write m -> ()"
-        , T.pack "       ; v -> v }"
+        , T.pack "       ; return v -> v }"
         , T.pack "  comp ()"
         ]
         (T.pack "runIO")
@@ -4779,7 +4815,7 @@ effectHandlerTests = testGroup "Wok.TypeChecking.EffectHandler"
         , T.pack "effect IO = { write : String -> () }"
         , T.pack "logToIO c ="
         , T.pack "  with { Logger.log m -> IO.write m"
-        , T.pack "       ; v -> v }"
+        , T.pack "       ; return v -> v }"
         , T.pack "  c ()"
         ]
         (T.pack "logToIO")
@@ -4808,6 +4844,245 @@ effectHandlerTests = testGroup "Wok.TypeChecking.EffectHandler"
         @?= Right (T.pack "forall a. (() -> a) -> a")
   ]
 
+-- First-class handler values (item-4 promotion, State slice): the exposed
+-- @Handler (E params) a b@ type and the install-site payload tying. The
+-- reject cases are the teeth: before the tying fix, 'dischargeEffects'
+-- dropped the row payload unforced, so a handler for @State U64@ installed
+-- over a body performing @State.set "oops"@ typechecked and ran.
+handlerValueTests :: TestTree
+handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
+  [ testCase "zero-param handler value scheme: Handler E a a" $
+      schemeOf
+        [ "effect Ask = { ask : U64 }"
+        , "mk = handler Ask { ask -> 41 ; return v -> v }"
+        ]
+        "mk"
+        @?= Right "forall a. Handler Ask a a"
+
+  , testCase "parameterized handler value scheme exposes the effect's param" $
+      schemeOf
+        [ "effect State s = { get : s, set : s -> () }"
+        , "mk = handler State { get -> 7 ; once set x k -> k () ; return v -> v }"
+        ]
+        "mk"
+        @?= Right "forall a. Handler (State U64) a a"
+
+  , testCase "install-site tying: mistyped perform payload is rejected" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "main : U64"
+             , "main ="
+             , "  let h = handler State { get -> 0 ; once set x k -> k () ; return v -> v } in"
+             , "  handle h in (let u = State.set \"oops\" in 1)"
+             ])
+      case r of
+        Left err -> assertBool ("expected Mismatch, got: " ++ err)
+                      ("Mismatch" `Data.List.isInfixOf` err)
+        Right v  -> assertFailure ("expected rejection, got: " ++ T.unpack v)
+
+  , testCase "install-site tying: well-typed payload accepted and runs" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "main : U64"
+             , "main ="
+             , "  let h = handler State { get -> 7 ; once set x k -> k () ; return v -> v } in"
+             , "  handle h in (let u = State.set 5 in State.get + 1)"
+             ])
+      r @?= Right "8"
+
+  , testCase "handler value missing an op arm is rejected (HandlerCoverage)" $
+      case schemeOf
+             [ "effect State s = { get : s, set : s -> () }"
+             , "mk = handler State { get -> 7 ; return v -> v }"
+             ]
+             "mk" of
+        Left msg -> assertBool ("expected HandlerCoverage, got: " ++ msg)
+                      ("HandlerCoverage" `Data.List.isInfixOf` msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  -- var seeding (task B): the polymorphic runner shape the prelude migration
+  -- needs -- seed from the construction scope, baton via two-arg resume.
+  , testCase "runner scheme: seed arg flows into the Handler's param and answer" $
+      schemeOf
+        [ "effect State s = { get : s, set : s -> () }"
+        , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
+        ]
+        "state"
+        @?= Right "forall a b. a -> Handler (State a) b (b, a)"
+
+  , testCase "var seeding: fused and value forms agree on a set/get round trip" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "runFused : (U64, U64)"
+             , "runFused ="
+             , "  with State { var s = 10 ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
+             , "  (let u = State.set (State.get + 5) in State.get)"
+             , "runValue : (U64, U64)"
+             , "runValue ="
+             , "  let h = handler State { var s = 10 ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in"
+             , "  handle h in (let u = State.set (State.get + 5) in State.get)"
+             , "main : ((U64, U64), (U64, U64))"
+             , "main = (runFused, runValue)"
+             ])
+      r @?= Right "((15, 15), (15, 15))"
+
+  , testCase "var seeding: two installs of one value each start from the seed" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "useOnce h d = handle h in (let u = State.set (State.get + d) in State.get)"
+             , "main : ((U64, U64), (U64, U64))"
+             , "main ="
+             , "  let h = handler State { var s = 10 ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in"
+             , "  (useOnce h 1, useOnce h 100)"
+             ])
+      r @?= Right "((11, 11), (110, 110))"
+
+  -- Effect resolution from the handler's TYPE (task D): a concrete
+  -- Handler E ... names its effect, so the body may perform other effects
+  -- (residual flows out) or none at all -- both were errors when the effect
+  -- could only be read off the body's row.
+  , testCase "concrete handler: body may perform a second effect (residual)" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "effect Logger = { log : U64 -> () }"
+             , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
+             , "runBoth : () -> (U64, U64) with Logger"
+             , "runBoth z = handle (state 5) in"
+             , "  (let u = Logger.log (State.get) in"
+             , "   let w = State.set 9 in State.get)"
+             , "collect : (() -> a with Logger) -> a"
+             , "collect c = with { Logger.log n -> () ; return v -> v } (c ())"
+             , "main : (U64, U64)"
+             , "main = collect runBoth"
+             ])
+      r @?= Right "(9, 9)"
+
+  , testCase "concrete handler: pure body is legal; return arm still runs" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
+             , "main : (U64, U64)"
+             , "main = handle (state 5) in 42"
+             ])
+      r @?= Right "(42, 5)"
+
+  -- Named install (task C, item-4 D5): `handle name = h in body` binds the
+  -- role label; `name.op` id-routes to that activation. Two same-effect
+  -- instances coexist -- the gap the named-instances feature left untested.
+  , testCase "named install: two instances of one effect route apart" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> v }"
+             , "main : (U64, U64)"
+             , "main ="
+             , "  handle a = state 1 in"
+             , "  handle b = state 20 in"
+             , "  (let u = a.set (a.get + b.get) in"
+             , "   (a.get, b.get))"
+             ])
+      r @?= Right "(21, 20)"
+
+  , testCase "named install: one handler value under two labels is two activations" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "main : (U64, U64)"
+             , "main ="
+             , "  let h = handler State { var s = 5 ; get -> s ; once set x k -> k x () ; return v -> v } in"
+             , "  handle a = h in"
+             , "  handle b = h in"
+             , "  (let u = a.set 99 in (a.get, b.get))"
+             ])
+      r @?= Right "(99, 5)"
+
+  -- Review round: a handler VALUE whose arms capture a second-class carrier
+  -- escaped the carrier-escape analysis (ran to NoMatchingHandler at runtime
+  -- where the byte-identical lambda was rejected statically).
+  , testCase "handler value capturing an instance handle is a CarrierEscape" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "effect E = { ask : U64 }"
+             , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> v }"
+             , "mk = handle c = state 7 in handler E { ask -> c.get ; return v -> v }"
+             , "main : U64"
+             , "main = handle mk in E.ask"
+             ])
+      case r of
+        Left err -> assertBool ("expected CarrierEscape, got: " ++ err)
+                      ("CarrierEscape" `Data.List.isInfixOf` err)
+        Right v  -> assertFailure ("expected rejection, got: " ++ T.unpack v)
+
+  -- Review round: two arms for one operation were silently accepted; runtime
+  -- dispatch first-matches, so the later arm was dead code with no diagnostic.
+  , testCase "duplicate op arm is rejected (handler value)" $
+      case schemeOf
+             [ "effect Ask = { ask : U64 }"
+             , "mk = handler Ask { ask -> 1 ; ask -> 2 ; return v -> v }"
+             ]
+             "mk" of
+        Left msg -> assertBool ("expected DuplicateOpArm, got: " ++ msg)
+                      ("DuplicateOpArm" `Data.List.isInfixOf` msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , testCase "duplicate op arm is rejected (fused ambient handler)" $
+      case schemeOf
+             [ "effect Ask = { ask : U64 }"
+             , "run c = with { Ask.ask -> 1 ; Ask.ask -> 2 ; return v -> v } (c ())"
+             ]
+             "run" of
+        Left msg -> assertBool ("expected DuplicateOpArm, got: " ++ msg)
+                      ("DuplicateOpArm" `Data.List.isInfixOf` msg)
+        Right s  -> assertFailure ("expected rejection, got: " ++ T.unpack s)
+
+  , testCase "named install of a polymorphic handler is rejected" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect Ask = { ask : U64 }"
+             , "run f = handle c = f in c.ask"
+             , "main : U64"
+             , "main = run (handler Ask { ask -> 41 ; return v -> v })"
+             ])
+      case r of
+        Left err -> assertBool ("expected UnsupportedFeature, got: " ++ err)
+                      ("UnsupportedFeature" `Data.List.isInfixOf` err)
+        Right v  -> assertFailure ("expected rejection, got: " ++ T.unpack v)
+
+  -- Regression: a VALUE-POSITION install used to elaborate its body at the
+  -- merge join, jumping PAST the KHandle frame -- the return arm silently
+  -- never ran (this program printed (6, 50)). The body is now TRet-elaborated
+  -- and the install thunk-wrapped, so the return arm's pair survives.
+  , testCase "value-position install runs the return arm" $ do
+      r <- runSourceToValueForced (T.unlines
+             [ "module Main"
+             , "import Std.Base"
+             , "effect State s = { get : s, set : s -> () }"
+             , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
+             , "main : ((U64, U64), (U64, U64))"
+             , "main ="
+             , "  ( handle (state 3) in (let u = State.set (State.get * 2) in State.get)"
+             , "  , handle (state 50) in State.get )"
+             ])
+      r @?= Right "((6, 6), (50, 50))"
+  ]
+
 -- Adversarial coverage for the effect system: the spec's acceptance criteria
 -- that the happy-path fixtures do NOT exercise -- partial discharge, the
 -- single-use-vs-threading rule (spec 136-151), multi-effect handlers, operation
@@ -4824,7 +5099,7 @@ effectPressureTests = testGroup "Wok.TypeChecking.EffectPressure"
             , "partial : (() -> a with IO + Logger + eff e) -> a with Logger + eff e"
             , "partial comp ="
             , "  with { IO.write m -> ()"
-            , "       ; v -> v }"
+            , "       ; return v -> v }"
             , "  comp ()"
             ]
             "partial"
@@ -4838,7 +5113,7 @@ effectPressureTests = testGroup "Wok.TypeChecking.EffectPressure"
             , "runBoth comp ="
             , "  with { IO.write m -> ()"
             , "       ; Logger.log m -> ()"
-            , "       ; v -> v }"
+            , "       ; return v -> v }"
             , "  comp ()"
             ]
             "runBoth"
@@ -4953,7 +5228,7 @@ effectPressureTests = testGroup "Wok.TypeChecking.EffectPressure"
             [ "effect IO = { read : String -> String }"
             , "bad comp ="
             , "  with { IO.read p -> 42"
-            , "       ; v -> v }"
+            , "       ; return v -> v }"
             , "  comp ()"
             ]
             "bad"
@@ -4973,7 +5248,7 @@ effectPressureTests = testGroup "Wok.TypeChecking.EffectPressure"
                  , "vacuous u = Logger.log \"x\""
                  , "weird c ="
                  , "  with { IO.write m -> ()"
-                 , "       ; v -> v }"
+                 , "       ; return v -> v }"
                  , "  vacuous ()"
                  ]
                  "weird" of
@@ -5185,7 +5460,7 @@ ioGroundEffectTests = testGroup "IO effect"
   , testCase "a with-handler targeting IO is rejected (IOEffectNotHandleable)" $
       case schemeOf
              [ "g x ="
-             , "  with IO { v -> v }"
+             , "  with IO { return v -> v }"
              , "  x"
              ]
              "g" of
@@ -5198,7 +5473,7 @@ ioGroundEffectTests = testGroup "IO effect"
     -- exercises inferHandler; this drives inferNamedHandler with effName == "IO".
     testCase "a named handler targeting IO is rejected (IOEffectNotHandleable)" $
       case schemeOf
-             [ "g x = with s = IO { v -> v } in x"
+             [ "g x = with s = IO { return v -> v } in x"
              ]
              "g" of
         Left msg -> assertBool ("expected IOEffectNotHandleable, got: " ++ msg)
@@ -6664,7 +6939,7 @@ rowShadowTests = testGroup "RowShadow"
 forgottenResumeTests :: TestTree
 forgottenResumeTests = testGroup "ForgottenResume"
   [ testCase "named unreferenced binder on returning op warns" $ do
-      -- `State.get k -> 0`: get : s is a returning op and k is never used.
+      -- `once State.get k -> 0`: get : s is a returning op and k is never used.
       let src = T.unlines
             [ "module Main", "import Base"
             , "effect State s = { get : s }"
@@ -6672,14 +6947,14 @@ forgottenResumeTests = testGroup "ForgottenResume"
             , "prog u = State.get"
             , "main : U64"
             , "main ="
-            , "  with { State.get k -> 0"
-            , "         ; v -> v }"
+            , "  with { once State.get k -> 0"
+            , "         ; return v -> v }"
             , "  prog ()" ]
       (_, ws) <- expectOKWithWarnings src
       length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 1
 
   , testCase "wildcard binder suppresses" $ do
-      -- `State.get _ -> 0`: explicit intentional discard; no warning.
+      -- `once State.get _ -> 0`: explicit intentional discard; no warning.
       let src = T.unlines
             [ "module Main", "import Base"
             , "effect State s = { get : s }"
@@ -6687,8 +6962,8 @@ forgottenResumeTests = testGroup "ForgottenResume"
             , "prog u = State.get"
             , "main : U64"
             , "main ="
-            , "  with { State.get _ -> 0"
-            , "         ; v -> v }"
+            , "  with { once State.get _ -> 0"
+            , "         ; return v -> v }"
             , "  prog ()" ]
       (_, ws) <- expectOKWithWarnings src
       length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 0
@@ -6705,14 +6980,14 @@ forgottenResumeTests = testGroup "ForgottenResume"
             , "risky u = Exn.throw 1"
             , "main : U64"
             , "main ="
-            , "  with { Exn.throw code k -> 0"
-            , "         ; v -> v }"
+            , "  with { once Exn.throw code k -> 0"
+            , "         ; return v -> v }"
             , "  risky ()" ]
       (_, ws) <- expectOKWithWarnings src
       length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 0
 
   , testCase "referenced binder does not warn" $ do
-      -- `State.get k -> k 0`: the continuation is used, so the arm resumes.
+      -- `once State.get k -> k 0`: the continuation is used, so the arm resumes.
       let src = T.unlines
             [ "module Main", "import Base"
             , "effect State s = { get : s }"
@@ -6720,8 +6995,8 @@ forgottenResumeTests = testGroup "ForgottenResume"
             , "prog u = State.get"
             , "main : U64"
             , "main ="
-            , "  with { State.get k -> k 0"
-            , "         ; v -> v }"
+            , "  with { once State.get k -> k 0"
+            , "         ; return v -> v }"
             , "  prog ()" ]
       (_, ws) <- expectOKWithWarnings src
       length [ () | TErr.ForgottenResume _ _ _ <- ws ] @?= 0
@@ -7687,6 +7962,8 @@ aprimKeysInModule (Anf.CoreModule binds) =
       ROp m _ _ as  -> Set.unions (map goA (maybe as (: as) m))
       RRecord _ fls -> Set.unions (map (goA . snd) fls)
       RProj _ a     -> goA a
+      RMakeHandler h -> goE (snd (Anf.hReturn h))
+                          `Set.union` Set.unions (map (goE . Anf.oaBody) (Anf.hOps h))
       RReuseCon{}          -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
       RForeignCall _ _ _ _ _ as -> Set.unions (map goA as)
     goE e = case e of
@@ -7699,6 +7976,7 @@ aprimKeysInModule (Anf.CoreModule binds) =
       Handle e' h         ->
         goE e' `Set.union` goE (snd (Anf.hReturn h))
                `Set.union` Set.unions (map (goE . Anf.oaBody) (Anf.hOps h))
+      InstallHandler a _ e' -> goA a `Set.union` goE e'
     goAlt (AltCon _ _ e) = goE e
     goAlt (AltLit _ e)   = goE e
     goAlt (AltDefault e) = goE e
@@ -7921,6 +8199,7 @@ hasLetJoin (Anf.Case _ alts)          = any altHasLetJoin alts
 hasLetJoin (Anf.Jump _ _)             = False
 hasLetJoin (Anf.Ret _)                = False
 hasLetJoin (Anf.Handle e _)           = hasLetJoin e
+hasLetJoin (Anf.InstallHandler _ _ e)   = hasLetJoin e
 
 altHasLetJoin :: Anf.Alt -> Bool
 altHasLetJoin (Anf.AltCon _ _ e)  = hasLetJoin e
@@ -8313,13 +8592,16 @@ elaborateEffectsTests = testGroup "ElaborateEffects"
              _                    -> False)
 
   , -- Handler in tail position:
-    -- with { IO.write m -> () ; v -> v } (comp ())
+    -- with { IO.write m -> () ; return v -> v } (comp ())
     testCase "EWith tail position: produces Handle + OpArm with auto-resume" $
       let unitE   = Abs.EUnit
           compApp = Abs.EApp (Abs.EVar (varId (T.pack "comp"))) unitE
           mPat    = Abs.APVar (varId (T.pack "m"))
           writeArm = Abs.HArm (conId (T.pack "IO")) (varId (T.pack "write")) [mPat] Abs.EUnit
-          retArm  = Abs.HUArm (varId (T.pack "v")) [] (Abs.EVar (varId (T.pack "v")))
+          -- Since the retrofit the value arm is spelled `return v -> e`, so it
+          -- is built as HRetArm; a bare HUArm is an operation arm.
+          retArm  = Abs.HRetArm (Abs.APVar (varId (T.pack "v")))
+                                (Abs.EVar (varId (T.pack "v")))
           expr    = Abs.EWith [writeArm, retArm] compApp
           result  = elaborateExprForTest effectTestEnv expr
       in do
@@ -9408,6 +9690,7 @@ matchCompilerTests = testGroup "MatchCompiler"
       collectJumps e
         ++ collectJumps (snd (Anf.hReturn h))
         ++ concatMap (collectJumps . Anf.oaBody) (Anf.hOps h)
+    collectJumps (Anf.InstallHandler _ _ e) = collectJumps e
 
     collectJumpsRhs :: Anf.Rhs -> [Name.JoinId]
     collectJumpsRhs (Anf.RLam _ e) = collectJumps e
@@ -13186,6 +13469,7 @@ tokenUniques (Anf.CoreModule bs) = concatMap (tokE . Anf.tbBody) bs
     tokE (Anf.Jump _ _)         = []
     tokE (Anf.Handle e h)       =
       tokE e ++ tokE (snd (Anf.hReturn h)) ++ concatMap (tokE . Anf.oaBody) (Anf.hOps h)
+    tokE (Anf.InstallHandler _ _ e) = tokE e
     tokAlt (Anf.AltCon _ _ e) = tokE e
     tokAlt (Anf.AltLit _ e)   = tokE e
     tokAlt (Anf.AltDefault e) = tokE e
@@ -14856,6 +15140,7 @@ countRcIntrinsicFor hint u = goE
     goE (Jump _ _)         = 0
     goE (LetRec defs e)    = sum [ goE d | (_, _, d) <- defs ] + goE e
     goE (Handle e _)       = goE e
+    goE (InstallHandler _ _ e) = goE e
     goRhs (RLam _ e) = goE e
     goRhs _          = 0
     goAlt (AltCon _ _ e) = goE e
@@ -19438,6 +19723,7 @@ hasMemberBodyEscape (CoreModule bs) = any (topB) bs
             inMember = any (\(_, _, d) -> go gU d) defs
         in inMember || go sibs body   -- group body uses the OUTER sibs only
       Handle _ _         -> False
+      InstallHandler{} -> False
     altG sibs (AltCon _ _ b) = go sibs b
     altG sibs (AltLit _ b)   = go sibs b
     altG sibs (AltDefault b) = go sibs b
@@ -19506,6 +19792,7 @@ hasCaptureBodyEscape (CoreModule bs) = any topB bs
             boxedBody = extend boxed [ b | (b, _, _) <- defs ]
         in any memberEscapes defs || go boxedBody body
       Handle _ _           -> False
+      InstallHandler{}   -> False
     altG boxed (AltCon _ bs' b) = go (extend boxed bs') b
     altG boxed (AltLit _ b)     = go boxed b
     altG boxed (AltDefault b)   = go boxed b
@@ -19548,6 +19835,7 @@ captureFlowsOut u0 = goE (Set.singleton u0)
       Case _ alts        -> any (goAlt tracked) alts
       LetJoin _ _ jb body -> goE tracked jb || goE tracked body
       Handle e' _        -> goE tracked e'
+      InstallHandler _ _ e' -> goE tracked e'
     goAlt tracked (AltCon _ _ e) = goE tracked e
     goAlt tracked (AltLit _ e)   = goE tracked e
     goAlt tracked (AltDefault e) = goE tracked e
@@ -19595,6 +19883,7 @@ oldCaptureEscapesBody u0 = goE (Set.singleton u0)
       Case _ alts           -> any (goAlt tracked) alts
       LetJoin _ _ jb body   -> goE tracked jb || goE tracked body
       Handle e' _           -> goE tracked e'
+      InstallHandler _ _ e'   -> goE tracked e'
     goAlt tracked (AltCon _ _ e) = goE tracked e
     goAlt tracked (AltLit _ e)   = goE tracked e
     goAlt tracked (AltDefault e) = goE tracked e
@@ -19615,6 +19904,7 @@ allMentionedUniques = go
       LetJoin _ ps jb body ->
         Set.fromList (map binderUnique ps) `Set.union` go jb `Set.union` go body
       Handle e' _         -> go e'
+      InstallHandler a _ e' -> atomVars a `Set.union` go e'
     goAlt (AltCon _ bs e) = Set.fromList (map binderUnique bs) `Set.union` go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e
@@ -19626,6 +19916,7 @@ allMentionedUniques = go
       ROp m _ _ as -> Set.unions (map atomVars (maybe as (: as) m))
       RRecord _ fl -> Set.unions (map (atomVars . snd) fl)
       RProj _ a    -> atomVars a
+      RMakeHandler _ -> Set.empty   -- proto/handler-values: never in this hand-built/generated corpus; internals ignored like Handle's
       RReuseCon{}             -> error "RReuseCon: produced only by reusePairing post-pass (never in hand-built test IR)"
       RForeignCall _ _ _ _ _ as -> Set.unions (map atomVars as)
 
@@ -19640,6 +19931,7 @@ allSubExprs e = e : case e of
   Case _ alts          -> concatMap altSub alts
   LetJoin _ _ jb body  -> allSubExprs jb ++ allSubExprs body
   Handle e' _          -> allSubExprs e'
+  InstallHandler _ _ e'  -> allSubExprs e'
   where
     altSub (AltCon _ _ b) = allSubExprs b
     altSub (AltLit _ b)   = allSubExprs b
@@ -19744,6 +20036,7 @@ hasCaptureCallHead (CoreModule bs) = any topB bs
             outerBody = Set.union outer gU
         in any inDef defs || go outerBody inMember body
       Handle _ _           -> False
+      InstallHandler{}   -> False
     altG outer inMember (AltCon _ bs' b) =
       go (Set.union outer (Set.fromList (map binderUnique bs'))) inMember b
     altG outer inMember (AltLit _ b)   = go outer inMember b
@@ -19773,6 +20066,7 @@ hasCrossRegion (CoreModule bs) = any topB bs
       Case _ alts        -> any (altG lr) alts
       LetJoin _ _ jb body -> go lr jb || go lr body
       Handle e' _        -> go lr e'
+      InstallHandler _ _ e' -> go lr e'
       LetRec defs body   ->
         let groupU = Set.fromList [ binderUnique b | (b, _, _) <- defs ]
             params ps = Set.fromList (map binderUnique ps)
@@ -19924,6 +20218,7 @@ exprHasJump (Case _ alts)      = any (exprHasJump . clusterAltBody) alts
 exprHasJump (LetJoin _ _ jb e) = exprHasJump jb || exprHasJump e
 exprHasJump (LetRec ds e)      = any (\(_, _, b) -> exprHasJump b) ds || exprHasJump e
 exprHasJump (Handle e _)       = exprHasJump e
+exprHasJump (InstallHandler _ _ e) = exprHasJump e
 
 -- | Does @e@ jump to the specific join @j@ (so dropping @j@'s binder would strand it)?
 exprJumpsTo :: JoinId -> Expr -> Bool
@@ -19934,6 +20229,7 @@ exprJumpsTo j (Case _ alts)      = any (exprJumpsTo j . clusterAltBody) alts
 exprJumpsTo j (LetJoin _ _ jb e) = exprJumpsTo j jb || exprJumpsTo j e
 exprJumpsTo j (LetRec ds e)      = any (\(_, _, b) -> exprJumpsTo j b) ds || exprJumpsTo j e
 exprJumpsTo j (Handle e _)       = exprJumpsTo j e
+exprJumpsTo j (InstallHandler _ _ e) = exprJumpsTo j e
 
 clusterAltBody :: Anf.Alt -> Expr
 clusterAltBody (AltCon _ _ b) = b
@@ -23075,6 +23371,7 @@ oracleWalk disabled placements = go
     go (Anf.Handle e h)       =
       go e `Map.union` go (snd (Anf.hReturn h))
         `Map.union` Map.unions (map (go . Anf.oaBody) (Anf.hOps h))
+    go (Anf.InstallHandler _ _ e) = go e
     goAlt (Anf.AltCon _ _ e)  = go e
     goAlt (Anf.AltLit _ e)    = go e
     goAlt (Anf.AltDefault e)  = go e
@@ -23116,6 +23413,7 @@ oracleHasHandle = go
     go (Anf.LetJoin _ _ jb e) = go jb || go e
     go (Anf.Jump _ _)         = False
     go (Anf.Handle _ _)       = True
+    go (Anf.InstallHandler _ _ _) = True
     goAlt (Anf.AltCon _ _ e)  = go e
     goAlt (Anf.AltLit _ e)    = go e
     goAlt (Anf.AltDefault e)  = go e
@@ -23141,6 +23439,7 @@ oracleFiresOp = go
     go (Anf.LetJoin _ _ jb e) = go jb || go e
     go (Anf.Jump _ _)         = False
     go (Anf.Handle e h)       = go e || goHandler h
+    go (Anf.InstallHandler _ _ e) = go e
     goAlt (Anf.AltCon _ _ e)  = go e
     goAlt (Anf.AltLit _ e)    = go e
     goAlt (Anf.AltDefault e)  = go e
@@ -23493,6 +23792,7 @@ forcedUniquesOf hints = Set.fromList . go
     go (Anf.Jump _ _)         = []
     go (Anf.Handle e h)       = go e ++ go (snd (Anf.hReturn h))
                                   ++ concatMap (go . Anf.oaBody) (Anf.hOps h)
+    go (Anf.InstallHandler _ _ e) = go e
     goAlt (Anf.AltCon _ _ e)  = go e
     goAlt (Anf.AltLit _ e)    = go e
     goAlt (Anf.AltDefault e)  = go e
@@ -27869,7 +28169,7 @@ foreignIoDischargeTests = testGroup "foreign IO discharge"
              [ "foreign module Libc \"c\" free \"free\" where"
              , "  memchr : Bytes -> U64 -> U64 -> U64 with IO"
              , "bad_handler x ="
-             , "  with IO { v -> v }"
+             , "  with IO { return v -> v }"
              , "  x"
              ]
              "bad_handler" of

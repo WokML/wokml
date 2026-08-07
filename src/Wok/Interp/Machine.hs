@@ -107,6 +107,29 @@ evalExpr prims sup expr sc k = case expr of
                            , scJoins = Map.insert j (JoinPoint jsc ps jbody jk) (scJoins jsc) }
             in Right (Eval jbody jsc' jk, sup)
 
+  -- proto/handler-values: install a first-class handler VALUE. Resolve the
+  -- atom to a VHandler, then push the SAME KHandle frame `Handle` pushes, but
+  -- with the frame scope taken from the handler's CONSTRUCTION env (so the arms
+  -- see their captured free vars) rather than the install site. The body runs
+  -- in the caller's scope `sc`. A NAMED install (`handle name = h in body`)
+  -- additionally binds its self binder to a fresh VInst for THIS activation in
+  -- the body's scope and stamps the binder into the frame's handler record, so
+  -- named performs id-route here (same Unique+tag discipline as the fused
+  -- named form below). The handler VALUE itself stays self-free -- naming is
+  -- per-install, which is what lets one value be installed under two labels.
+  InstallHandler a mSelf body -> do
+    hv <- resolveAtom prims sc a
+    case hv of
+      VHandler h hEnv ->
+        let tag = kontDepth k
+            h'  = maybe h (\sb -> h { hSelf = Just sb }) mSelf
+            sc' = case mSelf of
+                    Just sb -> sc { scEnv = bindBinder sb (VInst (nameUniq (bndName sb)) tag) (scEnv sc) }
+                    Nothing -> sc
+            hsc = sc { scEnv = hEnv }
+        in Right (Eval body sc' (KHandle h' tag hsc k), sup)
+      _ -> Left (PrimError (Tx.pack "InstallHandler: not a handler value"))
+
   Handle e h ->
     -- A named handler binds its self-instance binder to a VInst carrying the
     -- binder's Unique (the install SITE) and this activation's tag (the Kont
@@ -129,6 +152,9 @@ evalRhs prims sup b rhs body sc k = case rhs of
   RRecord t flds -> do
     vs <- mapM (\(l, a) -> (,) l <$> resolveAtom prims sc a) flds
     cont (VRecord t (Map.fromList vs))
+  -- proto/handler-values: build a first-class handler value, capturing the
+  -- current env (its arms' free vars) exactly as RLam captures for a closure.
+  RMakeHandler h -> cont (VHandler h (scEnv sc))
   RProj l a -> do
     v <- resolveAtom prims sc a
     case v of

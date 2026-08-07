@@ -288,6 +288,9 @@ containsCont (VRecord _ fm) = any containsCont (Map.elems fm)
 containsCont VLit{}         = False
 containsCont VPrim{}        = False
 containsCont VClosure{}     = False
+-- proto/handler-values: a handler value's arms are static code; like a closure
+-- capturing a carrier it is rejected statically, so it carries no live cont.
+containsCont VHandler{}     = False
 containsCont VInst{}        = False
 containsCont VBytes{}       = False
 

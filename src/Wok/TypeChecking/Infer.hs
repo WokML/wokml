@@ -300,6 +300,19 @@ instantiateParamSubst params = do
     pure (i, t)
   pure (Map.fromList pairs)
 
+-- | The type an effect's row label carries for a given parameter
+-- instantiation: @()@ for a zero-param effect, the single param's type, or a
+-- tuple of them. The SINGLE source of truth for this shape: the perform site
+-- (the @E.op@ arm of 'inferExprW') and the handler-value install site
+-- ('inferHandleValue') must build it identically, or install-site payload
+-- tying would silently never unify.
+effectPayloadTy :: [(Int, Kind)] -> Map.Map Int (Type s) -> Type s
+effectPayloadTy ps subst = case ps of
+  []       -> TCon TcUnit []
+  [(i, _)] -> Map.findWithDefault (TCon TcUnit []) i subst
+  _        -> TCon (TcTuple (length ps))
+                [ Map.findWithDefault (TCon TcUnit []) i subst | (i, _) <- ps ]
+
 -- | Substitute CTGen slots in a CType using the given index->Type map.
 -- Used when instantiating field types of a record constructor whose
 -- declaration carries type parameters.
@@ -2273,12 +2286,7 @@ inferExprW mono (Abs.EProj headE@(Abs.ECon (Abs.ConId (_, ename))) (Abs.VarId (p
               -- in the row.
               paramSubst <- instantiateParamSubst (eiParams eInfo)
               opTy <- freshenNeverResult (substCTypeWith paramSubst (schemeBody opScheme))
-              let labelTy = case eiParams eInfo of
-                    []      -> TCon TcUnit []
-                    [(i,_)] -> Map.findWithDefault (TCon TcUnit []) i paramSubst
-                    ps      -> TCon (TcTuple (length ps))
-                                 [ Map.findWithDefault (TCon TcUnit []) i paramSubst
-                                 | (i, _) <- ps ]
+              let labelTy = effectPayloadTy (eiParams eInfo) paramSubst
               emitEffect (Just pos) ename labelTy
               pure (opTy, Ty.Texp opTy (Ty.TProjCon ename label))
           | otherwise -> throwError (UnknownOperation (Just pos) ename label)
@@ -2517,6 +2525,14 @@ inferExprW mono (Abs.EWithNamed (Abs.VarId (npos, name)) fVar wargs body) = do
 -- type in the body's scope, so `self.op` performs on this handler instance.
 inferExprW mono (Abs.EWithNamedH selfV effCon arms body) =
   inferNamedHandler mono selfV effCon arms body
+inferExprW mono (Abs.EHandlerV effCon arms) =
+  inferHandlerValue mono effCon arms
+-- Both install forms carry the handler as HEAD + ATOM ARGS (the EWithRun
+-- application sugar); rebuild the plain application before inferring.
+inferExprW mono (Abs.EHandleV hExpr wargs body) =
+  inferHandleValue mono (rebuildWithArgs hExpr wargs) body
+inferExprW mono (Abs.EHandleN selfV hExpr wargs body) =
+  inferHandleNamedValue mono selfV (rebuildWithArgs hExpr wargs) body
 
 -- | Type-check a single-step application @f x@ using the standard arrow
 -- unification path. Extracted from 'inferExprW (EApp f x)' so that the
@@ -2571,7 +2587,9 @@ inferForeignSaturatedCall mono modName label memberTy args = do
 -- an operation of a header effect) or a value/return arm (when it has no
 -- arguments and matches no operation name).
 data ArmClass
-  = OpArmC Text Text [Abs.AtomPat] Abs.Exp (Int, Int)
+  = OpArmC Bool Text Text [Abs.AtomPat] Abs.Exp (Int, Int)
+      -- ^ Bool: DECLARED control arm (`once`); the last binder is the
+      -- continuation. Plain arms auto-resume and bind exactly the op's arity.
   | ValArmC Text Abs.Exp (Int, Int)
   | ParamArmC Text Abs.Exp (Int, Int)   -- slice 4a: handler-local param `name = init`
 
@@ -2580,20 +2598,33 @@ classifyArm env header arm = case arm of
   Abs.HArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body -> do
     unless (null header || en `elem` header) $
       throwError (HandlerEffectNotInHeader (Just pos) en)
-    pure (OpArmC en op ps body pos)
+    pure (OpArmC False en op ps body pos)
+  -- `once` control arm (retrofit): the clause kind is DECLARED, not counted.
+  Abs.HOnceArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body -> do
+    unless (null header || en `elem` header) $
+      throwError (HandlerEffectNotInHeader (Just pos) en)
+    pure (OpArmC True en op ps body pos)
   Abs.HUArm (Abs.VarId (pos, name)) ps body ->
-    -- Resolve an unqualified arm against the header effects. NOTE: in a HEADERLESS
-    -- block (`header == []`) the match list is always empty, so a bare `name -> e`
-    -- is treated as a VALUE arm -- unqualified OPERATION arms require a header (or
-    -- qualify the arm). An unqualified op arm written without a header therefore
-    -- lands in the value-arm branch and, if there is more than one, surfaces as
-    -- DuplicateReturnArm rather than a header-resolution error.
+    -- Resolve an unqualified arm against the header effects. A bare
+    -- `name -> e` that names no operation is NO LONGER a value arm: value
+    -- arms are written with the `return` keyword (HRetArm). The old silent
+    -- classification is the S-collapse family this retrofit closes.
     case [ en | en <- header, declaresOp env en name ] of
-      [en] -> pure (OpArmC en name ps body pos)
+      [en] -> pure (OpArmC False en name ps body pos)
       []   -> if null ps
-                then pure (ValArmC name body pos)
+                then throwError (ValueArmNeedsReturn (Just pos) name)
                 else throwError (UnknownUnqualifiedOp (Just pos) name)
       ens  -> throwError (HandlerOpAmbiguous (Just pos) name ens)
+  Abs.HOnceUArm (Abs.VarId (pos, name)) ps body ->
+    case [ en | en <- header, declaresOp env en name ] of
+      [en] -> pure (OpArmC True en name ps body pos)
+      []   -> throwError (UnknownUnqualifiedOp (Just pos) name)
+      ens  -> throwError (HandlerOpAmbiguous (Just pos) name ens)
+  -- `return` value arm: binder must be a plain variable (patterns in return
+  -- position are v2's D14, not carried by this retrofit).
+  Abs.HRetArm bpat body -> case bpat of
+    Abs.APVar (Abs.VarId (pos, v)) -> pure (ValArmC v body pos)
+    _                              -> throwError (ReturnArmBinderNotVar (atomPatPos bpat))
   -- Handler-local parameter `name = init` (slice 4a). Bind `name` at a fresh
   -- type sigma in scope of every arm and the value arm; `init` is checked at
   -- sigma; control arms see `resume : sigma -> T -> R`.
@@ -2608,6 +2639,100 @@ classifyArm env header arm = case arm of
     declaresOp e en op = case lookupEffect en e of
       Just eInfo -> Map.member op (eiOps eInfo)
       Nothing    -> False
+
+-- | E-SHADOW (strict; once/return retrofit): the first position at which the
+-- given name is RE-BOUND inside an expression -- by a lambda binder, a
+-- let-local equation head or argument pattern, a case/let-pattern binder, an
+-- as-pattern, a named-instance binder, a nested handler's arm binders, or a
+-- nested handler param. Deliberately stricter than liveness ("shadowed while
+-- unconsumed"): ANY rebinding of a continuation's name inside its arm is an
+-- error, delimited or not -- `(let k = f in k (k 1))` is the S2 silence with
+-- parentheses. Every constructor is matched without a catch-all so grammar
+-- growth surfaces here as an incomplete-pattern warning.
+shadowsName :: Text -> Abs.Exp -> Maybe (Int, Int)
+shadowsName nm = goE
+  where
+    goE e = case e of
+      Abs.EExpr e0 tails    -> goE e0 `orElse` firstJust [ goE t | Abs.ITail _ t <- tails ]
+      Abs.EApp f a          -> goE f `orElse` goE a
+      Abs.EVar _            -> Nothing
+      Abs.ECon _            -> Nothing
+      Abs.EProj e0 _        -> goE e0
+      Abs.EProjC e0 _       -> goE e0
+      Abs.ERecord _ fs      -> firstJust [ goE x | Abs.RFExpr _ x <- fs ]
+      Abs.ERecordExt _ e0 t -> goE e0 `orElse` goTrail t
+      Abs.ELitI _           -> Nothing
+      Abs.ELitS _           -> Nothing
+      Abs.ELitC _           -> Nothing
+      Abs.EParen e0         -> goE e0
+      Abs.EParenOp _        -> Nothing
+      Abs.EUnit             -> Nothing
+      Abs.EList es          -> firstJust (map goE es)
+      Abs.ETuple e0 es      -> goE e0 `orElse` firstJust (map goE es)
+      Abs.ELam ps e0        -> firstJust (map goAP ps) `orElse` goE e0
+      Abs.ELet ds e0        -> firstJust (map goLD ds) `orElse` goE e0
+      Abs.ECase e0 alts     -> goE e0 `orElse` firstJust (map goAlt alts)
+      Abs.EIf a b c         -> goE a `orElse` goE b `orElse` goE c
+      Abs.EWith arms e0           -> firstJust (map goArm arms) `orElse` goE e0
+      Abs.EWithH _ _ arms e0      -> firstJust (map goArm arms) `orElse` goE e0
+      Abs.EWithRun _ args e0      -> firstJust [ goE x | Abs.WRArg x <- args ] `orElse` goE e0
+      Abs.EWithNamed v _ args e0  -> goV v `orElse` firstJust [ goE x | Abs.WRArg x <- args ] `orElse` goE e0
+      Abs.EWithNamedH v _ arms e0 -> goV v `orElse` firstJust (map goArm arms) `orElse` goE e0
+      Abs.EHandlerV _ arms        -> firstJust (map goArm arms)
+      Abs.EHandleV h args e0      -> goE h `orElse` firstJust [ goE x | Abs.WRArg x <- args ] `orElse` goE e0
+      Abs.EHandleN v h args e0    -> goV v `orElse` goE h `orElse` firstJust [ goE x | Abs.WRArg x <- args ] `orElse` goE e0
+    goTrail t = case t of
+      Abs.TFNone    -> Nothing
+      Abs.TFSome fs -> firstJust [ goE x | Abs.RFExpr _ x <- fs ]
+    goArm a = case a of
+      Abs.HArm _ _ ps b     -> firstJust (map goAP ps) `orElse` goE b
+      Abs.HUArm _ ps b      -> firstJust (map goAP ps) `orElse` goE b
+      Abs.HOnceArm _ _ ps b -> firstJust (map goAP ps) `orElse` goE b
+      Abs.HOnceUArm _ ps b  -> firstJust (map goAP ps) `orElse` goE b
+      Abs.HRetArm p b       -> goAP p `orElse` goE b
+      Abs.HParam v e0       -> goV v `orElse` goE e0
+      Abs.HParamV v e0      -> goV v `orElse` goE e0
+    goAlt (Abs.AltC p b wh) = goP p `orElse` goE b `orElse` goWh wh
+    goWh w = case w of
+      Abs.NoWhere   -> Nothing
+      Abs.WithWh ds -> firstJust (map goLD ds)
+    goLD d = case d of
+      Abs.LDEqn lhs e0 wh -> goLHS lhs `orElse` goE e0 `orElse` goWh wh
+      Abs.LDSig {}        -> Nothing
+      Abs.LDPat p ps e0   -> goP p `orElse` firstJust (map goP ps) `orElse` goE e0
+    goLHS l = case l of
+      Abs.LHSPre fn ps    -> goFN fn `orElse` firstJust (map goAP ps)
+      Abs.LHSInfSym a _ b -> goAP a `orElse` goAP b
+      Abs.LHSInfBT a v b  -> goAP a `orElse` goV v `orElse` goAP b
+    goFN f = case f of
+      Abs.FNBare v -> goV v
+      Abs.FNBareSym _ -> Nothing
+      Abs.FNParen _   -> Nothing
+    goP p = case p of
+      Abs.PApp _ a as -> goAP a `orElse` firstJust (map goAP as)
+      Abs.PCons a p2  -> goAP a `orElse` goP p2
+      Abs.PAtom a     -> goAP a
+    goAP ap = case ap of
+      Abs.APVar v            -> goV v
+      Abs.APCon _            -> Nothing
+      Abs.APWild             -> Nothing
+      Abs.APLitI _           -> Nothing
+      Abs.APLitS _           -> Nothing
+      Abs.APLitC _           -> Nothing
+      Abs.APTuple p ps       -> goP p `orElse` firstJust (map goP ps)
+      Abs.APList ps          -> firstJust (map goP ps)
+      Abs.APParen p          -> goP p
+      Abs.PUnit              -> Nothing
+      Abs.APAs a v           -> goAP a `orElse` goV v
+      Abs.PRecord _ fs       -> firstJust [ goP q | Abs.RFPat _ q <- fs ]
+      Abs.PRecordOpen _ fs t -> firstJust [ goP q | Abs.RFPat _ q <- fs ] `orElse` goTail t
+      Abs.PRecordWild _ t    -> goTail t
+    goTail t = case t of
+      Abs.PRTNamed v -> goV v
+      Abs.PRTAnon    -> Nothing
+    goV (Abs.VarId (p, n)) = if n == nm then Just p else Nothing
+    orElse (Just x) _ = Just x
+    orElse Nothing  y = y
 
 -- | Does the typed expression reference the given (surface) variable name?
 -- Conservative (shadowing ignored -> only ever suppresses the lint, never a
@@ -2642,6 +2767,9 @@ texpMentions name = goE
       Ty.TCase e alts      -> goE e || any goA alts
       Ty.THandle e arms    -> goE e || any goArm arms
       Ty.TWithNamedH _ arms e -> any goArm arms || goE e
+      Ty.THandlerV _ arms  -> any goArm arms
+      Ty.THandleV h b      -> goE h || goE b
+      Ty.THandleNV _ h b   -> goE h || goE b
     goD (Ty.TLocalDecl _ _ b)   = goE b
     goA (Ty.TAlt _ ds b)        = any goD ds || goE b
     goArm (Ty.TReturnArm _ b)   = goE b
@@ -2684,16 +2812,29 @@ inferHandler mono header headerPos e arms = do
   -- A handler with no arms handles nothing; reject rather than silently
   -- producing an identity handler.
   when (null arms) $ throwError (EmptyHandler headerPos)
+  -- An UNDECLARED header effect must be reported here, at the header, BEFORE
+  -- any arm is classified. Classification resolves an unqualified arm head by
+  -- asking each header effect whether it declares that operation; an effect
+  -- that is not declared at all answers "no" to everything, so a perfectly
+  -- ordinary arm like `ask -> 0` under `with Bogus { ... }` would be blamed as
+  -- a value arm needing `return` -- the header's fault reported against the
+  -- arm. 'inferNamedHandler' already resolves its single effect before
+  -- classifying; this is the headed-ambient path catching up.
+  forM_ header $ \en ->
+    case lookupEffect en env of
+      Nothing -> throwError (MissingEffectDecl headerPos en)
+      Just _  -> pure ()
   -- Classify each arm against the header into an operation arm or a value arm.
   classified <- mapM (classifyArm env header) arms
-  let opArms    = [ (en, op, ps, body, pos) | OpArmC en op ps body pos <- classified ]
-      retArms   = [ (pos, v, body)          | ValArmC v body pos        <- classified ]
-      paramArms = [ (name, initE, pos)      | ParamArmC name initE pos  <- classified ]
+  let opArms    = [ (isO, en, op, ps, body, pos) | OpArmC isO en op ps body pos <- classified ]
+      retArms   = [ (pos, v, body)               | ValArmC v body pos           <- classified ]
+      paramArms = [ (name, initE, pos)           | ParamArmC name initE pos     <- classified ]
   -- At most one `return` arm is allowed; reject a second rather than silently
   -- ignoring it.
   case retArms of
     (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
     _                      -> pure ()
+  rejectDuplicateOpArms opArms
   -- Infer the handled expression under a fresh sub-ambient row so we can see
   -- exactly which effects it performs.
   subAmbient0 <- freshRVar
@@ -2722,24 +2863,24 @@ inferHandler mono header headerPos e arms = do
   -- "exactly these effects" set (so missing arms are coverage errors); without
   -- a header, the distinct effect names mentioned by arm heads.
   let handledEffects = if null header
-                         then Data.List.nub [ en | (en, _, _, _, _) <- opArms ]
+                         then Data.List.nub [ en | (_, en, _, _, _, _) <- opArms ]
                          else header
   -- Coverage: every operation of each handled effect must have an arm.
   forM_ handledEffects $ \en ->
     case lookupEffect en env of
       Nothing -> do
-        let armPos = case opArms of ((_, _, _, _, p) : _) -> Just p; [] -> Nothing
+        let armPos = case opArms of ((_, _, _, _, _, p) : _) -> Just p; [] -> Nothing
         throwError (MissingEffectDecl (maybe armPos Just headerPos) en)
       Just eInfo -> do
         when (isGroundIO en eInfo) $
           throwError (IOEffectNotHandleable headerPos)
         let declaredOps = Map.keys (eiOps eInfo)
-            handledOps  = [ op | (en', op, _, _, _) <- opArms, en' == en ]
+            handledOps  = [ op | (_, en', op, _, _, _) <- opArms, en' == en ]
             missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
         unless (null missing) $ do
           -- Prefer a matching op-arm position; for a header effect with no arm
           -- at all, fall back to the header position.
-          let pos = case [ p | (en', _, _, _, p) <- opArms, en' == en ] of
+          let pos = case [ p | (_, en', _, _, _, p) <- opArms, en' == en ] of
                       (p : _) -> Just p
                       []      -> headerPos
           throwError (HandlerCoverage pos en missing)
@@ -2747,84 +2888,19 @@ inferHandler mono header headerPos e arms = do
   -- types and check its body against the op's RESULT type. Arm bodies run under
   -- the OUTER ambient (the current one), so effects performed inside an arm
   -- (effect translation) flow to the enclosing computation.
-  opArmNodes <- forM opArms $ \(en, op, ps, body, pos) ->
+  -- The arm-typing loop itself is 'inferOpArmNode' -- the SINGLE source shared
+  -- with the named and value paths (review round: it existed three times).
+  -- What stays here is this ambient path's own discipline: resolve the
+  -- effect PER ARM (multi-effect headers) and instantiate its params PER ARM
+  -- (fresh, not shared -- the named/value paths share one substitution
+  -- instead, tying arms to an exposed handle/Handler type).
+  opArmNodes <- forM opArms $ \arm@(_, en, _, _, _, pos) ->
     case lookupEffect en env of
       Nothing -> throwError (MissingEffectDecl (Just pos) en)
-      Just eInfo -> case Map.lookup op (eiOps eInfo) of
-        Nothing -> throwError (UnknownOperation (Just pos) en op)
-        Just opScheme -> do
-          paramSubst <- instantiateParamSubst (eiParams eInfo)
-          -- NOTE: unlike the perform site (the `EProj` op-reference case), this
-          -- handler-arm path deliberately does NOT call `freshenNeverResult`. A
-          -- `Never` result must stay `Never` here so the arm's continuation is
-          -- typed `k : Never -> R` (uncallable -> a non-returning op cannot
-          -- resume) and an auto-resume arm body is forced to `Never`
-          -- (unconstructable). Freshening here would wrongly let an abort op
-          -- resume. Bottom elimination belongs only at the perform site.
-          let opTy = substCTypeWith paramSubst (schemeBody opScheme)
-          -- The op's arity is the count of leading arrows of its (param-
-          -- substituted) type; a value op (e.g. `ask : U64`) has arity 0.
-          arity <- arrowArity opTy
-          -- Split the arm's patterns into the op's argument patterns (the first
-          -- `arity`) and an optional trailing continuation binder. An arm with
-          -- exactly `arity` patterns auto-resumes (today's behaviour); one with
-          -- `arity + 1` patterns binds the continuation as its last pattern.
-          let (argPs, binderPs) = splitAt arity ps
-          -- Peel the op's argument types onto the arm's argument patterns.
-          patResults <- mapM inferAtomPat argPs
-          let pTys  = map (\(t, _, _) -> t) patResults
-              binds = concatMap (\(_, b, _) -> b) patResults
-              argPatNodes = map (\(_, _, n) -> n) patResults
-              mono1 = foldr (\(n, t) m -> Map.insert n t m) monoP binds
-          mResult <- peelArrowsWithArgUnify opTy pTys
-          resultTy <- case mResult of
-            Just r  -> pure r
-            Nothing -> throwError (UnknownOperation (Just pos) en op)
-          -- The resume binder's continuation type (see 'resumeContTyFor'),
-          -- threaded onto every arm shape so the elaborator types it as the
-          -- always-boxed arrow it is, not the answer type R.
-          resumeContTy <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
-          case binderPs of
-            [] -> do
-              -- AUTO-RESUME: no continuation binder. The arm body has the op's
-              -- RESULT type and is implicitly resumed with it (today's behaviour).
-              -- The empty resume name signals the auto-wrap path to the elaborator.
-              (bodyT, bodyNode) <- inferExprW mono1 body
-              unify (Just pos) bodyT resultTy
-              pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
-            [Abs.APWild] -> do
-              -- WILDCARD DISCARD: explicit intentional discard; body has the
-              -- answer type R; bind nothing; never lint. Resume-name sentinel
-              -- contract (shared with the elaborator): `Tx.empty` = auto-resume
-              -- (auto-wrap at the op result type); any NON-empty name = control
-              -- path (body is R, no auto-wrap). `"_"` is just a non-empty name
-              -- routing to the control path; binding the surface name `_` is
-              -- harmless because the body never references it.
-              (bodyT, bodyNode) <- inferExprW mono1 body
-              unify (Just pos) bodyT answerT
-              pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
-            [Abs.APVar (Abs.VarId (_, kname))] -> do
-              -- CONTROL: the trailing pattern is the continuation binder `k`, typed
-              -- with the shared 'resumeContTy' (`T -> R`) above so applying it in
-              -- the body flows its effects into the outer ambient. Invoking `k`
-              -- performs its own (internal, non-caller-root) rows; those are
-              -- skipped by the caller-root rule, but any residual with a
-              -- caller-supplied root (e.g. @run g 0@) is still recorded.
-              let mono2 = Map.insert kname resumeContTy mono1
-              (bodyT, bodyNode) <- inferExprW mono2 body
-              unify (Just pos) bodyT answerT
-              -- Forgotten-resume lint: a NAMED binder, unreferenced in the body,
-              -- on a RETURNING op (result /= Never). Wildcard arms (above) are the
-              -- intentional-discard escape hatch and never reach here.
-              resultTy' <- force resultTy
-              let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
-              unless (isNever || texpMentions kname bodyNode) $
-                addWarning (ForgottenResume (Just pos) en op)
-              pure (Ty.TOpArm en op argPatNodes kname resumeContTy bodyNode)
-            _ ->
-              -- More than `arity + 1` patterns, or a non-variable continuation
-              -- binder: not a valid operation arm shape.
-              throwError (MalformedHandlerArm (Just pos) en op)
+      Just eInfo -> do
+        paramSubst <- instantiateParamSubst (eiParams eInfo)
+        inferOpArmNode eInfo paramSubst monoP
+          (fmap (\(_, paramTy, _) -> paramTy) mParam) answerT arm
   -- Discharge the handled effects from the handled expression's row, leaving
   -- the residual effects to flow outward. Any CONCRETE unhandled label still
   -- surfaces via 'emitEffect' as normal; the residual's own bare TAIL is the
@@ -2886,15 +2962,16 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
     throwError (IOEffectNotHandleable (Just epos))
   -- Classify each arm against the single-effect header.
   classified <- mapM (classifyArm env [effName]) arms
-  let opArms    = [ (en, op, ps, b, pos) | OpArmC en op ps b pos <- classified ]
-      retArms   = [ (pos, v, b)          | ValArmC v b pos        <- classified ]
-      paramArms = [ (name, initE, pos)   | ParamArmC name initE pos <- classified ]
+  let opArms    = [ (isO, en, op, ps, b, pos) | OpArmC isO en op ps b pos <- classified ]
+      retArms   = [ (pos, v, b)               | ValArmC v b pos           <- classified ]
+      paramArms = [ (name, initE, pos)        | ParamArmC name initE pos  <- classified ]
   case retArms of
     (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
     _                      -> pure ()
+  rejectDuplicateOpArms opArms
   -- Coverage: every operation of the handled effect must have an arm.
   let declaredOps = Map.keys (eiOps eInfo)
-      handledOps  = [ op | (_, op, _, _, _) <- opArms ]
+      handledOps  = [ op | (_, _, op, _, _, _) <- opArms ]
       missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
   unless (null missing) $
     throwError (HandlerCoverage (Just epos) effName missing)
@@ -2917,46 +2994,13 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
   let monoP = case mParam of
         Just (name, ty, _) -> Map.insert name ty mono
         Nothing            -> mono
-  -- Type each operation arm. Mirrors 'inferHandler', but using the SHARED
-  -- paramSubst (no per-arm re-instantiation) so the op types tie to @handleTy@.
-  opArmNodes <- forM opArms $ \(en, op, ps, b, pos) ->
-    case Map.lookup op (eiOps eInfo) of
-      Nothing -> throwError (UnknownOperation (Just pos) en op)
-      Just opScheme -> do
-        let opTy = substCTypeWith paramSubst (schemeBody opScheme)
-        arity <- arrowArity opTy
-        let (argPs, binderPs) = splitAt arity ps
-        patResults <- mapM inferAtomPat argPs
-        let pTys  = map (\(t, _, _) -> t) patResults
-            binds = concatMap (\(_, bnd, _) -> bnd) patResults
-            argPatNodes = map (\(_, _, n) -> n) patResults
-            mono1 = foldr (\(n, t) m -> Map.insert n t m) monoP binds
-        mResult <- peelArrowsWithArgUnify opTy pTys
-        resultTy <- case mResult of
-          Just r  -> pure r
-          Nothing -> throwError (UnknownOperation (Just pos) en op)
-        -- The resume binder's continuation type (see 'resumeContTyFor'), threaded
-        -- onto every arm shape (same as the ambient-handler path above).
-        resumeContTy <- resumeContTyFor (fmap (\(_, paramTy, _) -> paramTy) mParam) resultTy answerT
-        case binderPs of
-          [] -> do
-            (bodyT, bodyNode) <- inferExprW mono1 b
-            unify (Just pos) bodyT resultTy
-            pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
-          [Abs.APWild] -> do
-            (bodyT, bodyNode) <- inferExprW mono1 b
-            unify (Just pos) bodyT answerT
-            pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
-          [Abs.APVar (Abs.VarId (_, kname))] -> do
-            let mono2 = Map.insert kname resumeContTy mono1
-            (bodyT, bodyNode) <- inferExprW mono2 b
-            unify (Just pos) bodyT answerT
-            resultTy' <- force resultTy
-            let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
-            unless (isNever || texpMentions kname bodyNode) $
-              addWarning (ForgottenResume (Just pos) en op)
-            pure (Ty.TOpArm en op argPatNodes kname resumeContTy bodyNode)
-          _ -> throwError (MalformedHandlerArm (Just pos) en op)
+  -- Type each operation arm via 'inferOpArmNode' (the single shared loop),
+  -- passing the SHARED paramSubst (no per-arm re-instantiation) so the op
+  -- types tie to @handleTy@.
+  opArmNodes <- mapM
+    (inferOpArmNode eInfo paramSubst monoP
+      (fmap (\(_, paramTy, _) -> paramTy) mParam) answerT)
+    opArms
   -- The body sees @self : handleTy@. Ambient effects of the body flow outward
   -- unchanged (we do NOT open a sub-ambient -- named performs never touch it).
   let monoSelf = Map.insert self handleTy monoP
@@ -2975,6 +3019,297 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
       unify Nothing rT answerT
       let retArm = Ty.TReturnArm (Ty.Tpat bodyT (Ty.TPVar v)) rNode
       pure (answerT, Ty.Texp answerT (Ty.TWithNamedH self (paramArmNodes ++ opArmNodes ++ [retArm]) bodyNode))
+
+-- ---------------------------------------------------------------------------
+-- First-class handler values (proto/handler-values)
+-- ---------------------------------------------------------------------------
+
+-- | Type ONE operation arm against a given answer type, with no body coupling.
+-- The SINGLE arm-typing loop, used by all three handler paths ('inferHandler',
+-- 'inferNamedHandler', 'inferHandlerValue'); the caller decides the
+-- substitution discipline -- 'inferHandler' passes a fresh per-arm
+-- @paramSubst@, the named/value paths pass ONE shared instantiation so every
+-- arm's op type ties to the same effect-param metavars the exposed
+-- handle/@Handler@ type carries. @mParamTy@ is the handler-local parameter's
+-- type when present; @answerT@ is the handler's answer type R; @monoP@ already
+-- has the param/self names in scope.
+--
+-- NOTE: unlike the perform site (the `EProj` op-reference case), this
+-- handler-arm path deliberately does NOT call `freshenNeverResult`. A `Never`
+-- result must stay `Never` here so the arm's continuation is typed
+-- `k : Never -> R` (uncallable -> a non-returning op cannot resume) and an
+-- auto-resume arm body is forced to `Never` (unconstructable). Freshening
+-- here would wrongly let an abort op resume. Bottom elimination belongs only
+-- at the perform site.
+inferOpArmNode
+  :: EffectInfo
+  -> Map.Map Int (Type s)
+  -> Map.Map Text (Type s)
+  -> Maybe (Type s)
+  -> Type s
+  -> (Bool, Text, Text, [Abs.AtomPat], Abs.Exp, (Int, Int))
+  -> TC s (Ty.THandlerArm (Type s))
+inferOpArmNode eInfo paramSubst monoP mParamTy answerT (isOnce, en, op, ps, body, pos) =
+  case Map.lookup op (eiOps eInfo) of
+      Nothing -> throwError (UnknownOperation (Just pos) en op)
+      Just opScheme -> do
+        let opTy = substCTypeWith paramSubst (schemeBody opScheme)
+        arity <- arrowArity opTy
+        let got      = length ps
+            expected = if isOnce then arity + 1 else arity
+        unless (got == expected) $
+          throwError (ArmArityMismatch (Just pos) en op isOnce expected got)
+        let (argPs, binderPs) = splitAt arity ps
+        patResults <- mapM inferAtomPat argPs
+        let pTys  = map (\(t, _, _) -> t) patResults
+            binds = concatMap (\(_, b, _) -> b) patResults
+            argPatNodes = map (\(_, _, n) -> n) patResults
+            mono1 = foldr (\(n, t) m -> Map.insert n t m) monoP binds
+        mResult <- peelArrowsWithArgUnify opTy pTys
+        resultTy <- case mResult of
+          Just r  -> pure r
+          Nothing -> throwError (UnknownOperation (Just pos) en op)
+        resumeContTy <- resumeContTyFor mParamTy resultTy answerT
+        case binderPs of
+          [] -> do
+            (bodyT, bodyNode) <- inferExprW mono1 body
+            unify (Just pos) bodyT resultTy
+            pure (Ty.TOpArm en op argPatNodes Tx.empty resumeContTy bodyNode)
+          [Abs.APWild] -> do
+            (bodyT, bodyNode) <- inferExprW mono1 body
+            unify (Just pos) bodyT answerT
+            pure (Ty.TOpArm en op argPatNodes (Tx.pack "_") resumeContTy bodyNode)
+          [Abs.APVar (Abs.VarId (_, kname))] -> do
+            case shadowsName kname body of
+              Just spos -> throwError (ContinuationShadowed (Just spos) kname)
+              Nothing   -> pure ()
+            let mono2 = Map.insert kname resumeContTy mono1
+            (bodyT, bodyNode) <- inferExprW mono2 body
+            unify (Just pos) bodyT answerT
+            resultTy' <- force resultTy
+            let isNever = case resultTy' of TCon TcNever [] -> True; _ -> False
+            unless (isNever || texpMentions kname bodyNode) $
+              addWarning (ForgottenResume (Just pos) en op)
+            pure (Ty.TOpArm en op argPatNodes kname resumeContTy bodyNode)
+          _ -> throwError (MalformedHandlerArm (Just pos) en op)
+
+-- | Infer a first-class handler VALUE @handler E { arms }@. No body: the arms
+-- are typed against fresh input (@a@) and answer (@b@) types, and the result is
+-- @Handler (E params) a b@ = @TCon (TcHandler E) (params ++ [a, b])@. The
+-- effect's params are instantiated ONCE and shared by every arm (the
+-- 'inferNamedHandler' discipline), then EXPOSED in the handler's type so the
+-- install site can tie the body's performs to this handler's instantiation --
+-- without the exposure, @handle (state "s") in State.get + 1@ would typecheck.
+-- The input @a@ is what a later @handle@'s body must produce; @b@ is what
+-- installing it yields. Unlike 'inferHandler' there is no sub-ambient row and
+-- no effect discharge -- those happen at the install site ('inferHandleValue').
+inferHandlerValue
+  :: Map.Map Text (Type s) -> Abs.ConId -> [Abs.HandlerArm] -> TC s (Type s, TExprS s)
+inferHandlerValue mono (Abs.ConId (epos, effName)) arms = do
+  env <- currentEnv
+  when (null arms) $ throwError (EmptyHandler (Just epos))
+  eInfo <- case lookupEffect effName env of
+    Nothing -> throwError (MissingEffectDecl (Just epos) effName)
+    Just i  -> pure i
+  when (isGroundIO effName eInfo) $
+    throwError (IOEffectNotHandleable (Just epos))
+  classified <- mapM (classifyArm env [effName]) arms
+  let opArms  = [ (isO, en, op, ps, b, pos) | OpArmC isO en op ps b pos <- classified ]
+      retArms = [ (pos, v, b)               | ValArmC v b pos           <- classified ]
+      paramArms = [ (name, initE, pos)      | ParamArmC name initE pos  <- classified ]
+  case retArms of
+    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
+    _                      -> pure ()
+  rejectDuplicateOpArms opArms
+  -- Coverage: every operation of the effect must have an arm. A handler value
+  -- missing an op would otherwise be caught only at runtime dispatch; the
+  -- fused install forms all enforce this statically, so the value form must too.
+  let declaredOps = Map.keys (eiOps eInfo)
+      handledOps  = [ op | (_, _, op, _, _, _) <- opArms ]
+      missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
+  unless (null missing) $
+    throwError (HandlerCoverage (Just epos) effName missing)
+  -- Handler-local parameter `var name = init` (the baton). Typed exactly as
+  -- the fused forms type it: `name` at a fresh sigma, `init : sigma` checked
+  -- under the CONSTRUCTION scope `mono` (the init does not see the param).
+  -- Seeding semantics for a VALUE: the init is EVALUATED AT CONSTRUCTION --
+  -- typing charges the init's effects to the construction site, so this is the
+  -- type-consistent choice -- and each install starts a fresh activation from
+  -- that captured seed (accept/09 per-install independence).
+  mParam <- case paramArms of
+    []                 -> pure Nothing
+    [(name, initE, _)] -> do
+      paramTy <- freshTVar KStar
+      (initT, initNode) <- inferExprW mono initE
+      unify Nothing initT paramTy
+      pure (Just (name, paramTy, initNode))
+    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
+  let monoP = case mParam of
+        Just (name, ty, _) -> Map.insert name ty mono
+        Nothing            -> mono
+      mParamTy = fmap (\(_, ty, _) -> ty) mParam
+  -- ONE shared parameter substitution across every arm AND the exposed type.
+  paramSubst <- instantiateParamSubst (eiParams eInfo)
+  let handlerParams = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
+                      | (i, _) <- eiParams eInfo ]
+  answerT <- freshTVar KStar   -- b: the output answer
+  inputT  <- freshTVar KStar   -- a: the value the handled body produces
+  opArmNodes <- mapM (inferOpArmNode eInfo paramSubst monoP mParamTy answerT) opArms
+  retArmNodes <- case retArms of
+    [] -> do
+      -- No value arm: return clause is the identity, so a = b.
+      unify (Just epos) inputT answerT
+      pure []
+    ((_, v, rb) : _) -> do
+      let mono' = Map.insert v inputT monoP
+      (rT, rNode) <- inferExprW mono' rb
+      unify (Just epos) rT answerT
+      pure [Ty.TReturnArm (Ty.Tpat inputT (Ty.TPVar v)) rNode]
+  let paramArmNodes = case mParam of
+        Just (name, _, initNode) -> [Ty.TParamArm name initNode]
+        Nothing                  -> []
+      hTy = TCon (TcHandler effName) (handlerParams ++ [inputT, answerT])
+  pure (hTy, Ty.Texp hTy (Ty.THandlerV effName (paramArmNodes ++ opArmNodes ++ retArmNodes)))
+
+-- | Infer @handle h in body@: install a first-class handler value. @h@ must
+-- have type @Handler E a b@; the body is typed under a fresh sub-ambient,
+-- constrained to produce @a@ and to perform @E@ (discharged here), and the
+-- whole expression has type @b@. Mirrors 'inferHandler''s discharge, taking the
+-- effect and answer types from @h@'s type instead of from arms.
+inferHandleValue
+  :: Map.Map Text (Type s) -> Abs.Exp -> Abs.Exp -> TC s (Type s, TExprS s)
+inferHandleValue mono hExpr body = do
+  -- The handler expression is inferred FIRST (source order). When its type is
+  -- already a concrete @Handler E ...@ -- every direct install of a runner
+  -- application, e.g. @handle (state 0) in ...@ -- the handled effect is read
+  -- off the TYPE, and the body may perform any number of OTHER effects; they
+  -- flow out as residual exactly as with the fused forms. Only a POLYMORPHIC
+  -- @h@ (@run f = handle f in E.ask@) falls back to reading the effect off the
+  -- body's row, which still demands exactly one performed effect -- we UNIFY
+  -- @f@ to a handler type, we do not inspect it.
+  (hTy, hNode) <- inferExprW mono hExpr
+  subAmbient0 <- freshRVar
+  subRef <- liftST (newSTRef subAmbient0)
+  (bodyT, bodyNode) <- withEffRow subRef (inferExprW mono body)
+  subRow <- liftST (readSTRef subRef)
+  hTy' <- force hTy
+  en <- case hTy' of
+    TCon (TcHandler e) _ -> pure e
+    _ -> do
+      labels <- concreteRowLabels subRow
+      case labels of
+        [l] -> pure l
+        []  -> throwError (UnsupportedFeature Nothing
+                 (Tx.pack "handle: cannot determine the handled effect (the \
+                          \handler is polymorphic and the body performs no \
+                          \effect)"))
+        _   -> throwError (UnsupportedFeature Nothing
+                 (Tx.pack "handle: cannot determine the handled effect (the \
+                          \handler is polymorphic and the body performs more \
+                          \than one effect)"))
+  -- The handler value must be @Handler (E params) a b@ with @a@ = the body's
+  -- result and @b@ a fresh answer. Unify (do not match) so a polymorphic @h@ is
+  -- solved. The effect's params are instantiated fresh here and tied BOTH ways:
+  -- to the handler value's exposed params (via the 'unify' below) and to the
+  -- payload each of the body's performs carried into the row (via
+  -- 'effectPayloadTy' against the row payloads). Without the payload tie,
+  -- discharging would drop the payload unforced and a mistyped handler
+  -- (@handle (state "s") in State.get + 1@) would slip through.
+  env <- currentEnv
+  eInfo <- case lookupEffect en env of
+    Nothing -> throwError (MissingEffectDecl Nothing en)
+    Just i  -> pure i
+  paramSubst <- instantiateParamSubst (eiParams eInfo)
+  let handlerParams = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
+                      | (i, _) <- eiParams eInfo ]
+      payloadTy = effectPayloadTy (eiParams eInfo) paramSubst
+  payloads <- rowPayloadsFor en subRow
+  mapM_ (unify Nothing payloadTy) payloads
+  answerT <- freshTVar KStar
+  unify Nothing hTy (TCon (TcHandler en) (handlerParams ++ [bodyT, answerT]))
+  residual <- dischargeEffects subRow [en]
+  emitRow Nothing residual
+  pure (answerT, Ty.Texp answerT (Ty.THandleV hNode bodyNode))
+
+-- | Rebuild the plain application an install form's HEAD + ATOM ARGS sugar
+-- denotes (shared by 'EHandleV'/'EHandleN'; the same fold 'EWithRun' uses).
+rebuildWithArgs :: Abs.Exp -> [Abs.WithArg] -> Abs.Exp
+rebuildWithArgs = foldl (\acc (Abs.WRArg e) -> Abs.EApp acc e)
+
+-- | Infer a NAMED install @handle name = h in body@ (item-4 D5): like
+-- 'inferHandleValue', but the activation is introduced as a named instance --
+-- @name@ is bound to the effect's instance-handle type in the body's scope,
+-- and @name.op@ performs on exactly this activation ('inferProjection's named
+-- perform, 'TPerformOn'). Mirrors 'inferNamedHandler's typing discipline:
+--
+--   * the handle type and the handler's exposed params share ONE
+--     instantiation, so @name.op@ ties to the same effect params the handler
+--     value carries;
+--   * NO ambient-row discharge -- named performs never reach the ambient row,
+--     and the body is inferred under the CURRENT ambient, so its OTHER
+--     (ambient) effects flow outward normally.
+--
+-- The handler's effect must be readable off its TYPE: a named instance needs
+-- the effect statically (the dot dispatch is type-directed), so a polymorphic
+-- @h@ is rejected rather than guessed from the body.
+inferHandleNamedValue
+  :: Map.Map Text (Type s) -> Abs.VarId -> Abs.Exp -> Abs.Exp -> TC s (Type s, TExprS s)
+inferHandleNamedValue mono (Abs.VarId (npos, self)) hExpr body = do
+  (hTy, hNode) <- inferExprW mono hExpr
+  hTy' <- force hTy
+  en <- case hTy' of
+    TCon (TcHandler e) _ -> pure e
+    _ -> throwError (UnsupportedFeature (Just npos)
+           (Tx.pack "handle " <> self <> Tx.pack " = ...: the handler's effect \
+                    \must be statically known (a concrete Handler type); a \
+                    \polymorphic handler cannot introduce a named instance"))
+  env <- currentEnv
+  eInfo <- case lookupEffect en env of
+    Nothing -> throwError (MissingEffectDecl (Just npos) en)
+    Just i  -> pure i
+  paramSubst <- instantiateParamSubst (eiParams eInfo)
+  let handlerParams = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
+                      | (i, _) <- eiParams eInfo ]
+      handleTy = TCon (TcEffect en) handlerParams
+  inputT  <- freshTVar KStar
+  answerT <- freshTVar KStar
+  unify Nothing hTy (TCon (TcHandler en) (handlerParams ++ [inputT, answerT]))
+  let mono' = Map.insert self handleTy mono
+  (bodyT, bodyNode) <- inferExprW mono' body
+  unify Nothing bodyT inputT
+  pure (answerT, Ty.Texp answerT (Ty.THandleNV self hNode bodyNode))
+
+-- | Reject a handler declaring two arms for one operation. Runtime dispatch
+-- first-matches ('lookupOpArm'), so a later duplicate arm would be silent
+-- dead code -- the dual of the coverage check. Shared by all three handler
+-- paths (ambient, named, value).
+rejectDuplicateOpArms
+  :: [(Bool, Text, Text, [Abs.AtomPat], Abs.Exp, (Int, Int))] -> TC s ()
+rejectDuplicateOpArms = go Set.empty
+  where
+    go _ [] = pure ()
+    go seen ((_, en, op, _, _, pos) : rest)
+      | (en, op) `Set.member` seen = throwError (DuplicateOpArm (Just pos) en op)
+      | otherwise                  = go (Set.insert (en, op) seen) rest
+
+-- | The concrete (named) effect labels of a row, ignoring its open tail.
+concreteRowLabels :: Row s -> TC s [Text]
+concreteRowLabels row = do
+  row' <- force row
+  case row' of
+    RowExtend l _ rest -> (l :) <$> concreteRowLabels rest
+    _                  -> pure []
+
+-- | The payload types carried by every occurrence of the given label in a row
+-- (ignoring the open tail). Companion to 'concreteRowLabels'.
+rowPayloadsFor :: Text -> Row s -> TC s [Type s]
+rowPayloadsFor label row = do
+  row' <- force row
+  case row' of
+    RowExtend l t rest
+      | l == label -> (t :) <$> rowPayloadsFor label rest
+      | otherwise  -> rowPayloadsFor label rest
+    _              -> pure []
 
 -- | Remove the given effect labels from a row (each label dropped once per
 -- occurrence is unnecessary in v1 -- effects are not duplicated by inference --
@@ -4445,6 +4780,17 @@ prettyCType (CTCon (TcEffect n) xs0) =
   case filter (/= CREmpty) xs0 of
     []  -> n
     xs  -> Tx.concat [n, Tx.pack " ", Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]
+-- @Handler (E params) a b@: the trailing two args are input/answer; anything
+-- before them is the effect's own parameter list, rendered as an effect
+-- application. (An under-applied TcHandler cannot be written or inferred, so
+-- the fallback 'show' arm below covers any malformed remainder.)
+prettyCType (CTCon (TcHandler n) xs) | length xs >= 2 =
+  let (ps, io) = splitAt (length xs - 2) xs
+      effTxt = case ps of
+        [] -> n
+        _  -> Tx.concat [Tx.pack "(", n, Tx.pack " ",
+                         Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom ps), Tx.pack ")"]
+  in Tx.concat (Tx.pack "Handler " : effTxt : concat [ [Tx.pack " ", prettyCTypeAtom t] | t <- io ])
 prettyCType (CTCon c xs) =
   Tx.concat [Tx.pack (show c), Tx.pack " ",
              Tx.intercalate (Tx.pack " ") (map prettyCTypeAtom xs)]

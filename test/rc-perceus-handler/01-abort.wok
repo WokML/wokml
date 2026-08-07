@@ -18,6 +18,6 @@ risky b = if b then Fail.fail "boom" else 7
 
 main : Outcome
 main =
-  with { Fail.fail msg k -> Failed msg
-         ; v -> Got v }
+  with { once Fail.fail msg k -> Failed msg
+         ; return v -> Got v }
   risky True

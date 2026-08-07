@@ -170,6 +170,7 @@ escapingAtomsRhs (RApp (AVar h) _)
   | nameHint h == dupHint || nameHint h == dropHint = []
 escapingAtomsRhs (RApp _ as)      = as                          -- head EXEMPT
 escapingAtomsRhs (RCon _ as)      = as
+escapingAtomsRhs (RMakeHandler _) = []   -- proto/handler-values: RC escape of a handler value not modeled (off --run path)
 escapingAtomsRhs (RRecord _ flds) = map snd flds
 escapingAtomsRhs (RProj _ a)      = [a]
 -- The FBIP reuse form ('RReuseCon tok c fields') is introduced by a post-pass
@@ -228,6 +229,7 @@ nonHeadOccs g (Case a alts)        =
 nonHeadOccs g (LetJoin _ _ jb e)   = nonHeadOccs g jb `Set.union` nonHeadOccs g e
 nonHeadOccs _ (Jump _ as)          = Set.unions (map atomVars as)
 nonHeadOccs g (Handle e _)         = nonHeadOccs g e
+nonHeadOccs g (InstallHandler _ _ e) = nonHeadOccs g e
 
 nonHeadOccsAlt :: Set Unique -> Alt -> Set Unique
 nonHeadOccsAlt g (AltCon _ _ e) = nonHeadOccs g e
@@ -270,6 +272,7 @@ dropTargets = goE
     -- which DOES run linearly. This matches 'escapeWalk'/'nonHeadOccs', which also stop
     -- at handler arms.
     goE (Handle e _)          = goE e
+    goE (InstallHandler _ _ e)  = goE e
 
     goAlt (AltCon _ _ e) = goE e
     goAlt (AltLit _ e)   = goE e
@@ -468,6 +471,7 @@ escapeWalkLetRec scrutEscapes0 letRecCaptureEscapes step = goE scrutEscapes0
         Case a alts         -> (scrutEscapes && hit a) || any (goAlt scrutEscapes tracked) alts
         LetJoin _ _ jb body -> goE scrutEscapes tracked jb || goE scrutEscapes tracked body
         Handle e' _         -> goE scrutEscapes tracked e'
+        InstallHandler _ _ e' -> goE scrutEscapes tracked e'
     goAlt scrutEscapes tracked (AltCon _ _ e) = goE scrutEscapes tracked e
     goAlt scrutEscapes tracked (AltLit _ e)   = goE scrutEscapes tracked e
     goAlt scrutEscapes tracked (AltDefault e) = goE scrutEscapes tracked e
@@ -596,6 +600,7 @@ consumingOccs caps = goE
     goE (LetJoin _ _ jb e)   = goE jb `Set.union` goE e
     goE (Jump _ as)          = Set.unions (map watched as)
     goE (Handle e _)         = goE e
+    goE (InstallHandler _ _ e) = goE e
 
     goAlt (AltCon _ _ e) = goE e
     goAlt (AltLit _ e)   = goE e
@@ -619,6 +624,7 @@ consumingOccs caps = goE
     -- an RProj parent as an admissible return-value escape, so a member that projects a
     -- capture stays rejected. Do NOT relax this to a borrow without re-proving #1 sound.
     goR (RProj _ a)      = watched a
+    goR (RMakeHandler _) = Set.empty   -- proto/handler-values: off --run path
     -- 'consumingOccs' (unlike 'escapingAtomsRhs') is on the COMPILE-TIME boundary
     -- guard path ONLY ('Wok.IR.Reachable.firstOrderNoHandlerViolations' ->
     -- 'letRecMemberConsumesCaptureNonEscaping'), which runs on RAW pre-Perceus IR
@@ -842,6 +848,7 @@ m2bResumeEscapesWalk exemptStore resume = go
       LetJoin _ _ jb body -> go jb || go body
       Handle e' h         ->
         go e' || go (snd (hReturn h)) || any (go . oaBody) (hOps h)
+      InstallHandler _ _ e' -> go e'
     goAlt (AltCon _ _ e) = go e
     goAlt (AltLit _ e)   = go e
     goAlt (AltDefault e) = go e
@@ -1009,6 +1016,7 @@ storeCalls resume = go Set.empty
         go fresh e'
           ++ go Set.empty (snd (hReturn h))
           ++ concatMap (go Set.empty . oaBody) (hOps h)
+      InstallHandler _ _ e' -> go fresh e'
     goAlt fresh (AltCon _ _ e) = go fresh e
     goAlt fresh (AltLit _ e)   = go fresh e
     goAlt fresh (AltDefault e) = go fresh e

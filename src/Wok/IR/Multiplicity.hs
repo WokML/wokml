@@ -116,6 +116,12 @@ cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
       Handle e' h ->
         addC (go env e')
              (if occursHandlerArms r h then Many else Zero)
+      -- proto/handler-values: the installed handler's arms were charged when
+      -- the value was BUILT (RMakeHandler in cardRhs); here only the body and a
+      -- possible mention of the continuation in the handler-value atom count.
+      InstallHandler a _ body
+        | mentionsAtom r a -> Many
+        | otherwise        -> go env body
 
     goAlt env (AltCon _ _ b) = go env b
     goAlt env (AltLit _ b)   = go env b
@@ -174,6 +180,9 @@ cardOfWithTrust onceSinks trustMap seedEnv r = go seedEnv
                             then Many else Zero
       RRecord _ flds   -> if any (mentionsAtom r . snd) flds then Many else Zero
       RProj _ a        -> if mentionsAtom r a then Many else Zero
+      -- proto/handler-values: building a handler value captures its arms; if any
+      -- arm mentions the continuation, that is an escape (Many). Conservative.
+      RMakeHandler h   -> if occursHandlerArms r h then Many else Zero
       -- The FBIP reuse form is introduced by a post-pass that runs AFTER
       -- multiplicity analysis; it never reaches this pass.
       RReuseCon{}      -> error "RReuseCon: produced only by reusePairing post-pass (after multiplicity analysis)"
@@ -191,6 +200,7 @@ occursExpr r e = case e of
   LetJoin _ _ jb b -> occursExpr r jb || occursExpr r b
   Jump _ as        -> mentionsAny r as
   Handle e' h      -> occursExpr r e' || occursHandlerArms r h
+  InstallHandler a _ b -> mentionsAtom r a || occursExpr r b
 
 occursRhs :: Name -> Rhs -> Bool
 occursRhs r rhs = case rhs of
@@ -201,6 +211,7 @@ occursRhs r rhs = case rhs of
   ROp minst _ _ as -> maybe False (mentionsAtom r) minst || mentionsAny r as
   RRecord _ flds   -> any (mentionsAtom r . snd) flds
   RProj _ a        -> mentionsAtom r a
+  RMakeHandler h   -> occursHandlerArms r h
   RReuseCon{}              -> error "RReuseCon: produced only by reusePairing post-pass (after multiplicity analysis)"
   RForeignCall _ _ _ _ _ as -> mentionsAny r as
 
@@ -235,9 +246,17 @@ opArmsInExpr e = case e of
   LetJoin _ _ jb b -> opArmsInExpr jb ++ opArmsInExpr b
   Jump _ _         -> []
   Handle e' h      -> opArmsInExpr e' ++ opArmsInHandler h
+  -- proto/handler-values: the installed value's arms are collected at the
+  -- RMakeHandler that built it; here only the body contributes.
+  InstallHandler _ _ b -> opArmsInExpr b
 
 opArmsInRhs :: Rhs -> [(Maybe JoinId, OpArm)]
 opArmsInRhs (RLam _ b) = opArmsInExpr b
+-- proto/handler-values: a handler VALUE carries op arms whose continuations
+-- must be one-shot-checked exactly like an inline handler's. The catch-all
+-- below would silently drop them, so this case is mandatory (not just for
+-- -Werror, which the catch-all satisfies).
+opArmsInRhs (RMakeHandler h) = opArmsInHandler h
 opArmsInRhs _          = []
 
 opArmsInAlt :: Alt -> [(Maybe JoinId, OpArm)]

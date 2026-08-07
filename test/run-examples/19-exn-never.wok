@@ -8,6 +8,6 @@ risky b = if b then Exn.throw "boom" else 7
 
 main : U64
 main =
-  with { Exn.throw msg k -> 0
-         ; v -> v }
+  with { once Exn.throw msg k -> 0
+         ; return v -> v }
   risky True

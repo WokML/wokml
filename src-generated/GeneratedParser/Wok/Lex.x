@@ -183,37 +183,37 @@ eitherResIdent tv s = treeFind resWords
 -- | The keywords and symbols of the language organized as binary search tree.
 resWords :: BTree
 resWords =
-  b "forall" 30
-    (b "_" 15
+  b "free" 31
+    (b "`" 16
        (b "::" 8
           (b "->" 4
              (b ")" 2 (b "(" 1 N N) (b "," 3 N N))
              (b ".." 6 (b "." 5 N N) (b ":" 7 N N)))
           (b "[" 12
              (b "=" 10 (b ";" 9 N N) (b "=>" 11 N N))
-             (b "]" 14 (b "\\" 13 N N) N)))
-       (b "deriving" 23
-          (b "class" 19
-             (b "as" 17 (b "`" 16 N N) (b "case" 18 N N))
-             (b "ctl" 21 (b "contract" 20 N N) (b "data" 22 N N)))
-          (b "else" 27
-             (b "eff" 25 (b "do" 24 N N) (b "effect" 26 N N))
-             (b "fixity" 29 (b "extern" 28 N N) N))))
-    (b "record" 45
-       (b "left" 38
-          (b "if" 34
-             (b "free" 32 (b "foreign" 31 N N) (b "fun" 33 N N))
-             (b "in" 36 (b "import" 35 N N) (b "instance" 37 N N)))
-          (b "module" 42
-             (b "local" 40 (b "let" 39 N N) (b "looser" 41 N N))
-             (b "owned" 44 (b "of" 43 N N) N)))
-       (b "use" 52
-          (b "then" 49
-             (b "row" 47 (b "right" 46 N N) (b "than" 48 N N))
-             (b "type" 51 (b "tighter" 50 N N) N))
-          (b "{" 56
-             (b "where" 54 (b "var" 53 N N) (b "with" 55 N N))
-             (b "}" 58 (b "|" 57 N N) N))))
+             (b "]" 14 (b "\\" 13 N N) (b "_" 15 N N))))
+       (b "eff" 24
+          (b "contract" 20
+             (b "case" 18 (b "as" 17 N N) (b "class" 19 N N))
+             (b "deriving" 22 (b "data" 21 N N) (b "do" 23 N N)))
+          (b "fixity" 28
+             (b "else" 26 (b "effect" 25 N N) (b "extern" 27 N N))
+             (b "foreign" 30 (b "forall" 29 N N) N))))
+    (b "record" 47
+       (b "left" 39
+          (b "if" 35
+             (b "handle" 33 (b "fun" 32 N N) (b "handler" 34 N N))
+             (b "in" 37 (b "import" 36 N N) (b "instance" 38 N N)))
+          (b "module" 43
+             (b "local" 41 (b "let" 40 N N) (b "looser" 42 N N))
+             (b "once" 45 (b "of" 44 N N) (b "owned" 46 N N))))
+       (b "use" 55
+          (b "than" 51
+             (b "right" 49 (b "return" 48 N N) (b "row" 50 N N))
+             (b "tighter" 53 (b "then" 52 N N) (b "type" 54 N N)))
+          (b "{" 59
+             (b "where" 57 (b "var" 56 N N) (b "with" 58 N N))
+             (b "}" 61 (b "|" 60 N N) N))))
   where
   b s n = B bs (TS bs n)
     where

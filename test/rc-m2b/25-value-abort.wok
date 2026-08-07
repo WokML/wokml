@@ -17,7 +17,7 @@ prog e = e.throw 5
 
 main : Option U64
 main =
-  let r = (with self = Exn { throw n k -> None ; v -> Some v } in prog self) in
+  let r = (with self = Exn { once throw n k -> None ; return v -> Some v } in prog self) in
   case r of
     None    -> None
     Some v  -> Some (v + 1)

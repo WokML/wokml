@@ -15,5 +15,5 @@ both : () -> () with IO + State U64
 handleDemo comp =
   with { IO.read p -> readDisk p
        ; IO.write m -> printStdout m
-       ; v -> v }
+       ; return v -> v }
   comp ()

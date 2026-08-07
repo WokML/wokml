@@ -230,6 +230,13 @@ directlyEscapes carriers e@(Texp ty node) = case node of
   -- A partial application capturing a handle: its (per-node) result type is an
   -- arrow, so it is an uncalled closure, and it references an in-scope handle.
   TApp _ _ -> capturesHandleClosure carriers ty e
+  -- A handler VALUE whose arms capture a handle is a closure over that handle
+  -- in everything but syntax: it can be returned/stored and INSTALLED after
+  -- the handle's activation is gone, and its arm then performs on a dead
+  -- instance (observed: NoMatchingHandler at runtime where the byte-identical
+  -- lambda is rejected statically). Same rule as TLam, over the arms' frees.
+  THandlerV _eff arms ->
+    not (Set.null (Set.intersection (Set.unions (map freeVarsArm arms)) carriers))
   _ -> False
 
 -- | Is this node a handle-capturing closure VALUE — i.e. a partial application
@@ -350,6 +357,18 @@ recurse ctx env node = case node of
     let env' = env { envCarriers = Set.insert self (envCarriers env)
                    , envLocals   = Set.insert self (envLocals env) }
     in mapM_ (checkArm ctx env') arms >> check ctx env' False body
+
+  -- proto/handler-values. A handler VALUE is first-class data (not a carrier),
+  -- so `handle h in body` treats `h` as an ordinary expression; both the value
+  -- and the body are checked, and the value's arms are checked when built.
+  THandlerV _eff arms -> mapM_ (checkArm ctx env) arms
+  THandleV hExpr body -> go False hExpr >> go False body
+  -- Named install: like THandleV for the handler value, PLUS the role label is
+  -- an instance handle in the body's scope (the TWithNamedH self discipline).
+  THandleNV self hExpr body ->
+    let env' = env { envCarriers = Set.insert self (envCarriers env)
+                   , envLocals   = Set.insert self (envLocals env) }
+    in go False hExpr >> check ctx env' False body
   where
     ok     = Right ()
     go a e = check ctx env a e
@@ -577,6 +596,10 @@ freeVars (Texp _ node) = case node of
   TWithNamedH self arms body ->
     let inner = Set.union (freeVars body) (Set.unions (map freeVarsArm arms))
     in Set.delete self inner
+  THandlerV _eff arms -> Set.unions (map freeVarsArm arms)
+  THandleV hExpr body -> Set.union (freeVars hExpr) (freeVars body)
+  THandleNV self hExpr body ->
+    Set.union (freeVars hExpr) (Set.delete self (freeVars body))
 
 freeVarsAlt :: TAlt CType -> Set Text
 freeVarsAlt (TAlt pat decls body) =
@@ -733,6 +756,12 @@ walk carrierTys trust sp name (Texp _ node) = case node of
 
   TWithNamedH _ arms body ->
     mapM_ walkArm arms >> walk carrierTys trust sp name body
+
+  THandlerV _eff arms -> mapM_ walkArm arms
+  THandleV hExpr body ->
+    walk carrierTys trust sp name hExpr >> walk carrierTys trust sp name body
+  THandleNV _ hExpr body ->
+    walk carrierTys trust sp name hExpr >> walk carrierTys trust sp name body
   where
     ok = Right ()
     checkBinder scope fut
@@ -850,6 +879,13 @@ consumeCard trust s = go (Set.singleton s) Set.empty
 
       TWithNamedH _ arms body ->
         addC (foldr (addC . armCard aliases locals) Zero arms) (go aliases locals body)
+
+      THandlerV _eff arms ->
+        foldr (addC . armCard aliases locals) Zero arms
+      THandleV hExpr body ->
+        addC (go aliases locals hExpr) (go aliases locals body)
+      THandleNV _ hExpr body ->
+        addC (go aliases locals hExpr) (go aliases locals body)
 
     -- An application @h a1 .. an@. Each argument that is a bare reference to an
     -- alias of the future is a CONSUMPTION (One) — UNLESS the callee is the

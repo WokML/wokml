@@ -17,8 +17,8 @@ producer u =
 
 drive : () -> U64
 drive u =
-  with Tick { tick k -> k 1 }
-    (with Log { emit n k -> k () }
+  with Tick { once tick k -> k 1 }
+    (with Log { once emit n k -> k () }
       (case start producer of
          Completed r   -> r
          Suspended _ g -> run g 5))

@@ -8,5 +8,5 @@ useTick u = Tick.tick 41
 
 main : U64
 main =
-  with { Tick.tick x k -> k (x + 1) }
+  with { once Tick.tick x k -> k (x + 1) }
   useTick ()

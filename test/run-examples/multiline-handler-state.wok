@@ -7,8 +7,8 @@ runState : s -> (() -> a with State s + eff e) -> (a, s) with eff e
 runState i c = with State {
     var s = i
     get -> s
-    set x k -> k x ()
-    v -> (v, s)
+    once set x k -> k x ()
+    return v -> (v, s)
   } c ()
 
 prog : () -> U64 with State U64

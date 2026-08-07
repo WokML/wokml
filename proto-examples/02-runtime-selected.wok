@@ -1,0 +1,13 @@
+module Main
+import Std.Base
+
+effect E = { ask : U64 }
+
+run f = handle f in E.ask
+
+pick b = case b of
+  True  -> handler E { ask -> 100 ; return v -> v }
+  False -> handler E { ask -> 200 ; return v -> v }
+
+main : U64
+main = run (pick False)

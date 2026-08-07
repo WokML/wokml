@@ -13,7 +13,7 @@ usePark u = Park.park 7
 main : U64
 main =
   let cell = __cont_cell_new () in
-  with { Park.park x k -> case x of
+  with { once Park.park x k -> case x of
            0 -> let a = __cont_store cell k in 0
            _ -> let b = __cont_store cell k in 1 }
   usePark ()

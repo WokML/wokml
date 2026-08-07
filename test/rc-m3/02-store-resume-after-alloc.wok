@@ -22,7 +22,7 @@ import Control
 effect Env = { envAsk : U64 }
 
 envReader : U64 -> (Env -> a with Env + eff e) -> a with eff e
-envReader n c = with self = Env { envAsk k ->
+envReader n c = with self = Env { once envAsk k ->
   let cell = __cont_cell_new () in
   let filled = __cont_store cell k in
   let k2 = __cont_take filled in

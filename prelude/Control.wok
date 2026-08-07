@@ -7,15 +7,15 @@ reader e c = with self = Reader { ask -> e } in c self
 
 effect State s = { get : s, set : s -> () }
 state : s -> (State s -> a with State s + eff e) -> (a, s) with eff e
-state i c = with self = State { var s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
+state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in c self
 
 effect Writer w = { tell : w -> () }
 writer : (Writer [w] -> a with Writer [w] + eff e) -> (a, [w]) with eff e
-writer c = with self = Writer { var log = [] ; tell w k -> k (log ++ w) () ; v -> (v, log) } in c self
+writer c = with self = Writer { var log = [] ; once tell w k -> k (log ++ w) () ; return v -> (v, log) } in c self
 
 effect Except e = { throw : e -> Never }
 except : (Except e -> a with Except e + eff r) -> Result a e with eff r
-except c = with self = Except { throw e k -> Err e ; v -> Ok v } in c self
+except c = with self = Except { once throw e k -> Err e ; return v -> Ok v } in c self
 
 -- the producer effect is unchanged
 effect Coro a b = { suspend : a -> b }
@@ -72,7 +72,7 @@ extern __cont_take     : ContCell r (row e) -> (b -> r with eff e)
 -- outcome as a Step. e = the producer's NON-Coro residual: emitted at the start site
 -- (before-suspend effects) AND captured into the Step (performed on resume).
 start : (() -> r with Coro a b + eff e) -> Step a b r (row e) with eff e
-start c = with Coro { suspend x k -> __coro_susp x k ; v -> __coro_done v } (c ())
+start c = with Coro { once suspend x k -> __coro_susp x k ; return v -> __coro_done v } (c ())
 
 -- step: resume once; the tail performs e, so the resume site must handle e.
 step : Suspension a b r (row e) -> b -> Step a b r (row e) with eff e
@@ -138,7 +138,7 @@ effect Async = { yield : () -> () }
 -- `Coro.suspend` (yield/resume carry unit). Discharges Async, introduces Coro;
 -- the child's non-Async residual e flows through.
 asCoro : (() -> r with Async + eff e) -> () -> r with Coro () () + eff e
-asCoro c _ = with Async { yield _ k -> k (Coro.suspend ()) } (c ())
+asCoro c _ = with Async { once yield _ k -> k (Coro.suspend ()) } (c ())
 
 -- par: run two Async children concurrently (deterministic lockstep) and return
 -- both results. Discharges Async (and Coro); the children's residual e is
@@ -210,7 +210,7 @@ data Request
 effect Conc = { req : Request -> Transport }
 
 asConc : (() -> a with Conc + eff e) -> () -> a with Coro Request Transport + eff e
-asConc c _ = with Conc { req r k -> k (Coro.suspend r) } (c ())
+asConc c _ = with Conc { once req r k -> k (Coro.suspend r) } (c ())
 
 -- driveConc (Haskell) has no global env, so it cannot call the wok `start`. The
 -- wok side hands it already-`start`-wrapped STARTER THUNKS: each `() -> Step ...`,

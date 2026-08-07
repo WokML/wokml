@@ -13,7 +13,7 @@ prog e =
   xs
 
 run : (Choose -> [U64] with Choose + eff e) -> [U64] with eff e
-run c = with self = Choose { choose n k -> [9, 9] ; v -> v } in c self
+run c = with self = Choose { once choose n k -> [9, 9] ; return v -> v } in c self
 
 main : [U64]
 main = run prog

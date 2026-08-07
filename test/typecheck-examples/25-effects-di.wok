@@ -17,12 +17,12 @@ greet u = Logger.log "hello"
 logToIO : (() -> a with Logger + eff e) -> a with IO + eff e
 logToIO c =
   with { Logger.log m -> IO.write m
-       ; v -> v }
+       ; return v -> v }
   c ()
 
 -- Discharge IO entirely: only the `eff e` tail remains in the result row.
 runIO : (() -> a with IO + eff e) -> a with eff e
 runIO c =
   with { IO.write m -> ()
-       ; v -> v }
+       ; return v -> v }
   c ()

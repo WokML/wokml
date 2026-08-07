@@ -259,7 +259,6 @@ instance Print GeneratedParser.Wok.Abs.ReservedKw where
     GeneratedParser.Wok.Abs.ReservedKw_record -> prPrec i 0 (concatD [doc (showString "record")])
     GeneratedParser.Wok.Abs.ReservedKw_row -> prPrec i 0 (concatD [doc (showString "row")])
     GeneratedParser.Wok.Abs.ReservedKw_fun -> prPrec i 0 (concatD [doc (showString "fun")])
-    GeneratedParser.Wok.Abs.ReservedKw_ctl -> prPrec i 0 (concatD [doc (showString "ctl")])
 
 instance Print GeneratedParser.Wok.Abs.SigName where
   prt i = \case
@@ -451,6 +450,9 @@ instance Print GeneratedParser.Wok.Abs.Exp where
     GeneratedParser.Wok.Abs.EWithRun varid withargs exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 varid, prt 0 withargs, doc (showString "in"), prt 0 exp])
     GeneratedParser.Wok.Abs.EWithNamed varid1 varid2 withargs exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 varid1, doc (showString "="), prt 0 varid2, prt 0 withargs, doc (showString "in"), prt 0 exp])
     GeneratedParser.Wok.Abs.EWithNamedH varid conid handlerarms exp -> prPrec i 2 (concatD [doc (showString "with"), prt 0 varid, doc (showString "="), prt 0 conid, doc (showString "{"), prt 0 handlerarms, doc (showString "}"), doc (showString "in"), prt 0 exp])
+    GeneratedParser.Wok.Abs.EHandlerV conid handlerarms -> prPrec i 2 (concatD [doc (showString "handler"), prt 0 conid, doc (showString "{"), prt 0 handlerarms, doc (showString "}")])
+    GeneratedParser.Wok.Abs.EHandleV exp1 withargs exp2 -> prPrec i 2 (concatD [doc (showString "handle"), prt 2 exp1, prt 0 withargs, doc (showString "in"), prt 0 exp2])
+    GeneratedParser.Wok.Abs.EHandleN varid exp1 withargs exp2 -> prPrec i 2 (concatD [doc (showString "handle"), prt 0 varid, doc (showString "="), prt 2 exp1, prt 0 withargs, doc (showString "in"), prt 0 exp2])
 
 instance Print GeneratedParser.Wok.Abs.InfixTail where
   prt i = \case
@@ -491,6 +493,9 @@ instance Print GeneratedParser.Wok.Abs.HandlerArm where
   prt i = \case
     GeneratedParser.Wok.Abs.HArm conid varid atompats exp -> prPrec i 0 (concatD [prt 0 conid, doc (showString "."), prt 0 varid, prt 0 atompats, doc (showString "->"), prt 0 exp])
     GeneratedParser.Wok.Abs.HUArm varid atompats exp -> prPrec i 0 (concatD [prt 0 varid, prt 0 atompats, doc (showString "->"), prt 0 exp])
+    GeneratedParser.Wok.Abs.HOnceArm conid varid atompats exp -> prPrec i 0 (concatD [doc (showString "once"), prt 0 conid, doc (showString "."), prt 0 varid, prt 0 atompats, doc (showString "->"), prt 0 exp])
+    GeneratedParser.Wok.Abs.HOnceUArm varid atompats exp -> prPrec i 0 (concatD [doc (showString "once"), prt 0 varid, prt 0 atompats, doc (showString "->"), prt 0 exp])
+    GeneratedParser.Wok.Abs.HRetArm atompat exp -> prPrec i 0 (concatD [doc (showString "return"), prt 0 atompat, doc (showString "->"), prt 0 exp])
     GeneratedParser.Wok.Abs.HParam varid exp -> prPrec i 0 (concatD [prt 0 varid, doc (showString "="), prt 0 exp])
     GeneratedParser.Wok.Abs.HParamV varid exp -> prPrec i 0 (concatD [doc (showString "var"), prt 0 varid, doc (showString "="), prt 0 exp])
 

@@ -16,8 +16,8 @@ runSt i c =
   with St
     { var s = i
     ; get -> s
-    ; set x k -> k k ()
-    ; v -> (v, s)
+    ; once set x k -> k k ()
+    ; return v -> (v, s)
     } c ()
 
 main : (U64, U64)

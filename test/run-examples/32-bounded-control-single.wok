@@ -8,4 +8,4 @@ prog u = Ask.ask
 
 -- Single-shot control resume in non-tail position. Must be 42.
 main : U64
-main = 1 + (with { Ask.ask k -> k 41 } prog ())
+main = 1 + (with { once Ask.ask k -> k 41 } prog ())

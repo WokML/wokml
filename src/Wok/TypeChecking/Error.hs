@@ -119,6 +119,9 @@ data TypeError
     -- ^ A handler omits operations of the handled effect (effect, missing ops).
   | DuplicateReturnArm SourceSpan
     -- ^ A handler has more than one @return@ arm; only one is allowed.
+  | DuplicateOpArm SourceSpan Text Text
+    -- ^ A handler declares two arms for one operation (effect, op). Runtime
+    --   dispatch first-matches, so the later arm would be silent dead code.
   | DuplicateHandlerParam SourceSpan
     -- ^ A parameterized handler block declares more than one @name = init@
     --   entry; a handler block may declare at most one such parameter.
@@ -126,6 +129,25 @@ data TypeError
     -- ^ A handler-local state entry was written in the bare @name = init@ form;
     --   it must be declared with @var@ (@var name = init@). Carries the offending
     --   binder name so the message points at it.
+  | ArmArityMismatch SourceSpan Text Text Bool Int Int
+    -- ^ E-ARITY (once/return retrofit): an arm's binder count does not match
+    --   its DECLARED clause kind. A plain arm binds exactly the op's arity and
+    --   auto-resumes; a @once@ arm binds arity + 1, the last binder being the
+    --   continuation. The old split-by-count is retired: a plain arm with a
+    --   trailing binder is an error, not a silent control arm (Section E, S1).
+    --   Args: position, effect, op, isOnce, expected count, got count.
+  | ValueArmNeedsReturn SourceSpan Text
+    -- ^ E-ARITY family: a bare unqualified arm (@v -> e@) names no operation;
+    --   value arms are written with the @return@ keyword (@return v -> e@).
+    --   Args: position, the head name written.
+  | ReturnArmBinderNotVar SourceSpan
+    -- ^ The @return@ arm's binder must be a plain variable; pattern binders in
+    --   return position are a v2 extension this retrofit does not carry.
+  | ContinuationShadowed SourceSpan Text
+    -- ^ E-SHADOW (strict): a @once@ continuation binder is re-bound somewhere
+    --   inside its arm body -- delimited or not. Rebinding the continuation's
+    --   name turns a double resume into silent ordinary calls (Section E, S2).
+    --   Args: position of the shadowing binder, continuation name.
   | UnknownClass Text
     -- ^ An instance references a class that has not been declared.
   | DuplicateClass Text

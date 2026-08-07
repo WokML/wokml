@@ -11,5 +11,5 @@ bad comp =
        ; var s = 1
        ; IO.read p -> resume(s, p)
        ; IO.write m -> resume(s, ())
-       ; v -> v }
+       ; return v -> v }
   comp ()

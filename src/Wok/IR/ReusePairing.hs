@@ -170,6 +170,7 @@ exprMaxU = go
     go (LetJoin _ ps jb e) = maximum (go jb : go e : map (uOf . bndName) ps)
     go (Jump _ as)         = foldr (max . atomMaxU) (-1) as
     go (Handle e h)        = max (go e) (handlerMaxU h)
+    go (InstallHandler a _ e) = max (atomMaxU a) (go e)
 
 -- | The largest 'Unique' anywhere in a handler --- mirrors
 -- 'Wok.IR.Perceus.handlerMaxU'. A handler arm body can bind a 'Unique' larger
@@ -198,6 +199,7 @@ rhsMaxU (RLam ps e)          = maximum (exprMaxU e : map (uOf . bndName) ps)
 rhsMaxU (ROp m _ _ as)       = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
 rhsMaxU (RRecord _ flds)     = foldr (max . atomMaxU . snd) (-1) flds
 rhsMaxU (RProj _ a)          = atomMaxU a
+rhsMaxU (RMakeHandler h)     = handlerMaxU h
 rhsMaxU (RReuseCon tok _ as)      = foldr (max . atomMaxU) (atomMaxU tok) as
 -- N/A: RForeignCall is never reuse-paired (only RCon/RReuseCon participate).
 -- FFI Slice 4: nor can a MoveOut (consumed) arg become a reuse SOURCE -- reuse
@@ -260,6 +262,11 @@ goExpr env sup (Handle e h) =
   -- optimization, never wrong behavior.
   let (sup1, e') = goExpr env sup e
   in (sup1, Handle e' h)
+-- proto/handler-values: mirror the Handle policy -- descend only into the body,
+-- leave the handler value's arms untraversed (a forgone reuse, never wrong).
+goExpr env sup (InstallHandler a mSelf body) =
+  let (sup1, body') = goExpr env sup body
+  in (sup1, InstallHandler a mSelf body')
 goExpr env sup (Case scrut alts) =
   let scrUniq = case scrut of
                   AVar n -> Just (nameUniq n)

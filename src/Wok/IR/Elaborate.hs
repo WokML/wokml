@@ -112,6 +112,23 @@ deliverRhs tk ty rhs = do
   n <- bindFresh (Tx.pack "t")
   pure (Let (Binder n Unrestricted ty) rhs (deliverAtom tk (AVar n)))
 
+-- | Deliver an 'InstallHandler' under the given tail continuation. In tail
+-- position it stands alone: the body (TRet-elaborated) returns through the
+-- KHandle frame and the return arm's answer Rets onward. In VALUE position
+-- the install is wrapped in a unit thunk and applied: the application's
+-- KApp/KLet frames sit below the KHandle, so the answer threads out by plain
+-- Ret and 'deliverRhs' routes it to the merge join. (Directly emitting the
+-- body at the join would jump PAST the frame, silently skipping the return
+-- arm -- the value-position bug fixed in the var-seeding commit.)
+deliverInstall :: TailK -> CType -> Expr -> Elab Expr
+deliverInstall TRet _ install = pure install
+deliverInstall tk ty install = do
+  fN <- bindFresh (Tx.pack "installT")
+  uN <- bindFresh (Tx.pack "u")
+  let thunk = RLam [Binder uN Unrestricted (CTCon TcUnit [])] install
+  rest <- deliverRhs tk ty (RApp (AVar fN) [ALit LUnit])
+  pure (Let (Binder fN Unrestricted (CTArr (CTCon TcUnit []) CREmpty ty)) thunk rest)
+
 -- ---------------------------------------------------------------------------
 -- ANF normalization combinators
 
@@ -122,6 +139,9 @@ isCompound (TIf{})     = True
 isCompound (TCase{})   = True
 isCompound (THandle{}) = True
 isCompound (TWithNamedH{}) = True
+isCompound (THandlerV{}) = True
+isCompound (THandleV{}) = True
+isCompound (THandleNV{}) = True
 isCompound _           = False
 
 -- | Elaborate an expression and name any non-trivial computation with a fresh
@@ -513,6 +533,9 @@ elabRhsF ty node@(TIf{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(TCase{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(THandle{}) k = elabCompoundRhs ty node k
 elabRhsF ty node@(TWithNamedH{}) k = elabCompoundRhs ty node k
+elabRhsF ty node@(THandlerV{}) k = elabCompoundRhs ty node k
+elabRhsF ty node@(THandleV{}) k = elabCompoundRhs ty node k
+elabRhsF ty node@(THandleNV{}) k = elabCompoundRhs ty node k
 
 -- TLet where a single Rhs is expected: scope the local bindings ONLY over the
 -- let body (see normName's TLet note). Route through normName so the body's
@@ -582,8 +605,144 @@ elabKF tk _ (TWithNamedH self arms body) = do
   let selfBinder = Binder selfN Unrestricted (teType body)
   withLocal self selfN (elabHandle tk body arms (Just selfBinder))
 
+-- proto/handler-values. `handler E { arms }` builds a handler VALUE with no
+-- body: reuse elabHandle's arm-building to produce the `Handler` record, then
+-- wrap it in RMakeHandler (an Rhs that evaluates to a VHandler). Delivered
+-- under the tail continuation like any other value-producing Rhs. A `var`
+-- param's seed is evaluated HERE, at construction: the seed let wraps the
+-- RMakeHandler so the captured env carries the seed value, and every later
+-- install starts its own activation from it (per-install seeding falls out of
+-- env immutability -- installs never write back into the captured env).
+elabKF tk ty (THandlerV _eff arms) = do
+  (h, mParam) <- buildHandlerRecord arms Nothing
+  case mParam of
+    Nothing -> deliverRhs tk ty (RMakeHandler h)
+    Just (pn, _, initE) ->
+      normName initE $ \a -> do
+        rest <- deliverRhs tk ty (RMakeHandler h)
+        pure (Let (Binder pn Unrestricted (teType initE)) (RAtom a) rest)
+
+-- `handle h in body` installs a handler value. The BODY is ALWAYS elaborated
+-- at TRet: its completion value must return THROUGH the KHandle frame (so the
+-- return arm runs), never jump past it. The former `elabK tk body` made a
+-- value-position install deliver the body's value straight to the merge join,
+-- silently skipping the return arm. A handler value's arms are TRet-baked at
+-- construction (hAnswerJoin is Nothing forever), so the whole install
+-- completes by plain Ret; in value position the result is routed to the merge
+-- join by wrapping the install in a unit thunk -- the application's KApp/KLet
+-- frames sit below the KHandle, so Ret threads the return arm's answer out to
+-- 'deliverRhs', which jumps to the join.
+elabKF tk ty (THandleV hExpr body) = do
+  bodyE <- elabK TRet body
+  normName hExpr $ \hAtom ->
+    deliverInstall tk ty (InstallHandler hAtom Nothing bodyE)
+
+-- Named install `handle name = h in body` (item-4 D5): bind the role label in
+-- the body's scope; the machine mints this activation's VInst for it and
+-- stamps the binder into the frame's handler record ('hSelf') so named
+-- performs id-route here. Same TRet-body + value-position thunk discipline as
+-- the unnamed form. The self binder's CType is a runtime-erased stand-in
+-- (mirrors 'elabKF TWithNamedH').
+elabKF tk ty (THandleNV self hExpr body) = do
+  selfN <- bindFresh self
+  let selfB = Binder selfN Unrestricted (teType body)
+  bodyE <- withLocal self selfN (elabK TRet body)
+  normName hExpr $ \hAtom ->
+    deliverInstall tk ty (InstallHandler hAtom (Just selfB) bodyE)
+
 -- Non-compound: name the result and deliver under tk
 elabKF tk ty node = elabRhsF ty node (deliverRhs tk ty)
+
+-- | Build the 'Handler' record for a first-class handler VALUE
+-- (proto/handler-values). Restricted to the still-unsupported shapes:
+-- installed in TAIL position (answerJoin = Nothing). @mSelf@ is carried for
+-- future named handler values; 'Nothing' for the ambient form. Shares the
+-- arm-lowering idiom of 'elabHandle' but without a body or value-position
+-- answer join. A handler-local `var` param IS supported: the param binder is
+-- minted here, arms resolve the surface name to it, and it is returned to the
+-- caller ('elabKF THandlerV'), which wraps the RMakeHandler in the seed let --
+-- construction-time evaluation, so the VALUE captures the seed and each
+-- install activates from it.
+buildHandlerRecord
+  :: [THandlerArm CType] -> Maybe Binder
+  -> Elab (Handler, Maybe (Name, Text, TExpr))
+buildHandlerRecord arms mSelf = do
+  let opArmsSrc  = [ (effect, op, ps, resume, resumeTy, body)
+                   | TOpArm effect op ps resume resumeTy body <- arms ]
+      retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
+      paramSrc   = [ (name, initE) | TParamArm name initE <- arms ]
+  mParam <- case paramSrc of
+    []                -> pure Nothing
+    ((name, initE):_) -> do
+      pn <- bindFresh name
+      pure (Just (pn, name, initE))
+  opArms <- mapM (elabOpArmK TRet mParam) opArmsSrc
+  retArm <- case retArmsSrc of
+    ((pat, rb) : _) -> elabReturnArmK TRet mParam pat rb
+    [] -> do
+      -- Identity return arm. The binder's CType is metadata unused by the
+      -- reference interpreter; a Unit placeholder is sufficient (an explicit
+      -- `return` arm is the usual case).
+      vN <- bindFresh (Tx.pack "v")
+      pure (Binder vN Unrestricted (CTCon TcUnit []), deliverAtom TRet (AVar vN))
+  let hParamB = fmap (\(pn, _, initE) -> Binder pn Unrestricted (teType initE)) mParam
+  pure (Handler retArm opArms Nothing hParamB mSelf, mParam)
+
+-- | Make the handler-local param name resolve to its binder inside an arm.
+-- Shared by 'elabHandle' and 'buildHandlerRecord'.
+handlerParamWrap :: Maybe (Name, Text, TExpr) -> Elab a -> Elab a
+handlerParamWrap (Just (pn, nm, _)) = withLocal nm pn
+handlerParamWrap Nothing            = id
+
+-- | Lower one `return` arm under the given tail continuation ('elabHandle'
+-- threads its own tk so a fused value-position handler's return arm jumps to
+-- the merge join; a handler VALUE's arms are TRet-baked).
+elabReturnArmK
+  :: TailK -> Maybe (Name, Text, TExpr) -> TPat -> TExpr -> Elab (Binder, Expr)
+elabReturnArmK tk mParam (Tpat pty (TPVar v)) rb = do
+  vN <- bindFresh v
+  rbE <- handlerParamWrap mParam (withLocal v vN (elabK tk rb))
+  pure (Binder vN Unrestricted pty, rbE)
+elabReturnArmK tk mParam (Tpat pty _) rb = do
+  vN <- bindFresh (Tx.pack "v")
+  rbE <- handlerParamWrap mParam (elabK tk rb)
+  pure (Binder vN Unrestricted pty, rbE)
+
+-- | Lower ONE operation arm under the given tail continuation -- the single
+-- copy shared by the fused forms ('elabHandle', threading its tk) and handler
+-- values ('buildHandlerRecord', pinned to TRet). Review round: this existed
+-- twice, and the resume-binder-type note below lived only on the fused copy.
+elabOpArmK
+  :: TailK -> Maybe (Name, Text, TExpr)
+  -> (Text, Text, [TPat], Text, CType, TExpr) -> Elab OpArm
+elabOpArmK tk mParam (effect, op, ps, resumeName, resumeContTy, body) = do
+  (argBinders, extender) <- elabParams ps
+  resumeN <- bindFresh (Tx.pack "resume")
+  armBody <-
+    if Tx.null resumeName
+      then
+        -- AUTO-RESUME: let res = resume(param, body) in deliver res. In a
+        -- parameterized handler the current param is the FIRST resume arg.
+        handlerParamWrap mParam $ extender $ normName body $ \v -> do
+          res <- bindFresh (Tx.pack "res")
+          let call = case mParam of
+                Just (pn, _, _) -> RApp (AVar resumeN) [AVar pn, v]
+                Nothing         -> RApp (AVar resumeN) [v]
+          pure (Let (Binder res Unrestricted (teType body))
+                    call
+                    (deliverAtom tk (AVar res)))
+      else
+        -- CONTROL: bind the surface name to the resume binder; elaborate the
+        -- body as-is (it already has the answer type R).
+        handlerParamWrap mParam $ extender $ withLocal resumeName resumeN (elabK tk body)
+  -- The resume binder is typed with the threaded continuation type `T -> R`
+  -- (the type the checker bound `k` to when checking this arm body), NOT
+  -- `teType body` (the answer type R). An arrow is ALWAYS boxed, so the
+  -- Perceus pass counts `resume` in the arm's owned set and drops it on a
+  -- discard arm; typing it with an unboxed answer R would silently drop it
+  -- from the owned set and leak the captured continuation (spec
+  -- docs/superpowers/specs/2026-06-19-m2b-resume-binder-type-leak-fix).
+  pure (OpArm effect op argBinders (Binder resumeN Unrestricted resumeContTy) armBody)
 
 -- | Shared lowering for both ambient (`THandle`) and named (`TWithNamedH`)
 -- handlers. `mSelf` is the self-instance binder for a named handler (set as
@@ -604,9 +763,9 @@ elabHandle tk e arms mSelf = do
     ((name, initE):_) -> do
       pn <- bindFresh name
       pure (Just (pn, name, initE))
-  opArms <- mapM (elabOpArm tk mParam) opArmsSrc
+  opArms <- mapM (elabOpArmK tk mParam) opArmsSrc
   retArm <- case retArmsSrc of
-    ((pat, rb) : _) -> elabReturnArm tk mParam pat rb
+    ((pat, rb) : _) -> elabReturnArmK tk mParam pat rb
     [] -> do
       vN <- bindFresh (Tx.pack "v")
       pure (Binder vN Unrestricted (teType e), deliverAtom tk (AVar vN))
@@ -622,51 +781,6 @@ elabHandle tk e arms mSelf = do
       -- the WHOLE Handle so `pn` is in scope when the handler is captured.
       normName initE $ \a ->
         pure (Let (Binder pn Unrestricted (teType initE)) (RAtom a) core)
-  where
-    elabReturnArm :: TailK -> Maybe (Name, Text, TExpr) -> TPat -> TExpr -> Elab (Binder, Expr)
-    elabReturnArm tk2 mParam (Tpat pty (TPVar v)) rb = do
-      vN <- bindFresh v
-      rbE <- paramWrap mParam (withLocal v vN (elabK tk2 rb))
-      pure (Binder vN Unrestricted pty, rbE)
-    elabReturnArm tk2 mParam (Tpat pty _) rb = do
-      vN <- bindFresh (Tx.pack "v")
-      rbE <- paramWrap mParam (elabK tk2 rb)
-      pure (Binder vN Unrestricted pty, rbE)
-
-    -- Make the handler-local param name resolve to its binder inside an arm.
-    paramWrap :: Maybe (Name, Text, TExpr) -> Elab a -> Elab a
-    paramWrap (Just (pn, nm, _)) = withLocal nm pn
-    paramWrap Nothing            = id
-
-    elabOpArm :: TailK -> Maybe (Name, Text, TExpr) -> (Text, Text, [TPat], Text, CType, TExpr) -> Elab OpArm
-    elabOpArm tk2 mParam (effect, op, ps, resumeName, resumeContTy, body) = do
-      (argBinders, extender) <- elabParams ps
-      resumeN <- bindFresh (Tx.pack "resume")
-      armBody <-
-        if Tx.null resumeName
-          then
-            -- AUTO-RESUME: let res = resume(param, body) in deliver res. In a
-            -- parameterized handler the current param is the FIRST resume arg.
-            paramWrap mParam $ extender $ normName body $ \v -> do
-              res <- bindFresh (Tx.pack "res")
-              let call = case mParam of
-                    Just (pn, _, _) -> RApp (AVar resumeN) [AVar pn, v]
-                    Nothing         -> RApp (AVar resumeN) [v]
-              pure (Let (Binder res Unrestricted (teType body))
-                        call
-                        (deliverAtom tk2 (AVar res)))
-          else
-            -- CONTROL: bind the surface name to the resume binder; elaborate the
-            -- body as-is (it already has the answer type R).
-            paramWrap mParam $ extender $ withLocal resumeName resumeN (elabK tk2 body)
-      -- The resume binder is typed with the threaded continuation type `T -> R`
-      -- (the type the checker bound `k` to when checking this arm body), NOT
-      -- `teType body` (the answer type R). An arrow is ALWAYS boxed, so the
-      -- Perceus pass counts `resume` in the arm's owned set and drops it on a
-      -- discard arm; typing it with an unboxed answer R would silently drop it
-      -- from the owned set and leak the captured continuation (spec
-      -- docs/superpowers/specs/2026-06-19-m2b-resume-binder-type-leak-fix).
-      pure (OpArm effect op argBinders (Binder resumeN Unrestricted resumeContTy) armBody)
 
 -- ---------------------------------------------------------------------------
 -- Tail position elaboration

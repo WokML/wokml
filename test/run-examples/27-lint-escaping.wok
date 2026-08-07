@@ -8,6 +8,6 @@ prog u = Async.await 7
 
 main : U64
 main =
-  with { Async.await fut k -> k fut
-         ; v               -> v }
+  with { once Async.await fut k -> k fut
+         ; return v               -> v }
   prog ()

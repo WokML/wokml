@@ -182,6 +182,7 @@ exprMaxU = go
     go (LetJoin _ ps jb e) = maximum (go jb : go e : map (uOf . bndName) ps)
     go (Jump _ as)         = foldr (max . atomMaxU) (-1) as
     go (Handle e h)        = max (go e) (handlerMaxU h)
+    go (InstallHandler a _ e) = max (atomMaxU a) (go e)
 
 handlerMaxU :: Handler -> Int
 handlerMaxU h =
@@ -206,6 +207,7 @@ altMaxU (AltDefault e)  = exprMaxU e
 rhsMaxU :: Rhs -> Int
 rhsMaxU (RAtom a)        = atomMaxU a
 rhsMaxU (RApp f as)      = foldr (max . atomMaxU) (atomMaxU f) as
+rhsMaxU (RMakeHandler h) = handlerMaxU h
 rhsMaxU (RCon _ as)      = foldr (max . atomMaxU) (-1) as
 rhsMaxU (RLam ps e)      = maximum (exprMaxU e : map (uOf . bndName) ps)
 rhsMaxU (ROp m _ _ as)   = foldr (max . atomMaxU) (maybe (-1) atomMaxU m) as
@@ -259,6 +261,7 @@ jumpTargets (Case _ alts)      = Set.unions (map (jumpTargets . altE) alts)
 jumpTargets (LetJoin _ _ jb e) = jumpTargets jb `Set.union` jumpTargets e
 jumpTargets (LetRec _ e)       = jumpTargets e   -- def bodies are own scopes
 jumpTargets (Handle e _)       = jumpTargets e
+jumpTargets (InstallHandler _ _ e) = jumpTargets e
 
 -- ---------------------------------------------------------------------------
 -- Escape / borrowership predicates
@@ -322,6 +325,8 @@ coveredExpr (LetRec defs e)     =
 -- 'm2bHandlerInFragmentStore' in "Wok.IR.Escape" for the full rationale.
 coveredExpr (Handle e h)        =
   m2bHandlerInFragmentStore h && coveredExpr e && coveredHandler h
+-- proto/handler-values: first-class handlers are not in the RC-compilable fragment.
+coveredExpr (InstallHandler _ _ _) = False
 
 coveredAlt :: Alt -> Bool
 coveredAlt (AltCon _ _ e) = coveredExpr e
@@ -342,6 +347,7 @@ coveredHandler h =
 -- ever appears inside an in-fragment 'Handle's instrumented region.
 coveredRhs :: Rhs -> Bool
 coveredRhs (RLam _ e) = coveredExpr e
+coveredRhs (RMakeHandler _) = False   -- proto/handler-values: not RC-compilable
 coveredRhs _          = True
 
 -- ---------------------------------------------------------------------------
@@ -952,6 +958,8 @@ ownExpr ctx sup delta (Handle e h)
           (sup3, ops') = mapAccumLPairs (ownOpArm ctx mParam) sup2 (hOps h)
       in (sup3, Handle e' (h { hReturn = (rb, rbody'), hOps = ops' }))
   | otherwise = (sup, Handle e h)   -- out of fragment: leave unchanged
+ownExpr _ _ _ (InstallHandler _ _ _) =
+  error "proto/handler-values: Perceus insertRC does not support first-class handlers (RC path, off --run)"
 
 -- | A fresh ownership scope for a handler arm: a handler arm runs in a NEW control
 -- context (the handler's continuation), so the join table, the kept-alive shared-env
@@ -1088,6 +1096,7 @@ dropParentThen sup env (Just p) = case Map.lookup p env of
 -- moves. All other RHS forms move their (owned, non-exempt) operands.
 ownedOccs :: Ctx -> Set Unique -> Rhs -> Map Unique Int
 ownedOccs ctx delta rhs = case rhs of
+  RMakeHandler _ -> Map.empty   -- proto/handler-values: off RC path
   RAtom a        -> count [a]
   -- BORROW-ON-CALL (M2a-2 Task 1): applying a function value READS the head @f@
   -- (the call does not move @f@ out of the callee --- 'enterRC' no longer consumes
@@ -1161,6 +1170,7 @@ ownedOccs ctx delta rhs = case rhs of
 -- accounting is 'ownedOccs', which filters to @delta@.
 moveOperandUniques :: Rhs -> [Unique]
 moveOperandUniques rhs = case rhs of
+  RMakeHandler _ -> []   -- proto/handler-values: off RC path
   RAtom a        -> atomUs [a]
   -- M3 (Task 3): @__cont_take cell@ BORROWS its cell argument (see 'ownedOccs').
   RApp (APrim k) _
@@ -1385,6 +1395,8 @@ mutExpr mut False (LetRec defs body) =
   in (d2, LetRec defs' body')
 mutExpr _   False e@(Ret _)    = (False, e)
 mutExpr _   False e@(Jump _ _) = (False, e)
+-- proto/handler-values: off the RC fault-injection path; leave unchanged.
+mutExpr _   done  e@(InstallHandler _ _ _) = (done, e)
 mutExpr mut False (Handle e h) =
   -- M2b-1 (Task 2): the handler arms hold inserted RC calls now, so the
   -- fault-injection walk descends into the handled expr first, then the return
@@ -1589,6 +1601,7 @@ collectJoins (LetRec _ e)         = collectJoins e   -- def bodies are own scope
 -- here; each handler ARM is its own ownership scope (see 'checkExpr'), so its joins
 -- are collected when that arm is audited, not here.
 collectJoins (Handle e _)         = collectJoins e
+collectJoins (InstallHandler _ _ e) = collectJoins e
 
 collectJoinsAlt :: Alt -> Map JoinId ([Binder], Expr)
 collectJoinsAlt (AltCon _ _ e) = collectJoins e
@@ -1620,6 +1633,7 @@ trackedBinders Jump{}         = Set.empty
 -- handler-arm binders + arm-body binders belong to the arm scopes (audited
 -- separately by 'checkExpr'), like 'LetRec' def-body binders, so not here.
 trackedBinders (Handle e _)   = trackedBinders e
+trackedBinders (InstallHandler _ _ e) = trackedBinders e
 
 trackedAlt :: Alt -> Set Unique
 trackedAlt (AltCon _ bs e) =
@@ -1840,6 +1854,8 @@ checkExpr env cnt (Jump j as) =
        Just (ps, jbody) ->
          let cnt2 = foldr (\b c -> if boxedBinder b then bumpC (binderUnique b) c else c) cnt1 ps
          in vs ++ checkExpr env cnt2 jbody
+-- proto/handler-values: off the RC lint path; recurse into the body only.
+checkExpr env cnt (InstallHandler _ _ body) = checkExpr env cnt body
 checkExpr env cnt (Handle e h) =
   -- M2b Task 2. Four regions, mirroring the pass ('ownExpr (Handle ...)'):
   --
@@ -1979,6 +1995,7 @@ leaks env cnt =
 -- 'checkExpr' (see the 'Let' case), not here.
 moveAtoms :: Set Unique -> Rhs -> [Atom]
 moveAtoms resume rhs = case rhs of
+  RMakeHandler _ -> []   -- proto/handler-values: off RC path
   RAtom a        -> [a]
   -- BORROW-ON-CALL (M2a-2 Task 1): the call head @f@ is READ, not moved (see
   -- 'ownedOccs'); only the arguments are moves. Keeping it consistent here is what

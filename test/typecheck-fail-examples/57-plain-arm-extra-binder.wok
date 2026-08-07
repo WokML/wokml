@@ -1,0 +1,26 @@
+-- S1 in the OTHER direction: a plain (auto-resume) arm that binds one binder
+-- too many. Pre-retrofit, the extra binder silently promoted the arm to the
+-- continuation-taking reading; the two readings were distinguished only by
+-- counting, so neither mistake could be reported. A plain arm now promises
+-- EXACTLY the operation's arity, and E-ARITY reports the surplus.
+--
+-- Together with 56-once-arity-collapse this pins the collapse as loud in both
+-- directions, which is what makes the declared clause kind worth its keyword.
+--
+-- codemod: skip
+-- This file HOLDS the mis-shaped arm on purpose. A plain arm binding arity + 1
+-- is exactly the shape the migration promotes to `once`, so without this marker
+-- a re-run of tools/Codemod.hs would silently repair the fixture and delete the
+-- regression it exists to pin.
+module Main
+import Std.Base
+
+effect Call = { call : (U64 -> U64) -> U64 }
+
+useCall : () -> U64 with Call
+useCall u = Call.call (\n -> n + 1)
+
+main : U64
+main =
+  with { Call.call f k -> k (f 41) }
+  useCall ()

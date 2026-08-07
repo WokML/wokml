@@ -1,0 +1,9 @@
+module Main
+import Std.Base
+
+effect E = { ask : U64 }
+
+run f = handle f in E.ask
+
+main : U64
+main = run (handler E { ask -> 41 ; return v -> v })

@@ -8,6 +8,6 @@ pick u = if Choice.flip then 10 else 20
 
 -- Outer context BEFORE the handler: 1 + (10 + 20) = 31.
 main : U64
-main = 1 + (with { Choice.flip k -> k True + k False
-                   ; v -> v }
+main = 1 + (with { once Choice.flip k -> k True + k False
+                   ; return v -> v }
              pick ())

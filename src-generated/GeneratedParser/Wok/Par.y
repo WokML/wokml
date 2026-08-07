@@ -44,44 +44,47 @@ import qualified Data.Text
   'case'     { PT _ (TS _ 18)    }
   'class'    { PT _ (TS _ 19)    }
   'contract' { PT _ (TS _ 20)    }
-  'ctl'      { PT _ (TS _ 21)    }
-  'data'     { PT _ (TS _ 22)    }
-  'deriving' { PT _ (TS _ 23)    }
-  'do'       { PT _ (TS _ 24)    }
-  'eff'      { PT _ (TS _ 25)    }
-  'effect'   { PT _ (TS _ 26)    }
-  'else'     { PT _ (TS _ 27)    }
-  'extern'   { PT _ (TS _ 28)    }
-  'fixity'   { PT _ (TS _ 29)    }
-  'forall'   { PT _ (TS _ 30)    }
-  'foreign'  { PT _ (TS _ 31)    }
-  'free'     { PT _ (TS _ 32)    }
-  'fun'      { PT _ (TS _ 33)    }
-  'if'       { PT _ (TS _ 34)    }
-  'import'   { PT _ (TS _ 35)    }
-  'in'       { PT _ (TS _ 36)    }
-  'instance' { PT _ (TS _ 37)    }
-  'left'     { PT _ (TS _ 38)    }
-  'let'      { PT _ (TS _ 39)    }
-  'local'    { PT _ (TS _ 40)    }
-  'looser'   { PT _ (TS _ 41)    }
-  'module'   { PT _ (TS _ 42)    }
-  'of'       { PT _ (TS _ 43)    }
-  'owned'    { PT _ (TS _ 44)    }
-  'record'   { PT _ (TS _ 45)    }
-  'right'    { PT _ (TS _ 46)    }
-  'row'      { PT _ (TS _ 47)    }
-  'than'     { PT _ (TS _ 48)    }
-  'then'     { PT _ (TS _ 49)    }
-  'tighter'  { PT _ (TS _ 50)    }
-  'type'     { PT _ (TS _ 51)    }
-  'use'      { PT _ (TS _ 52)    }
-  'var'      { PT _ (TS _ 53)    }
-  'where'    { PT _ (TS _ 54)    }
-  'with'     { PT _ (TS _ 55)    }
-  '{'        { PT _ (TS _ 56)    }
-  '|'        { PT _ (TS _ 57)    }
-  '}'        { PT _ (TS _ 58)    }
+  'data'     { PT _ (TS _ 21)    }
+  'deriving' { PT _ (TS _ 22)    }
+  'do'       { PT _ (TS _ 23)    }
+  'eff'      { PT _ (TS _ 24)    }
+  'effect'   { PT _ (TS _ 25)    }
+  'else'     { PT _ (TS _ 26)    }
+  'extern'   { PT _ (TS _ 27)    }
+  'fixity'   { PT _ (TS _ 28)    }
+  'forall'   { PT _ (TS _ 29)    }
+  'foreign'  { PT _ (TS _ 30)    }
+  'free'     { PT _ (TS _ 31)    }
+  'fun'      { PT _ (TS _ 32)    }
+  'handle'   { PT _ (TS _ 33)    }
+  'handler'  { PT _ (TS _ 34)    }
+  'if'       { PT _ (TS _ 35)    }
+  'import'   { PT _ (TS _ 36)    }
+  'in'       { PT _ (TS _ 37)    }
+  'instance' { PT _ (TS _ 38)    }
+  'left'     { PT _ (TS _ 39)    }
+  'let'      { PT _ (TS _ 40)    }
+  'local'    { PT _ (TS _ 41)    }
+  'looser'   { PT _ (TS _ 42)    }
+  'module'   { PT _ (TS _ 43)    }
+  'of'       { PT _ (TS _ 44)    }
+  'once'     { PT _ (TS _ 45)    }
+  'owned'    { PT _ (TS _ 46)    }
+  'record'   { PT _ (TS _ 47)    }
+  'return'   { PT _ (TS _ 48)    }
+  'right'    { PT _ (TS _ 49)    }
+  'row'      { PT _ (TS _ 50)    }
+  'than'     { PT _ (TS _ 51)    }
+  'then'     { PT _ (TS _ 52)    }
+  'tighter'  { PT _ (TS _ 53)    }
+  'type'     { PT _ (TS _ 54)    }
+  'use'      { PT _ (TS _ 55)    }
+  'var'      { PT _ (TS _ 56)    }
+  'where'    { PT _ (TS _ 57)    }
+  'with'     { PT _ (TS _ 58)    }
+  '{'        { PT _ (TS _ 59)    }
+  '|'        { PT _ (TS _ 60)    }
+  '}'        { PT _ (TS _ 61)    }
   L_charac   { PT _ (TC $$)      }
   L_quoted   { PT _ (TL $$)      }
   L_WokInt   { PT _ (T_WokInt _) }
@@ -228,7 +231,6 @@ ReservedKw
   | 'record' { GeneratedParser.Wok.Abs.ReservedKw_record }
   | 'row' { GeneratedParser.Wok.Abs.ReservedKw_row }
   | 'fun' { GeneratedParser.Wok.Abs.ReservedKw_fun }
-  | 'ctl' { GeneratedParser.Wok.Abs.ReservedKw_ctl }
 
 SigName :: { GeneratedParser.Wok.Abs.SigName }
 SigName
@@ -456,6 +458,9 @@ Exp2
   | 'with' VarId ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EWithRun $2 $3 $5 }
   | 'with' VarId '=' VarId ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EWithNamed $2 $4 $5 $7 }
   | 'with' VarId '=' ConId '{' ListHandlerArm '}' 'in' Exp { GeneratedParser.Wok.Abs.EWithNamedH $2 $4 $6 $9 }
+  | 'handler' ConId '{' ListHandlerArm '}' { GeneratedParser.Wok.Abs.EHandlerV $2 $4 }
+  | 'handle' Exp2 ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EHandleV $2 $3 $5 }
+  | 'handle' VarId '=' Exp2 ListWithArg 'in' Exp { GeneratedParser.Wok.Abs.EHandleN $2 $4 $5 $7 }
 
 MaybeTrailing :: { GeneratedParser.Wok.Abs.MaybeTrailing }
 MaybeTrailing
@@ -483,6 +488,9 @@ HandlerArm :: { GeneratedParser.Wok.Abs.HandlerArm }
 HandlerArm
   : ConId '.' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HArm $1 $3 $4 $6 }
   | VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HUArm $1 $2 $4 }
+  | 'once' ConId '.' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HOnceArm $2 $4 $5 $7 }
+  | 'once' VarId ListAtomPat '->' Exp { GeneratedParser.Wok.Abs.HOnceUArm $2 $3 $5 }
+  | 'return' AtomPat '->' Exp { GeneratedParser.Wok.Abs.HRetArm $2 $4 }
   | VarId '=' Exp { GeneratedParser.Wok.Abs.HParam $1 $3 }
   | 'var' VarId '=' Exp { GeneratedParser.Wok.Abs.HParamV $2 $4 }
 

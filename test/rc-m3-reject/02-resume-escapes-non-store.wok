@@ -17,7 +17,7 @@ import Control
 effect Tick = { tick : U64 }
 
 runTick : (Tick -> U64 with Tick + eff e) -> U64 with eff e
-runTick c = with self = Tick { tick k ->
+runTick c = with self = Tick { once tick k ->
   let k2 = k in
   let cell = __cont_cell_new () in
   let filled = __cont_store cell k2 in

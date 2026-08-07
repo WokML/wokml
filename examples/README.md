@@ -18,7 +18,7 @@ to see the lowered intermediate representation.)
 | `mtl-machine.wok` | the full mtl stack: `Reader` + `Writer` + `State` + `Except` | `Ok(((4, 30), [10, 30]))` |
 | `as-patterns.wok` | `as`-patterns (`pat as name`) in a case arm, a single-clause head, and a multi-clause function | `[8, 5, 6, 7]` |
 | `named-instances.wok` | named effect instances — two independent `State U64` cells, handle-typed helper params | `(((), 105), 0)` |
-| `generators.wok` | a generator/stream as a **one-shot** handler (`yield x k -> [x] ++ k ()`) | `[1, 2, 3, 4, 5, 6]` |
+| `generators.wok` | a generator/stream as a **one-shot** handler (`once yield x k -> [x] ++ k ()`) | `[1, 2, 3, 4, 5, 6]` |
 | `coroutine.wok` | one-shot escaping continuation: `start` returns a `Step`, `case` on `Completed`/`Suspended`, `run`/`step`/`cancel` an opaque second-class affine `Suspension` | `421` |
 | `generators-pull.wok` | **pull**-model generator: the consumer drives, `step`ping a `Suspension` and `case`ing each `Step` (contrast the push `generators.wok`) | `15` |
 | `pull-take.wok` | consumer-driven early termination: take the first `n` values then `cancel` the parked remainder | `3` |
@@ -68,7 +68,7 @@ done
   `State U64` cells told apart by name alone. Handles are second-class (scoped,
   can't escape their `with`).
 - **`generators.wok`** — a generator is **one-shot**, not multi-shot: each
-  `Yield.yield x k -> [x] ++ k ()` resumes once, and the producer's recursion
+  `once Yield.yield x k -> [x] ++ k ()` resumes once, and the producer's recursion
   (`count`) drives the "many." `--dump-multiplicity` reports `Yield.yield : 1`, so it
   is a legal handler under the one-shot law.
 - **`generators-pull.wok` / `pull-take.wok` / `pull-zip.wok`** — the **pull** model,
@@ -79,7 +79,7 @@ done
   shows the payoff over a single push handler — driving two producers at once, holding
   two `Suspension`s, which works because the tail binds in a `case` arm rather than a
   closure.
-- **`nondeterminism.wok`** — the multi-shot handler `flip k -> k True ++ k False` is a
+- **`nondeterminism.wok`** — the multi-shot handler `once flip k -> k True ++ k False` is a
   compile error, so backtracking is written explicitly with `List`. `concatMapL`'s
   lambda is the continuation `k` made first-class; `[]` is the pruned (0-shot) branch,
   `[(a, b)]` a successful one. The list monad *is* reified multi-shot.

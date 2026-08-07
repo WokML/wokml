@@ -6,6 +6,6 @@ import Base
 -- handle escaping into it is rejected.
 effect State s = { get : s, set : s -> () }
 state : s -> (State s -> a) -> a
-state i c = with self = State { var s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> v } in c self
 
 boxed = with count = state 0 in Some count

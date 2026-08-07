@@ -183,7 +183,9 @@ separator ImportName "," ;
 -- these words to the lexer's reserved set, keeping them out of VarId. When a
 -- feature ships, move its word out of here into that feature's real production.
 rules     ReservedKw ::= "contract" | "type" | "deriving" | "forall"
-                       | "do" | "record" | "row" | "fun" | "ctl" ;
+                       | "do" | "record" | "row" | "fun" ;
+-- `ctl` left this list when the control-arm keyword shipped as `once`
+-- (HOnceArm/HOnceUArm): the reserved seat is filled by the better name.
 DReserved. Decl ::= ReservedKw ;
 
 -- Helper: comma-separated additional names for multi-name sigs (`f, (+), h : T`).
@@ -445,9 +447,11 @@ EIf.      Exp2 ::= "if" Exp "then" Exp "else" Exp ;
 -- uses EXPLICIT braces (`with` cannot be a layout keyword without breaking the
 -- type-level `with` in `T -> R with E`). The trailing Exp is the handled
 -- computation, consumed like a lambda body (EWith is Exp2, body is full Exp).
--- A value arm (HVArm) is the return clause; the `return` keyword is gone. The
--- optional continuation binder is the (arity+1)-th AtomPat on an operation arm,
--- split from the op's arguments by the typechecker (Task 2), so HArm is unchanged.
+-- The clause KIND is DECLARED, not inferred from binder counts: a value arm is
+-- written `return v -> e` (HRetArm) and a control arm `once op ps k -> e`
+-- (HOnceArm/HOnceUArm), whose LAST AtomPat is the continuation. The old
+-- split-by-count reading is retired -- it is what made the S1/S2 collapses
+-- silent (see the HandlerArm productions below).
 -- Headerless handler (slice 1): every arm is dot-qualified.
 EWith.    Exp2 ::= "with" "{" [HandlerArm] "}" Exp ;
 -- Headed handler (slice 2): a non-empty ConId run names the handled effects so
@@ -466,14 +470,40 @@ EWithRun. Exp2 ::= "with" VarId [WithArg] "in" Exp ;
 -- names a primitive handler block.
 EWithNamed.  Exp2 ::= "with" VarId "=" VarId [WithArg] "in" Exp ;
 EWithNamedH. Exp2 ::= "with" VarId "=" ConId "{" [HandlerArm] "}" "in" Exp ;
+-- First-class handlers (proto/handler-values). `handler E { arms }` builds a
+-- handler VALUE with NO body -- the first production that yields a handler
+-- alone. `handle h in body` installs a handler value `h` around `body`. Together
+-- they split the fused `with` forms into construct + install, so a handler can
+-- be let-bound, returned from a function, and passed across a boundary (which
+-- the four prelude runners need and the fused forms cannot express).
+-- Both install forms take the handler as HEAD + ATOM ARGS (the EWithRun
+-- application sugar), so `handle state 0 in body` and
+-- `handle count = state 0 in body` parse without parens. The named form binds
+-- the role label `count`; `count.op` in the body performs on that activation
+-- (item-4 D5, the `with count = state 0 in` guarantee carried over). The `=`
+-- after `handle VarId` disambiguates from an unnamed install whose head is a
+-- variable (shift on `=`).
+EHandlerV. Exp2 ::= "handler" ConId "{" [HandlerArm] "}" ;
+EHandleV.  Exp2 ::= "handle" Exp2 [WithArg] "in" Exp ;
+EHandleN.  Exp2 ::= "handle" VarId "=" Exp2 [WithArg] "in" Exp ;
 WRArg.    WithArg ::= Exp2 ;
 separator WithArg "" ;
--- Qualified operation arm (unchanged).
+-- Qualified operation arm: AUTO-RESUME only. Binder count must equal the op's
+-- arity (E-ARITY); the continuation-splitting-by-count of the old Task 2 is
+-- retired -- clause kind is DECLARED, not inferred from counting (Section E,
+-- S1 collapse).
 HArm.     HandlerArm ::= ConId "." VarId [AtomPat] "->" Exp ;
--- Unqualified arm: covers BOTH the value arm (`v -> e`, zero AtomPats) and an
--- unqualified operation arm (`get -> e`, `set s -> e`). The typechecker classifies
--- each by resolving the head name against the header. Replaces HVArm.
+-- Unqualified auto-resume arm (headed handlers): op arity binders exactly.
 HUArm.    HandlerArm ::= VarId [AtomPat] "->" Exp ;
+-- Control arm: `once` declares that the LAST AtomPat is the continuation
+-- (affine, one-shot). Binder count must equal op arity + 1 (E-ARITY). The
+-- keyword states the law (v2 D10/D21: `ctl` rejected -- it imports the
+-- multi-shot prior); `ctl` left ReservedKw when this shipped.
+HOnceArm.  HandlerArm ::= "once" ConId "." VarId [AtomPat] "->" Exp ;
+HOnceUArm. HandlerArm ::= "once" VarId [AtomPat] "->" Exp ;
+-- Value arm: the `return` keyword RETURNS (reverses f927478's drop, on the
+-- Section E silent-collapse evidence). Exactly one binder, the final value.
+HRetArm.   HandlerArm ::= "return" AtomPat "->" Exp ;
 -- Handler-local parameter: a `name = init` seed entry inside the handler block.
 -- `=` distinguishes it from the `->` of op/value arms (HUArm/HArm). slice 4a.
 HParam.   HandlerArm ::= VarId "=" Exp ;

@@ -1,0 +1,5 @@
+module Main;
+ctl : U64 -> U64;
+ctl n = n + 1;
+useCtl : U64;
+useCtl = ctl 41

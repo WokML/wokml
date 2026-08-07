@@ -15,7 +15,7 @@ prog e =
     (h :: _) -> h
 
 run : (Exn -> U64 with Exn + eff e) -> U64 with eff e
-run c = with self = Exn { throw n k -> 88 ; v -> v } in c self
+run c = with self = Exn { once throw n k -> 88 ; return v -> v } in c self
 
 main : U64
 main = run prog

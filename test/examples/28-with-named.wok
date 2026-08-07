@@ -2,6 +2,6 @@ module Main
 
 prog count total = total
 
-state i c = with self = State { var s = i ; get -> s ; set x k -> k x () ; v -> (v, s) } in c self
+state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in c self
 
 main = with count = state 0 in with total = state 0 in prog count total

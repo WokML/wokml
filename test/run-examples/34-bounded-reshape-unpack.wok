@@ -10,7 +10,7 @@ risky b = if b then Exn.throw "boom" else 7
 -- and unpacked. Spec sec.12 claimed this needs a helper; it does not.
 main : U64
 main =
-  let r = (with { Exn.throw m k -> None ; v -> Some v } risky True) in
+  let r = (with { once Exn.throw m k -> None ; return v -> Some v } risky True) in
   case r of
     None   -> 1000
     Some n -> n

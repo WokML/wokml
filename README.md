@@ -66,7 +66,7 @@ cabal test --test-options=--accept
 - **Pattern matching:** `case e of { p1 -> e1; p2 -> e2 }`; top-level functions may have multiple clauses, compiled to decision trees.
 - **Records:** construction `Point { x = 1, y = 2 }`, projection `p.x`, patterns `Point { x = a, .. }`, row extension `Point { ..p, x = 9 }`.
 - **Type classes:** `class Eq a where { (==) : a -> a -> Bool }` and `instance Eq U64 where { ... }` (single-parameter; dictionary-passing).
-- **Effect handlers:** `with { Exn.throw m k -> None ; v -> Some v } e` — prefix handlers over the rest of the block; an operation arm auto-resumes unless it binds a continuation; optional header `with State { get -> 0 ; set s -> () }`; bounded form `(with H e)` scopes the handler to one expression. The `Never` bottom type marks non-returning operations.
+- **Effect handlers:** `with { once Exn.throw m k -> None ; return v -> Some v } e` — prefix handlers over the rest of the block; an operation arm auto-resumes unless it is declared `once`, which binds a continuation as its last binder; optional header `with State { get -> 0 ; set s -> () }`; bounded form `(with H e)` scopes the handler to one expression. The `Never` bottom type marks non-returning operations.
 - **Operator definitions** (all four equivalent):
   - `add x y = ...` -- prefix, alphabetic name
   - `(+) x y = ...` -- prefix, symbolic name in parens

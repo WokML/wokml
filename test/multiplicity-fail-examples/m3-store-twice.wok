@@ -14,5 +14,5 @@ main : U64
 main =
   let cellA = __cont_cell_new () in
   let cellB = __cont_cell_new () in
-  with { Park.park x k -> let a = __cont_store cellA k in let b = __cont_store cellB k in 0 }
+  with { once Park.park x k -> let a = __cont_store cellA k in let b = __cont_store cellB k in 0 }
   usePark ()

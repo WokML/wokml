@@ -22,9 +22,9 @@ runWriter : (() -> a with Writer + eff e) -> (a, Pair) with eff e
 runWriter c =
   with Writer
     { var log = Pair 0 0
-    ; tell1 w k -> let newLog = addToLog log w in k newLog ()
-    ; tell2 w k -> let newLog = setSecond log w in k newLog ()
-    ; v -> (v, log)
+    ; once tell1 w k -> let newLog = addToLog log w in k newLog ()
+    ; once tell2 w k -> let newLog = setSecond log w in k newLog ()
+    ; return v -> (v, log)
     } c ()
 
 prog : () -> U64 with Writer

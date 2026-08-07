@@ -16,7 +16,7 @@ prog e =
   go 2
 
 run : (Eff -> [U64] with Eff + eff r) -> Result [U64] U64 with eff r
-run c = with self = Eff { eop n k -> Err n ; v -> Ok v } in c self
+run c = with self = Eff { once eop n k -> Err n ; return v -> Ok v } in c self
 
 main : Result [U64] U64
 main = run prog

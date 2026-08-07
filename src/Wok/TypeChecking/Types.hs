@@ -61,6 +61,18 @@ data TyCon
   -- 'Wok.TypeChecking.Infer.inferProjection'). Distinct from 'TcUser', which
   -- tags ordinary (data) type constructors.
   | TcEffect Text
+  -- | A FIRST-CLASS HANDLER VALUE type (proto/handler-values).
+  -- @TcHandler "E"@ applied to @(params ++ [a, b])@ is @Handler (E params) a b@:
+  -- the type of a handler built by @handler E { arms }@ and consumed by
+  -- @handle h in body@. The effect's own parameter types come FIRST (empty for
+  -- a zero-param effect), so the install site can tie the body's performs to
+  -- this handler's instantiation; the last two args are always input/answer.
+  -- The effect name is baked into the tycon so the inferred type of a handler
+  -- value unifies structurally with a @handle@ site's expectation. UNLIKE
+  -- 'TcEffect' (a second-class instance handle), a handler value is ordinary
+  -- first-class data (D3), so 'Carrier.isHandleType' does NOT confine it.
+  -- Prototype note: currently inferred-only, never written in source.
+  | TcHandler Text
   deriving (Eq, Ord, Show)
 
 -- | A type EXPRESSION. After the merge this spans kinds: a node of kind KStar is

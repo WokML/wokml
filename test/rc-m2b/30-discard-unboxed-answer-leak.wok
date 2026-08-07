@@ -19,7 +19,7 @@ prog e =
     (h :: _) -> h
 
 run : (Choose -> U64 with Choose + eff e) -> U64 with eff e
-run c = with self = Choose { choose n k -> 88 ; v -> v } in c self
+run c = with self = Choose { once choose n k -> 88 ; return v -> v } in c self
 
 main : U64
 main = run prog

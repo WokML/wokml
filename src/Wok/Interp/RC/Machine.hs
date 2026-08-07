@@ -329,6 +329,9 @@ evalExprRC env expr sc k s = case expr of
                           (rscEnv sc) (zip defs [0 ..])
     in pure (REval body sc { rscEnv = groupEnv } k sEnv)
 
+  InstallHandler _ _ _ ->
+    error "proto/handler-values: the RC interpreter does not support first-class handler install (reference --run only)"
+
   Handle e h ->
     -- Install the counted handler frame (M2b-1 Task 3), mirroring the reference
     -- 'Wok.Interp.Machine.evalExpr' 'Handle' arm. A NAMED handler binds its
@@ -395,6 +398,9 @@ evalRhsRC env b rhs body sc k s = case rhs of
         cenv = Map.restrictKeys (rscEnv sc) fvs
     (a, s') <- allocRouted b (mkClosure cenv ps e) s
     cont (RVBox a) s'
+
+  RMakeHandler _ ->
+    error "proto/handler-values: the RC interpreter does not support handler value construction (reference --run only)"
 
   RProj l a -> do
     v <- liftRC (resolveRCAtom sc a)
@@ -1359,6 +1365,7 @@ bodyOpensArena plc = go
     go (Jump _ _)         = False
     go (Handle e h)       = go e || go (snd (hReturn h))
                               || any (go . oaBody) (hOps h)
+    go (InstallHandler _ _ e) = go e
     goAlt (AltCon _ _ e)  = go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e
@@ -1392,6 +1399,7 @@ bodyLendsBorrow = go
     go (Jump _ _)         = False
     go (Handle e h)       = go e || go (snd (hReturn h))
                               || any (go . oaBody) (hOps h)
+    go (InstallHandler _ _ e) = go e
     goAlt (AltCon _ _ e)  = go e
     goAlt (AltLit _ e)    = go e
     goAlt (AltDefault e)  = go e

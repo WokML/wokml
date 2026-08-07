@@ -8,7 +8,7 @@ prog u = State.get
 
 main : U64
 main =
-  with { State.get k    -> 0
-         ; State.set s k -> 0
-         ; v             -> v }
+  with { once State.get k    -> 0
+         ; once State.set s k -> 0
+         ; return v             -> v }
   prog ()

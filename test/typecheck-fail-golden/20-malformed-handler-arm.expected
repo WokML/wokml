@@ -1,1 +1,1 @@
-typecheck: typecheck in Main: MalformedHandlerArm (Just (11,10)) "Exn" "throw"
+typecheck: typecheck in Main: ArmArityMismatch (Just (11,10)) "Exn" "throw" False 1 3

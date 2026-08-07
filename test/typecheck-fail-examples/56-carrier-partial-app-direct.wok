@@ -6,7 +6,7 @@ import Base
 -- `with` body's result, so the handle `c` escapes through the returned closure.
 effect State s = { get : s, set : s -> () }
 state : s -> (State s -> a) -> a
-state i c = with self = State { var s = i ; get -> s ; set x k -> k x () ; v -> v } in c self
+state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> v } in c self
 
 peek : State U64 -> () -> U64
 peek c u = c.get

@@ -95,6 +95,10 @@ exprUniques = goE
       -- 'RCon' plus the token operand.
       Anf.RReuseCon tok _ xs       -> Set.union (av tok) (avs xs)
       Anf.RForeignCall _ _ _ _ _ xs -> avs xs
+      -- proto/handler-values: a handler value's reachable atoms are its arms'.
+      Anf.RMakeHandler h   ->
+        Set.union (goE (snd (Anf.hReturn h)))
+          (Set.unions [ goE (Anf.oaBody op) | op <- Anf.hOps h ])
     goA a = case a of
       Anf.AltCon _ _ e -> goE e
       Anf.AltLit _ e   -> goE e
@@ -111,6 +115,7 @@ exprUniques = goE
           (Set.unions
              ( goE (snd (Anf.hReturn h))
              : [ goE (Anf.oaBody op) | op <- Anf.hOps h ] ))
+      Anf.InstallHandler a _ body -> Set.union (av a) (goE body)
 
 -- | Handler-free scope guard. Returns a (possibly empty) list of human-readable
 -- violations: a program is in scope for the RC interpreter iff every top-level
@@ -223,6 +228,9 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
       -- A foreign call's args are plain atoms (no sub-expressions); no LetRec
       -- violation can arise from the call itself.
       Anf.RForeignCall{}          -> []
+      Anf.RMakeHandler{}          ->
+        [ Tx.pack "proto/handler-values: handler value construction is not \
+                  \supported by the RC interpreter (reference --run only)" ]
     alt mob lr bsc a = case a of
       Anf.AltCon _ bs b -> go mob lr (Set.union bsc (Set.fromList (boxedBs bs))) b
       Anf.AltLit _ b    -> go mob lr bsc b
@@ -371,6 +379,13 @@ exprScopeFeaturesWith bsc0 = nub . go Set.empty Set.empty bsc0
           ++ go mob lr bsc inner
           ++ go Set.empty lr bsc (snd (Anf.hReturn h))
           ++ concat [ go Set.empty lr bsc (Anf.oaBody op) | op <- Anf.hOps h ]
+      -- proto/handler-values: first-class handler install is not modeled by the
+      -- RC interpreter (off the --run reference path). Report honestly rather
+      -- than silently mis-analysing.
+      Anf.InstallHandler _ _ body ->
+        Tx.pack "proto/handler-values: first-class handler install is not \
+                \supported by the RC interpreter (reference --run only)"
+          : go mob lr bsc body
 
 -- | Precise violation messages for a handler that is OUTSIDE the M2b/M3
 -- store-route fragment. Value-position handlers ('hAnswerJoin = Just') are

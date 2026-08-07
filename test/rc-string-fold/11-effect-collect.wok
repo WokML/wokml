@@ -17,7 +17,7 @@ step u c = Emit.emit c
 -- collect: one-shot resume; result = c0 ++ (c1 ++ ( ... ++ "")) = the original.
 collect : String -> String
 collect s =
-  with Emit { emit ch k -> append (singleton ch) (k ()) ; v -> "" }
+  with Emit { once emit ch k -> append (singleton ch) (k ()) ; return v -> "" }
   foldChars step () s
 
 main : String

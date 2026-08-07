@@ -10,7 +10,7 @@ useTick u = Tick.tick 41
 
 main : U64
 main =
-  let r = (with { Tick.tick x k -> 88 } useTick ()) in
+  let r = (with { once Tick.tick x k -> 88 } useTick ()) in
   case r of
     0 -> 0
     _ -> r

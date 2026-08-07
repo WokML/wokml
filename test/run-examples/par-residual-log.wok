@@ -11,4 +11,4 @@ useE : () -> U64 with Log
 useE u = let (x, y) = par genE genE in x + y
 
 main : U64
-main = with Log { emit n k -> k () } (useE ())
+main = with Log { once emit n k -> k () } (useE ())

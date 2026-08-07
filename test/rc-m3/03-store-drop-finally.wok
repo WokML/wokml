@@ -35,10 +35,10 @@ effect Env = { envAsk : U64 }
 -- The 'Option a' answer type lets the abandon arm return 'None' while the
 -- resumed-program type stays 'a' --- the continuation 'k : U64 -> Option a'.
 envAbandon : (Env -> a with Env + eff e) -> Option a with eff e
-envAbandon c = with self = Env { envAsk k ->
+envAbandon c = with self = Env { once envAsk k ->
   let cell   = __cont_cell_new () in
   let filled = __cont_store cell k in
-  None ; v -> Some v } in c self
+  None ; return v -> Some v } in c self
 
 sumList : [U64] -> U64
 sumList xs = case xs of

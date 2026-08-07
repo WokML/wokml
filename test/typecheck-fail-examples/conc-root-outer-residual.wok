@@ -14,4 +14,4 @@ root : () -> U64 with Conc + Log
 root u = let a = yield () in Log.log 1
 
 main : U64
-main = with Log { log x k -> k () } runConc root
+main = with Log { once log x k -> k () } runConc root

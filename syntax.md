@@ -22,11 +22,14 @@ Default = no binder = auto-resume (tail-resumptive); body is the OPERATION's res
       with { Ask.ask -> 41 }      -- continues automatically with 41
       useAsk ()                   -- => 42
 
-Bind a continuation `k` to take control; body becomes the ANSWER type:
+Declare a control clause with `once` to bind the continuation `k`; body becomes
+the ANSWER type. The keyword states the law: the clause resumes AT MOST ONCE.
 
-    Exn.throw msg k   -> None                       -- 0x: abort (exception)
-    Choice.flip   k   -> append (k True) (k False)  -- Nx: multi-shot (backtracking)
-    Async.await fut k -> Blocked fut k              -- 1x-deferred: hand k off, resume later (async)
+    once Exn.throw msg k   -> None                       -- 0x: abort (exception)
+    once Choice.flip   k   -> append (k True) (k False)  -- Nx: rejected, one-shot law
+    once Async.await fut k -> Blocked fut k              -- 1x-deferred: hand k off, resume later (async)
 
-`k` is an ordinary name (no magic `resume`). Full spec:
+`k` is an ordinary name (no magic `resume`); `once` declares WHICH binder it is,
+not how many times it runs -- that stays inferred. A value clause is written
+`return v -> e`. Full spec:
 docs/superpowers/specs/2026-06-05-effect-handler-surface-syntax.md

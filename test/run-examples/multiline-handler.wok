@@ -3,8 +3,8 @@ import Base
 effect Counter = { tick : () -> () , read : U64 }
 demo : U64
 demo = with Counter {
-    tick u k -> k ()
-    read k   -> k 7
+    once tick u k -> k ()
+    once read k   -> k 7
   } (let a = Counter.tick () in Counter.read)
 main : U64
 main = demo

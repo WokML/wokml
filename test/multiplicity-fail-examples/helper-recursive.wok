@@ -18,5 +18,5 @@ useTick u = Tick.tick 41
 
 main : U64
 main =
-  with { Tick.tick n k -> loopK k n }
+  with { once Tick.tick n k -> loopK k n }
   useTick ()

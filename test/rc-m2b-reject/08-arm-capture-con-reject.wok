@@ -15,7 +15,7 @@ prog : Exn -> Wrap with Exn
 prog e = let u = e.throw 1 in Wrap [9]
 
 run : [U64] -> (Exn -> Wrap with Exn + eff e) -> Wrap with eff e
-run x c = with self = Exn { throw n k -> Wrap x ; v -> v } in c self
+run x c = with self = Exn { once throw n k -> Wrap x ; return v -> v } in c self
 
 main : Wrap
 main = let x = [7, 8] in run x prog

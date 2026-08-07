@@ -14,5 +14,5 @@ risky b = if b then Exn.throw "boom" else 7
 main : U64
 main =
   let a = (with State { get -> 5 ; set s -> () } prog ()) in
-  let b = (with { Exn.throw m k -> 0 ; v -> v } risky False) in
+  let b = (with { once Exn.throw m k -> 0 ; return v -> v } risky False) in
   a + b

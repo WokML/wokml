@@ -15,5 +15,5 @@ usePark u = Park.park 7
 main : U64
 main =
   let cell = __cont_cell_new () in
-  with { Park.park x k -> let a = __cont_store cell k in 0 }
+  with { once Park.park x k -> let a = __cont_store cell k in 0 }
   usePark ()

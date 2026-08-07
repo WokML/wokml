@@ -17,7 +17,7 @@ different inputs, and combine the results." The canonical illegal handler:
 
 ```
 -- COMPILE ERROR under one-shot-as-law: resumes k twice.
-with { Choice.flip k -> k True ++ k False }
+with { once Choice.flip k -> k True ++ k False }
 ```
 
 `k` is *the rest of the computation after `flip`*. Resuming it with `True` and again
@@ -115,7 +115,7 @@ count lo hi = case lo == hi of                 -- the producer's loop drives "ma
   True  -> ()
   False -> let u = Yield.yield lo in count (lo + 1) hi
 
-with { Yield.yield x k -> [x] ++ k () ; v -> [] }    -- one resume per yield -> 1-shot
+with { once Yield.yield x k -> [x] ++ k () ; return v -> [] }    -- one resume per yield -> 1-shot
 count 1 7                                            -- => [1, 2, 3, 4, 5, 6]
 ```
 

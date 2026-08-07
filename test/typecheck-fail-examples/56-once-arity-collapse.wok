@@ -1,0 +1,22 @@
+-- S1, the arity collapse, made loud. The operation's argument is ITSELF a
+-- function, so a one-binder arm is ambiguous between two readings:
+--
+--   argument reading:      call k -> k 41          (k is the U64 -> U64 arg)
+--   continuation reading:  once call f k -> k (f 41)
+--
+-- Under the pre-retrofit surface the clause kind was INFERRED by counting
+-- binders, so this program silently took the argument reading and ran, printing
+-- 42. The kind is now DECLARED: `once` promises arity + 1 binders, this arm
+-- binds 1, and E-ARITY reports the disagreement against the declaration.
+module Main
+import Std.Base
+
+effect Call = { call : (U64 -> U64) -> U64 }
+
+useCall : () -> U64 with Call
+useCall u = Call.call (\n -> n + 1)
+
+main : U64
+main =
+  with { once Call.call k -> k 41 }
+  useCall ()

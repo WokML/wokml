@@ -1,0 +1,17 @@
+-- The once/return retrofit moved the reserved-word boundary in two directions.
+--
+-- OUT: `ctl` left the reserved set. It was held for the control-arm keyword,
+-- and that seat went to `once` instead, so `ctl` is an ordinary lowercase
+-- identifier again -- usable as a function name, a parameter, a binder.
+--
+-- IN: `once` and `return` became clause-head keywords in the lexer, so they can
+-- no longer appear in identifier position. That rejection is pinned by its own
+-- fixture, 43-clause-keywords-rejected.wok, since a parse error cannot share a
+-- file with code that must parse.
+module Main
+
+ctl : U64 -> U64
+ctl n = n + 1
+
+useCtl : U64
+useCtl = ctl 41

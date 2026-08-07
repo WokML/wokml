@@ -12,6 +12,6 @@ risky b = if b then Exn.throw "boom" else 7
 -- because `throw`'s result is `Never`).
 main : Option U64
 main =
-  with { Exn.throw msg k -> None
-         ; v -> Some v }
+  with { once Exn.throw msg k -> None
+         ; return v -> Some v }
   risky True

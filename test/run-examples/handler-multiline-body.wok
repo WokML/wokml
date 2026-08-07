@@ -12,10 +12,10 @@ state : s -> (() -> a with State s + eff e) -> (a, s) with eff e
 state i c = with State {
     var s = i
     get -> s
-    set x k ->
+    once set x k ->
       let next = x in
       k next ()
-    v -> (v, s)
+    return v -> (v, s)
   } c ()
 
 prog : () -> U64 with State U64

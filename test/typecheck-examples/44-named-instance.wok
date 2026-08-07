@@ -4,4 +4,4 @@ import Base
 effect State s = { get : s, set : s -> () }
 
 runLocal : U64 -> U64
-runLocal i = with s = State { get -> i ; set x k -> k () ; v -> v } in let u = s.set i in s.get
+runLocal i = with s = State { get -> i ; once set x k -> k () ; return v -> v } in let u = s.set i in s.get

@@ -21,7 +21,7 @@ producer u =
 -- main does not obligate effect rows.
 drive : () -> U64
 drive u =
-  with Log { emit n k -> k () }
+  with Log { once emit n k -> k () }
     (case start producer of
        Completed r   -> r
        Suspended _ g -> run g 5)
