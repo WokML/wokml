@@ -1,0 +1,5 @@
+loser : () -> U64 with Async + Writer
+main : U64
+runRaced : () -> U64 with Writer
+toNum : U64 -> [U64] -> U64
+winner : () -> U64 with Async + Writer

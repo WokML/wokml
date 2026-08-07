@@ -1,0 +1,2 @@
+main : U64
+sumPairs : [U64] -> [U64] -> U64

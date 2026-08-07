@@ -18,9 +18,11 @@ import Control.Monad.Except (ExceptT (..), liftEither, runExceptT)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import qualified Data.Graph as G
+import Data.List (isSuffixOf)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import System.IO.Error (isDoesNotExistError)
 
@@ -29,6 +31,8 @@ import Wok.Parsing (parse)
 import qualified Wok.Prelude as Prelude
 import Wok.Reordering
   ( FixityError, FixityTable, ReorderError, buildFixityTable )
+import Wok.Sexp.Read (Pos (..), SexpError (..), readSExp)
+import Wok.Sexp.Surface (SurfaceError (..), surfaceModule)
 import Wok.SourceOrigin (Origin (..), originPath)
 import qualified Wok.TypeChecking.Infer as I
 
@@ -116,7 +120,7 @@ loadOne path = do
 
 parseAndPrep :: FilePath -> Origin -> Text -> Either LoaderError LoadedModule
 parseAndPrep path origin src = do
-  ast      <- first (LoadParseError path)  (parse src)
+  ast      <- first (LoadParseError path)  (parseSource path src)
   name     <- maybe (Left (LoadNoModuleHeader path)) Right (extractModuleName ast)
   fixities <- first (LoadFixityError path) (buildFixityTable ast)
   pure LoadedModule
@@ -126,6 +130,33 @@ parseAndPrep path origin src = do
     , lmImports  = extractImports ast
     , lmFixities = fixities
     }
+
+-- | Dispatch on file extension (spec D2): a path ending in @.sexp@ goes
+-- through the grammar/c s-expression reader + surface mapper; everything
+-- else goes through the BNFC parser as before. The .sexp dump carries no
+-- source positions of its own, so a reader/mapper error is rendered with
+-- the datum's line/col IN THE .SEXP FILE (spec D4) -- never a source
+-- position from anywhere else.
+parseSource :: FilePath -> Text -> Either String Module
+parseSource path src
+  | ".sexp" `isSuffixOf` path =
+      case readSExp src of
+        Left err    -> Left (renderSexpError err)
+        Right datum -> first renderSurfaceError (surfaceModule datum)
+  | otherwise = parse src
+
+renderPos :: Pos -> String
+renderPos (Pos l c) = show l ++ ":" ++ show c
+
+renderSexpError :: SexpError -> String
+renderSexpError e =
+  renderPos (sexpErrorPos e) ++ ": " ++ T.unpack (sexpErrorMessage e)
+
+renderSurfaceError :: SurfaceError -> String
+renderSurfaceError (MalformedDump p msg) =
+  renderPos p ++ ": " ++ T.unpack msg
+renderSurfaceError (SexpGap p tag label msg) =
+  renderPos p ++ ": " ++ T.unpack tag ++ " (" ++ T.unpack label ++ "): " ++ T.unpack msg
 
 -- v1 expects the module header as the first decl; later semantic-pass
 -- relaxation can allow it anywhere as long as it's unique.

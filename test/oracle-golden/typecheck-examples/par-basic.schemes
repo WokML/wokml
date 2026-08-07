@@ -1,0 +1,3 @@
+genA : () -> U64 with Async
+genB : () -> U64 with Async
+main : U64

@@ -1,0 +1,3 @@
+innerVal : () -> U64 with Conc
+main : U64
+outerVal : () -> U64 with Conc

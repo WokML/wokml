@@ -1,0 +1,3 @@
+first : forall a b. (a, b) -> a
+headOr : forall a. a -> [a] -> a
+isNone : forall a. Option a -> Bool

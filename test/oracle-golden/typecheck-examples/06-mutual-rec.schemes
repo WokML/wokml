@@ -1,0 +1,2 @@
+even : U64 -> Bool
+odd : U64 -> Bool

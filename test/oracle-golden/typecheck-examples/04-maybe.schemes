@@ -1,0 +1,2 @@
+fromOption : forall a. a -> Option a -> a
+mapOption : forall a b. (a -> b) -> Option a -> Option b

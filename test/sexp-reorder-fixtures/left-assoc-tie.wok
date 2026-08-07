@@ -1,0 +1,5 @@
+-- Equal precedence (same operator, no cross-operator equivalence classes):
+-- left-assoc takes the rightmost occurrence, so this groups as (a - b) - c.
+fixity - left
+
+f a b c = a - b - c

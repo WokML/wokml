@@ -1,0 +1,3 @@
+add : U64 -> U64 -> U64
+double : U64 -> U64
+quad : U64 -> U64

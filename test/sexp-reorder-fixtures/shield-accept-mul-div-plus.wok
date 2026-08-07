@@ -1,0 +1,8 @@
+-- Spec's first shield example: `+` looser than both `*` and `/`, which are
+-- themselves unrelated. `+` shields `*` from `/` (it stands between them and
+-- is looser than both), so the chain is well-formed.
+fixity + left
+fixity * left tighter than +
+fixity / left tighter than +
+
+f = 2 * 3 + 8 / 4

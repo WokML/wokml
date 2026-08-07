@@ -1,0 +1,5 @@
+genP : () -> U64 with Async + Writer
+genQ : () -> U64 with Async + Writer
+main : U64
+runPar : () -> (U64, U64) with Writer
+toNum : U64 -> [U64] -> U64

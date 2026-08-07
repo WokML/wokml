@@ -1,0 +1,2 @@
+main : U64
+worker : U64 -> () -> U64 with Coro

@@ -1,0 +1,8 @@
+-- A chain reachable only through a case alternative's body: the reorder
+-- walk must descend into ECase's alts, not just top-level equation bodies.
+fixity + left
+fixity * left tighter than +
+
+f x = case x of
+  0 -> 1 + 2 * 3
+  n -> n

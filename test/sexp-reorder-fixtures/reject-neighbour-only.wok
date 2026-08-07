@@ -1,0 +1,7 @@
+-- `*` is named only as `+`'s neighbour (the `tighter than` target); it
+-- never gets a `fixity *` declaration of its own. A name known only as a
+-- neighbour placeholder has no associativity of its own and cannot be used
+-- in a chain under reorder mode.
+fixity + left tighter than *
+
+f a b = a * b

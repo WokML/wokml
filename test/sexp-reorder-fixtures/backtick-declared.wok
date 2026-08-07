@@ -1,0 +1,8 @@
+-- A backtick-spelled alpha operator with its own fixity declaration, mixed
+-- with a symbol operator: operator identity is the spelling, not the
+-- backtick-vs-bare surface, so `div` here is the same table entry a bare
+-- `div` chain would look up.
+fixity + left
+fixity div left tighter than +
+
+f a b c = a + b `div` c

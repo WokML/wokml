@@ -1,0 +1,6 @@
+-- The simplest possible chain: one operator occurrence. reorderChain's
+-- findLoosest on a singleton is a no-op scan (best = 0), so this exercises
+-- the base case the idempotence property leans on.
+fixity + left
+
+f a b = a + b

@@ -34,7 +34,7 @@ CFLAGS  := $(STD) $(WARN) $(OPT) $(INCLUDE) -MMD -MP
 SANFLAG := -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
 LIB_SRC := wok_arena.c wok_diag.c wok_token.c wok_layout.c wok_ast.c \
-           wok_resolve.c \
+           wok_resolve.c wok_reorder.c \
            wok_parse.c wok_sexpr.c wok_print.c wok_shape.c wok_trivia.c \
            wok_utf8.c \
            wok_write.c
@@ -91,6 +91,26 @@ test: $(TEST_BIN) wokfmt wokparse
 	  if ./wokparse -check-only $$f > /dev/null 2>&1; then \
 	    echo "cli: -check-only must fault reject/07"; exit 1; fi; \
 	  echo "cli: mode split holds"
+	@# `-reorder` is a MODIFIER of `-sexp`, not a mode of its own (see
+	@# wok_reorder.h / docs/superpowers/specs/2026-08-07-sexp-reorder-pass.md):
+	@# naming it without `-sexp` is a usage error, not a silent no-op. On a
+	@# fixity-clean file `-sexp -reorder` dumps like any other -sexp run; on a
+	@# fixity-faulted file it must dump NOTHING, the same "no partial tree on
+	@# a fault" rule the bare/-check-only split above already keeps.
+	@g=../../test/sexp-reorder-fixtures/single-op-chain.wok; \
+	  b=../../test/sexp-reorder-fixtures/reject-undeclared-operator.wok; \
+	  if ./wokparse -reorder $$g > /dev/null 2>&1; then \
+	    echo "cli: -reorder without -sexp must be a usage error"; exit 1; fi; \
+	  ./wokparse -sexp -reorder $$g > /tmp/wok_reorder_ok 2>/dev/null || \
+	    { echo "cli: -sexp -reorder must dump a fixity-clean file"; exit 1; }; \
+	  [ -s /tmp/wok_reorder_ok ] || \
+	    { echo "cli: -sexp -reorder dumped nothing for a clean file"; exit 1; }; \
+	  if ./wokparse -sexp -reorder $$b > /tmp/wok_reorder_bad 2>/dev/null; then \
+	    echo "cli: -sexp -reorder must fault a fixity-broken file"; exit 1; fi; \
+	  if [ -s /tmp/wok_reorder_bad ]; then \
+	    echo "cli: -sexp -reorder must dump nothing on a fault"; exit 1; fi; \
+	  rm -f /tmp/wok_reorder_ok /tmp/wok_reorder_bad; \
+	  echo "cli: reorder mode split holds"
 
 # Every test, plus the corpus, under ASan + UBSan. Wired beside the existing
 # runtime sanitiser script.
@@ -110,6 +130,21 @@ sanitize:
 	  if [ $$rc -gt $$max ]; then \
 	    echo "sanitize: $$f exited $$rc"; exit 1; fi; done
 	@echo "sanitize: clean over $(words $(CORPUS)) corpus files"
+	@# The same corpus again, under `-sexp -reorder`: still only a sanitiser
+	@# report or an out-of-range exit code is a failure. Unlike -check-only,
+	@# reject/ is not the only directory allowed to fault here -- most of the
+	@# corpus declares no in-file `fixity` at all, and reorder mode has no
+	@# grace for an operator with no table entry (spec: "check mode would
+	@# have skipped it silently; reorder mode is strict"), so accept/, tour/
+	@# and fill/ files legitimately exit 1 too. What this sweep is actually
+	@# checking is ASan/UBSan silence and "nothing worse than a diagnosed
+	@# fault" over every corpus file's reorder path, not a directory-keyed
+	@# verdict the way -check-only's sweep above is.
+	@for f in $(CORPUS); do ./wokparse -sexp -reorder $$f > /dev/null 2>&1; \
+	  rc=$$?; \
+	  if [ $$rc -gt 1 ]; then \
+	    echo "sanitize: $$f -sexp -reorder exited $$rc"; exit 1; fi; done
+	@echo "sanitize: clean over $(words $(CORPUS)) corpus files under -reorder"
 	@# Instrumented objects must not be left where an ordinary `make` would
 	@# reuse them: they carry __asan/__ubsan references the normal link lacks.
 	@$(MAKE) clean > /dev/null

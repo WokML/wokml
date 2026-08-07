@@ -1,0 +1,3 @@
+main : U64
+passes : forall a. Suspension U64 U64 U64 a -> ()
+useIt : forall a. Suspension U64 U64 U64 a -> ()

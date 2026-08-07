@@ -7,6 +7,14 @@
 //   wokparse -layout FILE.wok      the stream after the layout filter
 //   wokparse -check-only FILE.wok  parse, resolve, report faults; print nothing else
 //   wokparse -json FILE.wok        the same faults, one JSON object per line
+//   wokparse -sexp -reorder FILE.wok
+//                                  parse -> resolve -> reorder -> dump: the
+//                                  s-expression carries precedence-RESOLVED
+//                                  chains instead of flat ones. `-reorder`
+//                                  is a modifier of `-sexp`, not a mode of
+//                                  its own -- it is an error without it (see
+//                                  docs/superpowers/specs/
+//                                  2026-08-07-sexp-reorder-pass.md).
 //
 // Human diagnostics are `file:line:col: message`, which every editor and CI
 // log already jumps to. A batch is printed, not the first fault.
@@ -20,6 +28,7 @@
 #include "../wok_diag.h"
 #include "../wok_layout.h"
 #include "../wok_parse.h"
+#include "../wok_reorder.h"
 #include "../wok_resolve.h"
 #include "../wok_sexpr.h"
 #include "../wok_token.h"
@@ -68,21 +77,35 @@ static void print_tokens(WokTokens t, const char *src, const WokDiagSink *d) {
 
 int main(int argc, char **argv) {
   Mode mode = M_SEXP;
+  bool saw_sexp = false;
+  bool reorder = false;
   int argi = 1;
   for (; argi < argc && argv[argi][0] == '-'; argi++) {
     if (strcmp(argv[argi], "-tokens") == 0) mode = M_TOKENS;
     else if (strcmp(argv[argi], "-layout") == 0) mode = M_LAYOUT;
     else if (strcmp(argv[argi], "-check-only") == 0) mode = M_CHECK;
-    else if (strcmp(argv[argi], "-sexp") == 0) mode = M_SEXP;
+    else if (strcmp(argv[argi], "-sexp") == 0) { mode = M_SEXP; saw_sexp = true; }
     else if (strcmp(argv[argi], "-json") == 0) mode = M_JSON;
+    else if (strcmp(argv[argi], "-reorder") == 0) reorder = true;
     else {
       fprintf(stderr, "wokparse: unknown flag %s\n", argv[argi]);
       return 2;
     }
   }
   if (argi >= argc) {
-    fprintf(stderr, "usage: wokparse [-tokens|-layout|-sexp|-check-only|-json]"
-                    " FILE.wok\n");
+    fprintf(stderr, "usage: wokparse [-tokens|-layout|-sexp[-reorder]|"
+                    "-check-only|-json] FILE.wok\n");
+    return 2;
+  }
+  // `-reorder` reassociates the very chains `-sexp` dumps, so it means
+  // nothing under any other mode -- and nothing implicitly either: -sexp is
+  // the default mode, but a bare `wokparse -reorder FILE` did not ASK for
+  // the dump `-reorder` modifies, so it is refused rather than guessed. The
+  // MODE check (not just "was -sexp typed") is what catches `-sexp -json
+  // -reorder`: a later mode flag overrides -sexp, and -reorder would
+  // otherwise silently do nothing under the mode that won.
+  if (reorder && (!saw_sexp || mode != M_SEXP)) {
+    fprintf(stderr, "wokparse: -reorder requires -sexp\n");
     return 2;
   }
 
@@ -110,12 +133,20 @@ int main(int argc, char **argv) {
       bool parsed = wok_diag_count(d) == 0;
       // Resolution runs only over a clean parse: a damaged tree has holes
       // where the names and counts belong, and the parse fault already said
-      // the true thing about them. And it runs only in the CHECK modes:
-      // -sexp is the dump tool, and a stage-4 fault must not cost the
-      // reader the very tree the fault is about.
-      if (parsed && (mode == M_CHECK || mode == M_JSON))
+      // the true thing about them. And it runs only in the CHECK modes, or
+      // under -sexp -reorder where the reorder pass needs resolve's fixity
+      // table -- plain -sexp stays the dump tool, and a stage-4 fault must
+      // not cost the reader the very tree the fault is about.
+      if (parsed && (mode == M_CHECK || mode == M_JSON)) {
         wok_resolve(file, src, a, d);
-      if (mode == M_SEXP && parsed) wok_sexpr_dump(file, src, stdout);
+      } else if (parsed && mode == M_SEXP && reorder) {
+        WokFixTable fix = {0};
+        wok_resolve_fix(file, src, a, d, &fix);
+        if (wok_diag_count(d) == 0)
+          file = (WokNode *)wok_reorder(file, src, a, d, &fix);
+      }
+      if (mode == M_SEXP && parsed && wok_diag_count(d) == 0)
+        wok_sexpr_dump(file, src, stdout);
     }
 
     if (wok_diag_count(d) > 0) {

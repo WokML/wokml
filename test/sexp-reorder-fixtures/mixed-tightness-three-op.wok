@@ -1,0 +1,7 @@
+-- Three distinct levels, fully ordered transitively: + loosest, then *,
+-- then ^ tightest. Should nest as a + (b * (c ^ d)).
+fixity + left
+fixity * left tighter than +
+fixity ^ right tighter than *
+
+f a b c d = a + b * c ^ d

@@ -1,0 +1,7 @@
+-- `+` and `-` are both declared but have no `tighter than`/`looser than`
+-- relation between them, and they sit adjacent with nothing between them to
+-- shield the pair: the chain is structurally ambiguous.
+fixity + left
+fixity - left
+
+f a b c = a + b - c

@@ -48,11 +48,11 @@ typedef struct {
 // with the same bits. Comparison is `bit(a,b)` / `bit(b,a)`, and a CYCLE is
 // `bit(a,a)` -- a node that reaches itself -- so the circularity check needs
 // no second algorithm and self-reference is just its one-node case.
-typedef struct {
-  WokSpan name;
-  u64 assoc;
-  u32 decl_off;  // where it was declared, for "already has a fixity at ..."
-} FixOp;
+// FixOp is WokFixTable's element type (wok_resolve.h): the table this stage
+// builds IS the handle the reorder pass consults, so there is one struct, not
+// a private one shaped like a public one. `decl_off` doubles as "where it was
+// declared" for the already-has-a-fixity diagnostic below.
+typedef WokFixOp FixOp;
 
 typedef struct {
   FixOp *ops;
@@ -1044,7 +1044,10 @@ static void sc_block(SC *c, WokSeq stmts) {
     const WokNode *s = stmts.items[i];
     if (s && s->tag == S_Handle) {
       sc_node(&in, S_Handle_handler(s));
-      in.env = push_value(&in, S_Handle_label(s));
+      // A zero-length label is parse-error recovery (the missing label was
+      // already faulted), not a binding; same guard as E_HandleIn's elision.
+      WokSpan hl = S_Handle_label(s);
+      if (hl.len != 0) in.env = push_value(&in, hl);
       continue;
     }
     if (s && s->tag == S_Use) {
@@ -1191,9 +1194,12 @@ static void sc_node(SC *c, const WokNode *n) {
   }
 }
 
-void wok_resolve(const WokNode *file, const char *src, WokArena *a,
-                 WokDiagSink *d) {
-  if (!file || file->tag != W_File) return;
+void wok_resolve_fix(const WokNode *file, const char *src, WokArena *a,
+                     WokDiagSink *d, WokFixTable *out_fix) {
+  if (!file || file->tag != W_File) {
+    if (out_fix) *out_fix = (WokFixTable){0};
+    return;
+  }
   R r = {.src = src, .d = d, .file = file, .arena = a, .effs = nullptr,
          .neffs = 0, .fix = {0}, .fix_note = nullptr};
   build_aliases(&r, file, a);
@@ -1206,4 +1212,12 @@ void wok_resolve(const WokNode *file, const char *src, WokArena *a,
   // check-kind order.
   SC sc = {.r = &r, .env = nullptr, .frame = 0, .nframe = 0};
   sc_node(&sc, (WokNode *)file);
+  if (out_fix)
+    *out_fix = (WokFixTable){.ops = r.fix.ops, .n = r.fix.n,
+                             .edge = r.fix.edge, .words = r.fix.words};
+}
+
+void wok_resolve(const WokNode *file, const char *src, WokArena *a,
+                 WokDiagSink *d) {
+  wok_resolve_fix(file, src, a, d, nullptr);
 }

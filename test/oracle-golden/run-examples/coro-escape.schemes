@@ -1,0 +1,2 @@
+main : U64
+producer : () -> U64 with Coro

@@ -1,0 +1,7 @@
+-- The sharpest form of reject-neighbour-unused: the file contains NO chain
+-- at all, so nothing ever consults the fixity table -- and the unresolved
+-- neighbour placeholder must still fault the module, exactly as Haskell's
+-- buildFixityTable fails before reorderAst runs.
+fixity + left tighter than *
+
+f = 0

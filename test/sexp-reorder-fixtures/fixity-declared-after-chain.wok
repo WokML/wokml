@@ -1,0 +1,6 @@
+-- The `fixity` declaration for `+` appears AFTER the equation that uses it.
+-- Table construction is a full scan of the module's decls before any
+-- reordering starts, so declaration order relative to use must not matter.
+f a b = a + b
+
+fixity + left

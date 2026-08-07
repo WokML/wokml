@@ -1,0 +1,2 @@
+myLength : forall a. [a] -> U64
+myMap : forall a b. (a -> b) -> [a] -> [b]

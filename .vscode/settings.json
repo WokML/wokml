@@ -1,3 +1,4 @@
 {
-    "terminal.integrated.gpuAcceleration": "off"
+    "terminal.integrated.gpuAcceleration": "off",
+    "editor.rulers": [80]
 }

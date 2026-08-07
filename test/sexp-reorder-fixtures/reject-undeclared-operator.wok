@@ -1,0 +1,4 @@
+-- `#` carries no `fixity` declaration anywhere in the file: reorder mode
+-- cannot place it in a chain without one (check mode would have skipped it
+-- silently; reorder mode is strict).
+f a b = a # b

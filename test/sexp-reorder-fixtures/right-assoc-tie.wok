@@ -1,0 +1,5 @@
+-- Equal precedence, right-assoc: the tie resolves to the leftmost
+-- occurrence, so this groups as a $ (b $ c).
+fixity $ right
+
+f a b c = a $ b $ c

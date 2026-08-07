@@ -1,0 +1,8 @@
+-- Spec's second shield example: same declarations as
+-- shield-accept-mul-div-plus.wok, but `*` and `/` sit ADJACENT with nothing
+-- looser between them, so nothing shields the incomparable pair.
+fixity + left
+fixity * left tighter than +
+fixity / left tighter than +
+
+f = 2 * 3 / 4 + 8

@@ -1,0 +1,3 @@
+main : U64
+slow : () -> U64 with Conc
+waiter : Promise U64 -> () -> U64 with Conc

@@ -1,0 +1,2 @@
+ignore : forall a. Suspension U64 U64 U64 a -> ()
+main : U64

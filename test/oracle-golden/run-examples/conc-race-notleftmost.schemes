@@ -1,0 +1,3 @@
+fast : () -> U64 with Conc
+main : U64
+slow : () -> U64 with Conc

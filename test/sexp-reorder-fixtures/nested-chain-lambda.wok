@@ -1,0 +1,6 @@
+-- A chain reachable only through a lambda body: the reorder walk must
+-- descend into ELam, not just top-level equation bodies.
+fixity + left
+fixity * left tighter than +
+
+f = \x y z -> x + y * z

@@ -1,0 +1,2 @@
+foo : forall a. U64 -> Suspension U64 U64 U64 a -> U64 with eff a
+main : U64

@@ -1,4 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
+-- Orphans: the sexp differential's normalization pass ('sexpNormalize')
+-- derives Data for the generated Abs types via standalone deriving below;
+-- the generated sublibrary cannot carry the instances itself without
+-- editing generated code.
+{-# OPTIONS_GHC -Wno-orphans #-}
 module Main where
 
 import Test.Tasty
@@ -39,6 +44,8 @@ import qualified Data.Set as Set
 import qualified Wok.TypeChecking.Typed as Typed
 import qualified Wok.TypeChecking as TC
 import qualified Wok.SourceOrigin as SO
+import qualified Wok.Sexp.Read as Sexp
+import qualified Wok.Sexp.Surface as Surface
 import qualified Wok.Prelude as Prelude
 import qualified Wok.Loader as Loader
 import qualified Wok.Pipeline as Pipeline
@@ -84,11 +91,16 @@ import Data.IORef (newIORef)
 import Data.Unique (newUnique, hashUnique)
 import System.Environment (lookupEnv)
 import Data.Bifunctor (first)
+import qualified Data.Either
 import qualified Data.List
 import qualified Data.Maybe
+import Data.Data (Data, gmapT)
+import Data.Typeable (cast)
 import Data.List (sortBy, isPrefixOf, intercalate)
 import Data.Ord (comparing)
 import System.FilePath (takeBaseName, replaceDirectory, replaceExtension)
+import System.Process (readProcessWithExitCode)
+import System.Exit (ExitCode (..))
 import Foreign.Ptr (castPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import qualified Data.ByteString.Unsafe as BSU
@@ -212,6 +224,13 @@ main = do
                       in not (isPrefixOf "coherence-" b)
                          && not (isPrefixOf "death-" b))
                rcFfiOwnedAllFiles
+  -- S3: env-gated parser-vs-parser differential over the corpus
+  -- intersection (spec D7). WOK_WOKPARSE=path/to/wokparse enables it;
+  -- unset, 'buildSexpDifferentialGroup' emits a single skip notice.
+  wokparseEnv <- lookupEnv "WOK_WOKPARSE"
+  sexpDifferentialGroup <- buildSexpDifferentialGroup wokparseEnv
+  sexpReorderGroup <- buildSexpReorderGroup wokparseEnv
+  sexpReorderPropertyGroup <- buildSexpReorderPropertyGroup wokparseEnv
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -223,6 +242,12 @@ main = do
     , constraintTypesTests
     , envSmokeTests
     , envOverlayTests
+    , sexpReadTests
+    , sexpSurfaceTests
+    , sexpLoaderTests
+    , sexpDifferentialGroup
+    , sexpReorderGroup
+    , sexpReorderPropertyGroup
     , sourceOriginTests
     , preludeTests
     , modPathTests
@@ -791,12 +816,17 @@ runProgramHarness path = do
   result <- Loader.loadProgram path []
   case result of
     Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
-    Right (entryName, ms) ->
-      case Pipeline.elaborateProgramFull entryName ms of
-        Left s  -> pure (BL.pack ("elaborate: " <> s <> "\n"))
-        Right cm -> case Interp.runModule cm of
-          Left rerr -> pure (BL.pack ("runtime error: " <> show rerr <> "\n"))
-          Right v   -> pure (BL.pack (T.unpack (Interp.renderValue v) <> "\n"))
+    Right (entryName, ms) -> pure (renderElaborateAndRun (Pipeline.elaborateProgramFull entryName ms))
+
+-- | The elaborate+run rendering shared by 'runProgramHarness' and the
+-- Sexp.Differential run-golden check (spec S3): both paths must produce
+-- byte-identical output from the SAME 'Either' outcome, so factor it once
+-- instead of risking the two copies drifting apart.
+renderElaborateAndRun :: Either String Anf.CoreModule -> BL.ByteString
+renderElaborateAndRun (Left s) = BL.pack ("elaborate: " ++ s ++ "\n")
+renderElaborateAndRun (Right cm) = case Interp.runModule cm of
+  Left rerr -> BL.pack ("runtime error: " ++ show rerr ++ "\n")
+  Right v   -> BL.pack (T.unpack (Interp.renderValue v) ++ "\n")
 
 typecheckSuccessHarness :: FilePath -> IO BL.ByteString
 typecheckSuccessHarness path = do
@@ -805,12 +835,19 @@ typecheckSuccessHarness path = do
     Left lerr -> pure (BL.pack ("loader: " <> show lerr <> "\n"))
     Right (entryName, ms) ->
       case Pipeline.typecheckProgram entryName ms of
-        Left s          -> pure (BL.pack ("pipeline: " <> s <> "\n"))
-        Right (decls, _ws) -> do
-          let sorted = sortBy (comparing TC.tdName) decls
-              ls     = [ T.unpack (TC.tdName d <> T.pack " : " <> TC.prettyScheme (TC.tdScheme d))
-                       | d <- sorted ]
-          pure (BL.pack (unlines ls))
+        Left s             -> pure (BL.pack ("pipeline: " <> s <> "\n"))
+        Right (decls, _ws) -> pure (renderSchemesBS decls)
+
+-- | The `name : scheme` rendering shared by 'typecheckSuccessHarness' and
+-- the Sexp.Differential golden check (spec S3): both paths must produce
+-- byte-identical output from the SAME typechecked decls, so factor it
+-- once instead of risking the two copies drifting apart.
+renderSchemesBS :: [TC.TypedDecl] -> BL.ByteString
+renderSchemesBS decls =
+  let sorted = sortBy (comparing TC.tdName) decls
+      ls     = [ T.unpack (TC.tdName d <> T.pack " : " <> TC.prettyScheme (TC.tdScheme d))
+               | d <- sorted ]
+  in BL.pack (unlines ls)
 
 typecheckFailHarness :: FilePath -> IO BL.ByteString
 typecheckFailHarness path = do
@@ -1163,18 +1200,25 @@ parseToBS :: FilePath -> IO BL.ByteString
 parseToBS path = do
   src <- TIO.readFile path
   case parse src of
-    Left err -> pure $ BL.pack ("PARSE ERROR: " ++ err ++ "\n")
-    Right ast1 -> do
-      let printed1 = Pr.printTree ast1
-      case parse (T.pack printed1) of
-        Left err -> pure $ BL.pack ("ROUND-TRIP PARSE ERROR: " ++ err ++ "\n---first print---\n" ++ printed1 ++ "\n")
-        Right ast2
-          | Pr.printTree ast2 == printed1 -> pure $ BL.pack (printed1 ++ "\n")
-          | otherwise ->
-              pure $ BL.pack $
-                "ROUND-TRIP MISMATCH (printed forms differ)\n"
-                ++ "--- first ---\n" ++ printed1 ++ "\n"
-                ++ "--- second ---\n" ++ Pr.printTree ast2 ++ "\n"
+    Left err   -> pure $ BL.pack ("PARSE ERROR: " ++ err ++ "\n")
+    Right ast1 -> pure (renderModuleRoundTrip ast1)
+
+-- | The print/reparse/verify rendering shared by 'parseToBS' and the
+-- Sexp.Differential parse-golden check (spec S3): both paths must produce
+-- byte-identical output from the SAME 'Module', so factor it once instead
+-- of risking the two copies drifting apart.
+renderModuleRoundTrip :: Module -> BL.ByteString
+renderModuleRoundTrip ast1 =
+  let printed1 = Pr.printTree ast1
+  in case parse (T.pack printed1) of
+       Left err -> BL.pack ("ROUND-TRIP PARSE ERROR: " ++ err ++ "\n---first print---\n" ++ printed1 ++ "\n")
+       Right ast2
+         | Pr.printTree ast2 == printed1 -> BL.pack (printed1 ++ "\n")
+         | otherwise ->
+             BL.pack $
+               "ROUND-TRIP MISMATCH (printed forms differ)\n"
+               ++ "--- first ---\n" ++ printed1 ++ "\n"
+               ++ "--- second ---\n" ++ Pr.printTree ast2 ++ "\n"
 
 -- Parse a wok source string into a Module. Use for building test fixtures.
 parseSrc :: Text -> Module
@@ -1649,6 +1693,1601 @@ envOverlayTests = testGroup "envOverlay"
            Right e  -> TE.lookupVar (T.pack "foo") e @?= Just s
            Left col -> assertFailure ("expected silent merge, got: " ++ show col)
   ]
+
+-- | The dialect input `"\\ \" \n \t \r \x41"` (real backslashes, not
+-- Haskell-escaped ones): each of the six accepted escapes back to back,
+-- built piece by piece rather than as one dense literal to keep the
+-- backslash bookkeeping honest.
+sexpEscapeAllInput :: Text
+sexpEscapeAllInput = T.concat
+  [ T.pack "\""
+  , T.pack "\\\\"    -- \\   -> backslash
+  , T.pack "\\\""    -- \"   -> doublequote
+  , T.pack "\\n"     -- \n   -> newline
+  , T.pack "\\t"     -- \t   -> tab
+  , T.pack "\\r"     -- \r   -> CR
+  , T.pack "\\x41"   -- \x41 -> 'A'
+  , T.pack "\""
+  ]
+
+-- | The decoded content 'sexpEscapeAllInput' must produce: backslash,
+-- doublequote, LF, tab, CR, 'A'. Ordinary Haskell string escapes coincide
+-- with the dialect's own escapes here, so this can be written directly.
+sexpEscapeAllExpected :: Text
+sexpEscapeAllExpected = T.pack "\\\"\n\t\rA"
+
+sexpReadTests :: TestTree
+sexpReadTests = testGroup "Wok.Sexp.Read"
+  [ testCase "a bare word" $
+      Sexp.readSExp (T.pack "hello")
+        @?= Right (Sexp.SWord (T.pack "hello") (Sexp.Pos 1 1))
+
+  , testCase "a flat list of words" $
+      Sexp.readSExp (T.pack "(a b c)")
+        @?= Right (Sexp.SList
+                     [ Sexp.SWord (T.pack "a") (Sexp.Pos 1 2)
+                     , Sexp.SWord (T.pack "b") (Sexp.Pos 1 4)
+                     , Sexp.SWord (T.pack "c") (Sexp.Pos 1 6)
+                     ]
+                     (Sexp.Pos 1 1))
+
+  , testCase "a nested list, positions track column" $
+      Sexp.readSExp (T.pack "(a (b c) d)")
+        @?= Right (Sexp.SList
+                     [ Sexp.SWord (T.pack "a") (Sexp.Pos 1 2)
+                     , Sexp.SList
+                         [ Sexp.SWord (T.pack "b") (Sexp.Pos 1 5)
+                         , Sexp.SWord (T.pack "c") (Sexp.Pos 1 7)
+                         ]
+                         (Sexp.Pos 1 4)
+                     , Sexp.SWord (T.pack "d") (Sexp.Pos 1 10)
+                     ]
+                     (Sexp.Pos 1 1))
+
+  , testCase "#t and #f are ordinary words, not booleans, at this layer" $ do
+      Sexp.readSExp (T.pack "#t") @?= Right (Sexp.SWord (T.pack "#t") (Sexp.Pos 1 1))
+      Sexp.readSExp (T.pack "#f") @?= Right (Sexp.SWord (T.pack "#f") (Sexp.Pos 1 1))
+
+  -- `seq`/`some`/`none` carry no special meaning at this layer either
+  -- (that is Wok.Sexp.Surface's job): `(seq)` is just a one-item list
+  -- holding the word "seq", the same as any other `(TAG)` shape would
+  -- read as a one-item list holding TAG's name.
+  , testCase "(seq) is a one-item list holding the word \"seq\"" $
+      Sexp.readSExp (T.pack "(seq)")
+        @?= Right (Sexp.SList [Sexp.SWord (T.pack "seq") (Sexp.Pos 1 2)] (Sexp.Pos 1 1))
+
+  , testCase "all six accepted string escapes decode correctly" $
+      Sexp.readSExp sexpEscapeAllInput
+        @?= Right (Sexp.SString sexpEscapeAllExpected (Sexp.Pos 1 1))
+
+  , testCase "\\u is not an accepted escape" $
+      case Sexp.readSExp (T.pack "\"\\u0041\"") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "\\' is not an accepted escape" $
+      case Sexp.readSExp (T.pack "\"\\'\"") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "\\0 (octal-style) is not an accepted escape" $
+      case Sexp.readSExp (T.pack "\"\\0\"") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "unterminated string literal is rejected" $
+      case Sexp.readSExp (T.pack "\"abc") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "unterminated list is rejected" $
+      case Sexp.readSExp (T.pack "(a b") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "a stray `)` with no open list is rejected" $
+      case Sexp.readSExp (T.pack ")") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "nesting exactly 256 deep is accepted" $
+      let src = T.replicate 256 (T.pack "(") <> T.replicate 256 (T.pack ")")
+      in case Sexp.readSExp src of
+           Right _ -> pure ()
+           Left e  -> assertFailure ("expected acceptance, got: " ++ show e)
+
+  , testCase "nesting 257 deep is rejected" $
+      let src = T.replicate 257 (T.pack "(") <> T.replicate 257 (T.pack ")")
+      in case Sexp.readSExp src of
+           Left _  -> pure ()
+           Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  -- Depth accounting matches the C reader EXACTLY: (seq ...)/(some X)/
+  -- (none) are schema plumbing, not nodes -- parse_opt/parse_seq run at
+  -- the parent node's depth -- so wrapper lists never consume a level.
+  , testCase "seq/some wrapper lists are depth-transparent (as in the C reader)" $ do
+      let deepSeq = T.replicate 300 (T.pack "(seq ") <> T.pack "x"
+                      <> T.replicate 300 (T.pack ")")
+      case Sexp.readSExp deepSeq of
+        Right _ -> pure ()
+        Left e  -> assertFailure ("expected acceptance of 300 seq wrappers, got: " ++ show e)
+      let deepSome = T.replicate 300 (T.pack "(some ") <> T.pack "x"
+                       <> T.replicate 300 (T.pack ")")
+      case Sexp.readSExp deepSome of
+        Right _ -> pure ()
+        Left e  -> assertFailure ("expected acceptance of 300 some wrappers, got: " ++ show e)
+
+  , testCase "node lists interleaved with seq wrappers count only the node levels" $ do
+      let nest n = T.replicate n (T.pack "(a (seq ") <> T.pack "x"
+                     <> T.replicate n (T.pack "))")
+      case Sexp.readSExp (nest 256) of
+        Right _ -> pure ()
+        Left e  -> assertFailure ("expected acceptance at 256 node levels, got: " ++ show e)
+      case Sexp.readSExp (nest 257) of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection at 257 node levels, got: " ++ show r)
+
+  , testCase "empty input is rejected" $
+      case Sexp.readSExp (T.pack "") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "trailing content after the root datum is rejected" $
+      case Sexp.readSExp (T.pack "(a) extra") of
+        Left _  -> pure ()
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+
+  , testCase "multi-byte UTF-8 passes through raw in a word" $
+      Sexp.readSExp (T.pack "café")
+        @?= Right (Sexp.SWord (T.pack "café") (Sexp.Pos 1 1))
+
+  , testCase "multi-byte UTF-8 passes through raw inside a string" $
+      Sexp.readSExp (T.pack "\"héllo wörld\"")
+        @?= Right (Sexp.SString (T.pack "héllo wörld") (Sexp.Pos 1 1))
+
+  -- Position correctness: two blank lines then a stray `)` on line 3 must
+  -- report line 3, column 1 -- not line 1 (an off-by-zero start) or line 2
+  -- (an off-by-one newline count).
+  , testCase "error position reports line 3 for a datum on line 3" $
+      case Sexp.readSExp (T.pack "\n\n)") of
+        Left e  -> Sexp.sexpErrorPos e @?= Sexp.Pos 3 1
+        Right r -> assertFailure ("expected rejection, got: " ++ show r)
+  ]
+
+-- ---------------------------------------------------------------------
+-- Wok.Sexp.Surface (S1b): v2 dump -> v1 Abs mapping
+-- ---------------------------------------------------------------------
+
+-- | Read a dump text and map it. A reader rejection is a test failure
+-- (these tests target the mapper, not the reader).
+surfaceOfText :: Text -> IO (Either Surface.SurfaceError Module)
+surfaceOfText txt = case Sexp.readSExp txt of
+  Left e  -> assertFailure ("reader rejected the dump: " ++ show e)
+  Right s -> pure (Surface.surfaceModule s)
+
+-- | The dump must map fully and print as the given v1 source text.
+surfaceShouldPrint :: Text -> String -> Assertion
+surfaceShouldPrint dump expected = do
+  r <- surfaceOfText dump
+  case r of
+    Right m -> Pr.printTree m @?= expected
+    Left e  -> assertFailure ("expected a full mapping, got: " ++ show e)
+
+-- | The dump must be rejected as MALFORMED (schema/family violation or
+-- damage node) -- never accepted, never a mere gap.
+surfaceShouldMalform :: Text -> Assertion
+surfaceShouldMalform dump = do
+  r <- surfaceOfText dump
+  case r of
+    Left (Surface.MalformedDump _ _) -> pure ()
+    Left g@(Surface.SexpGap {}) ->
+      assertFailure ("expected MalformedDump, got a gap: " ++ show g)
+    Right m -> assertFailure ("expected MalformedDump, mapped to: " ++ show m)
+
+-- | The dump must be recognized as WELL-FORMED v2 that v1 cannot express:
+-- a SexpGap carrying exactly the given tag.
+surfaceShouldGapAt :: Text -> Text -> Assertion
+surfaceShouldGapAt tag dump = do
+  r <- surfaceOfText dump
+  case r of
+    Left (Surface.SexpGap _ t _ _)
+      | t == tag  -> pure ()
+      | otherwise -> assertFailure ("expected a gap at " ++ T.unpack tag
+                                      ++ ", got one at " ++ T.unpack t)
+    Left e@(Surface.MalformedDump _ _) ->
+      assertFailure ("expected SexpGap, got: " ++ show e)
+    Right m -> assertFailure ("expected SexpGap, mapped to: " ++ show m)
+
+-- ---------------------------------------------------------------------
+-- Normalized STRUCTURAL tree equality -- the differential's comparator.
+--
+-- printTree proved BLIND as a differential oracle: the BNFC printer
+-- renders `TFun A (TWith B C E)` and `TWith A (TFun B C) E` as the SAME
+-- text (`A -> B -> C with E`), which is exactly how the T_With
+-- row-attachment mapper bug hid behind five files misdiagnosed as
+-- "position-sensitive typecheck divergence"; and it renders paren NODES
+-- invisibly by definition. The differential therefore compares `show`
+-- of NORMALIZED trees: strip the semantically-inert wrappers (EParen;
+-- zero-tail EExpr; PAtom-of-APParen; APParen-of-PAtom; TParen) and zero the
+-- (line, col) in the four positioned token newtypes (spec D4: the two
+-- paths legitimately disagree on positions). Deliberate consequence:
+-- "the user wrote redundant parens" no longer counts as a divergence --
+-- v2 does not retain that information at all (the same category of loss
+-- as positions and comments, spec's Non-goals).
+-- ---------------------------------------------------------------------
+
+deriving instance Data Abs.Module
+deriving instance Data Abs.Decl
+deriving instance Data Abs.ForeignFree
+deriving instance Data Abs.ForeignMember
+deriving instance Data Abs.ForeignSym
+deriving instance Data Abs.InstHead
+deriving instance Data Abs.MethodName
+deriving instance Data Abs.ClassEntry
+deriving instance Data Abs.InstEntry
+deriving instance Data Abs.Constraint
+deriving instance Data Abs.ModPath
+deriving instance Data Abs.ImportMod
+deriving instance Data Abs.ImportName
+deriving instance Data Abs.ReservedKw
+deriving instance Data Abs.SigName
+deriving instance Data Abs.SigNameComma
+deriving instance Data Abs.TyParam
+deriving instance Data Abs.FunLHS
+deriving instance Data Abs.FunName
+deriving instance Data Abs.Pat
+deriving instance Data Abs.AtomPat
+deriving instance Data Abs.RecordFieldPat
+deriving instance Data Abs.PatRowTail
+deriving instance Data Abs.Type
+deriving instance Data Abs.EffectAtom
+deriving instance Data Abs.EffectRow
+deriving instance Data Abs.RowContrib
+deriving instance Data Abs.ConDef
+deriving instance Data Abs.RecordFieldType
+deriving instance Data Abs.FixName
+deriving instance Data Abs.FixAssoc
+deriving instance Data Abs.FixRel
+deriving instance Data Abs.Exp
+deriving instance Data Abs.InfixTail
+deriving instance Data Abs.InfixOp
+deriving instance Data Abs.MaybeTrailing
+deriving instance Data Abs.RecordFieldExpr
+deriving instance Data Abs.WithArg
+deriving instance Data Abs.HandlerArm
+deriving instance Data Abs.LocalDecl
+deriving instance Data Abs.MaybeWhere
+deriving instance Data Abs.Alt
+deriving instance Data Abs.WokInt
+deriving instance Data Abs.ConId
+deriving instance Data Abs.VarId
+deriving instance Data Abs.VarSym
+
+-- | Bottom-up generic transform (syb's @everywhere@, inlined so the
+-- test suite needs no extra dependency).
+sexpEverywhere :: Data a => (forall b. Data b => b -> b) -> a -> a
+sexpEverywhere f = f . gmapT (sexpEverywhere f)
+
+-- | Apply a monomorphic rewrite wherever the generic traversal hits its
+-- type; identity everywhere else.
+sexpAdapt :: (Data a, Data b) => (b -> b) -> a -> a
+sexpAdapt f x = Data.Maybe.fromMaybe x (cast . f =<< cast x)
+
+sexpNormalize :: Module -> Module
+sexpNormalize = sexpEverywhere step
+  where
+    step :: forall c. Data c => c -> c
+    step =
+      sexpAdapt stripE . sexpAdapt stripP . sexpAdapt stripAP . sexpAdapt stripT
+        . sexpAdapt zeroInt . sexpAdapt zeroCon . sexpAdapt zeroVar . sexpAdapt zeroSym
+
+    -- A zero-tail chain node is denotationally its head: v1's grammar
+    -- funnels EVERY Exp-level parse through `EExpr head [tails]`, while
+    -- the mapper builds EExpr only for a real E_Chain -- both mean the
+    -- bare head when the tail list is empty.
+    stripE (Abs.EParen e)    = e
+    stripE (Abs.EExpr e [])  = e
+    stripE e                 = e
+
+    -- A parenthesized pattern standing where any Pat fits.
+    stripP (Abs.PAtom (Abs.APParen p)) = p
+    stripP p                           = p
+
+    -- A parenthesized ATOM standing where an atom fits. An APParen
+    -- around a non-atomic pattern is structurally REQUIRED (both paths
+    -- must produce it) and stays.
+    stripAP (Abs.APParen (Abs.PAtom a)) = a
+    stripAP a                           = a
+
+    stripT (Abs.TParen t) = t
+    stripT t              = t
+
+    zeroInt (Abs.WokInt (_, t)) = Abs.WokInt ((0, 0), t)
+    zeroCon (Abs.ConId  (_, t)) = Abs.ConId  ((0, 0), t)
+    zeroVar (Abs.VarId  (_, t)) = Abs.VarId  ((0, 0), t)
+    zeroSym (Abs.VarSym (_, t)) = Abs.VarSym ((0, 0), t)
+
+-- | First structural divergence between two normalized `show`s, with a
+-- window of context on each side.
+sexpShowDiffExcerpt :: String -> String -> String
+sexpShowDiffExcerpt wokN sexpN =
+  let common   = length (takeWhile id (zipWith (==) wokN sexpN))
+      start    = max 0 (common - 80)
+      window s = take 240 (drop start s)
+  in "first divergence at show-position " ++ show common ++ ":\n"
+       ++ "  wok:  ..." ++ window wokN ++ "\n"
+       ++ "  sexp: ..." ++ window sexpN
+
+-- | The ONE shared differential comparator, used by both the
+-- Sexp.Surface end-to-end fixtures and the Sexp.Differential corpus
+-- group: normalized structural equality, compared as `show`. On
+-- mismatch the failure message carries the tree-diff excerpt AND both
+-- printTree renderings. printTree is failure-message CONTEXT only,
+-- never a secondary assertion: as an assertion it is strictly noisier
+-- (it re-fails on the redundant parens normalization deliberately
+-- forgives) while adding no structural signal `show` does not already
+-- carry.
+sexpAssertNormalizedEq
+  :: String   -- ^ context: which file / fixture
+  -> Module   -- ^ the wok-path (v1-parsed) tree
+  -> Module   -- ^ the sexp-path (mapped) tree
+  -> Assertion
+sexpAssertNormalizedEq what wokT sexpT = do
+  let wokN  = show (sexpNormalize wokT)
+      sexpN = show (sexpNormalize sexpT)
+  if sexpN == wokN
+    then pure ()
+    else assertFailure $ unlines
+      [ what ++ ": normalized ASTs differ"
+      , sexpShowDiffExcerpt wokN sexpN
+      , "printTree (wok path):  " ++ Pr.printTree wokT
+      , "printTree (sexp path): " ++ Pr.printTree sexpT
+      ]
+
+-- | Both parse paths of one corpus file must agree structurally after
+-- the same reordering: `wokparse -sexp F` -> Read -> Surface vs
+-- `Wok.Parsing.parse F` (spec D7, single-file form). The fixture dumps in
+-- test/sexp-fixtures were produced by `grammar/c/wokparse -sexp`.
+sexpSurfaceEndToEnd :: FixityTable -> String -> TestTree
+sexpSurfaceEndToEnd table name =
+  testCase (name ++ " maps to the v1 parse (post-reorder, normalized)") $ do
+    dumpTxt <- TIO.readFile ("test/sexp-fixtures/" ++ name ++ ".sexp")
+    srcTxt  <- TIO.readFile ("test/typecheck-examples/" ++ name ++ ".wok")
+    datum   <- either (\e -> assertFailure ("reader rejected the dump: " ++ show e))
+                      pure (Sexp.readSExp dumpTxt)
+    mapped  <- either (\e -> assertFailure ("surface mapping failed: " ++ show e))
+                      pure (Surface.surfaceModule datum)
+    wokR    <- either (\e -> assertFailure ("reorder (wok path): " ++ show e))
+                      pure (reorderModuleWith table (parseSrc srcTxt))
+    sexpR   <- either (\e -> assertFailure ("reorder (sexp path): " ++ show e))
+                      pure (reorderModuleWith table mapped)
+    sexpAssertNormalizedEq name wokR sexpR
+
+-- The fixity table 02-arithmetic's chains need. The corpus file itself
+-- declares none (the compiler takes them from the prelude); both paths
+-- get the SAME table, so the comparison stays fair.
+sexpArithFixities :: FixityTable
+sexpArithFixities =
+  case buildFixityTable
+         (parseSrc "module F\nfixity + left\nfixity * left tighter than +\n") of
+    Right t -> t
+    Left e  -> error ("sexpArithFixities: " ++ show e)
+
+sexpSurfaceTests :: TestTree
+sexpSurfaceTests = testGroup "Sexp.Surface"
+  [ -- The five family-strictness dumps of grammar/c/test/test_sexpr.c
+    -- (~line 120), ported verbatim: the mapper must be exactly as strict
+    -- about FAMILIES as the C reader, and exactly as permissive about the
+    -- two legal subsumptions (STMT accepts EXPR, BINDLHS accepts LHS|PAT).
+    testGroup "family strictness (ported from test_sexpr.c)"
+      [ testCase "a clean equation maps (and prints as `f = a`)" $
+          surfaceShouldPrint
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Var \"a\") (seq))))"
+            "f = a"
+
+      , testCase "a TYPE in an expression slot is malformed" $
+          surfaceShouldMalform
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (T_Var \"a\") (seq))))"
+
+      , testCase "an EXPRESSION where a left-hand side belongs is malformed" $
+          surfaceShouldMalform
+            "(W_File (seq (D_Equation (E_Var \"f\") (E_Var \"a\") (seq))))"
+
+      , testCase "an EXPRESSION in a pattern sequence is malformed" $
+          surfaceShouldMalform
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq (E_Var \"x\"))) (E_Var \"a\") (seq))))"
+
+      -- The two subsumption dumps are WELL-FORMED (the C reader accepts
+      -- them); their constructs then land on v1 gaps, not on malformed.
+      , testCase "STMT-accepts-EXPR subsumption is well-formed; S_Use then gaps" $
+          surfaceShouldGapAt "S_Use"
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Block (seq (S_Use (seq (H_UseBind \"a\" \"b\"))) (E_Var \"a\"))) (seq))))"
+
+      , testCase "BINDLHS-accepts-PAT subsumption is well-formed; a wildcard bind then gaps" $
+          surfaceShouldGapAt "H_Bind"
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_LetIn (H_Bind (P_Wild) (E_Var \"a\")) (E_Var \"a\")) (seq))))"
+      ]
+
+  -- D5: the literal decoders, unit-tested directly. Inputs are the RAW
+  -- SOURCE LEXEMES a WFC_TEXT field carries -- wok quotes included.
+  , testGroup "literal decoders"
+      [ testCase "plain string body" $
+          Surface.decodeStringLexeme "\"abc\"" @?= Right "abc"
+      , testCase "empty string" $
+          Surface.decodeStringLexeme "\"\"" @?= Right ""
+      , testCase "\\n \\t \\r decode" $
+          Surface.decodeStringLexeme "\"a\\nb\\tc\\rd\"" @?= Right "a\nb\tc\rd"
+      , testCase "\\\\ and \\\" and \\' decode" $
+          Surface.decodeStringLexeme "\"a\\\\b\\\"c\\'d\"" @?= Right "a\\b\"c'd"
+      , testCase "\\x41 decodes to A" $
+          Surface.decodeStringLexeme "\"\\x41\"" @?= Right "A"
+      , testCase "\\0 decodes to NUL" $
+          Surface.decodeStringLexeme "\"\\0\"" @?= Right "\NUL"
+      , testCase "\\x with one hex digit is rejected" $
+          case Surface.decodeStringLexeme "\"\\x4\"" of
+            Left _  -> pure ()
+            Right r -> assertFailure ("expected rejection, got: " ++ show r)
+      , testCase "unknown escape \\q is rejected" $
+          case Surface.decodeStringLexeme "\"\\q\"" of
+            Left _  -> pure ()
+            Right r -> assertFailure ("expected rejection, got: " ++ show r)
+      , testCase "a lexeme without its quotes is rejected" $
+          case Surface.decodeStringLexeme "abc" of
+            Left _  -> pure ()
+            Right r -> assertFailure ("expected rejection, got: " ++ show r)
+      , testCase "an unescaped interior quote is rejected" $
+          case Surface.decodeStringLexeme "\"a\"b\"" of
+            Left _  -> pure ()
+            Right r -> assertFailure ("expected rejection, got: " ++ show r)
+      , testCase "plain char" $
+          Surface.decodeCharLexeme "'a'" @?= Right 'a'
+      , testCase "escaped char forms" $ do
+          Surface.decodeCharLexeme "'\\n'"   @?= Right '\n'
+          Surface.decodeCharLexeme "'\\''"   @?= Right '\''
+          Surface.decodeCharLexeme "'\\\\'"  @?= Right '\\'
+          Surface.decodeCharLexeme "'\\x41'" @?= Right 'A'
+      , testCase "a two-character char literal is rejected" $
+          case Surface.decodeCharLexeme "'ab'" of
+            Left _  -> pure ()
+            Right r -> assertFailure ("expected rejection, got: " ++ show r)
+      , testCase "an empty char literal is rejected" $
+          case Surface.decodeCharLexeme "''" of
+            Left _  -> pure ()
+            Right r -> assertFailure ("expected rejection, got: " ++ show r)
+      ]
+
+  -- R1 resolved against main's ACTUAL surface: PLAIN -> HUArm with
+  -- arity-many binders; CONTROL -> HUArm with the continuation appended
+  -- as the (arity+1)-th binder (both sides are affine one-shot); RETURN
+  -- (bare variable) -> the v1 value arm; VAR -> HParamV; ABORT -> gap.
+  , testGroup "handler clause mapping (R1)"
+      [ testCase "PLAIN + CONTROL + RETURN clauses map onto v1 arm forms" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_HandleIn \"\" (E_Handler \"Ask\" (seq (H_Clause 1 \"ask\" (seq (P_Var \"q\")) \"k\" (E_Var \"q\")) (H_Clause 2 \"\" (seq (P_Var \"v\")) \"\" (E_Var \"v\")))) (E_App (E_Var \"g\") (E_Unit))) (seq))))"
+          case r of
+            Right m -> Pr.printTree m
+              @?= Pr.printTree (parseSrc "f = with Ask { ask q k -> q; v -> v } g ()")
+            Left e -> assertFailure ("expected a full mapping, got: " ++ show e)
+
+      , testCase "a lowercase install label + VAR clause map to EWithNamedH/HParamV" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_HandleIn \"st\" (E_Handler \"Ask\" (seq (H_Clause 3 \"cur\" (seq) \"\" (E_Int 0)) (H_Clause 0 \"ask\" (seq) \"\" (E_Var \"cur\")))) (E_Var \"x\")) (seq))))"
+          case r of
+            Right m -> Pr.printTree m
+              @?= Pr.printTree (parseSrc "f = with st = Ask { var cur = 0; ask -> cur } in x")
+            Left e -> assertFailure ("expected a full mapping, got: " ++ show e)
+
+      , testCase "an ABORT clause is a SexpGap (v1 has no abort)" $
+          surfaceShouldGapAt "H_Clause"
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_HandleIn \"\" (E_Handler \"Except\" (seq (H_Clause 4 \"throw\" (seq (P_Var \"e\")) \"\" (E_Var \"e\")))) (E_Var \"x\")) (seq))))"
+      ]
+
+  -- D6: well-formed v2 constructs v1 cannot express fire named gaps.
+  , testGroup "v2-only constructs are SexpGap"
+      [ testCase "D_Alias: v1 has no type-alias declaration" $
+          surfaceShouldGapAt "D_Alias"
+            "(W_File (seq (D_Alias \"T\" (seq) (T_Unit))))"
+
+      , testCase "E_Assign: v1 has no := surface" $
+          surfaceShouldGapAt "E_Assign"
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Assign (E_Var \"x\") (E_Var \"y\")) (seq))))"
+
+      , testCase "E_UseIn: v1 has no use-rebind form" $
+          surfaceShouldGapAt "E_UseIn"
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_UseIn (seq (H_UseBind \"a\" \"b\")) (E_Var \"x\")) (seq))))"
+
+      , testCase "a real v2 dump (01-state-cell) gaps at E_Handler (handler value)" $ do
+          dumpTxt <- TIO.readFile "test/sexp-fixtures/v2-01-state-cell.sexp"
+          surfaceShouldGapAt "E_Handler" dumpTxt
+      ]
+
+  -- The T_With row-attachment fix: the row belongs to the INNERMOST
+  -- arrow (Infer.hs is the authority; printTree renders both
+  -- attachments identically, so these compare NORMALIZED structure).
+  , testGroup "T_With row attachment (innermost arrow)"
+      [ testCase "a row over an arrow chain lands on the innermost arrow" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Sig (seq (H_SigName \"mk\" #f)) (T_With (T_Fun (T_Con (N_ModPath (seq (N_Name \"U64\" #t)))) (T_Fun (T_Unit) (T_Con (N_ModPath (seq (N_Name \"U64\" #t)))))) (seq (H_RowEntry 0 \"\" (some (T_Con (N_ModPath (seq (N_Name \"Conc\" #t)))))))) #f)))"
+          case r of
+            Right m -> sexpAssertNormalizedEq "T_With innermost attachment"
+                         (parseSrc "mk : U64 -> () -> U64 with Conc") m
+            Left e -> assertFailure ("expected a full mapping, got: " ++ show e)
+
+      , testCase "a parenthesized T_With codomain (a distinct dump node) still maps" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Sig (seq (H_SigName \"mk\" #f)) (T_With (T_Fun (T_Con (N_ModPath (seq (N_Name \"U64\" #t)))) (T_With (T_Fun (T_Unit) (T_Con (N_ModPath (seq (N_Name \"U64\" #t))))) (seq (H_RowEntry 0 \"\" (some (T_Con (N_ModPath (seq (N_Name \"Conc\" #t))))))))) (seq (H_RowEntry 0 \"\" (some (T_Con (N_ModPath (seq (N_Name \"IO\" #t)))))))) #f)))"
+          case r of
+            Right m -> sexpAssertNormalizedEq "nested T_With codomain"
+                         (parseSrc "mk : U64 -> (() -> U64 with Conc) with IO") m
+            Left e -> assertFailure ("expected a full mapping, got: " ++ show e)
+      ]
+
+  -- Greedy-bodied operands must be re-wrapped where v1's grammar would
+  -- have required source parens: compared as printTree, since the
+  -- EParen node is exactly what is under test.
+  , testGroup "greedy operand wrapping (chain head / chain rhs / dot receiver)"
+      [ testCase "a greedy-bodied chain HEAD is wrapped" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Chain (E_If (E_Var \"c\") (E_Int 1) (E_Int 2)) (seq (H_ChainOp \"+\" #f (E_Int 3)))) (seq))))"
+          case r of
+            Right m -> Pr.printTree m @?= Pr.printTree (parseSrc "f = (if c then 1 else 2) + 3")
+            Left e  -> assertFailure ("expected a full mapping, got: " ++ show e)
+
+      , testCase "a greedy-bodied chain RHS is wrapped" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Chain (E_Var \"x\") (seq (H_ChainOp \"+\" #f (E_If (E_Var \"c\") (E_Int 1) (E_Int 2))) (H_ChainOp \"+\" #f (E_Int 3)))) (seq))))"
+          case r of
+            Right m -> Pr.printTree m @?= Pr.printTree (parseSrc "f = x + (if c then 1 else 2) + 3")
+            Left e  -> assertFailure ("expected a full mapping, got: " ++ show e)
+
+      , testCase "a greedy-bodied DOT receiver is wrapped" $ do
+          r <- surfaceOfText
+            "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_Dot (E_Lambda (seq (P_Var \"x\")) (E_Var \"x\")) \"g\" #f) (seq))))"
+          case r of
+            Right m -> Pr.printTree m @?= Pr.printTree (parseSrc "f = (\\ x -> x) . g")
+            Left e  -> assertFailure ("expected a full mapping, got: " ++ show e)
+      ]
+
+  -- D7 (single-file form): real dumps from the C front end reproduce the
+  -- v1 parse of the same source, compared with the shared normalized
+  -- structural comparator.
+  , testGroup "end-to-end vs the v1 parser"
+      [ sexpSurfaceEndToEnd emptyFixityTable "01-identity"
+      , sexpSurfaceEndToEnd sexpArithFixities "02-arithmetic"
+      , sexpSurfaceEndToEnd emptyFixityTable "04-maybe"
+      , sexpSurfaceEndToEnd emptyFixityTable "08-patterns"
+      , sexpSurfaceEndToEnd emptyFixityTable "09-higher-order"
+      , sexpSurfaceEndToEnd emptyFixityTable "11-unit"
+      ]
+  ]
+
+-- ---------------------------------------------------------------------
+-- Wok.Loader (S2): the `.sexp` dispatch branch in parseAndPrep
+-- ---------------------------------------------------------------------
+
+-- The six corpus files with BOTH a v1 twin and a mapper-clean dump (the
+-- same set the "end-to-end vs the v1 parser" group above exercises).
+sexpLoaderCorpus :: [String]
+sexpLoaderCorpus =
+  ["01-identity", "02-arithmetic", "04-maybe", "08-patterns", "09-higher-order", "11-unit"]
+
+-- Position-erased identity of a warning: the sexp path's SourceSpan points
+-- into the .sexp dump text (spec D4), never the original .wok source, so a
+-- literal Eq on TC.Warning would fail on position alone even when the two
+-- paths agree on substance. Compare identity instead, the same way the
+-- oracle contract already does for errors (spec D4/D8).
+warningIdentity :: TC.Warning -> String
+warningIdentity w = case w of
+  TC.BodylessBinding name _ -> "BodylessBinding " ++ T.unpack name
+  TC.RowShadow _ label outer inner ->
+    "RowShadow " ++ T.unpack label ++ " " ++ show outer ++ " " ++ show inner
+  TC.NonExhaustiveRecordPattern _ tag -> "NonExhaustiveRecordPattern " ++ T.unpack tag
+  TC.NonExhaustiveMatch _ name -> "NonExhaustiveMatch " ++ T.unpack name
+  TC.RedundantClause _ name idx -> "RedundantClause " ++ T.unpack name ++ " " ++ show idx
+  TC.ForgottenResume _ eff op -> "ForgottenResume " ++ T.unpack eff ++ " " ++ T.unpack op
+  TC.QualifierShadowsExisting qual src ns ->
+    "QualifierShadowsExisting " ++ T.unpack qual ++ " " ++ T.unpack src ++ " " ++ T.unpack ns
+
+sexpLoaderTests :: TestTree
+sexpLoaderTests = testGroup "Sexp.Loader"
+  [ testGroup "loadProgram: module name + imports match the .wok twin"
+      [ testCase name $ do
+          sexpR <- Loader.loadProgram ("test/sexp-fixtures/" ++ name ++ ".sexp") []
+          wokR  <- Loader.loadProgram ("test/typecheck-examples/" ++ name ++ ".wok") []
+          case (sexpR, wokR) of
+            (Right (sexpEntry, sexpMs), Right (wokEntry, wokMs)) -> do
+              sexpEntry @?= wokEntry
+              case ( Data.List.find ((== sexpEntry) . Loader.lmName) sexpMs
+                   , Data.List.find ((== wokEntry) . Loader.lmName) wokMs
+                   ) of
+                (Just sexpLm, Just wokLm) ->
+                  map Loader.isModule (Loader.lmImports sexpLm)
+                    @?= map Loader.isModule (Loader.lmImports wokLm)
+                _ -> assertFailure "entry module missing from its own loaded module list"
+            (Left e, _) -> assertFailure ("sexp load failed: " ++ show e)
+            (_, Left e) -> assertFailure ("wok load failed: " ++ show e)
+      | name <- sexpLoaderCorpus
+      ]
+
+  , testGroup "full pipeline: typecheckProgram schemes + warning identity match the .wok twin"
+      [ testCase name $ do
+          sexpSchemes <- typecheckSuccessHarness ("test/sexp-fixtures/" ++ name ++ ".sexp")
+          wokSchemes  <- typecheckSuccessHarness ("test/typecheck-examples/" ++ name ++ ".wok")
+          sexpSchemes @?= wokSchemes
+          sexpR <- Loader.loadProgram ("test/sexp-fixtures/" ++ name ++ ".sexp") []
+          wokR  <- Loader.loadProgram ("test/typecheck-examples/" ++ name ++ ".wok") []
+          case (sexpR, wokR) of
+            (Right (sexpEntry, sexpMs), Right (wokEntry, wokMs)) ->
+              case ( Pipeline.typecheckProgram sexpEntry sexpMs
+                   , Pipeline.typecheckProgram wokEntry wokMs
+                   ) of
+                (Right (_, sexpWarnings), Right (_, wokWarnings)) ->
+                  map warningIdentity sexpWarnings @?= map warningIdentity wokWarnings
+                (Left e, _) -> assertFailure ("sexp typecheck failed: " ++ e)
+                (_, Left e) -> assertFailure ("wok typecheck failed: " ++ e)
+            (Left e, _) -> assertFailure ("sexp load failed: " ++ show e)
+            (_, Left e) -> assertFailure ("wok load failed: " ++ show e)
+      | name <- sexpLoaderCorpus
+      ]
+
+  , testCase "a syntactically broken .sexp entry surfaces LoadParseError pointing into the .sexp file" $ do
+      result <- Loader.loadProgram "test/sexp-fixtures/broken-unterminated.sexp" []
+      case result of
+        Left (Loader.LoadParseError path msg) -> do
+          path @?= "test/sexp-fixtures/broken-unterminated.sexp"
+          assertBool
+            ("expected the message to carry a line:col position into the .sexp file, got: " ++ msg)
+            (":" `Data.List.isInfixOf` msg)
+        Left other -> assertFailure ("expected LoadParseError, got: " ++ show other)
+        Right _    -> assertFailure "expected the broken dump to be rejected"
+  ]
+
+-- ---------------------------------------------------------------------
+-- Sexp.Differential (S3): env-gated parser-vs-parser differential over
+-- the corpus intersection (spec D7). WOK_WOKPARSE=path/to/wokparse
+-- enables the group; unset, the group is a single always-passing notice
+-- so CI without a C toolchain stays green (spec S3 acceptance).
+-- ---------------------------------------------------------------------
+
+-- | Gap LABELS this group tolerates on an EXCLUDED file. Keyed to the
+-- stable construct label 'Surface.SexpGap' carries -- one label per
+-- distinct gap RULE in the mapper -- NOT to the node tag: the tag is
+-- whatever innermost node a rule fires on (a refutable let gaps at
+-- H_Bind, an upper name in an import list at N_Name), so a tag-keyed
+-- list both goes stale and lets a NEW gap rule hide under an
+-- already-listed broad tag (H_Clause alone covers both the abort gap
+-- and the pattern-return gap). Every entry below is one emission site
+-- in Wok.Sexp.Surface, commented with the spec-inventory construct it
+-- represents; a label OUTSIDE this set is a NEW finding, not a silent
+-- skip, and fails the summary.
+sexpDifferentialAllowedGapLabels :: Set.Set Text
+sexpDifferentialAllowedGapLabels = Set.fromList
+  [ -- category (c): no v1 equivalent, unconditional gaps
+    "type-alias-decl"              -- D_Alias: v1 has no type-alias declaration
+  , "use-rebind"                   -- E_UseIn: no `use x as label` rebind expression
+  , "handler-value"                -- E_Handler outside an install position (first-class handler value)
+  , "frame-slot-assign"            -- E_Assign: no `:=` assignment surface
+  , "statement-handle"             -- S_Handle: no statement-form handler install
+  , "statement-use"                -- S_Use: no use-rebind statement
+  , "statement-discard"            -- S_Discard: no discarded-expression sequencing
+  , "mid-block-expression"         -- E_Block: no non-final expression statement
+  , "block-without-final-expr"     -- E_Block ending in a non-expression statement
+    -- category (b): documented gap sub-cases of otherwise-mapped tags
+  , "import-list-plus-alias"       -- D_Import: v1 ImportMod is one-of list/alias
+  , "import-list-upper-name"       -- D_Import list entry: v1 lists are vars-only
+  , "row-kinded-decl-param"        -- H_TyParam (row e) on effect/class decls
+  , "class-extern-sig"             -- D_Class body: extern signature
+  , "class-default-where"          -- D_Class default equation with a where-block
+  , "class-body-decl-kind"         -- D_Class body: any other decl kind
+  , "instance-method-where"        -- D_Instance method with a where-block
+  , "instance-body-decl-kind"      -- D_Instance body: any other decl kind
+  , "qualified-constraint-head"    -- instance context with a qualified class head
+  , "non-constraint-context"       -- instance context not of `Class Type*` shape
+  , "where-extern-sig"             -- where-block: extern signature
+  , "where-decl-kind"              -- where-block: any other decl kind
+  , "lend-transfer"                -- T_Transfer lend: no borrow-tier type spelling
+  , "copy-transfer"                -- T_Transfer copy: v1 spells copy by omission
+  , "non-arrow-with"               -- T_With over a non-arrow body
+  , "row-var-not-tail"             -- H_RowEntry: row variable not in tail position
+  , "role-row-entry"               -- H_RowEntry role obligation `(name : Eff)`
+  , "qualified-effect-atom"        -- effect atom with a qualified head
+  , "non-constructor-effect-atom"  -- effect atom not of `ConId Type*` shape
+  , "qualified-record-pattern-head"-- P_Record with a qualified constructor head
+  , "general-negation"             -- E_Neg of a non-integer-literal operand
+  , "refutable-let-binding"        -- H_Bind lhs beyond eqn/var/tuple (e.g. `_`)
+  , "qualified-record-head"        -- E_Record with a qualified constructor head
+  , "computed-record-head"         -- E_Record head neither bare nor qualified constructor
+  , "foreign-slot-label"           -- E_HandleIn under a designation slot /= the effect
+  , "first-class-handler-install"  -- E_HandleIn installing a non-literal handler
+  , "pattern-return-clause"        -- H_Clause RETURN binding a pattern
+  , "abort-clause"                 -- H_Clause ABORT (v1 spells never-resume via a dropped k)
+  ]
+
+-- | Files EXCLUDED despite a clean sexp mapping -- ONE remaining entry.
+-- Keyed by 'takeBaseName'. History: this set once held 14 files in four
+-- categories; the fix round dissolved three of the categories:
+--
+--   * REDUNDANT-PARENS LOSS (7 files: 11-eq-option, 14-eq-signed-option,
+--     15-eq-u32, as-pattern-nested, coro-escape, coro-multi-driver,
+--     03-expressions) -- dissolved by the normalized structural
+--     comparator ('sexpAssertNormalizedEq'), which is deliberately blind
+--     to optional grouping v2 does not retain. 03-expressions' PARSE
+--     GOLDEN still byte-embeds its parens: see
+--     'sexpParseGoldenEmbedsParens'.
+--
+--   * "POSITION-SENSITIVE TYPECHECK DIVERGENCE" (5 files:
+--     conc-await-multi, conc-chan-order, conc-parall, coro-step-range,
+--     coro-step-zip) -- the theory was OVERTURNED: positions were
+--     irrelevant. The real cause was a T_With mapper bug (the effect row
+--     attached to the OUTERMOST arrow where v1 and Infer.hs attach it to
+--     the INNERMOST), invisible to the then-printTree comparator because
+--     printTree renders both attachments as the same text. Fixed in
+--     Wok.Sexp.Surface ('mapWithArrow'); all five files re-entered fully.
+--
+--   * NO V1 TWIN (13-data-lowercase-error) -- reclassified: v1's own
+--     parser rejects the source, so there are not two parses to diverge;
+--     see 'sexpNoV1Twin'.
+--
+-- What remains:
+--
+--   * conc-carrier-transport-rejected: POSITION-ONLY ERROR-SPAN
+--     MISMATCH, expected per spec D4 ("the oracle harness compares error
+--     identity ... never spans"). Both paths reject with the SAME error
+--     constructor (CarrierEscape), but the run golden embeds the full
+--     'Show' of the error including its span, and a sexp-path span
+--     points into the dump text, never the .wok source. Re-admitting it
+--     would require span-stripping the rendered error inside the golden
+--     comparison; the rendering has no machine-delimited span syntax to
+--     strip cleanly, so the exclusion stays and the file remains covered
+--     by its own wok-path run-golden test.
+sexpKnownDivergences :: Set.Set FilePath
+sexpKnownDivergences = Set.fromList
+  [ "conc-carrier-transport-rejected"
+  ]
+
+-- | Files the C front end accepts but v1's OWN parser rejects (a
+-- lowercase type name): there is no v1 tree to differ from, so calling
+-- them a "divergence" was dishonest. Each gets a dedicated test pinning
+-- exactly this state: the sexp path maps cleanly (it classified into
+-- the intersection to get here) while `parse` still rejects the source.
+-- If v1 ever learns to parse one, that test FAILS, forcing promotion
+-- into the real differential.
+sexpNoV1Twin :: Set.Set FilePath
+sexpNoV1Twin = Set.fromList
+  [ "13-data-lowercase-error"
+  ]
+
+-- | ParseOnly files whose PARSE golden byte-embeds redundant source
+-- parens (03-expressions.wok's `parens = (1)`): the normalized tree
+-- assertion (a) runs and must pass, but the golden byte comparison (b)
+-- is skipped -- the v2 dump carries no paren nodes at all, so the
+-- mapped tree can never byte-reproduce a golden that spells them.
+sexpParseGoldenEmbedsParens :: Set.Set FilePath
+sexpParseGoldenEmbedsParens = Set.fromList
+  [ "03-expressions"
+  ]
+
+-- | Pinned per-dir discovery expectation: (intersection count,
+-- excluded basenames -- C-parse rejections plus mapper gaps). Asserted
+-- EXACTLY by the summary test. Corpus growth, a wokparse grammar
+-- change, or a new mapper gap all require updating this pin by hand:
+-- that is deliberate -- coverage changes must be visible in review,
+-- never a silently shrinking intersection.
+sexpExpectedPerDir :: [(FilePath, (Int, [FilePath]))]
+sexpExpectedPerDir =
+  [ ("test/typecheck-examples", (27,
+      ["13-records","14-record-extension","15-record-patterns","16-multi-constructor-records","18-nominal-distinction","19-block-form-records","20-effects-decl","21-effects-arrow","22-effects-pure","23-effects-calls","24-effects-handle","25-effects-di","26-with-handler","28-with-header","43-state-param","44-named-instance","caf-local-inherits-ambient","conc-payload-recursive-ok","conc-surface","coro-pure-tail","coro-residual-handled","coro-residual-multi","local-fn-handle-ok","par-residual-log","row-param-bare","row-param-box","rung2-nested-fn-ok","two-named-effects-ok","user-data-step-not-carrier"]))
+  , ("test/examples", (5,
+      ["02-decls","04-lambda-let-case-if","05-patterns","06-types-data","07-where","08-infix-lhs","09-layout","11-warts","12-conid-split","14-modules","15-projection","16-reserved","17-reserved-error","19-operator-sigs","20-effects-syntax","26-typeclass","26-with-handler","27-with-header","28-with-named","40-extern-coro-types","41-row-kinded-params"]))
+  , ("test/run-examples", (49,
+      ["07-effect-ask","16-exn-abort","17-choice-multishot","18-value-op","19-exn-never","25-lint-forgotten-warn","26-lint-discard-wildcard","27-lint-escaping","28-bounded-multishot-arith","29-bounded-multishot-prefix","30-bounded-multishot-let","31-bounded-generator-splice","32-bounded-control-single","33-bounded-nested-multishot","34-bounded-reshape-unpack","35-bounded-header","36-bounded-autoresume","37-known-reentrant-multishot-limitation","40-state-param","41-state-writer-nested","42-writer-state-nested","45-with-in-sugar","46-std-control-mtl","49-named-instance","50-two-cells","51-sum-prod","52-aliasing","53-mixed-row","54-reentrant-routing","55-three-nested-cells","56-named-multishot","57-named-answers-ambient","58-named-state-reader","59-named-two-state-reader","60-named-state-writer","as-pattern-single","borrow-foreign-lend","borrow-malloc-lend","borrow-read","conc-foreign-sequential-await","conc-nested-own-handles","coro-pure-tail","coro-residual-handled","coro-residual-multi","handler-helper-resume","handler-multiline-body","handler-multiline-nested","local-decl-both-directions","local-fn-sees-value","multiline-handler","multiline-handler-state","par-residual-log","row-param-bare","row-param-box","user-cons-name"]))
+  , ("docs/redesign/examples/accept", (2,
+      ["01-state-cell","02-two-cells","03-ambient-mtl","04-generator","06-use-bridge","07-handler-values","08-proto-patterns","09-activation-independence","10-abort-except","12-nested-handlers-k"]))
+  ]
+
+-- | The four dispatch kinds spec S3 lists, keyed to how each corpus dir's
+-- existing golden group renders its output.
+data SexpKind
+  = SexpTypecheck -- test/typecheck-examples: typecheck success golden
+  | SexpParseOnly -- test/examples: parse golden (print/reparse round-trip)
+  | SexpRun       -- test/run-examples: run golden (elaborate + interpret)
+  | SexpV2Ingest  -- docs/redesign/examples/accept: no golden, no .wok twin parse
+  deriving (Eq, Show)
+
+sexpCorpusDirs :: [(FilePath, SexpKind)]
+sexpCorpusDirs =
+  [ ("test/typecheck-examples", SexpTypecheck)
+  , ("test/examples", SexpParseOnly)
+  , ("test/run-examples", SexpRun)
+  , ("docs/redesign/examples/accept", SexpV2Ingest)
+  ]
+
+-- | Per-file discovery outcome (spec S3's discovery rules). A gap
+-- exclusion carries the innermost tag AND the stable construct label
+-- (the label is what the allowlist is keyed on).
+data SexpOutcome
+  = SexpIntersection FilePath SexpKind Module
+  | SexpExcludedReject FilePath
+  | SexpExcludedGap FilePath Text Text
+  | SexpMalformed FilePath String
+
+-- | Run `wokparse -sexp F` ONCE (spec S3: never batch) and classify per
+-- the discovery rules: nonzero exit -> C-parse rejection; a SexpGap ->
+-- gap exclusion; any OTHER reader/mapper error -> a malformed dump the C
+-- front end produced, which is a real bug and becomes a FAILING test,
+-- never a skip; a clean mapping -> an intersection file.
+classifySexpFile :: FilePath -> SexpKind -> FilePath -> IO SexpOutcome
+classifySexpFile wokparseBin kind f = do
+  (code, out, _err) <- readProcessWithExitCode wokparseBin ["-sexp", f] ""
+  case code of
+    ExitFailure _ -> pure (SexpExcludedReject f)
+    ExitSuccess -> case Sexp.readSExp (T.pack out) of
+      Left e -> pure (SexpMalformed f
+        ("the reader rejected a dump the C front end emitted: " ++ show e))
+      Right datum -> case Surface.surfaceModule datum of
+        Left (Surface.SexpGap _ tag label _) -> pure (SexpExcludedGap f tag label)
+        Left (Surface.MalformedDump p msg) -> pure (SexpMalformed f
+          ("the mapper rejected a dump the C front end emitted, at "
+            ++ show p ++ ": " ++ T.unpack msg))
+        Right mapped -> pure (SexpIntersection f kind mapped)
+
+-- | Export fixity table per module name, folded in TOPOLOGICAL order
+-- (dependencies first, matching what 'Loader.loadProgram' already
+-- returns). Mirrors 'Wok.Pipeline.runPipelineFold''s per-module fold, but
+-- ONLY the fixity dimension: each module's export table is its own
+-- 'DFixity' decls overlaid on the merge of its direct imports' export
+-- tables. Built from exported primitives only ('overlayFixities',
+-- 'lmFixities', 'lmImports') since 'Wok.Pipeline' does not expose the
+-- per-module table it computes internally.
+sexpExportFixities :: [Loader.LoadedModule] -> Map.Map Text FixityTable
+sexpExportFixities = foldl step Map.empty
+  where
+    step acc m =
+      let importedFixs = [ Map.findWithDefault emptyFixityTable (Loader.isModule s) acc
+                          | s <- Loader.lmImports m ]
+          importsFix = Data.Either.fromRight emptyFixityTable
+                         (Control.Monad.foldM overlayFixities emptyFixityTable importedFixs)
+          exportFix  = Data.Either.fromRight importsFix (overlayFixities importsFix (Loader.lmFixities m))
+      in Map.insert (Loader.lmName m) exportFix acc
+
+-- | Build the sexp path's entry 'Loader.LoadedModule' directly from the
+-- already-mapped v1 'Module' -- no disk write (spec S3: no .sexp
+-- intermediate files; the dump text is only ever held in memory).
+-- Mirrors 'Wok.Loader.parseAndPrep''s shape (name / fixities / imports)
+-- without needing that function exported: the module header, 'DFixity'
+-- decls, and 'DImport' decls all come from the SAME mapped tree the
+-- reader+mapper already validated. 'synthPath' is a display-only tag
+-- (never read from disk), used the way 'Wok.SourceOrigin.UserFile'
+-- already tags any user-file-derived module.
+sexpEntryLoadedModule :: FilePath -> Module -> Either String Loader.LoadedModule
+sexpEntryLoadedModule synthPath mapped@(Module decls) = do
+  name <- case decls of
+    (DModule mp : _) -> Right (I.modPathText mp)
+    _                -> Left "sexp-mapped module has no leading DModule decl"
+  fixities <- either (Left . show) Right (buildFixityTable mapped)
+  let imports = [ Loader.ImportSpec (I.modPathText mp) imod | DImport mp imod <- decls ]
+  Right Loader.LoadedModule
+    { Loader.lmName     = name
+    , Loader.lmOrigin   = SO.UserFile synthPath
+    , Loader.lmAst      = mapped
+    , Loader.lmImports  = imports
+    , Loader.lmFixities = fixities
+    }
+
+-- | Assertion (a) (spec D7/S3): the sexp-mapped module and the v1 parse
+-- of the SAME source print identically after reordering with the SAME
+-- external (import-derived) fixity table. Mirrors 'sexpSurfaceEndToEnd'
+-- above, but DERIVES the external table from the actual module graph
+-- (via 'sexpExportFixities') instead of a hand-picked one: the general
+-- corpus, unlike the six S1/S2 fixtures, leans on prelude-declared
+-- operators (`+`, `*`, ...), not just per-file 'DFixity' decls.
+sexpAssertTreeEq :: FilePath -> Module -> Assertion
+sexpAssertTreeEq f mapped = do
+  wokLoad <- Loader.loadProgram f []
+  case wokLoad of
+    Left e -> assertFailure ("wok-path loadProgram failed: " ++ show e)
+    Right loaded -> sexpAssertTreeEq' f mapped loaded
+
+-- | Primed variant of 'sexpAssertTreeEq': takes an ALREADY-LOADED wok-path
+-- module graph instead of calling 'Loader.loadProgram' itself. Used by
+-- 'sexpBuildFileTest' to share a single load with 'sexpAssertGolden'' for
+-- the same file, instead of each assertion re-reading and re-parsing the
+-- six embedded preludes independently.
+sexpAssertTreeEq'
+  :: FilePath -> Module -> (Loader.ModuleName, [Loader.LoadedModule]) -> Assertion
+sexpAssertTreeEq' f mapped (entryName, ms) = do
+  srcTxt <- TIO.readFile f
+  case parse srcTxt of
+    Left e -> assertFailure ("v1 parse of " ++ f ++ " failed: " ++ e)
+    Right wokAst ->
+      case Data.List.find ((== entryName) . Loader.lmName) ms of
+        Nothing -> assertFailure "entry module missing from its own loaded module list"
+        Just entryLM -> do
+          let exportMap  = sexpExportFixities ms
+              importsFix = Data.Either.fromRight emptyFixityTable
+                (Control.Monad.foldM overlayFixities emptyFixityTable
+                  [ Map.findWithDefault emptyFixityTable (Loader.isModule s) exportMap
+                  | s <- Loader.lmImports entryLM ])
+          case (reorderModuleWith importsFix wokAst, reorderModuleWith importsFix mapped) of
+            (Right wokR, Right sexpR) -> sexpAssertNormalizedEq f wokR sexpR
+            (Left e, _) -> assertFailure ("wok-path reorder failed: " ++ show e)
+            (_, Left e) -> assertFailure ("sexp-path reorder failed: " ++ show e)
+
+-- | Assertion (a) for 'SexpParseOnly' files: these are standalone SNIPPETS
+-- under test/examples (no `module` header, no real imports, and often no
+-- `fixity` decls for the operators they use -- their OWN golden group,
+-- "parse golden", tests them with bare 'parse'/'printTree', NEVER
+-- reordered and never through 'Loader.loadProgram'). Routing them through
+-- 'sexpAssertTreeEq''s full Loader+reorder machinery both rejects them
+-- with 'LoadNoModuleHeader' (no module header) AND can fail reordering
+-- outright on an undeclared operator (e.g. 03-expressions.wok's bare `+`)
+-- that plain 'parse' never needed resolved. So this compares the RAW,
+-- UNREORDERED trees directly, at the same level their own golden already
+-- does.
+sexpAssertTreeEqFragment :: FilePath -> Module -> Assertion
+sexpAssertTreeEqFragment f mapped = do
+  srcTxt <- TIO.readFile f
+  case parse srcTxt of
+    Left e -> assertFailure ("v1 parse of " ++ f ++ " failed: " ++ e)
+    Right wokAst -> sexpAssertNormalizedEq f wokAst mapped
+
+-- | Assertion (b) (spec S3): golden equality against the file's EXISTING
+-- golden, using the SAME rendering its corpus already golden-tests with
+-- ('renderModuleRoundTrip' / 'renderSchemesBS' / 'renderElaborateAndRun'
+-- -- the exact functions 'parseToBS' / 'typecheckSuccessHarness' /
+-- 'runProgramHarness' call). For 'SexpTypecheck'/'SexpRun' this runs the
+-- SAME 'Loader.LoadedModule' list the wok-path golden test builds, with
+-- only the entry module swapped for its sexp-mapped counterpart --
+-- preludes are shared (spec R3: preludes stay v1 on both paths).
+sexpAssertGolden :: FilePath -> SexpKind -> Module -> Assertion
+sexpAssertGolden f SexpParseOnly mapped = do
+  expected <- BS.readFile (goldenFor f)
+  BL.toStrict (renderModuleRoundTrip mapped) @?= expected
+sexpAssertGolden f kind mapped = do
+  wokLoad <- Loader.loadProgram f []
+  case wokLoad of
+    Left e -> assertFailure ("wok-path loadProgram failed: " ++ show e)
+    Right loaded -> sexpAssertGolden' f kind mapped loaded
+
+-- | Primed variant of 'sexpAssertGolden' for the non-'SexpParseOnly'
+-- kinds: takes an ALREADY-LOADED wok-path module graph instead of calling
+-- 'Loader.loadProgram' itself (see 'sexpAssertTreeEq'' for why). Not
+-- defined for 'SexpParseOnly' since that clause never loads anything.
+sexpAssertGolden'
+  :: FilePath -> SexpKind -> Module -> (Loader.ModuleName, [Loader.LoadedModule]) -> Assertion
+sexpAssertGolden' f kind mapped (entryName, ms) =
+  case sexpEntryLoadedModule (f ++ ".sexp-synth") mapped of
+    Left e -> assertFailure ("building the sexp entry LoadedModule failed: " ++ e)
+    Right sexpLM -> do
+      let sexpMs = [ if Loader.lmName lm == entryName then sexpLM else lm | lm <- ms ]
+      case kind of
+        SexpTypecheck -> do
+          expected <- BS.readFile (typecheckGoldenFor f)
+          let actual = case Pipeline.typecheckProgram entryName sexpMs of
+                Left s             -> BL.pack ("pipeline: " ++ s ++ "\n")
+                Right (decls, _ws) -> renderSchemesBS decls
+          BL.toStrict actual @?= expected
+        SexpRun -> do
+          expected <- BS.readFile (runGoldenFor f)
+          let actual = renderElaborateAndRun (Pipeline.elaborateProgramFull entryName sexpMs)
+          BL.toStrict actual @?= expected
+        _ -> assertFailure "sexpAssertGolden': unreachable kind (ParseOnly handled above, V2Ingest has no golden)"
+
+-- | The six embedded preludes, extracted from any successful
+-- 'Loader.loadProgram' call (it always loads all six regardless of what
+-- the entry imports -- see 'Wok.Loader.loadProgram''s definition). Used
+-- for the v2-accept-corpus files ('SexpV2Ingest'): their .wok twin does
+-- not parse under v1 (the Haskell parser rejects 11 of 12, spec's corpus
+-- audit), so there is no v1-path 'loadProgram' call to borrow a module
+-- graph from for those files -- only the shared prelude ENVIRONMENT
+-- (spec R3) is reusable, identified by 'SO.Embedded' origin rather than
+-- by name so it does not depend on the throwaway entry's identity.
+sexpPreludeModules :: IO (Either Loader.LoaderError [Loader.LoadedModule])
+sexpPreludeModules = do
+  r <- Loader.loadProgram "test/typecheck-examples/01-identity.wok" []
+  pure (fmap (filter ((== SO.Embedded) . Loader.lmOrigin) . snd) r)
+
+-- | The v2-ingest assertion (spec S3): no golden, no .wok twin tree to
+-- compare against -- just that ingestion succeeds and typechecking
+-- produces SOME result (success or a genuine type error) WITHOUT a
+-- Haskell-level crash. Forces the same rendering 'sexpAssertGolden' would
+-- diff, inside 'Control.Exception.try', so a partial-function crash deep
+-- in the mapper or typechecker is reported as a failure, not silently
+-- passed by laziness.
+sexpAssertV2Ingest :: FilePath -> Module -> Assertion
+sexpAssertV2Ingest f mapped = do
+  preludesR <- sexpPreludeModules
+  case preludesR of
+    Left e -> assertFailure ("loading the shared preludes failed: " ++ show e)
+    Right preludeLMs ->
+      case sexpEntryLoadedModule (f ++ ".v2-sexp-synth") mapped of
+        Left e -> assertFailure ("building the sexp entry LoadedModule failed: " ++ e)
+        Right sexpLM -> do
+          let rendered = case Pipeline.typecheckProgram (Loader.lmName sexpLM) (preludeLMs ++ [sexpLM]) of
+                Left e'            -> BL.pack ("pipeline: " ++ e' ++ "\n")
+                Right (decls, _ws) -> renderSchemesBS decls
+          forced <- Control.Exception.try
+                      (Control.Exception.evaluate (BS.length (BL.toStrict rendered)))
+                    :: IO (Either Control.Exception.SomeException Int)
+          case forced of
+            Left ex -> assertFailure ("v2-ingest: typechecking crashed: " ++ show ex)
+            Right _ -> pure ()
+
+sexpBuildFileTest :: FilePath -> SexpKind -> Module -> TestTree
+sexpBuildFileTest f SexpV2Ingest mapped =
+  testCase (takeBaseName f ++ " (v2-ingest)") (sexpAssertV2Ingest f mapped)
+sexpBuildFileTest f SexpParseOnly mapped
+  | takeBaseName f `Set.member` sexpNoV1Twin =
+      -- Reaching this arm means the sexp mapping SUCCEEDED (the file
+      -- classified into the intersection); the pinned claim is that v1
+      -- still cannot parse the source, so there is no tree to diff.
+      testCase (takeBaseName f ++ " (v2-only: v1 must keep rejecting)") $ do
+        srcTxt <- TIO.readFile f
+        case parse srcTxt of
+          Left _  -> pure ()
+          Right _ -> assertFailure
+            (f ++ " now parses under v1: remove it from sexpNoV1Twin and \
+                  \promote it into the real differential")
+  | takeBaseName f `Set.member` sexpParseGoldenEmbedsParens =
+      testCase (takeBaseName f ++ " (normalized tree only; parse golden embeds parens)")
+        (sexpAssertTreeEqFragment f mapped)
+  | otherwise =
+      testCase (takeBaseName f) $ do
+        sexpAssertTreeEqFragment f mapped
+        sexpAssertGolden f SexpParseOnly mapped
+sexpBuildFileTest f kind mapped =
+  testCase (takeBaseName f) $ do
+    wokLoad <- Loader.loadProgram f []
+    case wokLoad of
+      Left e -> assertFailure ("wok-path loadProgram failed: " ++ show e)
+      Right loaded -> do
+        sexpAssertTreeEq' f mapped loaded
+        sexpAssertGolden' f kind mapped loaded
+
+-- | The whole env-gated group. Unset WOK_WOKPARSE => a single
+-- always-passing notice so CI without a C toolchain stays green. Set =>
+-- discover + classify each corpus file (one 'wokparse' invocation per
+-- file, spec S3: never batch), build one test per intersection file, one
+-- FAILING test per malformed dump, and a summary testCase that prints the
+-- per-dir counts and hard-asserts every observed gap tag is one the spec
+-- documents (spec S3 acceptance: "every exclusion is either a recorded
+-- SexpGap or a recorded C-parse rejection -- no silent skips").
+buildSexpDifferentialGroup :: Maybe FilePath -> IO TestTree
+buildSexpDifferentialGroup Nothing =
+  pure $ testGroup "Sexp.Differential"
+    [ testCase "skipped (WOK_WOKPARSE unset)" $
+        putStrLn
+          ( "Sexp.Differential skipped: set WOK_WOKPARSE=/path/to/wokparse to run "
+            ++ "the parser-vs-parser differential over the corpus intersection (spec D7/S3)." )
+    ]
+buildSexpDifferentialGroup (Just wokparseBin) = do
+  perDir <- Control.Monad.forM sexpCorpusDirs $ \(dir, kind) -> do
+    files    <- findByExtension [".wok"] dir
+    outcomes <- Control.Monad.forM (Data.List.sort files) (classifySexpFile wokparseBin kind)
+    pure (dir, outcomes)
+
+  let intersectionOf os = [ (f, kind, m) | SexpIntersection f kind m <- os ]
+      isKnownDivergence f = takeBaseName f `Set.member` sexpKnownDivergences
+
+      malformedTests =
+        [ testCase (takeBaseName f ++ " (malformed dump: a C-front-end/mapper bug, not a skip)")
+            (assertFailure msg)
+        | (_, os) <- perDir
+        , SexpMalformed f msg <- os
+        ]
+
+      perFileTests =
+        [ sexpBuildFileTest f kind m
+        | (_, os) <- perDir
+        , (f, kind, m) <- intersectionOf os
+        , not (isKnownDivergence f)
+        ]
+
+      badGaps =
+        [ (f, tag, label)
+        | (_, os) <- perDir
+        , SexpExcludedGap f tag label <- os
+        , label `Set.notMember` sexpDifferentialAllowedGapLabels
+        ]
+
+      summary = testCase "corpus intersection summary (pinned)" $ do
+        actuals <- Control.Monad.forM perDir $ \(dir, os) -> do
+          let inter     = intersectionOf os
+              n         = length inter
+              rejectSet = Set.fromList [ takeBaseName f | SexpExcludedReject f <- os ]
+              gapSet    = Set.fromList [ takeBaseName f | SexpExcludedGap f _ _ <- os ]
+              excluded  = rejectSet `Set.union` gapSet
+              nDiverged = length [ () | (f, _, _) <- inter, isKnownDivergence f ]
+          putStrLn
+            ( dir ++ ": intersection=" ++ show n
+              ++ " excluded-c-reject=" ++ show (Set.size rejectSet)
+              ++ " excluded-gap=" ++ show (Set.size gapSet)
+              ++ " excluded-known-divergence=" ++ show nDiverged )
+          pure (dir, n, excluded)
+        -- Corpus growth (or a wokparse/mapper behavior change) must
+        -- update the 'sexpExpectedPerDir' pins by hand -- that is the
+        -- point: a silent slide of a file from "differentially tested"
+        -- to "excluded" is exactly the coverage regression this
+        -- catches, and it is pinned as a SET so a same-count swap
+        -- cannot hide either.
+        let mismatches =
+              [ msg
+              | (dir, n, excluded) <- actuals
+              , msg <- case lookup dir sexpExpectedPerDir of
+                  Nothing -> ["no pinned expectation for corpus dir " ++ dir]
+                  Just (expectedN, expectedExcludedL) ->
+                    let expectedExcluded = Set.fromList expectedExcludedL
+                    in [ unlines
+                           [ dir ++ ": corpus discovery drifted from its pin"
+                           , "  pinned intersection=" ++ show expectedN ++ ", actual=" ++ show n
+                           , "  newly excluded:      " ++ show (Set.toList (excluded Set.\\ expectedExcluded))
+                           , "  no longer excluded:  " ++ show (Set.toList (expectedExcluded Set.\\ excluded))
+                           , "  full actual excluded set (paste into sexpExpectedPerDir if intended):"
+                           , "  " ++ show (Set.toList excluded)
+                           ]
+                       | expectedN /= n || expectedExcluded /= excluded
+                       ]
+              ]
+        Control.Monad.unless (null mismatches)
+          (assertFailure (intercalate "\n" mismatches))
+        assertBool
+          ("gap label(s) outside the mapper's documented gap rules: " ++ show badGaps)
+          (null badGaps)
+
+  pure $ testGroup "Sexp.Differential" (perFileTests ++ malformedTests ++ [summary])
+
+-- ---------------------------------------------------------------------
+-- Sexp.Reorder: env-gated differential for the C reorder pass
+-- (docs/superpowers/specs/2026-08-07-sexp-reorder-pass.md), over the
+-- purpose-built fixtures in test/sexp-reorder-fixtures. Same WOK_WOKPARSE
+-- gate and skip-notice convention as 'buildSexpDifferentialGroup'.
+--
+-- Two pipelines per accept fixture:
+--   A: wokparse -sexp -reorder FILE  -> Sexp.Read -> Surface           (no Haskell reordering)
+--   B: wokparse -sexp FILE           -> Sexp.Read -> Surface -> Wok.Reordering.reorderModule
+-- asserted structurally equal, plus idempotence of 'reorderModule' on A.
+--
+-- Reject fixtures assert the VERDICT agrees (C rejects <=> reorderModule
+-- returns Left), never the message (spec: "chain-level agreement on the
+-- message is NOT required, only the verdict").
+-- ---------------------------------------------------------------------
+
+sexpReorderFixtureDir :: FilePath
+sexpReorderFixtureDir = "test/sexp-reorder-fixtures"
+
+-- | Filenames make the expected verdict visible without opening the file
+-- (prompt convention): a "reject-" prefix means `wokparse -sexp -reorder`
+-- must fail on it; every other fixture must be accepted.
+sexpReorderExpectsReject :: FilePath -> Bool
+sexpReorderExpectsReject f = "reject-" `Data.List.isPrefixOf` takeBaseName f
+
+-- | The reorder differential's structural comparator. Verification note:
+-- 'sexpNormalize' ALREADY collapses every 'EParen' unconditionally (its
+-- 'stripE' clause, defined above) -- which is exactly the treatment this
+-- group needs. wok_reorder.c's own header comment records that this AST
+-- has no paren node at all ("no wrapper is built; the s-expression dump
+-- makes the nesting visible through bracket structure alone"), so the
+-- C-reordered dump never contains one, while Haskell's 'combineInfix'
+-- (src/Wok/Reordering.hs) wraps a nested chain operand in 'EParen' before
+-- re-nesting it. So THIS group needs no extra stripping step beyond what
+-- 'sexpNormalize' already does for every other sexp differential group --
+-- 'sexpNormalizeReorder' is a documented alias, not a new transform, and
+-- 'sexpNormalize' itself (and its existing callers' semantics) is
+-- untouched.
+sexpNormalizeReorder :: Module -> Module
+sexpNormalizeReorder = sexpNormalize
+
+-- | Assert pipeline A (wokparse -sexp -reorder, mapped, no Haskell
+-- reordering) and pipeline B (wokparse -sexp flat, mapped, THEN
+-- 'Wok.Reordering.reorderModule') agree after 'sexpNormalizeReorder'.
+-- Mirrors 'sexpAssertNormalizedEq''s shape and reuses 'sexpShowDiffExcerpt'
+-- for the failure-message diff excerpt; the two trees here are A/B
+-- (neither is the un-reordered v1 parse 'sexpAssertNormalizedEq' compares
+-- against), so the labels are spelled out instead of reusing its wording.
+sexpReorderAssertEq :: String -> Module -> Module -> Assertion
+sexpReorderAssertEq what treeA treeB = do
+  let normA = show (sexpNormalizeReorder treeA)
+      normB = show (sexpNormalizeReorder treeB)
+  if normA == normB
+    then pure ()
+    else assertFailure $ unlines
+      [ what ++ ": normalized ASTs differ"
+      , "  (first label below = pipeline A: wokparse -sexp -reorder;"
+        ++ " second = pipeline B: wokparse -sexp + Haskell reorderModule)"
+      , sexpShowDiffExcerpt normA normB
+      , "printTree (A): " ++ Pr.printTree treeA
+      , "printTree (B): " ++ Pr.printTree treeB
+      ]
+
+-- | Run `wokparse` with the given extra flags over one file and require a
+-- clean exit; on a nonzero exit, fail with the process's stderr+stdout as
+-- context. One invocation per call, matching 'classifySexpFile''s
+-- "never batch" convention.
+sexpReorderRunOk :: FilePath -> [String] -> FilePath -> String -> IO Module
+sexpReorderRunOk wokparseBin flags f context = do
+  (code, out, err) <- readProcessWithExitCode wokparseBin (flags ++ [f]) ""
+  case code of
+    ExitFailure _ -> assertFailure (context ++ ": expected a clean exit, got a fault:\n" ++ err ++ out)
+    ExitSuccess -> do
+      datum <- either (\e -> assertFailure (context ++ ": reader rejected the dump: " ++ show e))
+                      pure (Sexp.readSExp (T.pack out))
+      either (\e -> assertFailure (context ++ ": surface mapping failed: " ++ show e))
+             pure (Surface.surfaceModule datum)
+
+-- | An accept fixture: pipeline A vs pipeline B must agree structurally,
+-- and 'reorderModule' on A must be idempotent (a resolved chain already
+-- carries only singleton ops seqs).
+sexpReorderAcceptTest :: FilePath -> FilePath -> TestTree
+sexpReorderAcceptTest wokparseBin f = testCase (takeBaseName f) $ do
+  moduleA <- sexpReorderRunOk wokparseBin ["-sexp", "-reorder"] f
+               (f ++ " (pipeline A: wokparse -sexp -reorder)")
+  flatModule <- sexpReorderRunOk wokparseBin ["-sexp"] f
+               (f ++ " (pipeline B base: wokparse -sexp, flat)")
+  case reorderModule flatModule of
+    Left es -> assertFailure
+      (f ++ ": Haskell reorderModule rejected the flat-mapped tree, but the C \
+            \reorder pass accepted it (verdict mismatch): " ++ show es)
+    Right rmB -> do
+      sexpReorderAssertEq f moduleA (reorderedAst rmB)
+      case reorderModule moduleA of
+        Left es -> assertFailure
+          (f ++ ": reorderModule on the already-reordered tree A failed \
+                \(idempotence should be a no-op): " ++ show es)
+        Right rmA -> sexpReorderAssertEq (f ++ " (idempotence)") moduleA (reorderedAst rmA)
+
+-- | A reject fixture: `wokparse -sexp -reorder` must fault, AND
+-- 'reorderModule' on the flat-mapped tree must return 'Left' -- verdict
+-- agreement only (spec: message agreement is not required). The flat
+-- `wokparse -sexp` (no -reorder) must still parse cleanly, so the fixture
+-- is confirmed to be resolve-clean apart from its intended fixity fault,
+-- not accidentally exercising some other rejection.
+sexpReorderRejectTest :: FilePath -> FilePath -> TestTree
+sexpReorderRejectTest wokparseBin f = testCase (takeBaseName f) $ do
+  (codeA, outA, _errA) <- readProcessWithExitCode wokparseBin ["-sexp", "-reorder", f] ""
+  case codeA of
+    ExitSuccess -> assertFailure
+      (f ++ ": expected `wokparse -sexp -reorder` to reject this file, but it \
+            \produced a dump:\n" ++ outA)
+    ExitFailure _ -> do
+      flatModule <- sexpReorderRunOk wokparseBin ["-sexp"] f
+        (f ++ ": the flat `wokparse -sexp` (no -reorder) must still parse cleanly, \
+              \so the rejection under test is the reorder/fixity fault, not some \
+              \other parse problem")
+      case reorderModule flatModule of
+        Right _ -> assertFailure
+          (f ++ ": `wokparse -sexp -reorder` rejected this file, but Haskell's \
+                \reorderModule accepted the flat-mapped tree (verdict mismatch)")
+        Left _  -> pure ()
+
+buildSexpReorderGroup :: Maybe FilePath -> IO TestTree
+buildSexpReorderGroup Nothing =
+  pure $ testGroup "Sexp.Reorder"
+    [ testCase "skipped (WOK_WOKPARSE unset)" $
+        putStrLn
+          ( "Sexp.Reorder skipped: set WOK_WOKPARSE=/path/to/wokparse to run "
+            ++ "the reorder-pass differential over " ++ sexpReorderFixtureDir
+            ++ " (docs/superpowers/specs/2026-08-07-sexp-reorder-pass.md)." )
+    ]
+buildSexpReorderGroup (Just wokparseBin) = do
+  files <- findByExtension [".wok"] sexpReorderFixtureDir
+  let build f
+        | sexpReorderExpectsReject f = sexpReorderRejectTest wokparseBin f
+        | otherwise                  = sexpReorderAcceptTest wokparseBin f
+  pure $ testGroup "Sexp.Reorder" [ build f | f <- Data.List.sort files ]
+
+-- ---------------------------------------------------------------------
+-- Sexp.Reorder.Property: the "QuickCheck generator" bullet of the
+-- differential contract (docs/superpowers/specs/2026-08-07-sexp-reorder-pass.md,
+-- "The differential contract (Haskell side)"). The 77 scheme goldens and the
+-- purpose-built fixtures above use Base operators with no in-file `fixity`,
+-- so they only exercise the error path (every chain is "undeclared
+-- operator"). This group generates random fixity DAGs x random chains so the
+-- ACCEPT path -- tree-shape agreement between the C reorder pass and
+-- 'Wok.Reordering.reorderModule' -- gets exercised too. Same WOK_WOKPARSE
+-- gate, same skip-notice convention, and reuses every process-invocation and
+-- comparison helper the fixture-based group above defines (never
+-- re-implements process plumbing).
+-- ---------------------------------------------------------------------
+
+-- | Fixed pool of known-good operator spellings. Verified by hand against
+-- `wokparse -sexp -reorder` before being wired in here (each symbol lexes as
+-- one 'VarSym' token per grammar/Wok.cf's character class, and `dot` is a
+-- valid backtick-infix 'VarId'): every entry round-trips through a
+-- one-operator chain with its own `fixity` declaration. `$` needed the
+-- check most, since `\` is also a 'VarSym' character (lambda's sigil is a
+-- separate token) -- confirmed clean.
+sexpReorderOpPoolSym :: [String]
+sexpReorderOpPoolSym = ["+", "-", "*", "/", "^", "$", "<>", "<+>"]
+
+sexpReorderOpPoolAlpha :: [String]
+sexpReorderOpPoolAlpha = ["dot"]
+
+-- | The full pool (9 operators): 2-6 of these get declared per generated
+-- case, the rest stay available as neighbour-only / undeclared-operator
+-- fault material.
+sexpReorderOpPool :: [String]
+sexpReorderOpPool = sexpReorderOpPoolSym ++ sexpReorderOpPoolAlpha
+
+-- | Alpha operators print backtick-infix in a chain (`` `dot` ``); symbol
+-- operators print bare. Both spellings are bare (no backticks) on the LEFT
+-- side of a `fixity` declaration and inside `tighter than`/`looser than`
+-- (grammar: 'FixName' is a bare 'VarSym' or bare 'VarId', backtick-quoting
+-- is an 'InfixOp'-only surface, confirmed by test/sexp-reorder-fixtures/backtick-declared.wok).
+sexpReorderIsAlphaOp :: String -> Bool
+sexpReorderIsAlphaOp = (`elem` sexpReorderOpPoolAlpha)
+
+data GenAssoc = GenLeftAssoc | GenRightAssoc
+  deriving (Show)
+
+-- | One operator's own `fixity` declaration: its associativity plus zero or
+-- more "tighter than" targets. A target is usually another declared
+-- operator's name, but occasionally (the neighbour-only fault,
+-- test/sexp-reorder-fixtures/reject-neighbour-only.wok's shape) a name with
+-- no declaration of its own anywhere in the file.
+data GenFixityDecl = GenFixityDecl
+  { gfdName    :: String
+  , gfdAssoc   :: GenAssoc
+  , gfdTighter :: [String]
+  } deriving (Show)
+
+-- | Where the generated chain sits: at the top of the single equation, or
+-- nested one level under a lambda / case alternative, mirroring
+-- nested-chain-lambda.wok / nested-chain-case-arm.wok.
+data GenNesting = GenFlat | GenUnderLambda | GenUnderCaseArm
+  deriving (Eq, Show)
+
+-- | One generated case: a random fixity table over 2-6 pool operators
+-- (random assoc each, a DAG of "tighter than" edges built only from lower
+-- to higher index over a shuffled sub-pool so acyclicity is by
+-- construction -- the spec's own note that both sides then compute their
+-- OWN closure over it) x a random chain of 1-8 operator occurrences (mostly
+-- declared, occasionally a name absent from the table entirely). Operand
+-- VALUES never matter to this property (only chain SHAPE does), so the
+-- printer fills them in deterministically as ascending integer literals --
+-- this sidesteps the "unbound variable pollutes the verdict" trap the
+-- prompt calls out, without giving up any structural coverage.
+data GenReorderCase = GenReorderCase
+  { grcDecls    :: [GenFixityDecl]
+  , grcChainOps :: [String]
+  , grcNesting  :: GenNesting
+  } deriving (Show)
+
+instance QC.Arbitrary GenReorderCase where
+  arbitrary = do
+    k <- choose (2, 6)
+    shuffled <- QC.shuffle sexpReorderOpPool
+    let selected       = take k shuffled
+        undeclaredPool = drop k shuffled  -- always >= 3: pool has 9, k <= 6
+    assocs <- QC.vectorOf k (elements [GenLeftAssoc, GenRightAssoc])
+    let indexed = zip [0 :: Int ..] selected
+        pairs   = [ (i, nj) | (i, _) <- indexed, (j, nj) <- indexed, j > i ]
+    -- A tighter-than edge only ever runs from a lower shuffled index to a
+    -- higher one, so however many of these fire, the result is acyclic by
+    -- construction; 'compareOps' on both sides computes its own reachability
+    -- closure over whatever subset survives.
+    edgeFlags <- mapM (const (frequency [(2, pure True), (3, pure False)])) pairs
+    let edgesByOwner = Map.fromListWith (++)
+          [ (i, [nj]) | ((i, nj), True) <- zip pairs edgeFlags ]
+    -- Neighbour-only fault (small probability): one declared operator gets
+    -- an extra "tighter than X" where X carries no `fixity` of its own.
+    neighbourFault <- frequency [(1, pure True), (6, pure False)]
+    extraEdge <-
+      if neighbourFault && not (null undeclaredPool)
+        then do
+          ownerIdx <- choose (0, k - 1)
+          target   <- elements undeclaredPool
+          pure (Just (ownerIdx, target))
+        else pure Nothing
+    let extraFor i = case extraEdge of
+          Just (oi, t) | oi == i -> [t]
+          _                      -> []
+        decls =
+          [ GenFixityDecl name assoc (Map.findWithDefault [] i edgesByOwner ++ extraFor i)
+          | (i, name, assoc) <- zip3 [0 :: Int ..] selected assocs
+          ]
+    -- Chain: 1-8 occurrences, mostly declared operators; a small slice from
+    -- the undeclared pool exercises the "undeclared operator in chain"
+    -- fault directly (independent of the neighbour-only fault above).
+    n <- choose (1, 8)
+    chainOps <- QC.vectorOf n
+      (frequency
+        [ (85, elements selected)
+        , (15, elements (if null undeclaredPool then selected else undeclaredPool))
+        ])
+    nesting <- elements [GenFlat, GenUnderLambda, GenUnderCaseArm]
+    pure (GenReorderCase decls chainOps nesting)
+
+  -- Shrinking matters more than volume (spec): drop one declared operator,
+  -- drop one chain occurrence (never down to zero -- an empty chain is not
+  -- an infix chain at all), drop one "tighter than" edge, or flatten the
+  -- nesting -- one independent step at a time, so QuickCheck's shrink loop
+  -- converges to a minimal reproducer over repeated rounds.
+  shrink (GenReorderCase decls chainOps nesting) =
+       [ GenReorderCase ds chainOps nesting | ds <- dropOneOf decls ]
+    ++ [ GenReorderCase decls cs nesting | cs <- dropOneOf chainOps, not (null cs) ]
+    ++ [ GenReorderCase (dropOneTighterEdge decls) chainOps nesting
+       | any (not . null . gfdTighter) decls ]
+    ++ [ GenReorderCase decls chainOps GenFlat | nesting /= GenFlat ]
+    where
+      dropOneOf xs = [ take i xs ++ drop (i + 1) xs | i <- [0 .. length xs - 1] ]
+      dropOneTighterEdge ds = case break (not . null . gfdTighter) ds of
+        (pre, GenFixityDecl nm a (_ : ts) : post) -> pre ++ GenFixityDecl nm a ts : post
+        _                                          -> ds
+
+-- | Emit a self-contained wok SOURCE file for a generated case, matching the
+-- accepted surface in test/sexp-reorder-fixtures/: zero or more `fixity`
+-- lines (blank-line separated from the definition when there are any --
+-- matching reject-undeclared-operator.wok's zero-decl shape when there are
+-- none), then a single equation whose body is the chain, flat or nested one
+-- level under a lambda / case alternative.
+sexpReorderPrintCase :: GenReorderCase -> String
+sexpReorderPrintCase (GenReorderCase decls chainOps nesting) = case decls of
+  [] -> sexpReorderPrintDef nesting chain
+  _  -> unlines (map sexpReorderPrintDecl decls) ++ "\n" ++ sexpReorderPrintDef nesting chain
+  where
+    chain = sexpReorderPrintChain chainOps
+
+sexpReorderPrintDecl :: GenFixityDecl -> String
+sexpReorderPrintDecl (GenFixityDecl name assoc tighter) =
+  "fixity " ++ name ++ " " ++ sexpReorderPrintAssoc assoc
+    ++ concatMap (\t -> " tighter than " ++ t) tighter
+
+sexpReorderPrintAssoc :: GenAssoc -> String
+sexpReorderPrintAssoc GenLeftAssoc  = "left"
+sexpReorderPrintAssoc GenRightAssoc = "right"
+
+-- | @n@ operator occurrences need @n + 1@ operands; ascending integer
+-- literals (0, 1, 2, ...) are always resolve-clean and their VALUES are
+-- irrelevant to a fixity/shape property, so there is no reason to randomize
+-- them.
+sexpReorderPrintChain :: [String] -> String
+sexpReorderPrintChain ops = unwords (interleave operands (map sexpReorderPrintOp ops))
+  where
+    operands = map show [0 .. length ops]
+    interleave (o : os) (p : ps) = o : p : interleave os ps
+    interleave (o : _)  []       = [o]
+    interleave []       _        = []
+
+sexpReorderPrintOp :: String -> String
+sexpReorderPrintOp op
+  | sexpReorderIsAlphaOp op = "`" ++ op ++ "`"
+  | otherwise               = op
+
+sexpReorderPrintDef :: GenNesting -> String -> String
+sexpReorderPrintDef GenFlat        chain = "f = " ++ chain ++ "\n"
+sexpReorderPrintDef GenUnderLambda chain = "f = \\x -> " ++ chain ++ "\n"
+sexpReorderPrintDef GenUnderCaseArm chain =
+  "f = case 0 of\n  0 -> " ++ chain ++ "\n  n -> n\n"
+
+-- | Read a `wokparse -sexp[-reorder]` dump back into a 'Module' via the same
+-- Sexp.Read + Surface path every other differential group uses. Returns
+-- 'Left' instead of failing the test outright: the property distinguishes a
+-- generator bug (this should never happen for syntactically well-formed
+-- generated input) from a genuine C/Haskell divergence.
+sexpReorderReadDump :: String -> Either String Module
+sexpReorderReadDump out =
+  case Sexp.readSExp (T.pack out) of
+    Left e      -> Left ("reader rejected the dump: " ++ show e)
+    Right datum -> case Surface.surfaceModule datum of
+      Left e2 -> Left ("surface mapping failed: " ++ show e2)
+      Right m -> Right m
+
+-- | One 'wokparse' invocation over generated source text, via a fresh
+-- unique temp path (parallel-safe, unconditionally cleaned up) -- the same
+-- one-file-per-invocation convention 'sexpReorderRunOk' and
+-- 'runSourceWith' use elsewhere in this file (batched wokparse loops are
+-- flaky in this sandbox).
+sexpReorderRunGenerated
+  :: FilePath -> [String] -> String -> IO (ExitCode, String, String)
+sexpReorderRunGenerated wokparseBin flags src = do
+  u <- newUnique
+  let path = "test/.sexp-reorder-prop-tmp-" <> show (hashUnique u) <> ".wok"
+  Control.Exception.finally
+    (do writeFile path src
+        readProcessWithExitCode wokparseBin (flags ++ [path]) "")
+    (removeFileIfExists path)
+
+-- | Pure verdict-and-structure judgement given both pipelines' raw process
+-- results, for one generated case. All IO stays in 'sexpReorderPropertyCase'
+-- (spawning wokparse, writing the temp file); this function is where the
+-- property's actual logic lives.
+--
+--   1. Verdict agreement: pipeline A's exit code vs 'reorderModule' on the
+--      flat-mapped tree (Left <=> reject). A mismatch fails with both
+--      verdicts and the generated source in the counterexample.
+--   2. When both accept: pipeline A's mapped tree, normalized, must equal
+--      pipeline B's ('reorderModule' on the flat tree), normalized. Plus
+--      idempotence: 'reorderModule' on pipeline A's already-reordered tree
+--      must be a no-op.
+sexpReorderJudge
+  :: String                      -- ^ generated source, for the counterexample report
+  -> (ExitCode, String, String)  -- ^ pipeline A: wokparse -sexp -reorder
+  -> (ExitCode, String, String)  -- ^ pipeline B base: wokparse -sexp (flat)
+  -> Property
+sexpReorderJudge src (codeA, outA, errA) (codeFlat, outFlat, errFlat) =
+  QC.classify cAccepts     "C accepts" $
+  QC.classify (not cAccepts) "C rejects" $
+  case flatResult of
+    Left msg          -> counterexample (report ("GENERATOR BUG: " ++ msg)) False
+    Right flatModule ->
+      let hVerdict  = reorderModule flatModule
+          hAccepts  = either (const False) (const True) hVerdict
+          verdictOk = counterexample
+            (report
+              ( "verdict mismatch: C " ++ verdictWord cAccepts
+                ++ ", Haskell " ++ verdictWord hAccepts
+                ++ either ((" -- " ++) . show) (const "") hVerdict ))
+            (cAccepts == hAccepts)
+      in verdictOk .&&.
+         (if cAccepts && hAccepts
+            then sexpReorderJudgeAccepted src outA hVerdict
+            else property True)
+  where
+    cAccepts = codeA == ExitSuccess
+    flatResult
+      | codeFlat /= ExitSuccess = Left ("flat `wokparse -sexp` rejected the file: " ++ errFlat)
+      | otherwise               = sexpReorderReadDump outFlat
+    verdictWord accepted = if accepted then "accepts" else "rejects"
+    report note = unlines
+      [ "generated source:"
+      , src
+      , "pipeline A (-reorder) stderr: " ++ errA
+      , note
+      ]
+
+-- | The accept-side checks: pipeline A/B structural agreement, then
+-- idempotence of 'reorderModule' on pipeline A's already-reordered tree.
+sexpReorderJudgeAccepted
+  :: String -> String -> Either [ReorderError] ReorderedModule -> Property
+sexpReorderJudgeAccepted src outA hVerdict = case (sexpReorderReadDump outA, hVerdict) of
+  (Left msg, _) ->
+    counterexample ("GENERATOR BUG: pipeline A dump failed to map: " ++ msg ++ "\n" ++ src) False
+  (_, Left _) ->
+    counterexample "unreachable: hVerdict was Left under cAccepts && hAccepts" False
+  (Right moduleA, Right rmB) ->
+    let normA = show (sexpNormalizeReorder moduleA)
+        normB = show (sexpNormalizeReorder (reorderedAst rmB))
+        eqAB  = counterexample
+          ("pipeline A/B normalized trees differ:\n" ++ sexpShowDiffExcerpt normA normB ++ "\n" ++ src)
+          (normA == normB)
+        idem = case reorderModule moduleA of
+          Left es -> counterexample
+            ("idempotence failed: reorderModule on pipeline A's tree returned Left: "
+              ++ show es ++ "\n" ++ src) False
+          Right rmA ->
+            let normIdem = show (sexpNormalizeReorder (reorderedAst rmA))
+            in counterexample
+                 ("idempotence mismatch:\n" ++ sexpShowDiffExcerpt normA normIdem ++ "\n" ++ src)
+                 (normA == normIdem)
+    in eqAB .&&. idem
+
+-- | One generated case, end to end: print, run both pipelines once each,
+-- judge.
+sexpReorderPropertyCase :: FilePath -> GenReorderCase -> Property
+sexpReorderPropertyCase wokparseBin gc = QC.ioProperty $ do
+  let src = sexpReorderPrintCase gc
+  resA    <- sexpReorderRunGenerated wokparseBin ["-sexp", "-reorder"] src
+  resFlat <- sexpReorderRunGenerated wokparseBin ["-sexp"] src
+  pure (sexpReorderJudge src resA resFlat)
+
+-- | Registration: same WOK_WOKPARSE gate and skip-notice convention as
+-- 'buildSexpReorderGroup'. 150 cases by default (spec: "Case count: 150 by
+-- default... each case spawns wokparse twice; keep runtime sane").
+buildSexpReorderPropertyGroup :: Maybe FilePath -> IO TestTree
+buildSexpReorderPropertyGroup Nothing =
+  pure $ testGroup "Sexp.Reorder.Property"
+    [ testCase "skipped (WOK_WOKPARSE unset)" $
+        putStrLn
+          ( "Sexp.Reorder.Property skipped: set WOK_WOKPARSE=/path/to/wokparse to run "
+            ++ "the reorder-pass QuickCheck differential "
+            ++ "(docs/superpowers/specs/2026-08-07-sexp-reorder-pass.md)." )
+    ]
+buildSexpReorderPropertyGroup (Just wokparseBin) =
+  pure $ localOption (QuickCheckTests 150) $
+    testGroup "Sexp.Reorder.Property"
+      [ testProperty "random fixity DAGs x random chains: C/Haskell verdict + tree agreement"
+          (sexpReorderPropertyCase wokparseBin)
+      ]
 
 sourceOriginTests :: TestTree
 sourceOriginTests = testGroup "Wok.SourceOrigin"

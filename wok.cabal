@@ -138,6 +138,8 @@ library
         Wok.Prelude
         Wok.RecordLayout
         Wok.Reordering
+        Wok.Sexp.Read
+        Wok.Sexp.Surface
         Wok.SourceOrigin
         Wok.TypeChecking
         Wok.TypeChecking.Types
@@ -244,6 +246,7 @@ test-suite wok-tests
         containers,
         filepath,
         directory,
+        process,
         mtl,
         transformers,
         text

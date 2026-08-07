@@ -1,0 +1,3 @@
+main : U64
+second : U64 -> U64 -> U64
+x : U64

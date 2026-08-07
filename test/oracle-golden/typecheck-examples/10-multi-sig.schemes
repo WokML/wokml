@@ -1,0 +1,4 @@
+allZeros : Bool
+one : U64
+two : U64
+zero : U64

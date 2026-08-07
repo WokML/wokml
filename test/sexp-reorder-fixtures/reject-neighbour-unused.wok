@@ -1,0 +1,8 @@
+-- `*` exists only as `+`'s `tighter than` target and is NEVER used in any
+-- chain. The placeholder check must be a whole-table scan at pass entry
+-- (mirroring Haskell's checkNeighbors), not a per-occurrence check: the
+-- QuickCheck differential caught the occurrence-scoped version accepting
+-- this file while `reorderModule` rejected it (UnresolvedNeighbor).
+fixity + left tighter than *
+
+f = 0 + 1

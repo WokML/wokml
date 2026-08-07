@@ -1,0 +1,2 @@
+allEq : forall a. a -> a -> a -> Bool
+main : U64
