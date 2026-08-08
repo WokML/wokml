@@ -4,6 +4,6 @@ import Control
 -- Two DIFFERENT named effect instances (a State and a Reader) coexisting in
 -- the same scope; each is discharged by its own combinator. Must accept.
 prog : (U64, U64)
-prog = with s = state 0 in with r = reader 10 in let u = s.set r.ask in s.get
+prog = handle s = state 0 in handle r = reader 10 in let u = s.set r.ask in s.get
 main : (U64, U64)
 main = prog

@@ -13,9 +13,9 @@ sumList xs = case xs of
              let u   = State.set (cur + y) in
              sumList ys
 
--- `state 0 comp` runs `comp` with initial state 0 and returns ((), finalTotal).
+-- `handle state 0 in comp` runs `comp` with initial state 0 and returns ((), finalTotal).
 -- The destructuring `let (_, total) = ... in total` projects out the total.
 main : U64
 main =
-  let (result, total) = state 0 (\u -> sumList [3, 1, 4, 1, 5, 9, 2, 6]) in
+  let (result, total) = (handle state 0 in sumList [3, 1, 4, 1, 5, 9, 2, 6]) in
   total

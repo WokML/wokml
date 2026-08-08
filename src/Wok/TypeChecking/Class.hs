@@ -215,6 +215,15 @@ schemeOfType pmap ty = do
 typeArgToCType :: Map Text Int -> Abs.Type -> Either TypeError CType
 typeArgToCType vmap = go
   where
+    -- This env-free path cannot resolve `Handler (E params) a b` (the effect
+    -- namespace is unavailable), and 'resolveTyConName' would silently file it
+    -- as @TcUser "Handler"@ -- a key 'tyConKey' never looks up ("Handler$E").
+    -- Reject explicitly until instances over Handler types are designed.
+    notHandler mp
+      | modPathLeaf mp == Tx.pack "Handler" =
+          Left (MalformedInstance
+            (Tx.pack "first-class Handler types are not supported in class/instance heads"))
+      | otherwise = Right ()
     go t = case t of
       Abs.TQual _ body  -> go body
       Abs.TFun a b      -> CTArr <$> go a <*> pure CREmpty <*> go b
@@ -232,11 +241,13 @@ typeArgToCType vmap = go
                        (Tx.concat [ Tx.pack "unbound type variable '"
                                   , n
                                   , Tx.pack "' in class/instance head" ]))
-      Abs.TCon mp       -> Right (CTCon (resolveTyConName (modPathLeaf mp)) [])
+      Abs.TCon mp       -> notHandler mp >>
+        Right (CTCon (resolveTyConName (modPathLeaf mp)) [])
       Abs.TApp f x      ->
         let (h, args) = collectApp f x
         in case h of
-             Abs.TCon mp -> CTCon (resolveTyConName (modPathLeaf mp)) <$> mapM go args
+             Abs.TCon mp -> notHandler mp >>
+               (CTCon (resolveTyConName (modPathLeaf mp)) <$> mapM go args)
              _           -> Left (MalformedInstance
                               (Tx.pack "non-tycon type application in class/instance head"))
       Abs.TExtend{}     -> Left (MalformedInstance

@@ -614,7 +614,7 @@ elabKF tk _ (TWithNamedH self arms body) = do
 -- install starts its own activation from it (per-install seeding falls out of
 -- env immutability -- installs never write back into the captured env).
 elabKF tk ty (THandlerV _eff arms) = do
-  (h, mParam) <- buildHandlerRecord arms Nothing
+  (h, mParam) <- buildHandlerRecord arms
   case mParam of
     Nothing -> deliverRhs tk ty (RMakeHandler h)
     Just (pn, _, initE) ->
@@ -653,20 +653,18 @@ elabKF tk ty (THandleNV self hExpr body) = do
 -- Non-compound: name the result and deliver under tk
 elabKF tk ty node = elabRhsF ty node (deliverRhs tk ty)
 
--- | Build the 'Handler' record for a first-class handler VALUE
--- (proto/handler-values). Restricted to the still-unsupported shapes:
--- installed in TAIL position (answerJoin = Nothing). @mSelf@ is carried for
--- future named handler values; 'Nothing' for the ambient form. Shares the
--- arm-lowering idiom of 'elabHandle' but without a body or value-position
--- answer join. A handler-local `var` param IS supported: the param binder is
--- minted here, arms resolve the surface name to it, and it is returned to the
--- caller ('elabKF THandlerV'), which wraps the RMakeHandler in the seed let --
--- construction-time evaluation, so the VALUE captures the seed and each
--- install activates from it.
-buildHandlerRecord
-  :: [THandlerArm CType] -> Maybe Binder
-  -> Elab (Handler, Maybe (Name, Text, TExpr))
-buildHandlerRecord arms mSelf = do
+-- | Lower a handler block's arms into the pieces of a 'Handler' record --
+-- the ONE assembly shared by the fused forms ('elabHandle') and handler
+-- VALUES ('buildHandlerRecord'), so the param minting / arm loops / identity
+-- return arm cannot drift apart (review round: they had). @identityTy@ is
+-- the CType stamped on a SYNTHESIZED identity return binder: the fused form
+-- passes its handled body's type; a handler value has no body yet and passes
+-- a Unit placeholder (metadata only while RMakeHandler stays outside RC
+-- coverage -- see the epic spec's known-limit note).
+elabHandlerArms
+  :: TailK -> [THandlerArm CType] -> CType
+  -> Elab ((Binder, Expr), [OpArm], Maybe Binder, Maybe (Name, Text, TExpr))
+elabHandlerArms tk arms identityTy = do
   let opArmsSrc  = [ (effect, op, ps, resume, resumeTy, body)
                    | TOpArm effect op ps resume resumeTy body <- arms ]
       retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
@@ -676,17 +674,29 @@ buildHandlerRecord arms mSelf = do
     ((name, initE):_) -> do
       pn <- bindFresh name
       pure (Just (pn, name, initE))
-  opArms <- mapM (elabOpArmK TRet mParam) opArmsSrc
+  opArms <- mapM (elabOpArmK tk mParam) opArmsSrc
   retArm <- case retArmsSrc of
-    ((pat, rb) : _) -> elabReturnArmK TRet mParam pat rb
+    ((pat, rb) : _) -> elabReturnArmK tk mParam pat rb
     [] -> do
-      -- Identity return arm. The binder's CType is metadata unused by the
-      -- reference interpreter; a Unit placeholder is sufficient (an explicit
-      -- `return` arm is the usual case).
       vN <- bindFresh (Tx.pack "v")
-      pure (Binder vN Unrestricted (CTCon TcUnit []), deliverAtom TRet (AVar vN))
+      pure (Binder vN Unrestricted identityTy, deliverAtom tk (AVar vN))
   let hParamB = fmap (\(pn, _, initE) -> Binder pn Unrestricted (teType initE)) mParam
-  pure (Handler retArm opArms Nothing hParamB mSelf, mParam)
+  pure (retArm, opArms, hParamB, mParam)
+
+-- | Build the 'Handler' record for a first-class handler VALUE
+-- (proto/handler-values): TRet-baked arms, no body, no value-position answer
+-- join, no self binder (a named install stamps its binder via
+-- 'InstallHandler', never here). A handler-local `var` param IS supported:
+-- the param binder is minted in 'elabHandlerArms', arms resolve the surface
+-- name to it, and it is returned to the caller ('elabKF THandlerV'), which
+-- wraps the RMakeHandler in the seed let -- construction-time evaluation, so
+-- the VALUE captures the seed and each install activates from it.
+buildHandlerRecord
+  :: [THandlerArm CType]
+  -> Elab (Handler, Maybe (Name, Text, TExpr))
+buildHandlerRecord arms = do
+  (retArm, opArms, hParamB, mParam) <- elabHandlerArms TRet arms (CTCon TcUnit [])
+  pure (Handler retArm opArms Nothing hParamB Nothing, mParam)
 
 -- | Make the handler-local param name resolve to its binder inside an arm.
 -- Shared by 'elabHandle' and 'buildHandlerRecord'.
@@ -750,29 +760,15 @@ elabOpArmK tk mParam (effect, op, ps, resumeName, resumeContTy, body) = do
 -- putting a named handler's self binder in scope for `e` before calling.
 elabHandle :: TailK -> TExpr -> [THandlerArm CType] -> Maybe Binder -> Elab Expr
 elabHandle tk e arms mSelf = do
-  let opArmsSrc  = [ (effect, op, ps, resume, resumeTy, body)
-                   | TOpArm effect op ps resume resumeTy body <- arms ]
-      retArmsSrc = [ (pat, body) | TReturnArm pat body <- arms ]
-      paramSrc   = [ (name, initE) | TParamArm name initE <- arms ]
   handledBody <- elabK TRet e
-  -- Allocate the handler-local parameter binder up front (slice 4a). The SAME
-  -- `pn` flows into: withLocal (so arm bodies see the param), hParamB (so the
-  -- runtime re-installs it on resume), and the wrapping `let pn = init`.
-  mParam <- case paramSrc of
-    []                -> pure Nothing
-    ((name, initE):_) -> do
-      pn <- bindFresh name
-      pure (Just (pn, name, initE))
-  opArms <- mapM (elabOpArmK tk mParam) opArmsSrc
-  retArm <- case retArmsSrc of
-    ((pat, rb) : _) -> elabReturnArmK tk mParam pat rb
-    [] -> do
-      vN <- bindFresh (Tx.pack "v")
-      pure (Binder vN Unrestricted (teType e), deliverAtom tk (AVar vN))
+  -- Arm lowering is 'elabHandlerArms' (shared with 'buildHandlerRecord'); the
+  -- param binder minted there flows into withLocal (arm bodies see the
+  -- param), hParamB (the runtime re-installs it on resume), and the wrapping
+  -- `let pn = init` below.
+  (retArm, opArms, hParamB, mParam) <- elabHandlerArms tk arms (teType e)
   let answerJoin = case tk of
         TJump j -> Just j   -- value position: arms deliver via `jump j`
         TRet    -> Nothing  -- tail position: arms tail-return; nothing to rebind
-      hParamB = fmap (\(pn, _, initE) -> Binder pn Unrestricted (teType initE)) mParam
       core    = Handle handledBody (Handler retArm opArms answerJoin hParamB mSelf)
   case mParam of
     Nothing             -> pure core

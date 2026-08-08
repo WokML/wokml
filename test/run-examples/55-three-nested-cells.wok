@@ -11,4 +11,4 @@ read3 : State U64 -> State U64 -> State U64 -> (U64, U64, U64)
 read3 a b c = (a.get, b.get, c.get)
 
 main : ((((U64, U64, U64), U64), U64), U64)
-main = with a = state 1 in with b = state 2 in with c = state 3 in read3 a b c
+main = handle a = state 1 in handle b = state 2 in handle c = state 3 in read3 a b c

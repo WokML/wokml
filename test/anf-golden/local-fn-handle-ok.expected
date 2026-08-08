@@ -7,15 +7,14 @@ pure_local =
   t.1
 
 inscope =
-  let t.3 = \c -> letrec
+  let t.3 = state(0)
+  install t.3 in
+  letrec
     bump x =
       let t.2 = c.State.set(x)
       t.2
   let t.1 = bump(7)
   t.1
-  let t.4 = state(0)
-  let t.5 = t.4(t.3)
-  t.5
 
 main =
   inscope

@@ -17,4 +17,4 @@ prog s r =
   s.get
 
 main : (U64, U64)
-main = with s = state 10 in with r = reader 5 in prog s r
+main = handle s = state 10 in handle r = reader 5 in prog s r

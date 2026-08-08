@@ -114,6 +114,10 @@ isWithKw :: Token -> Bool
 isWithKw (PT _ (TK (TokSymbol t _))) = t == T.pack "with"
 isWithKw _               = False
 
+isHandlerKw :: Token -> Bool
+isHandlerKw (PT _ (TK (TokSymbol t _))) = t == T.pack "handler"
+isHandlerKw _               = False
+
 -- | Is this token the VarSym @+@?
 isPlusSym :: Token -> Bool
 isPlusSym (PT _ (T_VarSym t)) = t == T.pack "+"
@@ -143,6 +147,7 @@ isHandlerBrace revPrefix = case revPrefix of
   (p : _) | isWithKw p -> True                    -- with {
   _ -> case dropWhile isConId revPrefix of
          (w : _)          | isWithKw w -> True     -- with ConId... {
+         (w : _)          | isHandlerKw w -> True  -- handler ConId { (value form)
          (eq : v : w : _)                          -- with VarId = ConId {
            | isEquals eq && isVarId v && isWithKw w -> True
          _ -> False

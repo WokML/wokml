@@ -14,4 +14,4 @@ prog count total =
   total.set (total.get + count.get)
 
 main : (((), U64), U64)
-main = with count = state 0 in with total = state 0 in prog count total
+main = handle count = state 0 in handle total = state 0 in prog count total

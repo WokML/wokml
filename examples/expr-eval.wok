@@ -40,6 +40,6 @@ program = Div (Add (Lit 3) (Mul (Lit 4) (Lit 5))) (Lit 2)
 
 main : Result (U64, [U64]) String
 main =
-  with except in
-  with writer in
+  handle except in
+  handle writer in
   eval program

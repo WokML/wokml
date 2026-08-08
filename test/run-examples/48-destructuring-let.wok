@@ -2,8 +2,8 @@ module Main
 import Base
 import Control
 
-prog : State U64 -> U64 with State U64
-prog s = let a = State.get in let b = State.set (a + 5) in State.get
+prog : () -> U64 with State U64
+prog u = let a = State.get in let b = State.set (a + 5) in State.get
 
 main : U64
-main = let (result, _) = state 100 prog in result
+main = let (result, _) = (handle state 100 in prog ()) in result

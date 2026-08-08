@@ -703,6 +703,41 @@ translateSig env ty = do
         goT (Abs.TApp f x) = do
           let (h, args) = collectApp f x
           case h of
+            -- @Handler (E params) a b@ (item-4 D1/C3): the first-class
+            -- handler type, writable in signatures. Not a registered tycon
+            -- (no user decl introduces it), so it resolves here, before the
+            -- regular paths -- unless the user shadowed the name with their
+            -- own @data Handler@, which then wins below.
+            Abs.TCon modPath
+              | modPathText modPath == Tx.pack "Handler"
+              , Nothing <- lookupTyCon (Tx.pack "Handler") env' -> do
+                  let pos = modPathPos modPath
+                  case args of
+                    [effArg, aArg, bArg] -> do
+                      (effName, effArgs) <- case stripTParen effArg of
+                        Abs.TCon emp -> pure (modPathText emp, [])
+                        Abs.TApp ef ex -> case collectApp ef ex of
+                          (Abs.TCon emp, eargs) -> pure (modPathText emp, eargs)
+                          _ -> throwError (UnsupportedFeature (Just pos)
+                                 (Tx.pack "Handler's first argument must be an effect"))
+                        _ -> throwError (UnsupportedFeature (Just pos)
+                               (Tx.pack "Handler's first argument must be an effect"))
+                      eInfo <- case lookupEffect effName env' of
+                        Just i  -> pure i
+                        Nothing -> throwError (MissingEffectDecl (Just pos) effName)
+                      when (isGroundIO effName eInfo) $
+                        throwError (IOEffectNotHandleable (Just pos))
+                      unless (length (eiParams eInfo) == length effArgs) $
+                        throwError (ArityMismatch (Just pos) effName
+                          (length (eiParams eInfo)) (length effArgs))
+                      checkArgKinds pos effName effArgs (map snd (eiParams eInfo))
+                      checkArgKinds pos (Tx.pack "Handler") [aArg, bArg] [KStar, KStar]
+                      effCTs <- mapM goT effArgs
+                      aCT <- goT aArg
+                      bCT <- goT bArg
+                      pure (CTCon (TcHandler effName) (effCTs ++ [aCT, bCT]))
+                    _ -> throwError (ArityMismatch (Just pos)
+                           (Tx.pack "Handler") 3 (length args))
             Abs.TCon modPath -> do
               let name = modPathText modPath
                   pos  = modPathPos modPath
@@ -922,6 +957,12 @@ stripEParen other          = other
 argKind :: Abs.Type -> Kind
 argKind (Abs.TRowArg _) = KEffect
 argKind _               = KStar
+
+-- | Strip surface parens off a type, e.g. the @(State s)@ argument of a
+-- written @Handler (State s) a b@.
+stripTParen :: Abs.Type -> Abs.Type
+stripTParen (Abs.TParen t) = stripTParen t
+stripTParen t              = t
 
 -- | Kind-check a SATURATED tycon application's arguments against the tycon's
 -- declared per-parameter kinds ('tcParamKinds'). The caller must have already
@@ -2593,6 +2634,60 @@ data ArmClass
   | ValArmC Text Abs.Exp (Int, Int)
   | ParamArmC Text Abs.Exp (Int, Int)   -- slice 4a: handler-local param `name = init`
 
+-- | The block-level prologue shared by all three handler paths (ambient,
+-- named, value): classify every arm, then apply the rules that hold
+-- regardless of install discipline -- at most one `return` arm, no duplicate
+-- op arms. A new block-level rule belongs HERE, once, not in each path
+-- (review round: this prologue existed in three drifting copies).
+classifyHandlerBlock
+  :: Env -> [Text] -> [Abs.HandlerArm]
+  -> TC s ( [(Bool, Text, Text, [Abs.AtomPat], Abs.Exp, (Int, Int))]
+          , [((Int, Int), Text, Abs.Exp)]
+          , [(Text, Abs.Exp, (Int, Int))] )
+classifyHandlerBlock env header arms = do
+  classified <- mapM (classifyArm env header) arms
+  let opArms    = [ (isO, en, op, ps, b, pos) | OpArmC isO en op ps b pos <- classified ]
+      retArms   = [ (pos, v, b)               | ValArmC v b pos           <- classified ]
+      paramArms = [ (name, initE, pos)        | ParamArmC name initE pos  <- classified ]
+  case retArms of
+    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
+    _                      -> pure ()
+  rejectDuplicateOpArms opArms
+  pure (opArms, retArms, paramArms)
+
+-- | Type the at-most-one `var name = init` handler-local parameter (slice
+-- 4a): bind @name@ at a fresh sigma, check @init : sigma@ under the
+-- CONSTRUCTION scope (the init does not see the param), and extend the mono
+-- environment with the binder for the arms.
+inferHandlerParam
+  :: Map.Map Text (Type s) -> [(Text, Abs.Exp, (Int, Int))]
+  -> TC s (Maybe (Text, Type s, TExprS s), Map.Map Text (Type s))
+inferHandlerParam mono paramArms = do
+  mParam <- case paramArms of
+    []                 -> pure Nothing
+    [(name, initE, _)] -> do
+      paramTy <- freshTVar KStar
+      (initT, initNode) <- inferExprW mono initE
+      unify Nothing initT paramTy
+      pure (Just (name, paramTy, initNode))
+    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
+  let monoP = case mParam of
+        Just (name, ty, _) -> Map.insert name ty mono
+        Nothing            -> mono
+  pure (mParam, monoP)
+
+-- | Coverage for ONE effect: every operation it declares must have an arm --
+-- a missing op would otherwise surface only at runtime dispatch.
+checkHandlerCoverage
+  :: Maybe (Int, Int) -> Text -> EffectInfo
+  -> [(Bool, Text, Text, [Abs.AtomPat], Abs.Exp, (Int, Int))] -> TC s ()
+checkHandlerCoverage pos effName eInfo opArms = do
+  let declaredOps = Map.keys (eiOps eInfo)
+      handledOps  = [ op | (_, en', op, _, _, _) <- opArms, en' == effName ]
+      missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
+  unless (null missing) $
+    throwError (HandlerCoverage pos effName missing)
+
 classifyArm :: Env -> [Text] -> Abs.HandlerArm -> TC s ArmClass
 classifyArm env header arm = case arm of
   Abs.HArm (Abs.ConId (pos, en)) (Abs.VarId (_, op)) ps body -> do
@@ -2824,17 +2919,9 @@ inferHandler mono header headerPos e arms = do
     case lookupEffect en env of
       Nothing -> throwError (MissingEffectDecl headerPos en)
       Just _  -> pure ()
-  -- Classify each arm against the header into an operation arm or a value arm.
-  classified <- mapM (classifyArm env header) arms
-  let opArms    = [ (isO, en, op, ps, body, pos) | OpArmC isO en op ps body pos <- classified ]
-      retArms   = [ (pos, v, body)               | ValArmC v body pos           <- classified ]
-      paramArms = [ (name, initE, pos)           | ParamArmC name initE pos     <- classified ]
-  -- At most one `return` arm is allowed; reject a second rather than silently
-  -- ignoring it.
-  case retArms of
-    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
-    _                      -> pure ()
-  rejectDuplicateOpArms opArms
+  -- Classify the block and apply the shared block-level rules
+  -- ('classifyHandlerBlock': at most one return arm, no duplicate op arms).
+  (opArms, retArms, paramArms) <- classifyHandlerBlock env header arms
   -- Infer the handled expression under a fresh sub-ambient row so we can see
   -- exactly which effects it performs.
   subAmbient0 <- freshRVar
@@ -2844,21 +2931,7 @@ inferHandler mono header headerPos e arms = do
   -- at R and bind `resume : T -> R`, and the value/return arm produces R. A
   -- single shared metavar ties all of them together.
   answerT <- freshTVar KStar
-  -- Handler-local parameter (slice 4a): at most one `name = init` entry. Bind
-  -- `name` at a fresh type sigma; check `init : sigma`. The init seed is typed
-  -- under `mono` (it does NOT see the parameter name). The parameter name is
-  -- threaded via `monoP` into every op arm and the value arm.
-  mParam <- case paramArms of
-    []                 -> pure Nothing
-    [(name, initE, _)] -> do
-      paramTy <- freshTVar KStar
-      (initT, initNode) <- inferExprW mono initE
-      unify Nothing initT paramTy
-      pure (Just (name, paramTy, initNode))
-    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
-  let monoP = case mParam of
-        Just (name, ty, _) -> Map.insert name ty mono
-        Nothing            -> mono
+  (mParam, monoP) <- inferHandlerParam mono paramArms
   -- The handled effects: when a header is present it is the authoritative
   -- "exactly these effects" set (so missing arms are coverage errors); without
   -- a header, the distinct effect names mentioned by arm heads.
@@ -2874,16 +2947,12 @@ inferHandler mono header headerPos e arms = do
       Just eInfo -> do
         when (isGroundIO en eInfo) $
           throwError (IOEffectNotHandleable headerPos)
-        let declaredOps = Map.keys (eiOps eInfo)
-            handledOps  = [ op | (_, en', op, _, _, _) <- opArms, en' == en ]
-            missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
-        unless (null missing) $ do
-          -- Prefer a matching op-arm position; for a header effect with no arm
-          -- at all, fall back to the header position.
-          let pos = case [ p | (_, en', _, _, _, p) <- opArms, en' == en ] of
-                      (p : _) -> Just p
-                      []      -> headerPos
-          throwError (HandlerCoverage pos en missing)
+        -- Prefer a matching op-arm position; for a header effect with no arm
+        -- at all, fall back to the header position.
+        let pos = case [ p | (_, en', _, _, _, p) <- opArms, en' == en ] of
+                    (p : _) -> Just p
+                    []      -> headerPos
+        checkHandlerCoverage pos en eInfo opArms
   -- Type each operation arm: bind its argument patterns to the op's argument
   -- types and check its body against the op's RESULT type. Arm bodies run under
   -- the OUTER ambient (the current one), so effects performed inside an arm
@@ -2960,21 +3029,10 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
     Just i  -> pure i
   when (isGroundIO effName eInfo) $
     throwError (IOEffectNotHandleable (Just epos))
-  -- Classify each arm against the single-effect header.
-  classified <- mapM (classifyArm env [effName]) arms
-  let opArms    = [ (isO, en, op, ps, b, pos) | OpArmC isO en op ps b pos <- classified ]
-      retArms   = [ (pos, v, b)               | ValArmC v b pos           <- classified ]
-      paramArms = [ (name, initE, pos)        | ParamArmC name initE pos  <- classified ]
-  case retArms of
-    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
-    _                      -> pure ()
-  rejectDuplicateOpArms opArms
-  -- Coverage: every operation of the handled effect must have an arm.
-  let declaredOps = Map.keys (eiOps eInfo)
-      handledOps  = [ op | (_, _, op, _, _, _) <- opArms ]
-      missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
-  unless (null missing) $
-    throwError (HandlerCoverage (Just epos) effName missing)
+  -- Classify the block ('classifyHandlerBlock': shared block-level rules),
+  -- then coverage against the single-effect header.
+  (opArms, retArms, paramArms) <- classifyHandlerBlock env [effName] arms
+  checkHandlerCoverage (Just epos) effName eInfo opArms
   -- ONE shared parameter substitution (fresh metavars), reused for the handle
   -- type and every arm.
   paramSubst <- instantiateParamSubst (eiParams eInfo)
@@ -2982,18 +3040,7 @@ inferNamedHandler mono (Abs.VarId (_, self)) (Abs.ConId (epos, effName)) arms bo
                    | (i, _) <- eiParams eInfo ]
       handleTy   = TCon (TcEffect effName) handleArgs
   answerT <- freshTVar KStar
-  -- Handler-local parameter (slice 4a): at most one `name = init`.
-  mParam <- case paramArms of
-    []                 -> pure Nothing
-    [(name, initE, _)] -> do
-      paramTy <- freshTVar KStar
-      (initT, initNode) <- inferExprW mono initE
-      unify Nothing initT paramTy
-      pure (Just (name, paramTy, initNode))
-    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
-  let monoP = case mParam of
-        Just (name, ty, _) -> Map.insert name ty mono
-        Nothing            -> mono
+  (mParam, monoP) <- inferHandlerParam mono paramArms
   -- Type each operation arm via 'inferOpArmNode' (the single shared loop),
   -- passing the SHARED paramSubst (no per-arm re-instantiation) so the op
   -- types tie to @handleTy@.
@@ -3113,41 +3160,19 @@ inferHandlerValue mono (Abs.ConId (epos, effName)) arms = do
     Just i  -> pure i
   when (isGroundIO effName eInfo) $
     throwError (IOEffectNotHandleable (Just epos))
-  classified <- mapM (classifyArm env [effName]) arms
-  let opArms  = [ (isO, en, op, ps, b, pos) | OpArmC isO en op ps b pos <- classified ]
-      retArms = [ (pos, v, b)               | ValArmC v b pos           <- classified ]
-      paramArms = [ (name, initE, pos)      | ParamArmC name initE pos  <- classified ]
-  case retArms of
-    (_ : (pos2, _, _) : _) -> throwError (DuplicateReturnArm (Just pos2))
-    _                      -> pure ()
-  rejectDuplicateOpArms opArms
-  -- Coverage: every operation of the effect must have an arm. A handler value
-  -- missing an op would otherwise be caught only at runtime dispatch; the
-  -- fused install forms all enforce this statically, so the value form must too.
-  let declaredOps = Map.keys (eiOps eInfo)
-      handledOps  = [ op | (_, _, op, _, _, _) <- opArms ]
-      missing     = [ op | op <- declaredOps, op `notElem` handledOps ]
-  unless (null missing) $
-    throwError (HandlerCoverage (Just epos) effName missing)
-  -- Handler-local parameter `var name = init` (the baton). Typed exactly as
-  -- the fused forms type it: `name` at a fresh sigma, `init : sigma` checked
-  -- under the CONSTRUCTION scope `mono` (the init does not see the param).
-  -- Seeding semantics for a VALUE: the init is EVALUATED AT CONSTRUCTION --
-  -- typing charges the init's effects to the construction site, so this is the
-  -- type-consistent choice -- and each install starts a fresh activation from
-  -- that captured seed (accept/09 per-install independence).
-  mParam <- case paramArms of
-    []                 -> pure Nothing
-    [(name, initE, _)] -> do
-      paramTy <- freshTVar KStar
-      (initT, initNode) <- inferExprW mono initE
-      unify Nothing initT paramTy
-      pure (Just (name, paramTy, initNode))
-    (_ : (_, _, p2) : _) -> throwError (DuplicateHandlerParam (Just p2))
-  let monoP = case mParam of
-        Just (name, ty, _) -> Map.insert name ty mono
-        Nothing            -> mono
-      mParamTy = fmap (\(_, ty, _) -> ty) mParam
+  -- Classify the block ('classifyHandlerBlock': shared block-level rules),
+  -- then coverage: a handler value missing an op would otherwise be caught
+  -- only at runtime dispatch; the fused install forms enforce this
+  -- statically, so the value form must too.
+  (opArms, retArms, paramArms) <- classifyHandlerBlock env [effName] arms
+  checkHandlerCoverage (Just epos) effName eInfo opArms
+  -- Handler-local parameter `var name = init` (the baton). Seeding semantics
+  -- for a VALUE: the init is EVALUATED AT CONSTRUCTION -- typing charges the
+  -- init's effects to the construction site, so this is the type-consistent
+  -- choice -- and each install starts a fresh activation from that captured
+  -- seed (accept/09 per-install independence).
+  (mParam, monoP) <- inferHandlerParam mono paramArms
+  let mParamTy = fmap (\(_, ty, _) -> ty) mParam
   -- ONE shared parameter substitution across every arm AND the exposed type.
   paramSubst <- instantiateParamSubst (eiParams eInfo)
   let handlerParams = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
@@ -3219,6 +3244,8 @@ inferHandleValue mono hExpr body = do
   eInfo <- case lookupEffect en env of
     Nothing -> throwError (MissingEffectDecl Nothing en)
     Just i  -> pure i
+  when (isGroundIO en eInfo) $
+    throwError (IOEffectNotHandleable Nothing)
   paramSubst <- instantiateParamSubst (eiParams eInfo)
   let handlerParams = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
                       | (i, _) <- eiParams eInfo ]
@@ -3267,6 +3294,8 @@ inferHandleNamedValue mono (Abs.VarId (npos, self)) hExpr body = do
   eInfo <- case lookupEffect en env of
     Nothing -> throwError (MissingEffectDecl (Just npos) en)
     Just i  -> pure i
+  when (isGroundIO en eInfo) $
+    throwError (IOEffectNotHandleable (Just npos))
   paramSubst <- instantiateParamSubst (eiParams eInfo)
   let handlerParams = [ Map.findWithDefault (TCon TcUnit []) i paramSubst
                       | (i, _) <- eiParams eInfo ]

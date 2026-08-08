@@ -18,6 +18,6 @@ sumProd sum prod xs = case xs of
 -- main = ((sumProd_result, prod_final), sum_final) = ((((), 24), 10)).
 main : (((), U64), U64)
 main =
-  with sum  = state 0 in
-  with prod = state 1 in
+  handle sum  = state 0 in
+  handle prod = state 1 in
   sumProd sum prod [1, 2, 3, 4]

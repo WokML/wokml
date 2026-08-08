@@ -2,20 +2,20 @@ module Control
 import Base
 
 effect Reader r = { ask : r }
-reader : r -> (Reader r -> a with Reader r + eff e) -> a with eff e
-reader e c = with self = Reader { ask -> e } in c self
+reader : r -> Handler (Reader r) a a
+reader e = handler Reader { ask -> e }
 
 effect State s = { get : s, set : s -> () }
-state : s -> (State s -> a with State s + eff e) -> (a, s) with eff e
-state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in c self
+state : s -> Handler (State s) a (a, s)
+state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }
 
 effect Writer w = { tell : w -> () }
-writer : (Writer [w] -> a with Writer [w] + eff e) -> (a, [w]) with eff e
-writer c = with self = Writer { var log = [] ; once tell w k -> k (log ++ w) () ; return v -> (v, log) } in c self
+writer : Handler (Writer [w]) a (a, [w])
+writer = handler Writer { var log = [] ; once tell w k -> k (log ++ w) () ; return v -> (v, log) }
 
 effect Except e = { throw : e -> Never }
-except : (Except e -> a with Except e + eff r) -> Result a e with eff r
-except c = with self = Except { once throw e k -> Err e ; return v -> Ok v } in c self
+except : Handler (Except e) a (Result a e)
+except = handler Except { once throw e k -> Err e ; return v -> Ok v }
 
 -- the producer effect is unchanged
 effect Coro a b = { suspend : a -> b }

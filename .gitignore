@@ -29,3 +29,6 @@ REVIEW.md
 
 # superpowers brainstorming companion (local-only)
 .superpowers/
+
+# Blog drafts (local-only, generated notes)
+blog/

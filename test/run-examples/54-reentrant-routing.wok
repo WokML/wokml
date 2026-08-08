@@ -8,12 +8,12 @@ import Control
 -- `c` must keep routing to ITS OWN frame, not collapse onto the inner same-site
 -- frames minted at each depth. The depth-tag on each cell keeps activations
 -- apart, so `c.get` at the base case still reads the outermost seed 7.
--- main = (with c = state 7 in ...) so the outer state runner wraps the U64 7:
+-- main = (handle c = state 7 in ...) so the outer state runner wraps the U64 7:
 -- (result, c_final) = (7, 7).
 f : U64 -> State U64 -> U64
 f n c = case n == 0 of
   True  -> c.get
-  False -> let (res, ign) = (with inner = state 99 in f (n - 1) c) in res
+  False -> let (res, ign) = (handle inner = state 99 in f (n - 1) c) in res
 
 main : (U64, U64)
-main = with c = state 7 in f 3 c
+main = handle c = state 7 in f 3 c

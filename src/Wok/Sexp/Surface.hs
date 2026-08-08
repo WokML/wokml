@@ -990,6 +990,8 @@ wrapExpArg e = case e of
   Abs.EWithRun {}    -> Abs.EParen e
   Abs.EWithNamed {}  -> Abs.EParen e
   Abs.EWithNamedH {} -> Abs.EParen e
+  Abs.EHandleV {}    -> Abs.EParen e
+  Abs.EHandleN {}    -> Abs.EParen e
   _                  -> e
 
 mapExpr :: GNode -> Either SurfaceError Abs.Exp
@@ -1050,8 +1052,11 @@ mapExpr n = case (gTag n, gFields n) of
     Abs.EIf <$> mapExpr c <*> mapExpr t <*> mapExpr e
   ("E_Case", [FldNode scrut, FldSeq alts]) ->
     Abs.ECase <$> mapExpr scrut <*> mapM mapAlt alts
-  ("E_Handler", [FldName _ _, FldSeq _]) ->
-    gap n "handler-value" "v1 has no first-class handler values; a `handler E` literal is mappable only directly under handle"
+  ("E_Handler", [FldName eff ep, FldSeq clauses]) ->
+    -- A handler literal in ANY position maps to the first-class value node
+    -- (item-4 EHandlerV); only the install forms keep their fused mapping in
+    -- 'mapHandleIn', which intercepts its literal child before reaching here.
+    Abs.EHandlerV (mkConId ep eff) <$> mapM handlerArm clauses
   ("E_Assign", [FldNode _, FldNode _]) ->
     gap n "frame-slot-assign" "v1 has no `:=` frame-slot assignment surface"
   ("E_Record", [FldNode path, FldOpt spread, FldSeq fields]) ->
@@ -1124,16 +1129,34 @@ mapHandleIn n label lp handler body = case (gTag handler, gFields handler) of
               else gap n "foreign-slot-label" "v1 cannot install under a designation-slot label other than the handler's own effect"
           else Right (Abs.EWithNamedH (mkVarId lp label) (mkConId ep eff) arms b)
   _ -> do
+    -- A NON-literal handler expression: a first-class handler-value install
+    -- (item-4 EHandleV/EHandleN). v1's grammar takes the handler as an Exp2
+    -- HEAD plus atom WithArgs (`handle state 0 in b` = head `state`, arg `0`),
+    -- so the dumped application spine is split back into that sugar shape.
     notDamaged handler
-    gap n "first-class-handler-install" "v1 has no first-class handler values; only a `handler E` literal can be installed"
+    let spine e = case (gTag e, gFields e) of
+          ("E_App", [FldNode f, FldNode x]) -> let (h, xs) = spine f in (h, xs ++ [x])
+          _ -> (e, [])
+        (headN, argNs) = spine handler
+    h <- wrapExpArg <$> mapExpr headN
+    args <- mapM (fmap (Abs.WRArg . wrapExpArg) . mapExpr) argNs
+    b <- mapExpr body
+    if T.null label
+      then Right (Abs.EHandleV h args b)
+      else
+        if startsUpper label
+          then gap n "slot-label-value-install" "v1 cannot check a designation-slot label against a non-literal handler's effect"
+          else Right (Abs.EHandleN (mkVarId lp label) h args b)
 
--- Clause kinds (resolves spec question R1 against main's ACTUAL surface):
---   PLAIN   -> HUArm op <arity pats>           (v1 auto-resume arm)
---   CONTROL -> HUArm op <arity pats + k-var>   (v1 explicit-k arm; both
---              sides are affine one-shot, so the semantics coincide;
---              main never had `once`, so there is nothing to map it to)
---   RETURN  -> HUArm v []  when the clause binds a bare variable (v1's
---              value arm); a PATTERN return clause has no v1 form
+-- Clause kinds (against v1's post-retrofit arm surface -- clause kinds are
+-- DECLARED on both sides now):
+--   PLAIN   -> HUArm op <arity pats>              (v1 auto-resume arm)
+--   CONTROL -> HOnceUArm op <arity pats + k-var>  (v1 `once` arm; both sides
+--              are affine one-shot, so the semantics coincide)
+--   RETURN  -> HRetArm (APVar v)  when the clause binds a bare variable
+--              (v1's `return` arm); a PATTERN return clause parses in v1 but
+--              is rejected semantically (ReturnArmBinderNotVar), so it stays
+--              a gap
 --   VAR     -> HParamV
 --   ABORT   -> SexpGap: v1 spells never-resume by an explicit-k arm that
 --              drops k; mapping would have to invent a binder name
@@ -1153,13 +1176,13 @@ handlerArm n = case (gTag n, gFields n) of
           else do
             requireName
             aps <- mapM patAtom pats
-            Abs.HUArm (mkVarId np nm) (aps ++ [Abs.APVar (mkVarId kkp k)])
+            Abs.HOnceUArm (mkVarId np nm) (aps ++ [Abs.APVar (mkVarId kkp k)])
               <$> mapExpr body
     | kind == clauseReturn ->
         case (T.null nm, T.null k, pats) of
           (True, True, [p]) -> case (gTag p, gFields p) of
             ("P_Var", [FldName v vp]) ->
-              Abs.HUArm (mkVarId vp v) [] <$> mapExpr body
+              Abs.HRetArm (Abs.APVar (mkVarId vp v)) <$> mapExpr body
             _ -> do
               notDamaged p
               gap n "pattern-return-clause" "v1's value arm binds a bare variable; a pattern return clause has no v1 form"

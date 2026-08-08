@@ -1,0 +1,6 @@
+addTen : forall a. Handler Tick a a
+double : forall a. Handler Tick a a
+main : (U64, U64)
+pick : forall a. Bool -> Handler Tick a a
+runTick : Handler Tick U64 U64 -> U64
+useTick : () -> U64 with Tick

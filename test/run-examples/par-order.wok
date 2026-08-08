@@ -28,5 +28,5 @@ toNum acc xs = case xs of
   n :: rest -> toNum (acc * 10 + n) rest
 
 main : U64
-main = case writer (\u -> runPar ()) of
+main = case (handle writer in runPar ()) of
   (_, log) -> toNum 0 log

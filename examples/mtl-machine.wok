@@ -35,8 +35,8 @@ walk cmds = case cmds of
 -- The result nests as Result ((count, finalState), log) String.
 main : Result ((U64, U64), [U64]) String
 main =
-  with except in
-  with reader 10 in
-  with writer in
-  with state 0 in
+  handle except in
+  handle reader 10 in
+  handle writer in
+  handle state 0 in
   walk [Inc 1, Snapshot, Inc 2, Snapshot]

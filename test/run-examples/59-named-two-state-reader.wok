@@ -19,4 +19,4 @@ prog count total cfg =
   count.get + total.get
 
 main : ((U64, U64), U64)
-main = with count = state 1 in with total = state 0 in with cfg = reader 100 in prog count total cfg
+main = handle count = state 1 in handle total = state 0 in handle cfg = reader 100 in prog count total cfg

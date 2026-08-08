@@ -266,7 +266,37 @@ reorderExp t (ECase s alts)  = ECase <$> reorderExp t s <*> traverse (reorderAlt
 reorderExp t (EIf a b c)     = EIf <$> reorderExp t a <*> reorderExp t b <*> reorderExp t c
 reorderExp t (EProj e s)     = (\e' -> EProj e' s)  <$> reorderExp t e
 reorderExp t (EProjC e s)    = (\e' -> EProjC e' s) <$> reorderExp t e
+reorderExp t (EWith arms body) =
+  EWith <$> traverse (reorderArm t) arms <*> reorderExp t body
+reorderExp t (EWithH c hs arms body) =
+  EWithH c hs <$> traverse (reorderArm t) arms <*> reorderExp t body
+reorderExp t (EWithRun v args body) =
+  EWithRun v <$> traverse (reorderWithArg t) args <*> reorderExp t body
+reorderExp t (EWithNamed s v args body) =
+  EWithNamed s v <$> traverse (reorderWithArg t) args <*> reorderExp t body
+reorderExp t (EWithNamedH s c arms body) =
+  EWithNamedH s c <$> traverse (reorderArm t) arms <*> reorderExp t body
+reorderExp t (EHandlerV c arms) =
+  EHandlerV c <$> traverse (reorderArm t) arms
+reorderExp t (EHandleV h args body) =
+  EHandleV <$> reorderExp t h <*> traverse (reorderWithArg t) args
+           <*> reorderExp t body
+reorderExp t (EHandleN v h args body) =
+  EHandleN v <$> reorderExp t h <*> traverse (reorderWithArg t) args
+             <*> reorderExp t body
 reorderExp _ e               = Right e
+
+reorderArm :: FixityTable -> HandlerArm -> Either [ReorderError] HandlerArm
+reorderArm t (HArm c v ps e)      = HArm c v ps <$> reorderExp t e
+reorderArm t (HUArm v ps e)       = HUArm v ps <$> reorderExp t e
+reorderArm t (HOnceArm c v ps e)  = HOnceArm c v ps <$> reorderExp t e
+reorderArm t (HOnceUArm v ps e)   = HOnceUArm v ps <$> reorderExp t e
+reorderArm t (HRetArm p e)        = HRetArm p <$> reorderExp t e
+reorderArm t (HParam v e)         = HParam v <$> reorderExp t e
+reorderArm t (HParamV v e)        = HParamV v <$> reorderExp t e
+
+reorderWithArg :: FixityTable -> WithArg -> Either [ReorderError] WithArg
+reorderWithArg t (WRArg e) = WRArg <$> reorderExp t e
 
 reorderTail :: FixityTable -> InfixTail -> Either [ReorderError] InfixTail
 reorderTail t (ITail op rhs) = ITail op <$> reorderExp t rhs

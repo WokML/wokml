@@ -1,0 +1,2 @@
+f : U64 -> State U64 -> U64
+main : (U64, U64)

@@ -15,8 +15,18 @@ rm -f "$tmp"/GeneratedParser/Wok/Doc.txt \
       "$tmp"/GeneratedParser/Wok/Skel.hs \
       "$tmp"/GeneratedParser/Wok/Test.hs
 
-patch --silent "$tmp/GeneratedParser/Wok/Layout.hs" scripts/parser-patches/layout.patch
-patch --silent "$tmp/GeneratedParser/Wok/Par.y"     scripts/parser-patches/par.patch
+patch --silent -F0 "$tmp/GeneratedParser/Wok/Layout.hs" scripts/parser-patches/layout.patch
+patch --silent -F0 "$tmp/GeneratedParser/Wok/Par.y"     scripts/parser-patches/par.patch
+
+# BSD patch leaves .orig backups (and .rej on failure); they must never reach
+# the checked-in tree.
+find "$tmp" \( -name '*.orig' -o -name '*.rej' \) -delete
 
 rsync -a --delete "$tmp/GeneratedParser/" src-generated/GeneratedParser/
+
+# The no-op invariant, enforced instead of asserted in a comment: regenerating
+# without a grammar/patch change must leave the tree untouched.
+if ! git diff --quiet -- src-generated; then
+  echo "regen-parser: src-generated changed -- review the diff (grammar or patches moved)" >&2
+fi
 echo "regen-parser: done (patches applied)"

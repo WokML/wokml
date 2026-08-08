@@ -15,7 +15,7 @@
 -- The signature is monomorphic so the shadowed body's U64 result matches the
 -- answer type: E-SHADOW must be this file's ONLY fault.
 module Main
-import Std.Base
+import Base
 
 effect Tick = { tick : U64 -> U64 }
 

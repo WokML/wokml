@@ -19,6 +19,6 @@ logged cell =
 -- ((logged_result, log), cell_final) = (((105, [5]), 105)) from seed 5.
 main : ((U64, [U64]), U64)
 main =
-  with cell = state 5 in
-  with writer in
+  handle cell = state 5 in
+  handle writer in
   logged cell

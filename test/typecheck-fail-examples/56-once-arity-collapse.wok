@@ -9,7 +9,7 @@
 -- 42. The kind is now DECLARED: `once` promises arity + 1 binders, this arm
 -- binds 1, and E-ARITY reports the disagreement against the declaration.
 module Main
-import Std.Base
+import Base
 
 effect Call = { call : (U64 -> U64) -> U64 }
 

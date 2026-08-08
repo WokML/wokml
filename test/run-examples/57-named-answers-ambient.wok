@@ -1,10 +1,18 @@
 module Main
 import Base
-import Control
 
 -- Back-compat mixing: a NAMED handler (`count = state 5`) also answers a BARE
 -- ambient perform (`State.get`, no capability binder). The named runner is the
 -- enclosing State handler, so the ambient get resolves against it and reads the
 -- seed 5; the state runner wraps the result: (State.get, count_final) = (5, 5).
+--
+-- LOCAL runner copy: this mixing types ONLY through the callback runner's row
+-- (`with State s + eff e` discharges the ambient get). The prelude `state` is a
+-- handler-value producer now, and a named `handle` install does not discharge
+-- the ambient row, so this fixture keeps the sugar path it pins.
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a with State s + eff e) -> (a, s) with eff e
+state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in c self
+
 main : (U64, U64)
 main = with count = state 5 in State.get

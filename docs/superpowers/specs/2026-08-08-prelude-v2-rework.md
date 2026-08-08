@@ -1,6 +1,60 @@
 # Prelude v2 rework: retiring the R3 carve-out
 
-**Status: DRAFT — awaiting review**
+**Status: IN PROGRESS — phases 0–2 landed on `feat/prelude-v2-rework`; phase 3
+blocked on the coroutine/String-method planning discussion (owner constraint:
+no extern-surface work before that plan exists)**
+**Date: 2026-08-08 (status updated same day)**
+
+## Execution status (2026-08-08)
+
+- **D4 resolved**: the three lineages merged into `feat/prelude-v2-rework`
+  (`feat/retrofit-once-return` ⊂ `feat/handler-values-state`; one conflict-free
+  merge onto the sexp-oracle lineage). Merge-to-main still awaits the owner's
+  full-branch review.
+- **Phase 0 — DONE** (arrived via the merge): `handler E { ARMS }` values,
+  `handle [name =] h in body`, var seeding, named labels, carrier-escape gate.
+  O3 answered favorably: ambient dispatch reaches a `handle` install without
+  the P2 slot machinery.
+- **Phase 1 — DONE** (24a0815, 8826f09, 61d2c7c): `Handler` became writable in
+  signatures (item-4 C3); the four runners are handler-value producers; 23
+  corpus/example files migrated to `handle` spelling. Two fixtures keep LOCAL
+  callback-runner copies because the old shape is their subject
+  (57-named-answers-ambient, launder-leak-runner-sugar). O2 resolved: by hand
+  (3 mechanical shapes across ~23 files did not warrant a codemod).
+- **Phase 2 — DONE for the handle family** (f5beb00): `E_Handler` maps to
+  `EHandlerV` in all positions; `E_HandleIn` maps non-literal installs to
+  `EHandleV`/`EHandleN`. Differential intersection +10 files, oracle 74→82
+  goldens, all agreeing; accept/01's gap frontier is now its `:=` arm
+  (E_Assign, an explicit non-goal). Statement-form `S_Handle`/`S_Use` stays
+  unmapped — the v2 runners are expression-RHS `handler` values and never
+  need it (revisit only if the phase-3 text does).
+- **Known limit (review finding, 2026-08-08)**: the phase-1 migration moved
+  the four runners onto `RMakeHandler`/`InstallHandler`, which Perceus
+  declares not-RC-coverable, so binds using the prelude runners are no longer
+  instrumented by the RC balance/differential oracle. The rc-m2b/rc-perceus
+  corpora define LOCAL fused runners and lost nothing, but the oracle's reach
+  over the real prelude narrowed; restoring it is an RC-coverage slice of its
+  own (likely alongside the coroutine plan).
+- **Phase 3 — BLOCKED**: every prelude module carries `extern` compiler holes
+  (Control: the whole coroutine/ContCell block; String: the method prims).
+  Rewriting the text in v2 means re-spelling those surfaces, which the owner
+  has frozen pending a coroutine + String-method plan. Planning input, from
+  running `wokparse -check-only` over the CURRENT preludes:
+
+  | module | v2 parse today | first blocker |
+  |---|---|---|
+  | Array | parses | — |
+  | Bytes | parses | — |
+  | Base | rejects | `data X = A \| B` sum spelling; `class … where` |
+  | String | rejects | multi-line `let … in` body layout |
+  | Borrow | rejects | `foreign module … where` spelling |
+  | Control | rejects | `;` in handler blocks; `once`/`return` clause kinds (v2: comma-classified, `once` cut) |
+
+  So the v2 rewrite is dominated by mechanical re-spelling (data/class/layout/
+  foreign forms) — the extern coroutine/String surfaces translate 1:1 UNLESS
+  the planning discussion changes their shape, which is exactly why it comes
+  first.
+
 **Date: 2026-08-08**
 **Predecessor: 2026-08-06-sexp-ingestion-oracle.md (R3), docs/retrofit-item4-callback-runner-migration.md (item 4, worktree /Users/zy/wokml-retrofit)**
 

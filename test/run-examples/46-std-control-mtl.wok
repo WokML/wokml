@@ -22,8 +22,8 @@ prog u = let a = tick 10 in let b = tick 20 in tick 30
 
 main : Result ((U64, U64), [U64]) String
 main =
-  with except in
-  with reader 100 in
-  with writer in
-  with state 0 in
+  handle except in
+  handle reader 100 in
+  handle writer in
+  handle state 0 in
   prog ()

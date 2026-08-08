@@ -11,7 +11,7 @@
 -- if the readings were ever confused again: the once arm drops its
 -- continuation (legal -- affine means AT MOST once) and answers from `f`.
 module Main
-import Std.Base
+import Base
 
 effect Call = { call : (U64 -> U64) -> U64 }
 

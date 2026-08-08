@@ -2188,17 +2188,17 @@ sexpSurfaceTests = testGroup "Sexp.Surface"
             Right r -> assertFailure ("expected rejection, got: " ++ show r)
       ]
 
-  -- R1 resolved against main's ACTUAL surface: PLAIN -> HUArm with
-  -- arity-many binders; CONTROL -> HUArm with the continuation appended
-  -- as the (arity+1)-th binder (both sides are affine one-shot); RETURN
-  -- (bare variable) -> the v1 value arm; VAR -> HParamV; ABORT -> gap.
+  -- R1 against v1's post-retrofit arm surface: PLAIN -> HUArm with
+  -- arity-many binders; CONTROL -> HOnceUArm with the continuation appended
+  -- as the (arity+1)-th binder (both sides declare one-shot); RETURN
+  -- (bare variable) -> HRetArm; VAR -> HParamV; ABORT -> gap.
   , testGroup "handler clause mapping (R1)"
       [ testCase "PLAIN + CONTROL + RETURN clauses map onto v1 arm forms" $ do
           r <- surfaceOfText
             "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_HandleIn \"\" (E_Handler \"Ask\" (seq (H_Clause 1 \"ask\" (seq (P_Var \"q\")) \"k\" (E_Var \"q\")) (H_Clause 2 \"\" (seq (P_Var \"v\")) \"\" (E_Var \"v\")))) (E_App (E_Var \"g\") (E_Unit))) (seq))))"
           case r of
             Right m -> Pr.printTree m
-              @?= Pr.printTree (parseSrc "f = with Ask { ask q k -> q; v -> v } g ()")
+              @?= Pr.printTree (parseSrc "f = with Ask { once ask q k -> q; return v -> v } g ()")
             Left e -> assertFailure ("expected a full mapping, got: " ++ show e)
 
       , testCase "a lowercase install label + VAR clause map to EWithNamedH/HParamV" $ do
@@ -2228,9 +2228,13 @@ sexpSurfaceTests = testGroup "Sexp.Surface"
           surfaceShouldGapAt "E_UseIn"
             "(W_File (seq (D_Equation (L_Prefix \"f\" #f (seq)) (E_UseIn (seq (H_UseBind \"a\" \"b\")) (E_Var \"x\")) (seq))))"
 
-      , testCase "a real v2 dump (01-state-cell) gaps at E_Handler (handler value)" $ do
+      , testCase "a real v2 dump (01-state-cell) gaps at E_Assign (:= arm)" $ do
+          -- The gap FRONTIER moved with phase 2 of the prelude-v2 epic: the
+          -- handler VALUE now maps (EHandlerV), so the first unmappable
+          -- construct in accept/01 is its `cur := x` arm -- the := surface
+          -- the epic explicitly defers.
           dumpTxt <- TIO.readFile "test/sexp-fixtures/v2-01-state-cell.sexp"
-          surfaceShouldGapAt "E_Handler" dumpTxt
+          surfaceShouldGapAt "E_Assign" dumpTxt
       ]
 
   -- The T_With row-attachment fix: the row belongs to the INNERMOST
@@ -2397,7 +2401,6 @@ sexpDifferentialAllowedGapLabels = Set.fromList
   [ -- category (c): no v1 equivalent, unconditional gaps
     "type-alias-decl"              -- D_Alias: v1 has no type-alias declaration
   , "use-rebind"                   -- E_UseIn: no `use x as label` rebind expression
-  , "handler-value"                -- E_Handler outside an install position (first-class handler value)
   , "frame-slot-assign"            -- E_Assign: no `:=` assignment surface
   , "statement-handle"             -- S_Handle: no statement-form handler install
   , "statement-use"                -- S_Use: no use-rebind statement
@@ -2429,8 +2432,8 @@ sexpDifferentialAllowedGapLabels = Set.fromList
   , "refutable-let-binding"        -- H_Bind lhs beyond eqn/var/tuple (e.g. `_`)
   , "qualified-record-head"        -- E_Record with a qualified constructor head
   , "computed-record-head"         -- E_Record head neither bare nor qualified constructor
-  , "foreign-slot-label"           -- E_HandleIn under a designation slot /= the effect
-  , "first-class-handler-install"  -- E_HandleIn installing a non-literal handler
+  , "foreign-slot-label"           -- E_HandleIn literal install under a designation slot /= the effect
+  , "slot-label-value-install"     -- E_HandleIn: slot label uncheckable against a non-literal handler
   , "pattern-return-clause"        -- H_Clause RETURN binding a pattern
   , "abort-clause"                 -- H_Clause ABORT (v1 spells never-resume via a dropped k)
   ]
@@ -2478,15 +2481,17 @@ sexpKnownDivergences = Set.fromList
   ]
 
 -- | Files the C front end accepts but v1's OWN parser rejects (a
--- lowercase type name): there is no v1 tree to differ from, so calling
--- them a "divergence" was dishonest. Each gets a dedicated test pinning
--- exactly this state: the sexp path maps cleanly (it classified into
--- the intersection to get here) while `parse` still rejects the source.
--- If v1 ever learns to parse one, that test FAILS, forcing promotion
--- into the real differential.
+-- lowercase type name; `once` in identifier position, a clause keyword
+-- in v1 but an ordinary identifier in v2): there is no v1 tree to
+-- differ from, so calling them a "divergence" was dishonest. Each gets
+-- a dedicated test pinning exactly this state: the sexp path maps
+-- cleanly (it classified into the intersection to get here) while
+-- `parse` still rejects the source. If v1 ever learns to parse one,
+-- that test FAILS, forcing promotion into the real differential.
 sexpNoV1Twin :: Set.Set FilePath
 sexpNoV1Twin = Set.fromList
   [ "13-data-lowercase-error"
+  , "43-clause-keywords-rejected"
   ]
 
 -- | ParseOnly files whose PARSE golden byte-embeds redundant source
@@ -2507,14 +2512,14 @@ sexpParseGoldenEmbedsParens = Set.fromList
 -- never a silently shrinking intersection.
 sexpExpectedPerDir :: [(FilePath, (Int, [FilePath]))]
 sexpExpectedPerDir =
-  [ ("test/typecheck-examples", (27,
-      ["13-records","14-record-extension","15-record-patterns","16-multi-constructor-records","18-nominal-distinction","19-block-form-records","20-effects-decl","21-effects-arrow","22-effects-pure","23-effects-calls","24-effects-handle","25-effects-di","26-with-handler","28-with-header","43-state-param","44-named-instance","caf-local-inherits-ambient","conc-payload-recursive-ok","conc-surface","coro-pure-tail","coro-residual-handled","coro-residual-multi","local-fn-handle-ok","par-residual-log","row-param-bare","row-param-box","rung2-nested-fn-ok","two-named-effects-ok","user-data-step-not-carrier"]))
-  , ("test/examples", (5,
+  [ ("test/typecheck-examples", (29,
+      ["13-records","14-record-extension","15-record-patterns","16-multi-constructor-records","18-nominal-distinction","19-block-form-records","20-effects-decl","21-effects-arrow","22-effects-pure","23-effects-calls","24-effects-handle","25-effects-di","26-with-handler","28-with-header","43-state-param","44-named-instance","caf-local-inherits-ambient","conc-payload-recursive-ok","conc-surface","coro-pure-tail","coro-residual-handled","coro-residual-multi","par-residual-log","row-param-bare","row-param-box","rung2-nested-fn-ok","user-data-step-not-carrier"]))
+  , ("test/examples", (7,
       ["02-decls","04-lambda-let-case-if","05-patterns","06-types-data","07-where","08-infix-lhs","09-layout","11-warts","12-conid-split","14-modules","15-projection","16-reserved","17-reserved-error","19-operator-sigs","20-effects-syntax","26-typeclass","26-with-handler","27-with-header","28-with-named","40-extern-coro-types","41-row-kinded-params"]))
-  , ("test/run-examples", (49,
-      ["07-effect-ask","16-exn-abort","17-choice-multishot","18-value-op","19-exn-never","25-lint-forgotten-warn","26-lint-discard-wildcard","27-lint-escaping","28-bounded-multishot-arith","29-bounded-multishot-prefix","30-bounded-multishot-let","31-bounded-generator-splice","32-bounded-control-single","33-bounded-nested-multishot","34-bounded-reshape-unpack","35-bounded-header","36-bounded-autoresume","37-known-reentrant-multishot-limitation","40-state-param","41-state-writer-nested","42-writer-state-nested","45-with-in-sugar","46-std-control-mtl","49-named-instance","50-two-cells","51-sum-prod","52-aliasing","53-mixed-row","54-reentrant-routing","55-three-nested-cells","56-named-multishot","57-named-answers-ambient","58-named-state-reader","59-named-two-state-reader","60-named-state-writer","as-pattern-single","borrow-foreign-lend","borrow-malloc-lend","borrow-read","conc-foreign-sequential-await","conc-nested-own-handles","coro-pure-tail","coro-residual-handled","coro-residual-multi","handler-helper-resume","handler-multiline-body","handler-multiline-nested","local-decl-both-directions","local-fn-sees-value","multiline-handler","multiline-handler-state","par-residual-log","row-param-bare","row-param-box","user-cons-name"]))
-  , ("docs/redesign/examples/accept", (2,
-      ["01-state-cell","02-two-cells","03-ambient-mtl","04-generator","06-use-bridge","07-handler-values","08-proto-patterns","09-activation-independence","10-abort-except","12-nested-handlers-k"]))
+  , ("test/run-examples", (51,
+      ["07-effect-ask","16-exn-abort","17-choice-multishot","18-value-op","19-exn-never","25-lint-forgotten-warn","26-lint-discard-wildcard","27-lint-escaping","28-bounded-multishot-arith","29-bounded-multishot-prefix","30-bounded-multishot-let","31-bounded-generator-splice","32-bounded-control-single","33-bounded-nested-multishot","34-bounded-reshape-unpack","35-bounded-header","36-bounded-autoresume","37-known-reentrant-multishot-limitation","40-state-param","41-state-writer-nested","42-writer-state-nested","45-with-in-sugar","46-std-control-mtl","49-named-instance","50-two-cells","51-sum-prod","52-aliasing","53-mixed-row","56-named-multishot","57-named-answers-ambient","58-named-state-reader","59-named-two-state-reader","59-once-arity-both-readings","60-named-state-writer","as-pattern-single","borrow-foreign-lend","borrow-malloc-lend","borrow-read","conc-foreign-sequential-await","conc-nested-own-handles","coro-pure-tail","coro-residual-handled","coro-residual-multi","handler-helper-resume","handler-multiline-body","handler-multiline-nested","local-decl-both-directions","local-fn-sees-value","multiline-handler","multiline-handler-state","par-residual-log","row-param-bare","row-param-box","user-cons-name"]))
+  , ("docs/redesign/examples/accept", (5,
+      ["01-state-cell","02-two-cells","03-ambient-mtl","04-generator","06-use-bridge","09-activation-independence","10-abort-except"]))
   ]
 
 -- | The four dispatch kinds spec S3 lists, keyed to how each corpus dir's
@@ -4870,7 +4875,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "install-site tying: mistyped perform payload is rejected" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "main : U64"
              , "main ="
@@ -4885,7 +4890,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "install-site tying: well-typed payload accepted and runs" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "main : U64"
              , "main ="
@@ -4917,7 +4922,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "var seeding: fused and value forms agree on a set/get round trip" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "runFused : (U64, U64)"
              , "runFused ="
@@ -4935,7 +4940,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "var seeding: two installs of one value each start from the seed" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "useOnce h d = handle h in (let u = State.set (State.get + d) in State.get)"
              , "main : ((U64, U64), (U64, U64))"
@@ -4952,7 +4957,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "concrete handler: body may perform a second effect (residual)" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "effect Logger = { log : U64 -> () }"
              , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
@@ -4970,7 +4975,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "concrete handler: pure body is legal; return arm still runs" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
              , "main : (U64, U64)"
@@ -4984,7 +4989,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "named install: two instances of one effect route apart" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> v }"
              , "main : (U64, U64)"
@@ -4999,7 +5004,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "named install: one handler value under two labels is two activations" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "main : (U64, U64)"
              , "main ="
@@ -5016,7 +5021,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "handler value capturing an instance handle is a CarrierEscape" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "effect E = { ask : U64 }"
              , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> v }"
@@ -5054,7 +5059,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "named install of a polymorphic handler is rejected" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect Ask = { ask : U64 }"
              , "run f = handle c = f in c.ask"
              , "main : U64"
@@ -5072,7 +5077,7 @@ handlerValueTests = testGroup "Wok.TypeChecking.HandlerValue"
   , testCase "value-position install runs the return arm" $ do
       r <- runSourceToValueForced (T.unlines
              [ "module Main"
-             , "import Std.Base"
+             , "import Base"
              , "effect State s = { get : s, set : s -> () }"
              , "state i = handler State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) }"
              , "main : ((U64, U64), (U64, U64))"

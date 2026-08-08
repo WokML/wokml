@@ -1,7 +1,7 @@
 -- Named effect instances: hold MULTIPLE reachable instances of ONE effect.
 --
--- Today a plain `with state 0 in` gives you one cell; a second one shadows it
--- (nearest-handler wins). Naming the instance fixes that: `with count = state 0
+-- Today a plain `handle state 0 in` gives you one cell; a second one shadows it
+-- (nearest-handler wins). Naming the instance fixes that: `handle count = state 0
 -- in ...` introduces an instance bound to `count`, and you perform through the
 -- name -- `count.get`, `count.set x`. Two named cells are independent.
 --
@@ -47,11 +47,11 @@ sumProd sum prod xs = case xs of
 -- each return an `(answer, finalState)` pair, so the whole expression is
 --   ((transfer_answer, b_final), a_final) = ((((), 105), 0)).
 --
--- Try editing main to `with sum = state 0 in with prod = state 1 in
+-- Try editing main to `handle sum = state 0 in handle prod = state 1 in
 -- sumProd sum prod [1,2,3,4]` -- you'll get sum = 10 and prod = 24, two
 -- same-typed cells kept apart by name alone.
 main : (((), U64), U64)
 main =
-  with a = state 100 in
-  with b = state 5 in
+  handle a = state 100 in
+  handle b = state 5 in
   transfer a b

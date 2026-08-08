@@ -112,66 +112,62 @@ dict$Eq$Bytes =
   let t = Eq$Dict(dict$Eq$Bytes$m0, dict$Eq$Bytes$m1)
   t
 
-reader e c =
-  let t = c(self)
-  let _drop.1 = __rc_drop(e)
-  let _drop.2 = __rc_drop(c)
-  t
-  with self = {
+reader e =
+  let t = handler {
+  with {
     return v -> v
     Reader.ask(resume) ->
       let res = resume(e)
       res
   }
+  }
+  t
 
-state i c =
+state i =
   let s = i
-  let t.1 = c(self)
-  let _drop.1 = __rc_drop(c)
-  t.1
-  with self = {
+  let t.3 = handler {
+  with {
     return v ->
-      let t.3 = Tuple2(v, s)
-      t.3
+      let t.2 = Tuple2(v, s)
+      t.2
     State.get(resume.1) ->
-      let _dup = __rc_dup(s)
       let res = resume.1(s, s)
       res
     State.set(x, resume.2) ->
-      let t.2 = resume.2(x, ())
-      let _drop.2 = __rc_drop(s)
-      t.2
+      let t.1 = resume.2(x, ())
+      t.1
   }
+  }
+  t.3
 
-writer c =
-  let t.5 = Nil
-  let log = t.5
-  let t.1 = c(self)
-  let _drop = __rc_drop(c)
-  t.1
-  with self = {
+writer =
+  let t.4 = Nil
+  let log = t.4
+  let t.5 = handler {
+  with {
     return v ->
-      let t.4 = Tuple2(v, log)
-      t.4
+      let t.3 = Tuple2(v, log)
+      t.3
     Writer.tell(w, resume) ->
-      let t.2 = ++(log, w)
-      let t.3 = resume(t.2, ())
-      t.3
-  }
-
-except c =
-  let t.1 = c(self)
-  let _drop.1 = __rc_drop(c)
-  t.1
-  with self = {
-    return v ->
-      let t.3 = Ok(v)
-      t.3
-    Except.throw(e, resume) ->
-      let t.2 = Err(e)
-      let _drop.2 = __rc_drop(resume)
+      let t.1 = ++(log, w)
+      let t.2 = resume(t.1, ())
       t.2
   }
+  }
+  t.5
+
+except =
+  let t.3 = handler {
+  with {
+    return v ->
+      let t.2 = Ok(v)
+      t.2
+    Except.throw(e, resume) ->
+      let t.1 = Err(e)
+      t.1
+  }
+  }
+  t.3
 
 start c =
   let t.1 = c(())
@@ -492,7 +488,7 @@ raceSpawn ch fs =
       t.9
 
 classify xs =
-  join j412(r) =
+  join j404(r) =
     let n = r
     let t = Pair(n, xs)
     t
@@ -502,10 +498,10 @@ classify xs =
       case ys of
         Nil ->
           let _drop.1 = __rc_drop(ys)
-          jump j412(0)
+          jump j404(0)
         Cons z _ ->
           let _drop.2 = __rc_drop(ys)
-          jump j412(z)
+          jump j404(z)
 
 main =
   let t.2 = Nil

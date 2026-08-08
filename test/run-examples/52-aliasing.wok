@@ -15,4 +15,4 @@ bump2 a b =
 
 -- main = (bump2_result, cell_final) = (((), 12)).
 main : ((), U64)
-main = with cell = state 10 in bump2 cell cell
+main = handle cell = state 10 in bump2 cell cell

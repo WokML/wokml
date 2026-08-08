@@ -6,12 +6,12 @@ import Control
 -- is then RETURNED out of the `with` block. Calling the returned closure later
 -- performs on a dead handler, so it must be rejected with CarrierEscape -- just
 -- like the semantically identical lambda form `let helper = \ x -> c.set x`.
--- (`with c = state 0 in BODY` wraps BODY's result via the return arm `v -> (v,
+-- (`handle c = state 0 in BODY` wraps BODY's result via the return arm `v -> (v,
 -- s)`, so the escaping helper rides out inside the `(helper, finalState)` tuple;
 -- the signature reflects that tuple so the carrier check -- not a type mismatch
 -- -- is what rejects the program.)
 leak : () -> ((U64 -> ()), U64)
-leak u = with c = state 0 in let helper x = c.set x in helper
+leak u = handle c = state 0 in let helper x = c.set x in helper
 
 main : U64
 main = 0

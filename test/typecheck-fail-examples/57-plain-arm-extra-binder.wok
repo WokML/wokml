@@ -13,7 +13,7 @@
 -- a re-run of tools/Codemod.hs would silently repair the fixture and delete the
 -- regression it exists to pin.
 module Main
-import Std.Base
+import Base
 
 effect Call = { call : (U64 -> U64) -> U64 }
 

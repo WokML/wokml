@@ -37,5 +37,5 @@ toNum acc xs = case xs of
   n :: rest -> toNum (acc * 10 + n) rest
 
 main : U64
-main = case writer (\u -> runRaced ()) of
+main = case (handle writer in runRaced ()) of
   (_, log) -> toNum 0 log

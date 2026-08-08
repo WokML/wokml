@@ -1,0 +1,3 @@
+inscope : ((), U64)
+main : ((), U64)
+pure_local : U64

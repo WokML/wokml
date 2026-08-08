@@ -1,12 +1,19 @@
 module Main
 import Base
-import Control
 -- rung-2 DEATH TEST (was the rung-1 boundary): this handler-position residual
 -- laundering is now REJECTED with UndischargedEffect by the caller-root provenance
 -- rule. The runner-sugar form `with s = <runner> in body` launders the body's
 -- residual `e` (supplied by callback `f`) through the runner's own terminal
 -- exemption; `driveSugar` declares closed yet performs `e`.
 -- See docs/superpowers/specs/2026-07-02-resume-launders-rung2-provenance.md
+--
+-- LOCAL runner copy: the fixture's subject is the SUGAR shape itself, which any
+-- user-defined callback runner still expresses; the prelude `state` is a
+-- handler-value producer now.
+effect State s = { get : s, set : s -> () }
+state : s -> (State s -> a with State s + eff e) -> (a, s) with eff e
+state i c = with self = State { var s = i ; get -> s ; once set x k -> k x () ; return v -> (v, s) } in c self
+
 driveSugar : (() -> U64 with eff e) -> (U64, U64)
 driveSugar f = with s = state 0 in f ()
 main : U64

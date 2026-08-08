@@ -18,4 +18,4 @@ prog s w =
   b
 
 main : ((U64, [U64]), U64)
-main = with s = state 7 in with w = writer in prog s w
+main = handle s = state 7 in handle w = writer in prog s w
