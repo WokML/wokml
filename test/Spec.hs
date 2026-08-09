@@ -231,6 +231,9 @@ main = do
   sexpDifferentialGroup <- buildSexpDifferentialGroup wokparseEnv
   sexpReorderGroup <- buildSexpReorderGroup wokparseEnv
   sexpReorderPropertyGroup <- buildSexpReorderPropertyGroup wokparseEnv
+  preludeV2Files <- findByExtension [".wok"] "prelude/v2"
+  let preludeV2Found = Data.List.sort (map takeBaseName preludeV2Files)
+      preludeV2FreshnessGroup = buildPreludeV2FreshnessGroup wokparseEnv preludeV2Found
   defaultMain $ testGroup "wok"
     [ testGroup "parse golden"
         [ goldenVsString (takeBaseName f) (goldenFor f) (parseToBS f)
@@ -248,6 +251,8 @@ main = do
     , sexpDifferentialGroup
     , sexpReorderGroup
     , sexpReorderPropertyGroup
+    , preludeV2TwinTests preludeV2Found
+    , preludeV2FreshnessGroup
     , sourceOriginTests
     , preludeTests
     , modPathTests
@@ -2660,7 +2665,9 @@ sexpAssertTreeEq' f mapped (entryName, ms) = do
 -- outright on an undeclared operator (e.g. 03-expressions.wok's bare `+`)
 -- that plain 'parse' never needed resolved. So this compares the RAW,
 -- UNREORDERED trees directly, at the same level their own golden already
--- does.
+-- does. ALSO reused by 'preludeV2TwinTests': there the v1 file is a full
+-- module, but the comparison wanted is the same bare
+-- parse-then-normalized-diff against an already-mapped tree.
 sexpAssertTreeEqFragment :: FilePath -> Module -> Assertion
 sexpAssertTreeEqFragment f mapped = do
   srcTxt <- TIO.readFile f
@@ -2872,6 +2879,73 @@ buildSexpDifferentialGroup (Just wokparseBin) = do
           (null badGaps)
 
   pure $ testGroup "Sexp.Differential" (perFileTests ++ malformedTests ++ [summary])
+
+-- ---------------------------------------------------------------------
+-- Prelude.V2Twins: the phase-3 drift gate of the prelude-v2 epic
+-- (docs/superpowers/specs/2026-08-08-prelude-v2-rework.md, D1/O1).
+-- Each translated prelude module lives twice: the v1 source under
+-- prelude/ (the corpus default until S5) and its v2 twin under
+-- prelude/v2/ with a CHECKED-IN wokparse dump beside it. The drift test
+-- runs UNGATED (the dump is checked in, no C toolchain needed): read the
+-- dump, map it through Wok.Sexp.Surface, and require the result to be
+-- normalized-structurally EQUAL to the v1 parse of the v1 twin -- tree
+-- equality implies environment equality (schemes, fixities, instances),
+-- so this is strictly stronger than a scheme comparison. Control has no
+-- entry: its `extern data Step` (transparent extern ADT) has NO v2
+-- spelling -- an owner question filed with the coroutine plan.
+-- ---------------------------------------------------------------------
+
+-- | The v2 twin modules, DISCOVERED from prelude/v2/ (like every other
+-- corpus group) so a future twin -- Control, once the coroutine plan
+-- resolves its `extern data` spelling -- is gated automatically, never
+-- silently uncovered. 'preludeV2RequiredModules' pins the phase-3 floor:
+-- discovery returning less than these five is a broken checkout, not an
+-- empty corpus.
+preludeV2RequiredModules :: [String]
+preludeV2RequiredModules = ["Array", "Base", "Borrow", "Bytes", "String"]
+
+preludeV2TwinTests :: [String] -> TestTree
+preludeV2TwinTests found = testGroup "Prelude.V2Twins"
+  ( testCase "discovery covers the phase-3 modules" (assertBool
+      ("prelude/v2 discovery lost modules: found " ++ show found)
+      (all (`elem` found) preludeV2RequiredModules))
+  : [ testCase (m ++ ": checked-in v2 dump maps to the v1 prelude's tree") $ do
+        dumpTxt <- TIO.readFile ("prelude/v2/" ++ m ++ ".sexp")
+        mapped <- case Sexp.readSExp dumpTxt of
+          Left e  -> assertFailure ("reader rejected prelude/v2/" ++ m ++ ".sexp: " ++ show e)
+          Right s -> case Surface.surfaceModule s of
+            Left e   -> assertFailure ("mapper rejected prelude/v2/" ++ m ++ ".sexp: " ++ show e)
+            Right md -> pure md
+        sexpAssertTreeEqFragment ("prelude/" ++ m ++ ".wok") mapped
+    | m <- found
+    ] )
+
+-- | The D1 freshness gate: WOK_WOKPARSE-gated byte comparison of each
+-- checked-in dump against a fresh `wokparse -sexp` of its v2 source, so
+-- a grammar or source change cannot leave a stale dump behind.
+buildPreludeV2FreshnessGroup :: Maybe FilePath -> [String] -> TestTree
+buildPreludeV2FreshnessGroup Nothing _ =
+  testGroup "Prelude.V2Freshness"
+    [ testCase "skipped (WOK_WOKPARSE unset)" $
+        putStrLn
+          ( "Prelude.V2Freshness skipped: set WOK_WOKPARSE=/path/to/wokparse to "
+            ++ "check the prelude/v2/*.sexp dumps for drift (prelude-v2 spec D1)." )
+    ]
+buildPreludeV2FreshnessGroup (Just wokparseBin) found =
+  testGroup "Prelude.V2Freshness"
+    [ testCase (m ++ ": checked-in dump is fresh") $ do
+        let src = "prelude/v2/" ++ m ++ ".wok"
+        (code, out, errOut) <- readProcessWithExitCode wokparseBin ["-sexp", src] ""
+        case code of
+          ExitFailure c -> assertFailure
+            ("wokparse rejected " ++ src ++ " (exit " ++ show c ++ "): " ++ errOut)
+          ExitSuccess -> do
+            stored <- readFile ("prelude/v2/" ++ m ++ ".sexp")
+            assertBool
+              (src ++ "'s checked-in dump is stale: regenerate with wokparse -sexp")
+              (out == stored)
+    | m <- found
+    ]
 
 -- ---------------------------------------------------------------------
 -- Sexp.Reorder: env-gated differential for the C reorder pass

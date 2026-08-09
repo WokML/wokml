@@ -1,0 +1,21 @@
+module Bytes
+import Base
+
+-- A raw, unverified byte buffer (not necessarily valid UTF-8).
+-- The tycon is pre-registered in the compiler's initial environment
+-- (kind *, arity 0); no extern type declaration is needed here.
+
+extern fromList  : [U64] -> Bytes
+extern toList    : Bytes -> [U64]
+extern length    : Bytes -> U64
+extern index     : Bytes -> U64 -> U64
+extern fromBytes : Bytes -> Option String
+extern toBytes   : String -> Bytes
+
+-- FFI bytes-in (Slice 1): host-blessed DETERMINISTIC foreign producers that
+-- demonstrate the C->RC ownership handoff. __ffi_demo_copy copies the foreign
+-- buffer into a wok-owned cell (Tier 1); __ffi_demo_adopt adopts it and frees
+-- it at refcount-zero (Tier 2). Transitional fixtures: superseded by the
+-- Slice-2 foreign-module surface. Pure-typed (no IO effect yet; deterministic).
+extern __ffi_demo_copy  : U64 -> Bytes
+extern __ffi_demo_adopt : U64 -> Bytes

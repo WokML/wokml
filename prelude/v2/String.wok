@@ -1,0 +1,82 @@
+module String
+import Base
+
+-- String is a flat UTF-8 byte buffer (Slice E1). The tycon is pre-registered
+-- in the compiler's initial environment (kind *, arity 0); no extern type
+-- declaration is needed here.
+--
+-- Naming convention (no qualified imports yet, so names carry their view):
+--   length / index      = codepoint-level (UTF-8 decoded)
+--   byteLength / byteAt = byte-level (raw UTF-8 bytes)
+--
+-- NOTE: importing BOTH String and Array unqualified in the same module
+-- will cause a name conflict on 'length' and 'index' (qualified imports are a
+-- deferred slice). Keep string-only programs array-free, and vice versa.
+
+extern length     : String -> U64
+extern index      : String -> U64 -> Char
+extern byteLength : String -> U64
+extern byteAt     : String -> U64 -> U64
+extern append     : String -> String -> String
+
+-- StringZilla FFI primitives (Slice E2)
+extern indexOfFromRaw : String -> String -> U64 -> U64   -- byte pos, or `notFound` if absent
+extern hash           : String -> U64                    -- sz_hash of the UTF-8 bytes (deterministic)
+extern editDistance   : String -> String -> U64          -- byte-level unit-cost Levenshtein
+
+-- Zero-copy slice prims (Slice E4)
+extern slice     : String -> U64 -> U64 -> String   -- codepoint window [start, start+len), saturating
+extern byteSlice : String -> U64 -> U64 -> String   -- byte window [start, start+len), saturating; PrimError if split
+
+-- Codepoint iteration (Slice E5). Offsets are BYTE offsets into the UTF-8 buffer.
+extern decodeCharAt : String -> U64 -> Char   -- codepoint starting at byte offset; PrimError if not a boundary
+extern charWidthAt  : String -> U64 -> U64    -- byte width (1..4) of that codepoint; PrimError if not a boundary
+extern singleton    : Char -> String          -- one codepoint as a string
+
+-- "not found" sentinel returned by indexOfFromRaw (== C WOK_SZ_NOT_FOUND == UINT64_MAX).
+notFound : U64
+notFound = 18446744073709551615
+
+-- find from a byte offset, as an Option
+indexOfFrom : String -> String -> U64 -> Option U64
+indexOfFrom s n from =
+  let r = indexOfFromRaw s n from
+  case eqU64 r notFound of
+    True  -> None
+    False -> Some r
+
+indexOf : String -> String -> Option U64
+indexOf s n = indexOfFrom s n 0
+
+contains : String -> String -> Bool
+contains s n = case indexOf s n of
+  Some _ -> True
+  None   -> False
+
+take : String -> U64 -> String
+take s n = slice s 0 n
+
+drop : String -> U64 -> String
+drop s n = slice s n (length s)
+
+-- count of NON-OVERLAPPING occurrences. Empty needle -> 0 (avoids the degenerate loop).
+count : String -> String -> U64
+count s n = case eqU64 (byteLength n) 0 of
+  True  -> 0
+  False -> countFrom s n 0 0
+
+countFrom : String -> String -> U64 -> U64 -> U64
+countFrom s n from acc = case indexOfFrom s n from of
+  None   -> acc
+  Some i -> countFrom s n (i + byteLength n) (acc + 1)
+
+-- foldChars: left fold over codepoints, single pass (O(n)). Effect-polymorphic:
+-- the closure may perform effects; foldChars performs exactly those effects.
+foldChars : (s -> Char -> s with eff e) -> s -> String -> s with eff e
+foldChars f acc str = foldCharsGo f acc str 0 (byteLength str)
+
+foldCharsGo : (s -> Char -> s with eff e) -> s -> String -> U64 -> U64 -> s with eff e
+foldCharsGo f acc str off end =
+  case eqU64 off end of
+    True  -> acc
+    False -> foldCharsGo f (f acc (decodeCharAt str off)) str (off + charWidthAt str off) end

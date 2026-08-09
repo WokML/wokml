@@ -35,7 +35,29 @@ no extern-surface work before that plan exists)**
   corpora define LOCAL fused runners and lost nothing, but the oracle's reach
   over the real prelude narrowed; restoring it is an RC-coverage slice of its
   own (likely alongside the coroutine plan).
-- **Phase 3 — BLOCKED**: every prelude module carries `extern` compiler holes
+- **Phase 3 — FIVE OF SIX DONE (owner-approved 2026-08-08, faithful 1:1
+  re-spelling only)**: `prelude/v2/{Array,Base,Borrow,Bytes,String}.wok` are
+  v2 twins, each with a CHECKED-IN wokparse dump beside it. O1 RESOLVED as
+  its leaning: v1 twins stay the corpus default until S5; the Prelude.V2Twins
+  group (ungated -- dumps are checked in) requires each dump, mapped through
+  Wok.Sexp.Surface, to be normalized-structurally EQUAL to the v1 parse of
+  the v1 twin (tree equality implies environment equality -- schemes,
+  fixities, instances -- so this is stronger than a scheme drift test);
+  Prelude.V2Freshness (WOK_WOKPARSE-gated) byte-compares each dump against a
+  fresh wokparse run (D1). The mapper needed ZERO extensions -- the phase-2
+  expectations (D_Alias/E_Assign/S_Discard not needed) held. Translation
+  deltas were purely mechanical: `data`->`type`, `class`/`instance`/`foreign
+  module` drop `where`, one `let ... in` becomes a block let. Under twins,
+  "R3 retired" means precisely: the v2 closure exists for these five modules
+  and is drift-verified; BNFC remains the corpus default until S5.
+- **Phase 3 residue — Control is OWNER-BLOCKED**: `extern data Step a b r
+  (row e) = Completed r | Suspended ...` is a TRANSPARENT extern ADT, and v2
+  has no spelling for it (`extern type` is opaque-only; probed, and the C
+  schema's D_ExternType carries no constructor field). Choosing the v2
+  spelling -- or restructuring Step -- is agenda item #1 of the coroutine
+  planning conversation; Control.wok gets its v2 twin after that.
+- **Phase 3 — BLOCKED before that plan** (context kept for the record):
+  every prelude module carries `extern` compiler holes
   (Control: the whole coroutine/ContCell block; String: the method prims).
   Rewriting the text in v2 means re-spelling those surfaces, which the owner
   has frozen pending a coroutine + String-method plan. Planning input, from

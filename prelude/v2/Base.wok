@@ -1,0 +1,74 @@
+module Base
+
+fixity + left
+fixity - left
+fixity * left tighter than +
+fixity / left tighter than +
+fixity == left looser than +
+fixity /= left looser than +
+fixity && left looser than ==
+fixity || left looser than &&
+fixity ++ right
+
+fixity $  right looser than ||
+
+type Bool = True | False
+type Option a = Some a | None
+type Result t e = Ok t | Err e
+
+extern (+)  : U64 -> U64 -> U64
+extern (-)  : U64 -> U64 -> U64
+extern (*)  : U64 -> U64 -> U64
+extern (/)  : U64 -> U64 -> U64
+extern div  : U64 -> U64 -> U64
+extern mod  : U64 -> U64 -> U64
+extern (&&) : Bool -> Bool -> Bool
+extern (||) : Bool -> Bool -> Bool
+extern (++) : [a] -> [a] -> [a]
+extern ($)  : (a -> b) -> a -> b
+
+id : a -> a
+id x = x
+
+const : a -> b -> a
+const x y = x
+
+extern eqU64 : U64 -> U64 -> Bool
+extern eqU32 : U32 -> U32 -> Bool
+extern u32   : U64 -> U32 -- we hardcoded all number literal to U64 sorry
+
+not : Bool -> Bool
+not x = case x of
+  True  -> False
+  False -> True
+
+class Eq a
+  (==) : a -> a -> Bool
+  (/=) : a -> a -> Bool
+  (/=) x y = not (x == y)
+
+instance Eq U64
+  (==) = eqU64
+
+instance Eq U32
+  (==) = eqU32
+
+instance (Eq a) => Eq (Option a)
+  (==) x y =
+    case x of
+      None   -> case y of
+        None   -> True
+        Some _ -> False
+      Some a -> case y of
+        None   -> False
+        Some b -> a == b
+
+extern eqString : String -> String -> Bool
+
+instance Eq String
+  (==) = eqString
+
+extern eqBytes : Bytes -> Bytes -> Bool
+
+instance Eq Bytes
+  (==) = eqBytes
