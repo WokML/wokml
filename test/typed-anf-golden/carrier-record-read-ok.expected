@@ -1,0 +1,24 @@
+readN r : R =
+  let t : U64 = r.n
+  t
+
+bumpedN r : R =
+  let p : R = r.b
+  let t.2 : R = R { b = p, n = 1 }
+  let r2 : R = t.2
+  let t.1 : U64 = r2.n
+  t.1
+
+sink p : Point =
+  7
+
+twice p : Point =
+  let t.3 : U64 = sink(p)
+  let a : U64 = t.3
+  let t.2 : U64 = sink(p)
+  let b : U64 = t.2
+  let t.1 : U64 = +(a, b)
+  t.1
+
+main =
+  0

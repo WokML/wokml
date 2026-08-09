@@ -1,0 +1,26 @@
+module Main
+import Base
+import Borrow
+-- Containment (spec 2026-08-10), R2 realized: the RECORD form of the same
+-- hole. Found during implementation -- the declaration-site closure alone did
+-- NOT close this, because a record's type is `CTRecord tag row` (the tag is the
+-- CONSTRUCTOR name, field types live structurally in the row), so there is no
+-- tycon name for the carrier predicates to look up. `data R = R Borrow` was
+-- correctly rejected while `data R = R { b : Borrow }` was accepted.
+--
+-- Consequence if left open: a second-class foreign borrow escapes its lending
+-- activation, which the Slice-3 borrow-noescape negative control demonstrates
+-- is a genuine use-after-free (the activation-scoped close frees the buffer the
+-- escapee then reads). Closed by answering record containment STRUCTURALLY in
+-- `isHandleType`/`isAffineCarrierType` (see `recordRowCarries`).
+--
+-- `Borrow` is the carrier used here deliberately: it takes no type parameters,
+-- and parameterized records are broken by a separate pre-existing bug
+-- (`freeze: unexpected Rigid`), so a `Suspension` field cannot yet be spelled
+-- in a record at all. When that bug is fixed, the affine carriers reach this
+-- same route -- and this fixture is what proves the route is already shut.
+data R = R { b : Borrow }
+leak : R -> [R]
+leak r = [r]
+main : U64
+main = 0

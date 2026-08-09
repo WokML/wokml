@@ -1,0 +1,16 @@
+module Main
+import Base
+import Control
+-- Containment (spec 2026-08-10), `mentions` ARGUMENT traversal: the carrier
+-- need not be the field's head type. `[Suspension …]` contains one under a
+-- `List` argument, so `L` is a derived carrier and cannot escape.
+--
+-- Note what this does NOT do: `List` itself stays an ordinary type. The rule
+-- is applied to the field types written in each declaration, and `List`'s own
+-- field type is a quantified slot (`CTGen`), never a carrier. Contagion
+-- travels through a USE of `List` at carrier type, not into `List`.
+data L (row e) = L [Suspension U64 U64 U64 (row e)]
+leak : L (row e) -> [L (row e)]
+leak l = [l]
+main : U64
+main = 0

@@ -192,6 +192,13 @@ check ctx env allowed e@(Texp _ node)
   -- (via 'recurse') before any child expressions are checked, so nested
   -- escapes (e.g. @[start producer]@ inside an arm) are still caught.
   | carrierEscapeEnabled, isInlineFutureApp (ctxCarrierTys ctx) e, not allowed, not (ctxHandlerArm ctx) = err ctx
+  -- A projection / record literal / record extension whose own RESULT TYPE is a
+  -- carrier. Needed because the BASE of a projection or extension is an allowed
+  -- position (so an ordinary field stays readable), which leaves the result as
+  -- the only place to catch `[r.b]` / `[R { ..r }]`. No handler-arm exemption:
+  -- unlike a saturated call, these are never a handler's structural answer-type
+  -- constructor.
+  | carrierEscapeEnabled, isCarrierRecordNode (ctxCarrierTys ctx) e, not allowed = err ctx
   -- A PRODUCER THUNK: a lambda whose result type is itself an affine carrier
   -- (e.g. @\\() -> start (asConc c)@ of type @() -> Step …@). Such a lambda is the
   -- structural carrier constructor demanded by a driver that must call @start@
@@ -266,6 +273,33 @@ isInlineFutureApp :: Set Text -> TExpr -> Bool
 isInlineFutureApp carrierTys (Texp ty (TApp _ _)) = isAffineCarrierType carrierTys ty
 isInlineFutureApp _          _                    = False
 
+-- | Does this node PRODUCE a carrier by reading or rebuilding a record, rather
+-- than by being one? A projection, a record literal, and a record extension are
+-- all value forms whose RESULT can be a carrier even though the node itself is
+-- none of 'directlyEscapes'' forms (no bare carrier variable, no capturing
+-- closure) and is not a 'TApp' (so 'isInlineFutureApp' misses it).
+--
+-- Without this, making the projection/extension BASE an allowed position (which
+-- is what keeps `r.n` on an ordinary field legal) leaves the carrier reachable
+-- one keystroke away:
+--
+-- > leakProj    r = [r.b]                  -- the raw Borrow, in a list
+-- > leakExt     r = [R { ..r, n = 1 }]     -- same Borrow, new record
+-- > leakRebuild r = [R { b = r.b, n = 1 }]
+-- > getH        p = [p.h]                  -- an effect handle out of its `with`
+--
+-- Judging the node by its own RESULT TYPE is what separates those from the
+-- legitimate read: @r.n : U64@ is not a carrier and stays allowed, while
+-- @r.b : Borrow@ and @R { ..r } : R@ are and do not. 'isHandleType' rather than
+-- 'isAffineCarrierType' because this must also stop an effect-instance handle
+-- leaving its scope, which is the carrier rule's original purpose.
+isCarrierRecordNode :: Set Text -> TExpr -> Bool
+isCarrierRecordNode carrierTys (Texp ty node) = case node of
+  TProj {}      -> isHandleType carrierTys ty
+  TRecord {}    -> isHandleType carrierTys ty
+  TRecordExt {} -> isHandleType carrierTys ty
+  _             -> False
+
 -- | Is this a PRODUCER THUNK — a lambda whose result type (after peeling its
 -- parameters) is an affine carrier (a 'Step'/'Suspension')? Such a lambda is a
 -- structural carrier constructor: a deferred @start@ that a driver must apply
@@ -324,10 +358,28 @@ recurse ctx env node = case node of
   TIf c a b -> mapM_ (go False) [c, a, b]
   TTuple xs -> mapM_ (go False) xs
   TList xs  -> mapM_ (go False) xs
-  TProj e _ -> go False e
+  -- The BASE of a projection or a record extension is an ALLOWED position.
+  -- Reading a field does not carry the record outward, and neither does
+  -- building a new record from it: what leaves is the field (or the new
+  -- record), whose own position is judged by the parent. This matters once a
+  -- record holding a carrier is itself a carrier ('recordRowCarries'): without
+  -- the allowance, `r.n` on an ordinary `U64` field would be rejected as an
+  -- escape merely because some OTHER field of `r` holds a carrier, which
+  -- leaks nothing and is exactly the shape the carrier rule exists to keep
+  -- usable. Storing or returning the record whole (`[r]`, `f r = r`) is still
+  -- caught, because those positions are not allowed.
+  --
+  -- Residual, pre-existing and unchanged by this allowance: the RESULT of a
+  -- projection or extension is not re-checked against its own type, so
+  -- `getB r = r.b` hands out a carrier field. The escape walk catches bare
+  -- carrier variables, capturing closures, and inline carrier-producing
+  -- applications ('isInlineFutureApp') -- not arbitrary carrier-typed
+  -- expressions. Closing that route is a separate change with a much wider
+  -- blast radius.
+  TProj e _ -> go True e
 
   TRecord _ fs        -> mapM_ (go False . snd) fs
-  TRecordExt _ e fs   -> go False e >> mapM_ (go False . snd) fs
+  TRecordExt _ e fs   -> go True e >> mapM_ (go False . snd) fs
 
   -- let: a binding RHS is a tracked position (allowed) — binding a carrier to a
   -- name does not let it escape; instead the name joins the carrier set, so any
@@ -489,9 +541,42 @@ bindDecls carrierTys env decls = env
 -- @CTCon (TcEffect _) _@, or a MARKED carrier tycon (an @extern data@/@extern
 -- type@, whose name is in @carrierTys@)? Both must not escape their scope.
 isHandleType :: Set Text -> CType -> Bool
-isHandleType _          (CTCon (TcEffect _) _) = True
-isHandleType carrierTys (CTCon (TcUser n)   _) = Set.member n carrierTys
-isHandleType _          _                       = False
+isHandleType carrierTys (CTRecord _ row) = recordRowCarries (isHandleType carrierTys) row
+isHandleType carrierTys ty               = isNominalHandleType carrierTys ty
+
+-- | Does a record type's row carry a carrier in one of its fields?
+--
+-- The containment closure ('Wok.TypeChecking.Env.carrierClosure') derives
+-- carrier-ness for DATA tycons, and the two predicates above answer for those
+-- by nominal lookup. A record cannot be answered that way: its type is
+-- @CTRecord tag row@, where the tag is the CONSTRUCTOR name and the field
+-- types live structurally in the row, so there is no tycon name to look up.
+-- Answer containment structurally instead — a record is a carrier exactly
+-- when one of its fields is.
+--
+-- This closes the record half of the same laundering hole the closure closes
+-- for positional constructors: without it @data R = R { b : Borrow }@ lets a
+-- second-class foreign borrow escape its lending activation (the Slice-3
+-- use-after-free that the borrow-noescape negative control demonstrates),
+-- while the positional @data R = R Borrow@ is correctly rejected.
+--
+-- An arrow-typed field is NOT containment, matching decision D2 of the
+-- containment spec (a field of function type produces or consumes a carrier
+-- rather than holding one, and closure capture is guarded separately).
+--
+-- The element test is a PARAMETER, not hard-wired to 'isHandleType', because
+-- the two callers ask different questions and 'isHandleType' answers only its
+-- own. Its first arm reports every effect-instance handle as a carrier while
+-- IGNORING the name set, so wiring it in unconditionally would make a record
+-- containing a handle come back affine from 'isAffineCarrierType' -- directly
+-- contradicting that function's contract that effect handles are second-class
+-- but never consume-once. Each caller passes its own predicate, so nesting
+-- recurses under the right question.
+recordRowCarries :: (CType -> Bool) -> CType -> Bool
+recordRowCarries carries = go
+  where
+    go (CRExtend _ ft rest) = carries ft || go rest
+    go _                    = False
 
 -- | A parameter slot into which a carrier may be passed (condition 2, extended):
 --
@@ -510,8 +595,26 @@ isHandleType _          _                       = False
 isHandleSlot :: Set Text -> CType -> Bool
 isHandleSlot carrierTys pt = isHandleType carrierTys pt || isHandleContinuation pt
   where
-    isHandleContinuation (CTArr dom _ _) = isHandleType carrierTys dom
+    -- NOMINAL domains only. The runner-continuation allowance is deliberately
+    -- permissive -- it lets a closure CAPTURING a handle be passed -- and that
+    -- was scoped to genuine handle / marked-carrier domains. Admitting a domain
+    -- that is a carrier only by RECORD CONTAINMENT would extend it to arbitrary
+    -- user functions: with @data R = R { b : Borrow, n : U64 }@, a parameter of
+    -- type @R -> U64@ would become a "runner continuation" slot, and
+    -- @keep (\\ r -> … bo …)@ could store a Borrow-capturing closure in a list --
+    -- accepted, while the identical program over a carrier-FREE record is
+    -- rejected. So the containment-derived cases must not reach here.
+    isHandleContinuation (CTArr dom _ _) = isNominalHandleType carrierTys dom
     isHandleContinuation _               = False
+
+-- | The NOMINAL half of 'isHandleType': an effect-instance handle, or a tycon
+-- named in the carrier set. Excludes the structural record case, so callers
+-- that must not be widened by record containment ('isHandleContinuation') can
+-- ask this instead. 'isHandleType' is this plus the record case.
+isNominalHandleType :: Set Text -> CType -> Bool
+isNominalHandleType _          (CTCon (TcEffect _) _) = True
+isNominalHandleType carrierTys (CTCon (TcUser n)   _) = Set.member n carrierTys
+isNominalHandleType _          _                      = False
 
 -- | The parameter types of a (curried) arrow type, in order. A non-arrow is [].
 arrowParamTypes :: CType -> [CType]
@@ -1005,4 +1108,12 @@ futureBindersOfDecls carrierTys decls = Set.unions
 -- bound, so they are excluded here regardless of which set is passed.
 isAffineCarrierType :: Set Text -> CType -> Bool
 isAffineCarrierType carrierTys (CTCon (TcUser n) _) = Set.member n carrierTys
+-- A record holding an AFFINE carrier is itself consume-once, for the same
+-- reason a record holding any carrier is second-class: the field is reachable
+-- from the record. Structural, not nominal — see 'recordRowCarries'. Recursing
+-- through 'isAffineCarrierType' (not 'isHandleType') is what keeps the
+-- exclusion above true of records too: a record whose only carrier field is an
+-- effect-instance handle is NOT affine, and the affine-FILTERED name set the
+-- caller passes keeps a record of 'Borrow' non-affine as well.
+isAffineCarrierType carrierTys (CTRecord _ row)     = recordRowCarries (isAffineCarrierType carrierTys) row
 isAffineCarrierType _          _                     = False

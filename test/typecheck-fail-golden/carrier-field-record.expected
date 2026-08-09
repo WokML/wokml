@@ -1,0 +1,1 @@
+typecheck: typecheck in Main: CarrierEscape (Just (24,1)) "leak"

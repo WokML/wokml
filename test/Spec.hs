@@ -1590,7 +1590,102 @@ envSmokeTests = testGroup "Wok.TypeChecking.Env"
   , testCase "TypeError has Show" $
       let err = TErr.UnknownVar Nothing (T.pack "ghost")
       in length (show err) > 0 @?= True
+  , carrierClosureTests
   ]
+
+-- | 'TE.carrierClosure' contract (spec 2026-08-10-carrier-containment-fix).
+--
+-- The closure derives 'tcCarrier'/'tcAffine' for tycons that structurally hold
+-- a carrier, which is what stops a marked carrier being laundered out of its
+-- activation inside an ordinary user type. These cases pin the four decisions
+-- the traversal encodes; the corresponding SURFACE behaviour is pinned by
+-- test/typecheck-fail-examples/carrier-field-*.wok and
+-- test/typecheck-examples/carrier-field-thunk-ok.wok.
+carrierClosureTests :: TestTree
+carrierClosureTests = testGroup "carrierClosure (containment)"
+  [ testCase "a field DECLARED at carrier type derives a carrier" $
+      let e = envWithField (carrierTy affineCarrier) in
+      isCarrierOf (T.pack "Box") (TE.carrierClosure e) @?= (True, True)
+
+  , testCase "affinity follows the KIND of carrier contained" $
+      -- Holding a non-affine carrier (the 'Borrow' shape: second-class but
+      -- read-many) must yield second-class WITHOUT consume-once.
+      let e = envWithField (carrierTy nonAffineCarrier) in
+      isCarrierOf (T.pack "Box") (TE.carrierClosure e) @?= (True, False)
+
+  , testCase "a carrier nested under a type ARGUMENT still derives" $
+      -- data Box = Box [Suspension]: the carrier is not the field's head.
+      let e = envWithField (Ty.CTCon (Ty.TcUser (T.pack "List"))
+                                     [carrierTy affineCarrier]) in
+      isCarrierOf (T.pack "Box") (TE.carrierClosure e) @?= (True, True)
+
+    -- The two negative cases assert 'tcCarrier' ONLY: 'tcAffine' is
+    -- documented as meaningless when 'tcCarrier' is False, and defaults to
+    -- True, so asserting it here would pin an undefined value.
+  , testCase "an ARROW-typed field does NOT derive (D2, producer thunks)" $
+      -- data Box = Box (() -> Suspension): produces a carrier, does not hold
+      -- one. Contaminating this would break the prelude's runConc/spawn shape.
+      let e = envWithField (Ty.CTArr (Ty.CTCon Ty.TcU64 []) Ty.CREmpty
+                                     (carrierTy affineCarrier)) in
+      fst (isCarrierOf (T.pack "Box") (TE.carrierClosure e)) @?= False
+
+  , testCase "a quantified field does NOT derive (D3, guarded at the use site)" $
+      let e = envWithField (Ty.CTGen 0) in
+      fst (isCarrierOf (T.pack "Box") (TE.carrierClosure e)) @?= False
+
+  , testCase "an ordinary container tycon is not itself poisoned" $
+      -- `List`'s own field is a quantified slot, so `List` stays clean even in
+      -- an env where a `List` of carriers exists. Contagion travels through a
+      -- USE of `List` at carrier type, never into `List`.
+      let e = envWithField (Ty.CTCon (Ty.TcUser (T.pack "List"))
+                                     [carrierTy affineCarrier]) in
+      fst (isCarrierOf (T.pack "List") (TE.carrierClosure e)) @?= False
+
+  , testCase "the closure is idempotent" $
+      -- Re-run per module as imported tycons arrive already closed, so a
+      -- second application must not oscillate or widen.
+      let e  = envWithField (carrierTy affineCarrier)
+          c1 = TE.carrierClosure e
+      in TE.envTyCons (TE.carrierClosure c1) @?= TE.envTyCons c1
+
+  , testCase "an already-marked non-affine carrier does not become affine" $
+      -- Borrow must survive the closure with tcAffine still False.
+      let e = envWithField (Ty.CTGen 0) in
+      isCarrierOf nonAffineCarrier (TE.carrierClosure e) @?= (True, False)
+  ]
+  where
+    affineCarrier    = T.pack "Suspension"
+    nonAffineCarrier = T.pack "Borrow"
+
+    carrierTy n = Ty.CTCon (Ty.TcUser n) []
+
+    isCarrierOf n e = case TE.lookupTyCon n e of
+      Nothing   -> (False, False)
+      Just info -> (TE.tcCarrier info, TE.tcAffine info)
+
+    mkTyCon cons carrier affine = TE.TyConInfo
+      { TE.tcKind = Ty.KStar, TE.tcArity = 0, TE.tcCons = cons
+      , TE.tcCarrier = carrier, TE.tcAffine = affine, TE.tcParamKinds = [] }
+
+    -- An env holding the two prelude-shaped carriers, an ordinary `List`
+    -- (whose own field is a quantified slot, so it must stay clean), and a
+    -- user `Box` with a single field of the given type.
+    envWithField fieldTy =
+      let conBox = TE.ConInfo
+            { TE.conScheme = Ty.mkScheme []
+                (Ty.CTArr fieldTy Ty.CREmpty (carrierTy (T.pack "Box")))
+            , TE.conArity = 1, TE.conTyCon = T.pack "Box" }
+          conCons = TE.ConInfo
+            { TE.conScheme = Ty.mkScheme []
+                (Ty.CTArr (Ty.CTGen 0) Ty.CREmpty (carrierTy (T.pack "List")))
+            , TE.conArity = 1, TE.conTyCon = T.pack "List" }
+      in TE.extendCon (T.pack "Box") conBox
+       . TE.extendCon (T.pack "Cons") conCons
+       . TE.extendTyCon (T.pack "Box")  (mkTyCon [T.pack "Box"] False True)
+       . TE.extendTyCon (T.pack "List") (mkTyCon [T.pack "Cons"] False True)
+       . TE.extendTyCon affineCarrier    (mkTyCon [] True True)
+       . TE.extendTyCon nonAffineCarrier (mkTyCon [] True False)
+       $ TE.emptyEnv
 
 envOverlayTests :: TestTree
 envOverlayTests = testGroup "envOverlay"
@@ -2518,7 +2613,7 @@ sexpParseGoldenEmbedsParens = Set.fromList
 sexpExpectedPerDir :: [(FilePath, (Int, [FilePath]))]
 sexpExpectedPerDir =
   [ ("test/typecheck-examples", (29,
-      ["13-records","14-record-extension","15-record-patterns","16-multi-constructor-records","18-nominal-distinction","19-block-form-records","20-effects-decl","21-effects-arrow","22-effects-pure","23-effects-calls","24-effects-handle","25-effects-di","26-with-handler","28-with-header","43-state-param","44-named-instance","caf-local-inherits-ambient","conc-payload-recursive-ok","conc-surface","coro-pure-tail","coro-residual-handled","coro-residual-multi","par-residual-log","row-param-bare","row-param-box","rung2-nested-fn-ok","user-data-step-not-carrier"]))
+      ["13-records","14-record-extension","15-record-patterns","16-multi-constructor-records","18-nominal-distinction","19-block-form-records","20-effects-decl","21-effects-arrow","22-effects-pure","23-effects-calls","24-effects-handle","25-effects-di","26-with-handler","28-with-header","43-state-param","44-named-instance","caf-local-inherits-ambient","carrier-field-thunk-ok","carrier-record-read-ok","conc-payload-recursive-ok","conc-surface","coro-pure-tail","coro-residual-handled","coro-residual-multi","par-residual-log","row-param-bare","row-param-box","rung2-nested-fn-ok","user-data-step-not-carrier"]))
   , ("test/examples", (7,
       ["02-decls","04-lambda-let-case-if","05-patterns","06-types-data","07-where","08-infix-lhs","09-layout","11-warts","12-conid-split","14-modules","15-projection","16-reserved","17-reserved-error","19-operator-sigs","20-effects-syntax","26-typeclass","26-with-handler","27-with-header","28-with-named","40-extern-coro-types","41-row-kinded-params"]))
   , ("test/run-examples", (51,

@@ -1,0 +1,24 @@
+readN r =
+  let t = r.n
+  t
+
+bumpedN r =
+  let p = r.b
+  let t.2 = R { b = p, n = 1 }
+  let r2 = t.2
+  let t.1 = r2.n
+  t.1
+
+sink p =
+  7
+
+twice p =
+  let t.3 = sink(p)
+  let a = t.3
+  let t.2 = sink(p)
+  let b = t.2
+  let t.1 = +(a, b)
+  t.1
+
+main =
+  0

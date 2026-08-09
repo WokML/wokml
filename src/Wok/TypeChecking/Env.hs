@@ -30,15 +30,19 @@ module Wok.TypeChecking.Env
   , extendClass
   , extendInstance
   , extendForeignModule
+  , carrierClosure
   ) where
 
 import Data.List (nub)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified GeneratedParser.Wok.Abs as Abs
 import Wok.FFI.Blessed (ArgTransfer)
-import Wok.TypeChecking.Types (CType, Constraint, Kind, Scheme)
+import Wok.TypeChecking.Types
+  (CType (..), Constraint, Kind, Scheme (..), TyCon (..))
 
 data ConInfo = ConInfo
   { conScheme :: Scheme
@@ -313,3 +317,118 @@ extendForeignModule k v e = e { envForeignModules = Map.insert k v (envForeignMo
 -- @import M as A@).
 lookupQualifier :: Text -> Env -> Maybe (Text, Map Text Scheme)
 lookupQualifier k = Map.lookup k . envQualifiers
+
+-- ---------------------------------------------------------------------------
+-- Carrier containment closure (spec 2026-08-10-carrier-containment-fix)
+-- ---------------------------------------------------------------------------
+
+-- | Close 'tcCarrier' / 'tcAffine' under CONTAINMENT: a tycon whose
+-- constructors structurally hold a carrier IS a carrier, derived rather than
+-- declared.
+--
+-- WHY. Both soundness passes ('checkCarriers', 'checkFutureAffine') track
+-- binder names of carrier type, using the set of tycons flagged 'tcCarrier'.
+-- Without this closure a marked carrier can be smuggled out of its activation
+-- inside an ordinary user type — @data Box (row e) = Box (Suspension … (row e))@
+-- — after which it is first-class, duplicable, and resumable twice (the
+-- @[g]@-rejected / @[Box g]@-accepted asymmetry). Closing the set under
+-- containment makes @Box@ a carrier, so the existing escape and consume-once
+-- checks fire with no change to either pass.
+--
+-- WRITE-BACK, not a local set. 'tcCarrier' has three readers: the two
+-- soundness passes' set construction, the row-var rigidification test
+-- ('effectRelevantRowVars'), and the Conc payload check. Deriving the flags
+-- INTO the env keeps every present and future reader consistent, instead of
+-- patching the readers that happen to exist today.
+--
+-- Affinity propagates by KIND of containment: holding an affine carrier
+-- ('Suspension'/'Step'/'ContCell') yields consume-once AND second-class;
+-- holding only a non-affine carrier (FFI 'Borrow', read-many by design)
+-- yields second-class alone. An already-marked tycon never loses a flag.
+--
+-- Idempotent and monotone, so re-running it per module (imported tycons
+-- arrive already closed) cannot oscillate.
+carrierClosure :: Env -> Env
+carrierClosure env = env { envTyCons = Map.mapWithKey apply (envTyCons env) }
+  where
+    apply n info
+      | Set.member n carriers =
+          info { tcCarrier = True, tcAffine = Set.member n affines }
+      | otherwise = info
+
+    (carriers, affines) = fixpoint seed0 affine0
+
+    seed0   = Map.keysSet (Map.filter tcCarrier (envTyCons env))
+    affine0 = Map.keysSet
+                (Map.filter (\i -> tcCarrier i && tcAffine i) (envTyCons env))
+
+    -- Monotone over a finite tycon set, so this terminates; recursive and
+    -- mutually recursive declarations converge by construction.
+    -- @affines@ stays a subset of @carriers@ for free: affine0 ⊆ seed0, and
+    -- @mentions affines ⊆ mentions carriers@ whenever affines ⊆ carriers.
+    fixpoint cs as =
+      let grow s = Set.union s (Set.fromList
+                     [ n | n <- Map.keys (envTyCons env)
+                         , not (Set.member n s)
+                         , any (mentions s) (fieldTysOf n) ])
+          cs' = grow cs
+          as' = grow as
+      in if Set.size cs' == Set.size cs && Set.size as' == Set.size as
+           then (cs, as)
+           else fixpoint cs' as'
+
+    -- Declared field types of every POSITIONAL constructor of a tycon, kept as
+    -- the arrow spine of the constructor scheme.
+    --
+    -- Record constructors are deliberately out of reach here: 'tcCons' holds
+    -- positional constructors only (see @registerCons@ in "Wok.TypeChecking.Infer",
+    -- which builds it from @ConDef@s and says so), and a record VALUE is typed
+    -- structurally as @CTRecord tag row@ rather than @CTCon (TcUser n) args@,
+    -- so a derived flag on the tycon would not be consulted for it anyway.
+    -- Record containment is therefore answered structurally, at the carrier
+    -- predicates ('Wok.TypeChecking.Carrier.recordRowCarries'), NOT by this
+    -- closure. Adding a speculative 'envRecordCons' fallback here would be
+    -- unreachable code implying a coverage this function does not provide.
+    fieldTysOf n = case Map.lookup n (envTyCons env) of
+      Nothing   -> []
+      Just info -> concatMap conFields (tcCons info)
+
+    conFields cn = case Map.lookup cn (envCons env) of
+      Just ci -> conFieldTys (conArity ci) (schemeBody (conScheme ci))
+      Nothing -> []
+
+    conFieldTys :: Int -> CType -> [CType]
+    conFieldTys k (CTArr d _ c) | k > 0 = d : conFieldTys (k - 1) c
+    conFieldTys _ _                     = []
+
+-- | Does this type structurally CONTAIN one of the given carrier tycons?
+--
+-- Total over 'CType'. Two cases carry the design and are easy to get
+-- backwards:
+--
+--   * 'CTArr' STOPS contagion. A field of function type does not contain a
+--     carrier, it produces or consumes one — @data F = F (() -> Step …)@ is
+--     the prelude's producer-thunk shape (@runConc@/@spawn@/@async@) and must
+--     stay legal. SOUNDNESS DEPENDENCY: this is safe only because a closure
+--     that CAPTURES a carrier is independently rejected by the escape check's
+--     capture rule, so a thunk can return a fresh carrier but cannot smuggle
+--     an existing one. Weakening that rule reopens this as a hole.
+--
+--   * 'CTGen' does not trigger contagion. A quantified slot cannot be known to
+--     be a carrier at declaration time; containment through a polymorphic slot
+--     (@Pair g 1@, @[g]@, @(g, 1)@, @erase g@) is guarded at the USE site by
+--     the escape check. The two mechanisms partition the problem.
+--
+-- Traversing 'CTCon' arguments does NOT poison the container tycon: the rule
+-- is applied to the field types written in each declaration, so
+-- @data L = L [Suspension …]@ makes @L@ a carrier while @List@ itself stays
+-- clean (its own field type is a 'CTGen').
+mentions :: Set Text -> CType -> Bool
+mentions s ty = case ty of
+  CTCon (TcUser n) args -> Set.member n s || any (mentions s) args
+  CTCon _          args -> any (mentions s) args
+  CTRecord _ row        -> mentions s row
+  CRExtend _ ft rest    -> mentions s ft || mentions s rest
+  CTArr {}              -> False
+  CREmpty               -> False
+  CTGen _               -> False

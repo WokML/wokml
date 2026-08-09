@@ -1,0 +1,28 @@
+module Main
+import Base
+import Borrow
+-- Containment (spec 2026-08-10), full-branch review round: the RESULT of a
+-- projection, record literal, or record extension is judged by its own type.
+--
+-- The BASE of a projection/extension is an allowed position, so that reading an
+-- ordinary field (`r.n`) stays legal when a SIBLING field holds a carrier. That
+-- allowance left the carrier reachable one keystroke from the rejected
+-- `leak r = [r]`, via four spellings that are all this same escape:
+--
+--     [r.b]                    -- the raw Borrow, in a list
+--     [R { ..r, n = 1 }]       -- same Borrow, new record
+--     [R { b = r.b, n = 1 }]   -- same Borrow, rebuilt field-by-field
+--     [p.h]                    -- an effect handle out of its `with` scope
+--
+-- All four are now rejected by judging the node's RESULT type, which is what
+-- distinguishes them from `r.n : U64` (not a carrier, still legal).
+--
+-- This file pins the extension form. `bump` was briefly an ACCEPT fixture,
+-- which pinned record-return escape as correct and contradicted the sibling
+-- `leak r = [r]` reject in carrier-field-record.wok -- one keystroke apart, the
+-- opposite verdict.
+data R = R { b : Borrow, n : U64 }
+bump : R -> R
+bump r = R { ..r, n = 1 }
+main : U64
+main = 0

@@ -1,0 +1,46 @@
+module Main
+import Base
+import Borrow
+
+-- Containment (spec 2026-08-10): the ACCEPT side of record containment, all
+-- three cases from the /code-review high round on this fix. A record holding a
+-- carrier is itself a carrier, so it cannot be stored or returned whole (see
+-- test/typecheck-fail-examples/carrier-field-record.wok) -- but that must not
+-- make the record unusable.
+
+data R = R { b : Borrow, n : U64 }
+
+-- (1) Reading an ORDINARY field must stay legal. The projection BASE is an
+-- allowed position: reading `n` carries nothing outward, and rejecting it
+-- merely because a SIBLING field holds a carrier would leak nothing while
+-- making carrier-holding records unreadable.
+readN : R -> U64
+readN r = r.n
+
+-- (2) Record EXTENSION is legal as an intermediate: the base is copied into a
+-- new record, and reading an ordinary field off the result carries nothing out.
+-- RETURNING the rebuilt record is NOT legal and is pinned as a reject in
+-- test/typecheck-fail-examples/carrier-record-rebuild.wok -- the new record
+-- still holds the same `Borrow`, so handing it back would carry the carrier out
+-- of the activation exactly as `f r = r` does.
+bumpedN : R -> U64
+bumpedN r = let r2 = R { ..r, n = 1 } in r2.n
+
+-- (3) A record whose carrier field is an EFFECT-INSTANCE HANDLE must not be
+-- treated as affine. Effect handles are second-class but never consume-once,
+-- so passing such a record to two consumers is legal. (Regression guard: the
+-- record containment test must recurse under the CALLER's predicate --
+-- `isHandleType` reports every effect handle as a carrier while ignoring the
+-- name set, so routing the affine question through it made this a spurious
+-- FutureConsumedTwice.)
+effect State s = { get : s, set : s -> () }
+data Point = Point { x : U64 }
+
+sink : Point + { h : State U64 } -> U64
+sink p = 7
+
+twice : Point + { h : State U64 } -> U64
+twice p = let a = sink p in let b = sink p in a + b
+
+main : U64
+main = 0

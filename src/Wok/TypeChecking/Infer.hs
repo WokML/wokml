@@ -39,6 +39,7 @@ import qualified Wok.TypeChecking.Builtins as Builtins
 import Wok.TypeChecking.Env
   ( ConInfo (..), Env, EffectInfo (..), ForeignMemberInfo (..)
   , ForeignModuleInfo (..), RecordConInfo (..), TyConInfo (..)
+  , carrierClosure
   , envTyCons
   , extendCon, extendEffect, extendForeignModule
   , extendRecordCon, extendTyCon, extendVar
@@ -4321,12 +4322,28 @@ inferProgramTC seedEnv origin decls = do
   -- Pass 2 + 3: collect sigs and infer equations via inferTopLetGroup.
   -- Warnings (BodylessBinding, RowShadow, …) are emitted into the TC
   -- monad's warning channel via addWarning; they are collected by runTC.
-  withEnv (const env1i) $ do
+  -- Close the carrier flags under CONTAINMENT before any body is inferred
+  -- (spec 2026-08-10-carrier-containment-fix): a tycon structurally holding a
+  -- carrier becomes one, so a marked carrier cannot be laundered out of its
+  -- activation inside an ordinary user type (`data Box = Box (Suspension …)`).
+  --
+  -- WHY HERE, and not beside the two set constructions below: 'tcCarrier' is
+  -- also read DURING inference, by the row-var rigidification test
+  -- ('isCarrier'/'effectRelevantRowVars'), so a closure applied afterwards
+  -- would arrive too late for it. All tycons and constructors are registered
+  -- by this point (pass 1 + the effect/foreign/class/instance registrars), so
+  -- the closure's inputs are complete. Deriving the flags INTO the env also
+  -- keeps the third reader ('checkConcPayload') consistent for free -- do not
+  -- "helpfully" re-derive a local carrier set at any of the three sites.
+  let env1x = carrierClosure env1i
+  withEnv (const env1x) $ do
     tds <- inferTopLetGroup origin externs localDecls
     env2 <- currentEnv
-    -- Names of marked carrier tycons (extern data/type), read off the env's
-    -- tcCarrier flags. Threaded into both post-inference soundness passes so
-    -- carrier-ness rides the marker, not a TyCon tag (slice 4d).
+    -- Names of carrier tycons, read off the env's tcCarrier flags -- now
+    -- CLOSED UNDER CONTAINMENT by 'carrierClosure' above, so this picks up
+    -- derived carriers as well as the `extern data`/`extern type` marked ones.
+    -- Threaded into both post-inference soundness passes so carrier-ness rides
+    -- the marker, not a TyCon tag (slice 4d).
     let carrierTys = Set.fromList
           [ n | (n, info) <- Map.toList (envTyCons env2), tcCarrier info ]
         -- The AFFINE subset of 'carrierTys' -- carriers flagged 'tcAffine'

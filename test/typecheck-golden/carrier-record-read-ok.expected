@@ -1,0 +1,5 @@
+bumpedN : R { b,n, } -> U64
+main : U64
+readN : R { b,n, } -> U64
+sink : Point { h,x, } -> U64
+twice : Point { h,x, } -> U64

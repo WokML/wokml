@@ -1,0 +1,20 @@
+module Main
+import Base
+import Control
+-- Containment (spec 2026-08-10), decision D3: the OTHER half of the two-guard
+-- partition. A carrier reaching a POLYMORPHIC constructor slot is caught at the
+-- USE site by the escape check, not by the declaration-site closure -- a
+-- quantified field cannot be known to be a carrier when `Pair` is declared, so
+-- `Pair` is correctly NOT a derived carrier.
+--
+-- This is the shape that made the hole legible: `Pair g 1` was always rejected
+-- while `Box g` (the same value, a precisely-typed field away) was accepted.
+-- Pinned here so the closure can never be "simplified" into taking over this
+-- route and quietly dropping the use-site guard.
+data Pair a b = Pair a b
+grabPoly : Step U64 () () (row e) -> [Pair (Suspension U64 () () (row e)) U64]
+grabPoly s = case s of
+  Completed _   -> []
+  Suspended x g -> [Pair g 1]
+main : U64
+main = 0

@@ -1,0 +1,2 @@
+main : U64
+store : forall a. F a -> [F a]

@@ -1,0 +1,7 @@
+store f : F a3 =
+  let t.1 : [F a3] = Nil
+  let t.2 : [F a3] = Cons(f, t.1)
+  t.2
+
+main =
+  0

@@ -1,0 +1,25 @@
+module Main
+import Base
+import Control
+
+-- Containment (spec 2026-08-10), decision D2: an ARROW-typed field does NOT
+-- make its type a carrier. A field of function type does not CONTAIN a
+-- carrier -- it produces or consumes one. This is the prelude's producer-thunk
+-- shape (`runConc`/`spawn`/`async` all build `\ () -> start (asConc …)`), so
+-- contaminating it would break the prelude.
+--
+-- `F` must therefore stay ORDINARY: storable and returnable, unlike the
+-- derived carriers pinned in test/typecheck-fail-examples/carrier-field-*.wok.
+--
+-- SOUNDNESS DEPENDENCY (spec R3): this exemption is safe only because a
+-- closure that CAPTURES a carrier is independently rejected by the escape
+-- check's capture rule. A thunk may return a FRESH carrier; it cannot smuggle
+-- an existing one. If that capture rule is ever weakened, D2 becomes a hole
+-- and this fixture becomes the wrong expectation.
+data F (row e) = F (() -> Step U64 U64 U64 (row e))
+
+store : F (row e) -> [F (row e)]
+store f = [f]
+
+main : U64
+main = 0

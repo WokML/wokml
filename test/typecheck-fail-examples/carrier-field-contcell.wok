@@ -1,0 +1,12 @@
+module Main
+import Base
+import Control
+-- Containment (spec 2026-08-10): the hole was not specific to `Suspension`.
+-- `ContCell` is a marked carrier too, and laundered through a user
+-- constructor identically, exposing M3 stored continuations by the same route.
+-- The closure covers every marked carrier, not one named type.
+data CellBox r (row e) = CellBox (ContCell r (row e))
+stash : ContCell U64 (row e) -> [CellBox U64 (row e)]
+stash c = [CellBox c]
+main : U64
+main = 0

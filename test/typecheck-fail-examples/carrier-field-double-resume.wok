@@ -1,0 +1,36 @@
+module Main
+import Base
+import Control
+-- Containment (spec 2026-08-10): THE EXPLOIT this fix exists to stop.
+--
+-- Before the fix this program TYPE-CHECKED and RAN, printing 211 = 105 + 106:
+-- one one-shot continuation resumed twice, with 5 and again with 6. Both
+-- disciplines were laundered at once -- the carrier escaped its activation
+-- inside `Box`, and `Box` being ordinary data made it freely duplicable, so
+-- `unbox b` twice resumed the same parked continuation twice.
+--
+-- Under `WOK_DEBUG_ONESHOT=1` the runtime one-shot oracle reported
+-- `OneShotViolation` on this program while the static law accepted it: a
+-- differential witness that the two disagreed. They must now agree, by the
+-- static law rejecting it -- the oracle should never get the chance to fire.
+data Box (row e) = Box (Suspension U64 U64 U64 (row e))
+
+prod : () -> U64 with Coro U64 U64
+prod u = let x = Coro.suspend 1 in x + 100
+
+escape : Step U64 U64 U64 (row e) -> [Box (row e)]
+escape s = case s of
+  Completed _   -> []
+  Suspended x g -> [Box g]
+
+unbox : Box (row e) -> U64 -> U64 with eff e
+unbox bx v = case bx of
+  Box g -> run g v
+
+useTwice : [Box (row e)] -> U64 with eff e
+useTwice bs = case bs of
+  []     -> 0
+  b :: _ -> let r1 = unbox b 5 in let r2 = unbox b 6 in r1 + r2
+
+main : U64
+main = useTwice (escape (start prod))
