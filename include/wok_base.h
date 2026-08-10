@@ -14,6 +14,42 @@
 #error "wok requires C23 (-std=c23)"
 #endif
 
+// ------------------------------------------------------- feature tests
+//
+// SELF-POLICING FIRST. glibc's features.h defines _FEATURES_H as soon as it
+// has settled which declarations exist. Arriving here after that, with no
+// _POSIX_C_SOURCE in hand, means a system header won the race and everything
+// below is decoration. Left undetected it surfaces hundreds of lines later as
+// "struct stat has no member st_mtim", which names neither the cause nor the
+// file that caused it -- so say it here, where the fix is.
+#if defined(_FEATURES_H) && !defined(_POSIX_C_SOURCE)
+#error "wok_base.h must be included BEFORE any system header (see the ordering rule below)"
+#endif
+//
+// -std=c23 is strict ISO: it defines __STRICT_ANSI__, and glibc then withholds
+// every POSIX declaration -- fmemopen, popen, opendir, dup2, and struct stat's
+// st_mtim among them. This build wants strict ISO for the LANGUAGE and POSIX
+// for the LIBRARY, which is not a contradiction, just something that has to be
+// asked for. Asked for once, here, instead of in each file that trips over it.
+//
+// ORDERING RULE -- the reason this sits above every #include below: a
+// feature-test macro has effect only if it precedes the first system header.
+// So wok_base.h must be reached before <stdio.h> in every translation unit.
+// The house style already delivers that, because each .c opens with its own
+// header and the project headers include this one. A .c that opens with a
+// system header instead silently gets the strict-ISO configuration and will
+// fail to see POSIX -- if that happens, include "wok_base.h" first, explicitly.
+//
+// The Apple clause is not symmetry for its own sake: asking for POSIX on
+// Darwin HIDES the Darwin extensions (st_mtimespec, which wok_write.c needs on
+// that platform), so the two have to be requested together.
+#if !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE 1
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -68,20 +104,32 @@ typedef uintptr_t uptr;
 // including globals. Character-class predicates over a constexpr bitmap
 // qualify. Anything that dereferences a pointer, or reads a static table,
 // DOES NOT -- use WOK_READONLY for those.
-#if defined(__has_c_attribute) && __has_c_attribute(unsequenced)
-#  define WOK_PURE [[unsequenced]]
-#elif defined(__GNUC__)
+// GNU spelling FIRST, deliberately. C23 requires [[unsequenced]] and
+// [[reproducible]] to appertain to the function DECLARATOR -- they must follow
+// the parameter list -- but all 63 uses in this repo are prefixes, ahead of the
+// return type. GCC 15 implements the attribute and rejects that placement
+// ("can only be applied to function declarators"); clang 19 does not implement
+// it at all, so __has_c_attribute was false there and the GNU branch was taken,
+// which is why only GCC ever complained.
+//
+// __attribute__((const)) is valid in prefix position on both, and carries the
+// same optimisation licence. To use the standard spelling instead, all 63 sites
+// have to move to suffix position -- a separate, mechanical change.
+#if defined(__GNUC__)
 #  define WOK_PURE __attribute__((const))
+#elif defined(__has_c_attribute) && __has_c_attribute(unsequenced)
+#  define WOK_PURE [[unsequenced]]
 #else
 #  define WOK_PURE
 #endif
 
 // WOK_READONLY: reads memory through its arguments or from static data, but
 // writes none and has no other effects. The right one for a table lookup.
-#if defined(__has_c_attribute) && __has_c_attribute(reproducible)
-#  define WOK_READONLY [[reproducible]]
-#elif defined(__GNUC__)
+// GNU spelling first, for the placement reason documented on WOK_PURE above.
+#if defined(__GNUC__)
 #  define WOK_READONLY __attribute__((pure))
+#elif defined(__has_c_attribute) && __has_c_attribute(reproducible)
+#  define WOK_READONLY [[reproducible]]
 #else
 #  define WOK_READONLY
 #endif

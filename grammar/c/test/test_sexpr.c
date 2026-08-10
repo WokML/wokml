@@ -5,6 +5,11 @@
 // not need to be. It only needs to put at least one instance of every field
 // class (and a nullary node) somewhere in the tree the generic walker sees.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <string.h>
 
 #include "../wok_arena.h"

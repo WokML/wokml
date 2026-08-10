@@ -23,13 +23,17 @@
 
 #pragma once
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "wok_arena.h"
-#include "wok_base.h"
 
 typedef struct WokNode WokNode;
 

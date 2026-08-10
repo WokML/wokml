@@ -5,6 +5,11 @@
 // Apple's Command Line Tools decline to ship. test/fuzz_layout.c remains the
 // libFuzzer entry point for a machine with a full LLVM.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>

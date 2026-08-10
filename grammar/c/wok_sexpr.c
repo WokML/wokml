@@ -8,13 +8,16 @@
 
 // This include a string buffer here.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include "wok_sexpr.h"
 
 #include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
-
-#include "wok_base.h"
 
 // Real C call-stack depth, in both directions, is bounded by this: a node
 // recurses into its NODE/OPT/SEQ fields, which recurse into their nodes, and

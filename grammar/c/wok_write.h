@@ -18,11 +18,14 @@
 
 #pragma once
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#include "wok_base.h"
 
 // Identity of a file at a moment. The byte hash is the authority; size and
 // mtime are cheap corroboration that also catch a same-length edit whose hash

@@ -4,6 +4,11 @@
 //
 //   cd grammar/c && make fuzz && ./test/fuzz_parse -max_len=8192 corpus/
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

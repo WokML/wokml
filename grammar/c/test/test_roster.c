@@ -3,6 +3,11 @@
 // A roster checked against another hand-written roster is not checked at all,
 // so every check here goes through the real scanner.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <string.h>
 
 #include "../wok_arena.h"

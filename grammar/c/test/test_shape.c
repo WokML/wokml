@@ -5,6 +5,11 @@
 // only asserted "these two are equal" would be satisfied by a function that
 // returns the empty string.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <string.h>
 
 #include "../wok_arena.h"

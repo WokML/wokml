@@ -1,0 +1,4 @@
+packages: .
+
+-- Pinned so a fixed commit always resolves the same Hackage state.
+index-state: hackage.haskell.org 2026-08-10T07:17:06Z

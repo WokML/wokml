@@ -51,7 +51,7 @@ CORPUS := $(wildcard ../../test/redesign/accept/*.wok) \
           $(wildcard testdata/tour/*.wok) \
           $(wildcard testdata/fill/*.wok)
 
-.PHONY: all test sanitize sweep fuzz clean corpus
+.PHONY: all test sanitize sweep fuzz clean corpus coverage
 
 all: wokparse wokfmt
 
@@ -148,6 +148,87 @@ sanitize:
 	@# Instrumented objects must not be left where an ordinary `make` would
 	@# reuse them: they carry __asan/__ubsan references the normal link lacks.
 	@$(MAKE) clean > /dev/null
+
+# Line coverage, GCC ONLY. gcov's data format is tied to the compiler that
+# produced it, so this must run in the gcc devshell -- `gcov` there is that
+# gcc's gcov, which is the whole reason the shells are separate.
+#
+# -O1, not -O0: nixpkgs' gcc injects -D_FORTIFY_SOURCE, and glibc #warns that
+# fortification needs optimization, which -Werror turns into a build failure.
+# -O1 satisfies it while still keeping line attribution close enough to the
+# source to read; -O2 is where the optimiser merges lines until the report
+# describes the object instead.
+COVDIR := coverage
+GCOV   ?= gcov
+
+# PROVENANCE. A coverage report with no commit on it is unreadable a week
+# later: you cannot tell what it measured, and two reports cannot be compared.
+# So the commit, its date, and the CI run are stamped into both outputs.
+#
+# SOURCE_DATE_EPOCH is the reason the first published report read
+# "Test Date: 1980-01-01". Nix exports it as 315532800 so builds are
+# reproducible, and lcov honours it. Unsetting it would restore wall-clock and
+# lose reproducibility; setting it to the COMMIT's own date keeps the report
+# reproducible AND makes the date mean something -- rebuild this commit
+# tomorrow and you get the same page, dated when the code was written.
+COV_SHA   := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+COV_EPOCH := $(shell git log -1 --format=%ct 2>/dev/null || date +%s)
+COV_DATE  := $(shell date -u -r $(COV_EPOCH) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+               || date -u -d @$(COV_EPOCH) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+# Set by CI; empty locally, which is itself information.
+COV_RUN   ?= $(if $(GITHUB_RUN_ID),https://github.com/$(GITHUB_REPOSITORY)/actions/runs/$(GITHUB_RUN_ID),)
+# --ignore-errors unused: the exclude list below is a SUPERSET covering every
+# platform this can run on, so some pattern always matches nothing -- vendor/
+# is under runtime/ and never compiled here, /nix/store only exists in CI,
+# /usr only outside it. lcov 2.x treats an unused pattern as a hard error
+# (exit 25), which would make the report platform-specific for no gain.
+LCOV   ?= lcov --gcov-tool $(GCOV) --rc branch_coverage=0 --ignore-errors unused
+coverage:
+	$(MAKE) clean
+	$(MAKE) test CC=$(CC) CFLAGS="$(STD) $(WARN) -O1 -g --coverage $(INCLUDE)"
+	@mkdir -p $(COVDIR)
+	@# The BASELINE is not optional. A file no test ever enters emits no .gcda
+	@# and would be missing from the report entirely -- so it would not lower
+	@# the percentage, and the untested file becomes invisible. That is the one
+	@# thing this report exists to show, so capture zero counts for everything
+	@# compiled and merge them under the measured run.
+	$(LCOV) --capture --initial --directory $(BUILD) --base-directory . \
+	  --output-file $(COVDIR)/base.info
+	$(LCOV) --capture --directory $(BUILD) --base-directory . \
+	  --output-file $(COVDIR)/run.info
+	$(LCOV) --add-tracefile $(COVDIR)/base.info \
+	  --add-tracefile $(COVDIR)/run.info --output-file $(COVDIR)/all.info
+	@# Vendored code and the suites themselves are not the subject. Left in,
+	@# they dominate the denominator and the number stops meaning anything.
+	$(LCOV) --remove $(COVDIR)/all.info \
+	  '*/test/*' '*/vendor/*' '/nix/store/*' '/usr/*' \
+	  --output-file $(COVDIR)/wok.info
+	SOURCE_DATE_EPOCH=$(COV_EPOCH) genhtml $(COVDIR)/wok.info \
+	  --output-directory $(COVDIR)/html \
+	  --title "$(COV_SHA)" --legend --show-details
+	@# The same measurement for readers that are not browsers. Served next to
+	@# the HTML, so a tool asks for one URL instead of scraping 86 files of
+	@# markup. uncovered_lines is the part worth having: a percentage says how
+	@# much is missed, the line numbers say what.
+	python3 ../../scripts/lcov-to-json.py $(COVDIR)/wok.info \
+	  --root ../.. --commit $(COV_SHA) --generated-at "$(COV_DATE)" \
+	  > $(COVDIR)/html/coverage.json
+	@# EXACTNESS GATE. The JSON is consumed by tools that cannot notice a
+	@# wrong number, so it is checked against lcov's own summary of the same
+	@# tracefile and the build stops on any disagreement. This is not
+	@# hypothetical: the two silently differed once (365 functions vs 686),
+	@# because the parser knew only the classic FN:/FNDA: spelling.
+	$(LCOV) --summary $(COVDIR)/wok.info 2>&1 \
+	  | python3 ../../scripts/coverage-verify.py $(COVDIR)/html/coverage.json
+	@printf '{"commit":"%s","date":"%s","run":"%s"}\n' \
+	  '$(COV_SHA)' '$(COV_DATE)' '$(COV_RUN)' > $(COVDIR)/html/build.json
+	@# The raw tracefile too: it is what both of the above were derived from,
+	@# and a tool that wants to recompute rather than trust us needs it.
+	@cp $(COVDIR)/wok.info $(COVDIR)/html/coverage.info
+	python3 ../../scripts/coverage-postprocess.py $(COVDIR)/html \
+	  --commit $(COV_SHA) --date "$(COV_DATE)" --run "$(COV_RUN)"
+	@echo "coverage: $(COVDIR)/html/index.html  (+ coverage.json, build.json, coverage.info)"
+	@echo "stamped:  commit $(COV_SHA), dated $(COV_DATE)"
 
 sweep: $(BUILD)/test/test_layout_sweep
 	./$(BUILD)/test/test_layout_sweep

@@ -6,6 +6,11 @@
 // carries the diagnostic code it must produce as its first line. A filter
 // that stops catching a fault is as bad as one that invents one.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdio.h>
 #include <string.h>
 

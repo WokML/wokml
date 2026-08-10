@@ -8,6 +8,11 @@
 // `"\xFF"` puts 0xFF into the message, and a JSON string must be well-formed
 // UTF-8. Found by feeding the CLI hostile files; pinned here.
 
+// First, and deliberately: this suite uses fmemopen, and wok_base.h carries
+// the POSIX feature-test macros that a system header would otherwise settle
+// before we got a say. See the ordering rule there.
+#include "wok_base.h"
+
 #include <stdio.h>
 #include <string.h>
 

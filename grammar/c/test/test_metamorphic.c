@@ -33,6 +33,11 @@
 // == Dump(t)), so the property compares against the same dump either way, and
 // which files take that route is COMPUTED (has_hanging_block), not listed.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

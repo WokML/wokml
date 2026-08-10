@@ -39,13 +39,17 @@
 // parentheses is deliberately NOT done: punctuation the author did not write
 // is a worse trade than one long line.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include "wok_print.h"
 
 #include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "wok_base.h"
 #include "wok_token.h"
 #include "wok_trivia.h"
 
@@ -405,8 +409,13 @@ enum { EP_EXPR = 0, EP_CHAIN = 1, EP_NEG = 2, EP_APP = 3, EP_ATOM = 4 };
 // path or an H_ChainOp -- where a bracket is SYNTAX, not grouping -- so the
 // invariant is asserted rather than described.
 enum { PREC_FIXED = 4 };
-static_assert(PREC_FIXED >= TP_ATOM && PREC_FIXED >= PP_ATOM &&
-                  PREC_FIXED >= EP_ATOM,
+// The casts carry weight: PREC_FIXED and the *_ATOM rungs are enumerators of
+// DIFFERENT anonymous enums, and GCC's -Wenum-compare rejects comparing two
+// unrelated enum types. Comparing their integer values is precisely what is
+// meant here, so say so.
+static_assert((int)PREC_FIXED >= (int)TP_ATOM &&
+                  (int)PREC_FIXED >= (int)PP_ATOM &&
+                  (int)PREC_FIXED >= (int)EP_ATOM,
               "PREC_FIXED must top every ladder; see the note above");
 
 typedef struct {

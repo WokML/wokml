@@ -46,10 +46,10 @@
 // re-reports one tree. A property test that cannot reproduce its own
 // counterexample is a rumour.
 
-// dup2, for the hush below. The existing suites already reach for POSIX
-// (test_metamorphic walks directories), so this asks for it by name rather
-// than relying on a platform that leaves it visible under -std=c23.
-#define _POSIX_C_SOURCE 200809L
+// First, and deliberately: this suite uses dup2 for the hush below, and
+// wok_base.h carries the POSIX feature-test macros. See the ordering rule
+// there.
+#include "wok_base.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -1496,6 +1496,28 @@ static WokSpan atom_min(const Pool *p, NameRule rule, WokSpan cur) {
   WOK_UNREACHABLE();
 }
 
+// Two tiers, and picking the wrong one is what -Wformat-truncation keeps
+// catching:
+//
+//   WHY_CAP     -- a raw explanation, as tree_valid writes it.
+//   SHR_WHY_CAP -- a SHRINKER REPORT: one of those plus the wrapper below.
+//
+// Anything that receives Shr::why, directly or through shrink()'s out-param,
+// needs the second. Sizing such a buffer at WHY_CAP is not a near miss; it
+// silently loses the tail of the only text that explains the failure.
+enum { WHY_CAP = 192 };
+
+// The wrapper Shr puts around a quoted explanation. Spelled once, as a macro,
+// and pasted into the format string at the use site -- so the size below and
+// the text actually written can never disagree.
+#define SHR_WHY_WRAP "a tree the tables forbid: "
+
+// Sized from the wrapper plus a FULL inner explanation, rather than a round
+// number picked by hand: at 192 the tail was silently dropped, in precisely
+// the report that exists to explain a failure. `sizeof` on the literal counts
+// its NUL, which is the byte the result needs anyway.
+enum { SHR_WHY_CAP = WHY_CAP + sizeof SHR_WHY_WRAP };
+
 typedef struct {
   const Pool *pool;
   WokArena *a;
@@ -1508,9 +1530,16 @@ typedef struct {
   bool audit;
   unsigned audited;
   int broke;
-  char why[192];  // the FIRST breakage, reported by the caller once the
-                  // printer's own chatter is out of the way
+  // The FIRST breakage, reported by the caller once the printer's own chatter
+  // is out of the way.
+  char why[SHR_WHY_CAP];
 } Shr;
+
+// The other message Shr writes is a bare literal, so it cannot be truncated
+// by a long argument -- but it can be made longer by an editor. Pin it.
+static_assert(sizeof "a candidate that trips the latch" <= SHR_WHY_CAP,
+              "Shr::why must hold every message written into it");
+
 
 // Writes `v` into the slot, tests, and keeps it only if the failure survived.
 static bool try_slot(Shr *s, WokNode *file, WokNode *owner, u8 slot,
@@ -1525,11 +1554,11 @@ static bool try_slot(Shr *s, WokNode *file, WokNode *owner, u8 slot,
   // becomes a segfault inside the very pass that was meant to explain a
   // failure. Checked in both modes: in audit it is the whole point, and in a
   // real shrink it is the guard that keeps a report from becoming a crash.
-  char why[192];
+  char why[WHY_CAP];
   bool ok = tree_valid(s->pool, file, why, sizeof why);
   if (!ok) {
     if (s->broke == 0)
-      snprintf(s->why, sizeof s->why, "a tree the tables forbid: %s", why);
+      snprintf(s->why, sizeof s->why, SHR_WHY_WRAP "%s", why);
     s->broke++;
   }
   if (s->audit) {
@@ -1904,7 +1933,7 @@ enum { SHR_SELFTEST_MAX = 10 };  // the spec's own number
 static int shrink_audit(const Pool *pool) {
   unsigned audited = 0;
   int broke = 0;
-  char why[192] = {0};
+  char why[SHR_WHY_CAP] = {0};
   Hush h = hush_begin();  // the printer reports every over-width line, and an
                           // audit prints thousands of candidates
   for (u32 i = 0; i < 200; i++) {
@@ -1946,7 +1975,7 @@ static int shrink_selftest(const Pool *pool) {
       continue;
     }
     int sbroke = 0;
-    char swhy[192] = {0};
+    char swhy[SHR_WHY_CAP] = {0};
     (void)shrink(file, pool, a, holds_an_if, nullptr, &sbroke, swhy,
                  sizeof swhy);
     u32 after = count_nodes(file);
@@ -2014,7 +2043,7 @@ static Prop run_one(u64 seed, const Pool *pool, bool verbose, bool *seen,
     u32 before = count_nodes(file);
     SameFailure ctx = {.pool = pool, .target = prop};
     int broke = 0;
-    char bwhy[192] = {0};
+    char bwhy[SHR_WHY_CAP] = {0};
     unsigned steps = shrink(file, pool, a, same_failure, &ctx, &broke, bwhy,
                             sizeof bwhy);
     if (broke != 0)

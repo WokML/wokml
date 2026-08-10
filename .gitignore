@@ -42,3 +42,8 @@ CONTEXT.md
 # Scratch modules the interpreter suite writes beside its fixtures; the name
 # carries a hashUnique, so every run leaves a differently-named stray.
 test/.interp-tmp-*.wok
+# Local planning notes (readable in-repo, never committed)
+plans/
+
+# lcov/genhtml output
+grammar/c/coverage/

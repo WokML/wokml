@@ -1,22 +1,27 @@
+/* NOTE ON THE PRAGMA SPELLING BELOW: it must be `GCC`, not `clang`. GCC
+   ignores `#pragma clang diagnostic` outright, so with the clang spelling none
+   of these suppressions reached GCC and the vendored header failed the build
+   on -Wunused-function. Clang honours the GCC spelling too, so one spelling
+   covers both compilers; the clang spelling covers only one. */
 /* StringZilla wrappers for wok String Slice E2. Raw-byte-range entry points so the
    same functions serve a C cell, a Haskell ByteString, and an encodeUtf8 buffer.
    All StringZilla entry points are compiled as inline-static into this single TU
    (SZ_DYNAMIC_DISPATCH=0, the default): the definitions live inside the header's
    #if !SZ_DYNAMIC_DISPATCH guard, so do NOT set SZ_DYNAMIC_DISPATCH=1 here. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wpedantic"
-#pragma clang diagnostic ignored "-Wconversion"
-#pragma clang diagnostic ignored "-Wdouble-promotion"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wunused-function"
-#pragma clang diagnostic ignored "-Wextra"
-#pragma clang diagnostic ignored "-Wstrict-aliasing"
-#pragma clang diagnostic ignored "-Wstrict-prototypes"
-#pragma clang diagnostic ignored "-Wunknown-pragmas"
-#pragma clang diagnostic ignored "-Wformat-security"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Wdouble-promotion"
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wextra"
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#pragma GCC diagnostic ignored "-Wstrict-prototypes"
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#pragma GCC diagnostic ignored "-Wformat-security"
 #include "stringzilla/stringzilla.h"
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 #include <stdint.h>
 #include <stddef.h>
 

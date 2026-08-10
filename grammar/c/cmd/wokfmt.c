@@ -12,6 +12,11 @@
 // 11.7 ms. There is nothing a cache could save that is worth the staleness it
 // would risk.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -23,6 +23,11 @@
 // was one column out would either wrap the 80-column case or fail to wrap the
 // 81-column one.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>

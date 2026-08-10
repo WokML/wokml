@@ -12,9 +12,12 @@
 
 #pragma once
 
-#include <stddef.h>
-
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
 #include "wok_base.h"
+
+#include <stddef.h>
 
 // Length of the well-formed sequence at p, or 0 if it is ill-formed --
 // unexpected byte, truncated, bad continuation, overlong, surrogate, or above

@@ -2,15 +2,27 @@
 
 #pragma once
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "wok_base.h"
-
-static int wok_test_failures = 0;
-static int wok_test_checks = 0;
+// [[maybe_unused]] because a suite is free to use TEST_DONE() without ever
+// calling CHECK -- test_layout_corpus does exactly that -- and a `static` no
+// translation unit touches is an error under -Werror=unused-variable. GCC
+// reports it; clang does not, which is why it went unnoticed until a second
+// compiler ran.
+//
+// Unlike the function attributes in wok_base.h, the standard spelling is
+// correct in this position: on a VARIABLE declaration the attribute appertains
+// to the thing declared, which is what is meant.
+[[maybe_unused]] static int wok_test_failures = 0;
+[[maybe_unused]] static int wok_test_checks = 0;
 
 #define CHECK(cond, ...)                                       \
   do {                                                         \

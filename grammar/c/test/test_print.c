@@ -21,6 +21,11 @@
 // canonical form that depends on more than one item at a time and so is the
 // one part that could break property 2.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>

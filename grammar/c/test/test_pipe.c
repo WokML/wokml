@@ -10,6 +10,11 @@
 // because the thing under test is the CLI contract: which stream carries the
 // payload, which carries the diagnostics, and what the exit code means.
 
+// First, and deliberately: this suite uses popen/pclose and opendir, and
+// wok_base.h carries the POSIX feature-test macros. See the ordering rule
+// there.
+#include "wok_base.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>

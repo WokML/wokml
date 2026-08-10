@@ -20,6 +20,11 @@
 // -- no fixtures, no golden files -- so a shape assertion here is checked
 // against the actual tree the pass built, not a hand-drawn picture of it.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdio.h>
 #include <string.h>
 

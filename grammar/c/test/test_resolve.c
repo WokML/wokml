@@ -17,6 +17,11 @@
 // E-LABEL is in the registry and appears on two reject files, and neither
 // fault is one this stage can see, so E-LABEL is not in the set.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include <stdio.h>
 #include <string.h>
 

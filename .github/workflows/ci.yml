@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The v2 front end, on every OS/arch/compiler combination we claim to
+  # support. `make test` builds 20 test binaries, runs them, then checks the
+  # two CLI mode splits.
+  #
+  # GCC is a REQUIRED check as of the warning-fix round; between them the two
+  # compilers found attribute misplacement, POSIX visibility under strict ISO,
+  # an enum-compare, truncation at both ends of a report chain, and an unused
+  # static. Every one was invisible to a single-compiler build.
+  #
+  # macOS carries no gcc leg: nixpkgs' GCC is largely uncached on Darwin, and
+  # Apple clang is what this code is actually built with there.
+  grammar-c:
+    name: grammar/c (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, label: linux-x64 clang, shell: clang, cc: clang }
+          - { os: ubuntu-24.04, label: linux-x64 gcc, shell: gcc, cc: gcc }
+          - { os: ubuntu-24.04-arm, label: linux-arm64 clang, shell: clang, cc: clang }
+          - { os: ubuntu-24.04-arm, label: linux-arm64 gcc, shell: gcc, cc: gcc }
+          - { os: macos-latest, label: macos-arm64 clang, shell: clang, cc: clang }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - run: nix develop .#${{ matrix.shell }} --command make -C grammar/c test CC=${{ matrix.cc }}
+
+  # The Haskell compiler proper: library, executables and the tasty suite.
+  #
+  # WOK_WOKPARSE is the point of the wokparse build below. Three groups --
+  # Sexp.Differential, Sexp.Reorder, Sexp.Reorder.Property -- are gated on it,
+  # and when it is unset they do NOT fail: they register a single passing test
+  # saying "skipped". 2318 tests green without it, 2427 with. So an unguarded
+  # `cabal test` reports success while silently dropping the entire
+  # C-front-end-vs-Haskell differential, which is exactly the check CI exists
+  # to run. The grep after the run makes that impossible rather than merely
+  # discouraged.
+  haskell:
+    name: haskell (ghc 9.10.3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Keyed on the freeze file: nix pins the COMPILER, but every Hackage
+      # package still comes from cabal, so the freeze file is what decides
+      # whether this cache is still valid.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 (node24)
+        with:
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            ~/.local/state/cabal
+            dist-newstyle
+          key: cabal-${{ runner.os }}-ghc9103-${{ hashFiles('cabal.project.freeze') }}
+          restore-keys: cabal-${{ runner.os }}-ghc9103-
+
+      - name: build wokparse (the WOK_WOKPARSE gate depends on it)
+        run: nix develop .#gcc --command make -C grammar/c wokparse CC=gcc
+
+      # Without this the index is empty and every dependency is "unknown
+      # package". The index-state pin in cabal.project still decides WHICH
+      # versions resolve; update only makes an index exist to resolve against.
+      - name: cabal update
+        run: nix develop .#haskell --command cabal update
+
+      - name: cabal build
+        run: nix develop .#haskell --command cabal build --enable-tests all
+
+      - name: cabal test
+        run: |
+          nix develop .#haskell --command env \
+            WOK_WOKPARSE="$PWD/grammar/c/wokparse" \
+            cabal test --test-show-details=streaming 2>&1 | tee test.log
+
+      - name: the gated groups must have RUN, not skipped
+        run: |
+          if grep -q 'skipped (WOK_WOKPARSE unset)' test.log; then
+            echo "::error::WOK_WOKPARSE was not seen by the suite -- the Sexp groups"
+            echo "::error::silently skipped and the run is not the green it claims."
+            exit 1
+          fi
+          echo "gated groups ran"
+
+  # Coverage: GCC + lcov, Linux only, its own job.
+  #
+  # Not folded into grammar-c: `make sanitize` ends with `make clean` by
+  # design, coverage wants -O0 where the build wants -O2, and instrumented
+  # objects must never be reused by a normal build.
+  coverage:
+    name: coverage (gcc + lcov)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - run: nix develop .#gcc --command make -C grammar/c coverage CC=gcc
+
+      - name: summarise
+        run: nix develop .#gcc --command lcov --list grammar/c/coverage/wok.info
+
+      # Uploaded whether or not a deploy follows: a report that only exists
+      # inside a job that later fails is a report nobody reads. This also
+      # keeps the report reachable on pull requests, which deliberately do
+      # not deploy.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (node24)
+        with:
+          name: coverage-html
+          path: grammar/c/coverage/html
+          if-no-files-found: error
+
+      # Publish to coverage.wokml.org.
+      #
+      # The `if` is a security boundary, not a preference. GitHub withholds
+      # secrets from workflows triggered by a fork's pull_request, so a deploy
+      # step there could only ever fail -- and pull_request_target, which WOULD
+      # hand the token over, runs the PR's own code with it. So: pushes to the
+      # default branch, or a deliberate manual run. Never a PR.
+      #
+      # netlify deploy uploads the directory to Netlify's CDN and flips the
+      # alias atomically; --prod is what points the live domain at this
+      # deploy rather than leaving it as a preview.
+      # WHERE is checked before WHEN. The first attempt at this deployed to the
+      # `wokml` project and replaced wokml.org with the coverage report
+      # (run 31373848009). Branch guards would not have stopped that: the step
+      # was right about when to run and wrong about what it was pointing at.
+      # So the target is now ASSERTED against Netlify's own record of the
+      # project, and a mismatch fails the job instead of publishing.
+      #
+      # The secret is NETLIFY_COVERAGE_SITE_ID, not NETLIFY_SITE_ID: a generic
+      # name is what let the wrong value look plausible.
+      - name: verify the deploy target is the coverage project
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          SITE_ID: ${{ secrets.NETLIFY_COVERAGE_SITE_ID }}
+          EXPECTED: coverage.wokml.org
+        run: |
+          set -euo pipefail
+          site=$(nix develop .#deploy --command \
+            netlify api getSite --data "{\"site_id\":\"$SITE_ID\"}")
+          name=$(printf '%s' "$site" | jq -r '.name // "?"')
+          domains=$(printf '%s' "$site" \
+            | jq -r '[(.custom_domain // empty)] + (.domain_aliases // []) | join(" ")')
+          echo "target project : $name"
+          echo "domains        : ${domains:-<none>}"
+          for d in $domains; do
+            if [ "$d" = "$EXPECTED" ]; then
+              echo "verified: $EXPECTED is served by this project"
+              exit 0
+            fi
+          done
+          echo "::error::Refusing to publish. The project behind"
+          echo "::error::NETLIFY_COVERAGE_SITE_ID serves '${domains:-nothing}',"
+          echo "::error::not $EXPECTED. Attach $EXPECTED to project '$name'"
+          echo "::error::(Domain management -> Add a domain), or point the"
+          echo "::error::secret at the project that already serves it."
+          exit 1
+
+      - name: publish to coverage.wokml.org
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_COVERAGE_SITE_ID }}
+        run: |
+          set -euo pipefail
+          nix develop .#deploy --command netlify deploy \
+            --prod \
+            --dir grammar/c/coverage/html \
+            --message "coverage @ ${GITHUB_SHA::7}"

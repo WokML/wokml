@@ -22,11 +22,14 @@
 // move a comment behind one that preceded it in the source is overridden and
 // the comment joins its predecessor instead.
 
+// The prelude comes FIRST: it carries the POSIX feature-test macros, which
+// have no effect once a system header has been read. wok_base.h hard-errors
+// if it is reached too late.
+#include "wok_base.h"
+
 #include "wok_trivia.h"
 
 #include <string.h>
-
-#include "wok_base.h"
 
 // The tree is bounded by the parser's own depth cap; this is only a guard so
 // a hostile or damaged tree cannot walk off the C stack.
