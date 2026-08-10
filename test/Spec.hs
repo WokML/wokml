@@ -2618,7 +2618,7 @@ sexpExpectedPerDir =
       ["02-decls","04-lambda-let-case-if","05-patterns","06-types-data","07-where","08-infix-lhs","09-layout","11-warts","12-conid-split","14-modules","15-projection","16-reserved","17-reserved-error","19-operator-sigs","20-effects-syntax","26-typeclass","26-with-handler","27-with-header","28-with-named","40-extern-coro-types","41-row-kinded-params"]))
   , ("test/run-examples", (51,
       ["07-effect-ask","16-exn-abort","17-choice-multishot","18-value-op","19-exn-never","25-lint-forgotten-warn","26-lint-discard-wildcard","27-lint-escaping","28-bounded-multishot-arith","29-bounded-multishot-prefix","30-bounded-multishot-let","31-bounded-generator-splice","32-bounded-control-single","33-bounded-nested-multishot","34-bounded-reshape-unpack","35-bounded-header","36-bounded-autoresume","37-known-reentrant-multishot-limitation","40-state-param","41-state-writer-nested","42-writer-state-nested","45-with-in-sugar","46-std-control-mtl","49-named-instance","50-two-cells","51-sum-prod","52-aliasing","53-mixed-row","56-named-multishot","57-named-answers-ambient","58-named-state-reader","59-named-two-state-reader","59-once-arity-both-readings","60-named-state-writer","as-pattern-single","borrow-foreign-lend","borrow-malloc-lend","borrow-read","conc-foreign-sequential-await","conc-nested-own-handles","coro-pure-tail","coro-residual-handled","coro-residual-multi","handler-helper-resume","handler-multiline-body","handler-multiline-nested","local-decl-both-directions","local-fn-sees-value","multiline-handler","multiline-handler-state","par-residual-log","row-param-bare","row-param-box","user-cons-name"]))
-  , ("docs/redesign/examples/accept", (5,
+  , ("test/redesign/accept", (5,
       ["01-state-cell","02-two-cells","03-ambient-mtl","04-generator","06-use-bridge","09-activation-independence","10-abort-except"]))
   ]
 
@@ -2628,7 +2628,7 @@ data SexpKind
   = SexpTypecheck -- test/typecheck-examples: typecheck success golden
   | SexpParseOnly -- test/examples: parse golden (print/reparse round-trip)
   | SexpRun       -- test/run-examples: run golden (elaborate + interpret)
-  | SexpV2Ingest  -- docs/redesign/examples/accept: no golden, no .wok twin parse
+  | SexpV2Ingest  -- test/redesign/accept: no golden, no .wok twin parse
   deriving (Eq, Show)
 
 sexpCorpusDirs :: [(FilePath, SexpKind)]
@@ -2636,7 +2636,7 @@ sexpCorpusDirs =
   [ ("test/typecheck-examples", SexpTypecheck)
   , ("test/examples", SexpParseOnly)
   , ("test/run-examples", SexpRun)
-  , ("docs/redesign/examples/accept", SexpV2Ingest)
+  , ("test/redesign/accept", SexpV2Ingest)
   ]
 
 -- | Per-file discovery outcome (spec S3's discovery rules). A gap

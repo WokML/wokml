@@ -1,8 +1,0 @@
-module Main
-import Base
-
-main : U64
-main =
-  let s = 5
-  s := 6
-  s

@@ -36,8 +36,8 @@
 #include "check.h"
 
 static const char *const dirs[] = {
-    "../../docs/redesign/examples/accept",
-    "../../docs/redesign/examples/reject",
+    "../../test/redesign/accept",
+    "../../test/redesign/reject",
     "testdata/tour",
     // The line-filling boundary cases. They belong here as well as in
     // test_fill: a WRAPPED file is the one shape where a break could have

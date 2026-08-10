@@ -513,9 +513,9 @@ static int check_cases(void) {
 int main(void) {
   int bad = 0, seen = 0;
   bool accepts = false, rejects = true;
-  bad += wok_test_walk("../../docs/redesign/examples/accept", resolve_one,
+  bad += wok_test_walk("../../test/redesign/accept", resolve_one,
                        &accepts, &seen);
-  bad += wok_test_walk("../../docs/redesign/examples/reject", resolve_one,
+  bad += wok_test_walk("../../test/redesign/reject", resolve_one,
                        &rejects, &seen);
   bad += wok_test_walk("testdata/tour", resolve_one, &accepts, &seen);
   // fill/ too: this suite is the ONLY resolver gate that runs under plain

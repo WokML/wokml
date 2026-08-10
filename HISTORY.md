@@ -12,7 +12,11 @@ are preserved in each commit message, so nothing is lost -- run `git log` for th
 Entries marked **breaking** changed the language surface, the prelude, or the CLI in a way
 that required existing `.wok` code to change; the commit message states the migration.
 
+Note that all these docs and specification reference are pointing to git tags `port-v1`.
 
+`/docs` has been removed since we want to overhaul the LLM code assist pipeline, previously
+it is kept for record purpose. So in there you may find local machine's absolute path and
+we are sorry about it.
 
 ## May 2026
 

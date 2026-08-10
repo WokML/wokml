@@ -42,8 +42,8 @@ int main(void) {
     return 0;
   }
 
-  const char *dirs[] = {"../../docs/redesign/examples/accept",
-                        "../../docs/redesign/examples/reject",
+  const char *dirs[] = {"../../test/redesign/accept",
+                        "../../test/redesign/reject",
                         "testdata/tour", "testdata/fill"};
   int files = 0;
   for (usize di = 0; di < sizeof dirs / sizeof *dirs; di++) {

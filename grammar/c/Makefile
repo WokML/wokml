@@ -46,8 +46,8 @@ TEST_BIN := $(TEST_SRC:%.c=$(BUILD)/%)
 DEPS := $(LIB_OBJ:.o=.d) $(BUILD)/cmd/wokparse.d $(BUILD)/cmd/wokfmt.d \
         $(TEST_BIN:=.d)
 
-CORPUS := $(wildcard ../../docs/redesign/examples/accept/*.wok) \
-          $(wildcard ../../docs/redesign/examples/reject/*.wok) \
+CORPUS := $(wildcard ../../test/redesign/accept/*.wok) \
+          $(wildcard ../../test/redesign/reject/*.wok) \
           $(wildcard testdata/tour/*.wok) \
           $(wildcard testdata/fill/*.wok)
 
@@ -85,7 +85,7 @@ test: $(TEST_BIN) wokfmt wokparse
 	@# (a stage-4 fault must not cost the reader the tree it is about), while
 	@# the check modes gate on stage 4 too. reject/07 is parse-clean with a
 	@# resolver fault, so it distinguishes the two.
-	@f=../../docs/redesign/examples/reject/07-assign-outside.wok; \
+	@f=../../test/redesign/reject/07-assign-outside.wok; \
 	  ./wokparse $$f > /dev/null 2>&1 || \
 	    { echo "cli: bare mode must dump a parse-clean file"; exit 1; }; \
 	  if ./wokparse -check-only $$f > /dev/null 2>&1; then \

@@ -21,8 +21,8 @@
 #include "check.h"
 
 static const char *const good_dirs[] = {
-    "../../docs/redesign/examples/accept",
-    "../../docs/redesign/examples/reject",
+    "../../test/redesign/accept",
+    "../../test/redesign/reject",
     "testdata/tour",
 };
 

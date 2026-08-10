@@ -108,8 +108,8 @@ static usize mutate(const unsigned char *in, usize n, unsigned char *out) {
 
 
 int main(void) {
-  load_dir("../../docs/redesign/examples/accept");
-  load_dir("../../docs/redesign/examples/reject");
+  load_dir("../../test/redesign/accept");
+  load_dir("../../test/redesign/reject");
   load_dir("testdata/tour");
   load_dir("testdata/parse-bad");
   load_dir("testdata/layout-bad");

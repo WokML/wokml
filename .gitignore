@@ -32,3 +32,13 @@ REVIEW.md
 
 # Blog drafts (local-only, generated notes)
 blog/
+
+CLAUDE.md
+AGENTS.md
+
+# I wonder should I do this.
+CONTEXT.md
+
+# Scratch modules the interpreter suite writes beside its fixtures; the name
+# carries a hashUnique, so every run leaves a differently-named stray.
+test/.interp-tmp-*.wok

@@ -1,8 +1,0 @@
-(module Main)
-(import Base)
-(effect State (params s) (op get s) (op set (-> s (unit))))
-(effect Tick (params) (op tick (-> U64 U64)))
-(sig (names double) (app Handler Tick a a))
-(def double (params) (handler Tick (clause tick (args x) (infix x (* 2)))))
-(sig (names main) U64)
-(def main (params) (block (handle (slot State) double) 0))

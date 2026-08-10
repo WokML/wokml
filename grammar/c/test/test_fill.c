@@ -36,8 +36,8 @@
 #include "check.h"
 
 static const char *const corpus_dirs[] = {
-    "../../docs/redesign/examples/accept",
-    "../../docs/redesign/examples/reject",
+    "../../test/redesign/accept",
+    "../../test/redesign/reject",
     "testdata/tour",
     "testdata/fill",
 };

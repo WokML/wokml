@@ -41,8 +41,8 @@ static_assert(offsetof(WokNode, slot) == 16, "slots still follow the header");
 
 static const char *const dirs[] = {
     "testdata/trivia",
-    "../../docs/redesign/examples/accept",
-    "../../docs/redesign/examples/reject",
+    "../../test/redesign/accept",
+    "../../test/redesign/reject",
     "testdata/tour",
 };
 

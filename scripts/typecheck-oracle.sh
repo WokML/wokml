@@ -12,7 +12,7 @@
 # group (test/Spec.hs), so the oracle corpus tracks the S3 intersection:
 #
 #   test/typecheck-examples  test/examples  test/run-examples
-#   docs/redesign/examples/accept
+#   test/redesign/accept
 #
 # minus the files test/Spec.hs's `sexpKnownDivergences` excludes from that
 # intersection (a single file: the position-only error-span mismatch on
@@ -98,7 +98,7 @@ export wok_datadir="$REPO_ROOT"
 # ---------------------------------------------------------------
 # Corpus
 # ---------------------------------------------------------------
-CORPUS_DIRS="test/typecheck-examples test/examples test/run-examples docs/redesign/examples/accept"
+CORPUS_DIRS="test/typecheck-examples test/examples test/run-examples test/redesign/accept"
 
 # test/Spec.hs, sexpKnownDivergences -- keep in sync by hand.
 KNOWN_DIVERGENCES="conc-carrier-transport-rejected"
